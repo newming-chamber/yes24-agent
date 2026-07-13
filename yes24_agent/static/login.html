@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Yes24 AI 어시스턴트 · 로그인</title>
+  <style>
+    :root {
+      --bg: #f7f7f8; --panel: #ffffff; --border: #e5e5e8; --text: #1a1a1e;
+      --muted: #8a8a92; --accent: #2563eb; --error: #dc2626;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #17171a; --panel: #202024; --border: #313136; --text: #ececf0;
+        --muted: #9a9aa2; --accent: #60a5fa; --error: #fca5a5;
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg); color: var(--text); display: flex; align-items: center;
+      justify-content: center; padding: 20px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", sans-serif;
+    }
+    .card {
+      width: 100%; max-width: 340px; background: var(--panel); border: 1px solid var(--border);
+      border-radius: 16px; padding: 28px 24px; box-shadow: 0 8px 30px rgba(0,0,0,0.12);
+    }
+    .logo { font-size: 30px; text-align: center; }
+    h1 { font-size: 17px; font-weight: 600; text-align: center; margin: 10px 0 2px; }
+    p.sub { font-size: 12.5px; color: var(--muted); text-align: center; margin: 0 0 20px; }
+    label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 6px; }
+    input[type="password"] {
+      width: 100%; padding: 11px 12px; font-size: 14.5px; border-radius: 10px;
+      border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    }
+    input[type="password"]:focus { outline: none; border-color: var(--accent); }
+    button {
+      width: 100%; margin-top: 14px; padding: 11px; font-size: 14.5px; font-weight: 600;
+      border: none; border-radius: 10px; background: var(--accent); color: #fff; cursor: pointer;
+    }
+    button:hover { filter: brightness(1.05); }
+    .error {
+      font-size: 12.5px; color: var(--error); margin-top: 12px; text-align: center;
+      min-height: 16px;
+    }
+    .error[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <form class="card" method="post" action="/login">
+    <div class="logo">📚</div>
+    <h1>Yes24 AI 어시스턴트</h1>
+    <p class="sub">접근하려면 비밀번호를 입력하세요.</p>
+    <label for="password">비밀번호</label>
+    <input id="password" name="password" type="password" autocomplete="current-password"
+           autofocus required placeholder="비밀번호" />
+    <button type="submit">들어가기</button>
+    <div class="error" id="error" hidden>비밀번호가 올바르지 않아요.</div>
+  </form>
+  <script>
+    // 서버가 실패 시 /login?error=1로 되돌린다 — 그때만 에러 문구를 보인다.
+    if (new URLSearchParams(location.search).has("error")) {
+      document.getElementById("error").hidden = false;
+    }
+  </script>
+</body>
+</html>

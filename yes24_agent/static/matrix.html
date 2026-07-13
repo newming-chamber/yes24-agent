@@ -1,0 +1,1483 @@
+<!doctype html>
+<!--
+  16뷰 RBTI 매트릭스 시뮬레이터 UI (C4/matrix-ux 소유).
+  한 질문 → 16 RBTI 페르소나의 답변을 4×4 그리드로 **한 화면에 동시** 전시·비교한다.
+  자기완결 HTML/CSS/JS(외부 CDN 없음). SSE 계약은 matrix_runner.py 상단 docstring 참조.
+
+  계약 요약:
+  - POST /chat/matrix {question, session_id?} → text/event-stream. 화면은 GET /matrix.
+  - 글로벌 프레임(col 없음): status{stage,detail} · source{id,title,url,type} ·
+    done{sources,session_id}(종료 신호=col 없는 done 1개).
+  - 열 프레임(col=0~15): delta{text,col,code?,name?,axis_label?}(카드 본문 전체 1회 + 정체성) ·
+    done{sources,cited_ids,col}(그 열 인용검증 출처=공유풀 부분집합).
+  - 열은 완료 순서로 도착 → col/code로 카드에 라우팅.
+
+  레이아웃 철학(사용자 요구): "훑기는 한 화면, 깊이는 클릭".
+  - 페이지는 100vh 고정 flex 컬럼, 매트릭스가 남은 높이를 4행 균등 분할 → 16셀이 뷰포트에 한 번에.
+  - 카드 본문은 내부 스크롤 없이 하단 페이드로 잘리고, 클릭 시 모달에서 전문+출처+채택.
+  - 축 색 아이덴티티: 열(취향폭×동기)=hue 밴드, 행(패턴×정보처리)=분석(쿨)·공감(웜) 코드배지.
+
+  방어: 백엔드가 delta에 code/name/axis_label을 안 실어도 동작(code=col 파생, axis_label=코드 파생).
+-->
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RBTI 16유형 비교 · 매트릭스</title>
+  <style>
+    :root {
+      --bg: #f6f6f8;
+      --panel: #ffffff;
+      --border: #e4e4e8;
+      --border-soft: #eeeef1;
+      --text: #1a1a1e;
+      --muted: #85858d;
+      --accent: #2563eb;
+      --accent-soft: #dbeafe;
+      --web: #ea580c;
+      --error-text: #b91c1c;
+      --card-bg: #ffffff;
+      --skeleton: #ececf0;
+      --head-bg: #f0f0f3;
+      --shadow: rgba(20, 20, 40, 0.10);
+      --grid-line: rgba(20, 20, 40, 0.035);
+      --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f0f12;
+        --panel: #1a1a1f;
+        --border: #2c2c33;
+        --border-soft: #232329;
+        --text: #ececf0;
+        --muted: #9a9aa2;
+        --accent: #60a5fa;
+        --accent-soft: #1e3a5f;
+        --web: #fb923c;
+        --error-text: #fca5a5;
+        --card-bg: #1c1c21;
+        --skeleton: #262630;
+        --head-bg: #202027;
+        --shadow: rgba(0, 0, 0, 0.45);
+        --grid-line: rgba(255, 255, 255, 0.028);
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; max-width: 100%; overflow: hidden; }
+    body {
+      /* 절제 패스: 모눈 배경·액센트 글로우 제거 — 조용한 단색 표면(정보가 장식보다 앞서게). */
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo",
+        "Noto Sans KR", Roboto, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      line-height: 1.5;
+    }
+
+    /* 100vh 고정 flex 컬럼 — 매트릭스만 flex:1로 남은 높이를 채운다(페이지 스크롤 0). */
+    .wrap {
+      height: 100vh; max-width: 1500px; margin: 0 auto;
+      padding: 12px 16px 14px; display: flex; flex-direction: column; gap: 8px;
+      overflow: hidden;
+    }
+    .wrap > *:not(.matrix) { flex: 0 0 auto; }
+
+    /* ── 헤더 ── */
+    header.top { display: flex; align-items: center; gap: 10px; }
+    header.top .logo { font-size: 19px; }
+    header.top h1 { font-size: 16.5px; font-weight: 800; margin: 0; letter-spacing: -0.02em; }
+    /* 모노 스펙 태그 — 분류 체계의 차원(4축→16유형)을 데이터로 표기(장식 아님). */
+    header.top .spec {
+      font-family: var(--mono); font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em;
+      color: var(--muted); border: 1px solid var(--border); border-radius: 6px; padding: 2px 7px;
+      display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+    }
+    header.top .spec .dots { display: inline-flex; gap: 2px; }
+    header.top .spec .dots i { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
+    header.top .sub { font-size: 12px; color: var(--muted); }
+    header.top .spacer { flex: 1 1 auto; }
+    header.top a.backlink {
+      font-size: 12.5px; color: var(--muted); background: var(--panel);
+      border: 1px solid var(--border); border-radius: 9px; padding: 6px 12px;
+      cursor: pointer; text-decoration: none; white-space: nowrap; transition: color .12s, border-color .12s;
+    }
+    header.top a.backlink:hover { color: var(--text); border-color: var(--accent); }
+    header.top a.backlink:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    /* ── 컨트롤 패널(질문+필터) ── */
+    .panel-box {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 13px;
+      padding: 10px 12px; display: flex; flex-direction: column; gap: 9px;
+    }
+    .composer { display: flex; gap: 8px; align-items: center; }
+    .composer input {
+      flex: 1; border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 13px; font-size: 14px; font-family: inherit; background: var(--bg);
+      color: var(--text); line-height: 1.4;
+    }
+    .composer input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .composer button {
+      border: none; border-radius: 10px; padding: 0 18px; height: 40px; font-size: 13.5px;
+      font-weight: 700; cursor: pointer; white-space: nowrap; transition: filter .12s, opacity .12s;
+    }
+    .btn-send { background: var(--accent); color: #fff; }
+    .btn-send:hover:not(:disabled) { filter: brightness(1.08); }
+    .btn-send:disabled { opacity: 0.45; cursor: default; }
+    .btn-stop { background: transparent; color: var(--error-text); border: 1px solid var(--border) !important; }
+    .btn-stop:disabled { display: none; }
+    /* 키보드 포커스 가시성(a11y) — 마우스 클릭엔 안 뜨고 키보드 탐색 시만. */
+    .btn-send:focus-visible, .btn-stop:focus-visible, .filter-reset:focus-visible,
+    .shared-toggle:focus-visible, .cell:focus-visible, .m-adopt:focus-visible,
+    .m-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    /* 상태 + 필터를 한 줄에 정돈 */
+    .controls-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+    .status-bar { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); }
+    .status-bar .dot {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
+      animation: pulse 1.3s ease-in-out infinite; flex: 0 0 auto;
+    }
+    .status-bar.done .dot { animation: none; background: #22c55e; }
+    .status-bar.error { color: var(--error-text); }
+    .status-bar.error .dot { background: var(--error-text); animation: none; }
+    @keyframes pulse { 0%,100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); } 50% { opacity: 0.55; box-shadow: 0 0 0 5px transparent; } }
+    .status-bar .count { font-family: var(--mono); font-size: 11px; color: var(--text); font-weight: 600; letter-spacing: 0.02em; }
+
+    .filters { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .filter-axis { display: flex; align-items: center; gap: 4px; }
+    .filter-axis .fa-label { font-size: 10.5px; color: var(--muted); font-weight: 600; margin-right: 1px; }
+    .fchip {
+      font-size: 11.5px; border: 1px solid var(--border); background: var(--bg); color: var(--text);
+      border-radius: 999px; padding: 3px 9px; cursor: pointer; font-family: inherit;
+      transition: color .1s, background-color .1s, border-color .1s;
+    }
+    .fchip:hover { border-color: var(--accent); }
+    .fchip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    /* 활성 칩: 채움 + 은은한 링으로 "눌렸다"가 즉시 보이게. */
+    .fchip.on { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700;
+      box-shadow: 0 0 0 3px var(--accent-soft); }
+    /* 필터 적용 결과 카운터("N / 16 유형 표시") — 필터 없으면 비어서 숨김. */
+    .filter-count { font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--accent); white-space: nowrap; }
+    .filter-count:empty { display: none; }
+    .filter-reset {
+      font-size: 11.5px; color: var(--muted); background: transparent; border: 1px solid var(--border);
+      border-radius: 999px; padding: 3px 10px; cursor: pointer; font-family: inherit;
+    }
+    .filter-reset:hover { color: var(--text); }
+
+    /* 공유 출처 — 접이식(기본 접힘, 스크롤 원인 제거) */
+    .shared { display: flex; align-items: center; gap: 8px; min-height: 24px; }
+    .shared-toggle {
+      font-size: 11.5px; color: var(--muted); background: transparent; border: 1px solid var(--border);
+      border-radius: 999px; padding: 3px 11px; cursor: pointer; font-family: inherit;
+      display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+    }
+    .shared-toggle:hover { color: var(--text); border-color: var(--accent); }
+    .shared-toggle .chev { transition: transform .15s; display: inline-block; }
+    .shared-toggle.open .chev { transform: rotate(90deg); }
+    .shared-toggle .ss-count { font-weight: 700; color: var(--text); }
+    .ss-chips { display: flex; gap: 7px; overflow-x: auto; flex: 1 1 auto; padding-bottom: 2px; }
+    .ss-chips[hidden] { display: none; }
+    .ss-card {
+      flex: 0 0 auto; max-width: 190px; background: var(--card-bg); border: 1px solid var(--border);
+      border-radius: 9px; padding: 5px 9px; cursor: pointer; display: flex; align-items: center; gap: 6px;
+    }
+    .ss-card:hover { border-color: var(--accent); }
+    .ss-card.web { border-left: 3px solid var(--web); }
+    .ss-card .num {
+      font-size: 10px; font-weight: 700; color: #fff; background: var(--accent);
+      border-radius: 4px; min-width: 16px; height: 16px; display: inline-flex;
+      align-items: center; justify-content: center; padding: 0 3px; flex: 0 0 auto;
+    }
+    .ss-card.web .num { background: var(--web); }
+    .ss-card .title { font-size: 11.5px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* ── 4×4 매트릭스 (남은 높이 전부) ── */
+    .matrix {
+      flex: 1 1 auto; min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(58px, auto) repeat(4, minmax(0, 1fr));
+      grid-template-rows: auto repeat(4, minmax(0, 1fr));
+      gap: 7px;
+    }
+    .corner {
+      grid-row: 1; grid-column: 1;
+      display: flex; align-items: center; justify-content: center; text-align: center;
+      font-family: var(--mono); font-size: 8px; letter-spacing: 0.02em; color: var(--muted); line-height: 1.3;
+    }
+    .col-head, .row-head {
+      display: flex; align-items: center; justify-content: center; text-align: center;
+      gap: 4px; overflow: hidden;
+    }
+    .col-head {
+      grid-row: 1; flex-direction: row; padding: 2px 4px;
+      border-bottom: 1.5px solid color-mix(in srgb, var(--col-hue, var(--border)) 70%, var(--border));
+    }
+    .col-head .h-main { font-size: 11.5px; font-weight: 700; color: var(--text); white-space: nowrap; }
+    /* 절제: 컬러 보더 칩 → 뮤트 모노 텍스트(축색은 상단 보더가 전담). */
+    .col-head .h-sub { font-family: var(--mono); font-size: 9px; font-weight: 700; letter-spacing: 0.08em; color: var(--muted); }
+    .row-head {
+      grid-column: 1; flex-direction: column; padding: 4px 3px; gap: 2px;
+      border-left: 2px solid color-mix(in srgb, var(--row-hue, var(--border)) 70%, var(--border));
+    }
+    .row-head .h-main { font-size: 10.5px; font-weight: 700; color: var(--text); line-height: 1.15; }
+    .row-head .h-sub { font-family: var(--mono); font-size: 9px; font-weight: 700; letter-spacing: 0.08em; color: var(--muted); }
+
+    .cell {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      /* 절제2: 축색 상단 보더 = 유일한 구조 신호. 가늘고(1.5px) 옅게(70% 혼합). */
+      border-top: 1.5px solid color-mix(in srgb, var(--col-hue, var(--border)) 70%, var(--border));
+      border-radius: 11px;
+      display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+      cursor: pointer; position: relative;
+      transition: transform .13s ease, box-shadow .13s ease, border-color .13s ease, opacity .18s ease;
+    }
+    /* 절제: hover 글로우(hue 링) 제거, 은은한 리프트만. */
+    .cell:hover { transform: translateY(-2px); box-shadow: 0 4px 14px var(--shadow); z-index: 2; }
+    .cell.dim { opacity: 0.2; filter: saturate(0.4); }
+    .cell.dim:hover { opacity: 0.85; filter: none; transform: none; }
+    .cell.pending { cursor: default; }
+    .cell.pending:hover { transform: none; box-shadow: none; }
+
+    .cell .c-head {
+      flex: 0 0 auto; padding: 7px 9px 5px;
+      display: flex; flex-direction: column; gap: 2px;
+      border-bottom: 1px solid var(--border-soft);
+    }
+    .cell .c-code-row { display: flex; align-items: center; gap: 6px; }
+    /* 절제2: 배지 완전 중립(무채색) + 축색은 좌측 2px 보더로만(도트 대신). 원색 fill 제거. */
+    .cell .c-code {
+      font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: 0.1em;
+      color: var(--muted); background: var(--head-bg);
+      border-left: 2px solid var(--badge-c, var(--accent));
+      border-radius: 0 4px 4px 0; padding: 1.5px 6px; flex: 0 0 auto;
+    }
+    .cell .c-name {
+      font-size: 12px; font-weight: 700; color: var(--text); line-height: 1.25;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .cell.pending .c-name { color: var(--muted); font-weight: 500; }
+
+    /* 본문: 내부 스크롤 없이 남은 높이만큼 보이고 하단 페이드로 잘림(상세는 모달). */
+    .cell .c-body {
+      flex: 1 1 auto; min-height: 0; overflow: hidden; position: relative;
+      padding: 7px 9px 4px; font-size: 11.5px; line-height: 1.5; color: var(--text);
+      white-space: pre-wrap; word-break: break-word;
+      -webkit-mask-image: linear-gradient(180deg, #000 72%, transparent 100%);
+      mask-image: linear-gradient(180deg, #000 72%, transparent 100%);
+    }
+    .cell .c-body.empty { color: var(--muted); -webkit-mask-image: none; mask-image: none; }
+    /* 구조화 본문: 흐르는 전문(셀 높이만큼 채우고 하단 페이드) + 대표책(하단 고정). */
+    .cell .c-body.structured {
+      display: flex; flex-direction: column; gap: 6px;
+      -webkit-mask-image: none; mask-image: none;
+    }
+    /* 본문 = 흐르는 전문. 남는 공간을 채우고(flex:1) 넘치면 하단 페이드로 자연스럽게 잘림.
+       짧은 답변은 짧게, 풍부한 답변은 풍부하게(훑기는 한 화면, 깊이는 클릭). */
+    .cell .c-flow {
+      flex: 1 1 auto; min-height: 0; overflow: hidden;
+      font-size: 11.5px; line-height: 1.5; color: var(--text);
+      white-space: pre-wrap; word-break: break-word;
+      -webkit-mask-image: linear-gradient(180deg, #000 78%, transparent 100%);
+      mask-image: linear-gradient(180deg, #000 78%, transparent 100%);
+    }
+    .cell .c-pick {
+      flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
+      padding-top: 6px; border-top: 1px dashed var(--border-soft);
+    }
+    /* 정직 폴백 셀(책 못 찾음/추천 미완성)은 살짝 muted로 구분. */
+    .cell.fallback { opacity: 0.62; }
+    .cell.fallback .c-flow { color: var(--muted); -webkit-mask-image: none; mask-image: none; }
+    /* 대표책 마커: 이모지 대신 축색 '책등' 틱(색 시스템과 일관, AI-slop 이모지 회피). */
+    .cell .c-pick-ico { width: 3px; height: 13px; border-radius: 2px; background: var(--col-hue, var(--accent)); flex: 0 0 auto; }
+    /* W2 표지 썸네일: image_url 있으면 틱 대신 작은 책 표지. lazy·실패 시 우아한 제거(틱 복귀). */
+    .cell .c-pick-cover {
+      width: 20px; height: 28px; object-fit: cover; border-radius: 2px; flex: 0 0 auto;
+      background: var(--skeleton); box-shadow: 0 1px 3px var(--shadow);
+      opacity: 0; transition: opacity .3s ease;
+    }
+    .cell .c-pick-cover.loaded { opacity: 1; }
+    .cell .c-pick-title { font-size: 11.5px; font-weight: 700; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1 1 auto; }
+    .cell .c-pick-price { font-family: var(--mono); font-size: 10px; font-weight: 700; color: var(--col-hue, var(--accent)); white-space: nowrap; flex: 0 0 auto; }
+    .cell .c-pick-more { font-family: var(--mono); font-size: 9px; font-weight: 700; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; flex: 0 0 auto; }
+
+    .cell .c-foot {
+      flex: 0 0 auto; padding: 4px 8px 6px; display: flex; align-items: center; gap: 4px;
+      overflow-x: auto;
+    }
+    .cell .c-foot:empty { display: none; }
+    .cell .c-chip {
+      flex: 0 0 auto; font-size: 9.5px; font-weight: 700; color: #fff; background: var(--accent);
+      border-radius: 4px; min-width: 15px; height: 15px; display: inline-flex; align-items: center;
+      justify-content: center; padding: 0 3px; cursor: pointer;
+    }
+    .cell .c-chip.web { background: var(--web); }
+    .cell .c-chip.hl { outline: 2px solid var(--text); outline-offset: 1px; }
+
+    /* 인용 마커 */
+    sup.marker {
+      color: var(--accent); font-weight: 700; font-size: 0.72em; cursor: pointer;
+      padding: 0 1px; vertical-align: super;
+    }
+    sup.marker:hover { text-decoration: underline; }
+    sup.marker + sup.marker { margin-left: 2px; }
+
+    /* ── 모션 ─────────────────────────────────────────────
+       (1) 스켈레톤 대각 스태거 등장(페이지/새 질문 시 그리드가 좌상→우하 물결로 나타남)
+       (2) 열 도착 마이크로 인터랙션: 콘텐츠 페이드업 + hue 스캔라인 1회 스윕
+       (3) 모달 스프링, 필터 전환은 .cell transition으로 흡수
+       (4) prefers-reduced-motion: 모션 제거, 최종 상태(opacity)만 유지 */
+    .skel { background: var(--skeleton); border-radius: 5px; height: 8px; margin: 6px 0; animation: shimmer 1.5s ease-in-out infinite; }
+    .skel.w70 { width: 70%; } .skel.w90 { width: 90%; } .skel.w50 { width: 50%; }
+    @keyframes shimmer { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+    /* (1) 셀 스태거 등장 — 지연은 JS가 대각(행+열) 기준으로 부여. 절제: 미세하게(4px, 스케일 없음).
+       fill-mode는 backwards(딜레이 구간만 from 상태 유지) — both/forwards는 종료 후에도
+       애니메이션의 opacity:1이 캐스케이드를 영구히 이겨 .cell.dim(필터 디밍)이 무력화된다(실측). */
+    .cell { animation: cellReveal 0.34s ease backwards; }
+    @keyframes cellReveal { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+    /* (2) 열 도착: 콘텐츠 페이드업(절제: 스캔라인 스윕 제거). */
+    @keyframes cardIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+    .cell.filled .c-head, .cell.filled .c-body, .cell.filled .c-foot { animation: cardIn 0.4s ease both; }
+
+    /* (3) 모달 스프링(오버슈트) + 백드롭 페이드 */
+    @keyframes modalIn { 0% { opacity: 0; transform: translateY(10px) scale(0.955); } 100% { opacity: 1; transform: none; } }
+    @keyframes backdropIn { from { opacity: 0; } to { opacity: 1; } }
+    .modal { animation: modalIn 0.34s cubic-bezier(0.2, 0.9, 0.25, 1.15) both; }
+    .modal-backdrop:not([hidden]) { animation: backdropIn 0.2s ease both; }
+
+    /* (4) 모션 민감 사용자 존중 */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.001ms !important; animation-delay: 0ms !important;
+        animation-iteration-count: 1 !important; transition-duration: 0.001ms !important;
+      }
+      .cell:hover { transform: none; }
+    }
+
+    /* ── 확대 모달 ── */
+    .modal-backdrop {
+      position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,0.5);
+      display: flex; align-items: center; justify-content: center; padding: 22px;
+      backdrop-filter: blur(2px);
+    }
+    .modal-backdrop[hidden] { display: none; }
+    .modal {
+      background: var(--card-bg); border: 1px solid var(--border);
+      border-top: 4px solid var(--col-hue, var(--accent)); border-radius: 16px;
+      width: min(640px, 100%); max-height: 86vh; display: flex; flex-direction: column;
+      overflow: hidden; box-shadow: 0 24px 70px rgba(0,0,0,0.5);
+    }
+    .modal .m-head { padding: 16px 18px 12px; border-bottom: 1px solid var(--border-soft); position: relative; }
+    .modal .m-code-row { display: flex; align-items: center; gap: 9px; margin-bottom: 6px; }
+    .modal .m-code {
+      font-family: var(--mono); font-size: 12px; font-weight: 700; letter-spacing: 0.14em;
+      color: var(--text); background: var(--head-bg);
+      border-left: 2px solid var(--badge-c, var(--accent)); border-radius: 0 5px 5px 0; padding: 2px 9px;
+    }
+    .modal .m-axis { font-family: var(--mono); font-size: 11px; letter-spacing: 0.03em; }
+    .modal .m-axis { font-size: 12px; color: var(--muted); }
+    .modal .m-name { font-size: 17px; font-weight: 700; color: var(--text); line-height: 1.35; padding-right: 34px; }
+    .modal .m-close {
+      position: absolute; top: 12px; right: 14px; font-size: 22px; line-height: 1; color: var(--muted);
+      background: transparent; border: none; cursor: pointer;
+    }
+    .modal .m-close:hover { color: var(--text); }
+    /* W2 모달 책 표지 스트립 — 이 유형이 고른 책들을 표지로. 비면 숨김. */
+    .modal .m-books { display: flex; gap: 12px; overflow-x: auto; padding: 14px 18px 4px; }
+    .modal .m-books:empty { display: none; }
+    .modal .m-book { flex: 0 0 auto; width: 58px; cursor: pointer; }
+    .modal .m-book-cover {
+      width: 58px; height: 82px; object-fit: cover; border-radius: 5px; display: block;
+      background: var(--skeleton); box-shadow: 0 2px 10px var(--shadow); opacity: 0; transition: opacity .3s ease;
+    }
+    .modal .m-book-cover.loaded { opacity: 1; }
+    .modal .m-book-title { font-size: 10px; color: var(--muted); margin-top: 5px; line-height: 1.3;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    .modal .m-body { padding: 12px 18px 16px; overflow-y: auto; font-size: 14px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
+    .modal .m-foot { padding: 12px 18px 16px; border-top: 1px solid var(--border-soft); display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .modal .m-chips { display: flex; gap: 8px; overflow-x: auto; flex: 1 1 auto; }
+    .modal .m-adopt {
+      font-size: 13px; font-weight: 700; color: #fff; background: var(--accent); border: none;
+      border-radius: 10px; padding: 9px 17px; cursor: pointer; font-family: inherit; white-space: nowrap;
+    }
+    .modal .m-adopt:hover { filter: brightness(1.08); }
+
+    /* ── W3: 취향 픽 토너먼트 ── */
+    .tourney-btn {
+      font-size: 12px; font-weight: 700; color: #fff;
+      background: linear-gradient(90deg, #3b82f6, #a78bfa);
+      border: none; border-radius: 999px; padding: 6px 14px; cursor: pointer; font-family: inherit;
+      white-space: nowrap; box-shadow: 0 2px 10px color-mix(in srgb, #6d5bd0 35%, transparent);
+    }
+    .tourney-btn[hidden] { display: none; }
+    .tourney-btn:hover { filter: brightness(1.08); }
+    .tourney-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    .tourney-backdrop {
+      position: fixed; inset: 0; z-index: 70; background: rgba(0,0,0,0.62);
+      display: flex; align-items: center; justify-content: center; padding: 20px;
+      backdrop-filter: blur(3px);
+    }
+    .tourney-backdrop[hidden] { display: none; }
+    .tourney-panel {
+      position: relative; width: min(760px, 100%); max-height: 90vh; overflow: hidden;
+      background: var(--panel); border: 1px solid var(--border); border-radius: 18px;
+      padding: 22px 22px 24px; display: flex; flex-direction: column; gap: 14px;
+      box-shadow: 0 24px 70px rgba(0,0,0,0.55);
+      animation: modalIn 0.34s cubic-bezier(0.2, 0.9, 0.25, 1.15) both;
+    }
+    .t-close {
+      position: absolute; top: 14px; right: 16px; font-size: 22px; line-height: 1; color: var(--muted);
+      background: transparent; border: none; cursor: pointer; z-index: 2;
+    }
+    .t-close:hover { color: var(--text); }
+    .t-progress { height: 5px; background: var(--border-soft); border-radius: 999px; overflow: hidden; }
+    .t-progress span { display: block; height: 100%; width: 0; border-radius: 999px;
+      background: linear-gradient(90deg, #3b82f6, #a78bfa); transition: width 0.35s ease; }
+    .t-round { font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em; color: var(--muted); margin-top: 8px; }
+    .t-axis { color: var(--text); font-weight: 700; }
+    .t-q { font-size: 19px; font-weight: 800; letter-spacing: -0.01em; margin-top: 2px; }
+    .t-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .t-card {
+      background: var(--card-bg); border: 1.5px solid var(--border); border-radius: 14px;
+      padding: 14px; cursor: pointer; display: flex; flex-direction: column; gap: 8px; text-align: left;
+      font-family: inherit; color: var(--text); transition: transform 0.13s ease, box-shadow 0.13s ease, border-color 0.13s ease, opacity 0.2s ease;
+    }
+    .t-card:hover { transform: translateY(-3px); border-color: var(--pick-hue, var(--accent));
+      box-shadow: 0 10px 26px var(--shadow); }
+    .t-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .t-card.chosen { border-color: var(--pick-hue, var(--accent)); box-shadow: 0 0 0 2px var(--pick-hue, var(--accent)); }
+    .t-card.notchosen { opacity: 0.32; transform: scale(0.97); }
+    .t-card.fallback { opacity: 0.5; }
+    .t-card .tc-badge {
+      font-family: var(--mono); font-size: 12px; font-weight: 800; letter-spacing: 0.14em; color: #fff;
+      background: var(--pick-hue, var(--accent)); border-radius: 6px; padding: 2px 10px; align-self: flex-start;
+    }
+    .t-card .tc-diff { font-size: 12.5px; font-weight: 700; color: var(--pick-hue, var(--accent)); }
+    .t-card .tc-name { font-size: 14px; font-weight: 700; line-height: 1.3; }
+    .t-card .tc-gist { font-size: 12px; color: var(--muted); line-height: 1.5;
+      display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+    .t-card .tc-pick { font-size: 11.5px; color: var(--text); margin-top: auto; padding-top: 8px;
+      border-top: 1px dashed var(--border-soft); }
+    .t-card .tc-pick b { color: var(--pick-hue, var(--accent)); font-family: var(--mono); }
+
+    .t-result { display: flex; flex-direction: column; gap: 14px; align-items: center; text-align: center;
+      animation: cardIn 0.4s ease both; }
+    /* .t-result에 display:flex를 줬으므로 UA [hidden]이 무력화됨 → 명시 override 필요. */
+    .t-result[hidden] { display: none; }
+    .t-result .tr-label { font-size: 13px; color: var(--muted); }
+    .t-result .tr-code { font-family: var(--mono); font-size: 26px; font-weight: 800; letter-spacing: 0.16em;
+      color: var(--pick-hue, var(--accent)); }
+    .t-result .tr-name { font-size: 18px; font-weight: 800; }
+    .t-result .tr-axis { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+    .t-result .tr-gist { font-size: 13px; color: var(--text); line-height: 1.6; max-width: 62ch; }
+    .t-result .tr-actions { display: flex; gap: 10px; margin-top: 4px; }
+    .t-result .tr-adopt { font-size: 14px; font-weight: 700; color: #fff; background: var(--accent);
+      border: none; border-radius: 11px; padding: 11px 22px; cursor: pointer; font-family: inherit; }
+    .t-result .tr-adopt:hover { filter: brightness(1.08); }
+    .t-result .tr-again { font-size: 13px; color: var(--muted); background: transparent;
+      border: 1px solid var(--border); border-radius: 11px; padding: 11px 18px; cursor: pointer; font-family: inherit; }
+    .t-result .tr-again:hover { color: var(--text); }
+
+    @media (max-width: 560px) {
+      .t-cards { grid-template-columns: 1fr; }
+      .t-q { font-size: 17px; }
+    }
+
+    /* ── 반응형: 좁으면 축헤더 접고 열 축소(데스크톱은 한 화면 4×4 유지) ── */
+    @media (max-width: 900px) {
+      html, body { overflow: auto; }
+      .wrap { height: auto; min-height: 100vh; overflow: visible; }
+      .matrix { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: none; }
+      .corner, .col-head, .row-head { display: none; }
+      .cell { min-height: 210px; }
+      .cell .c-body { -webkit-mask-image: none; mask-image: none; overflow-y: auto; }
+    }
+    @media (max-width: 540px) {
+      .matrix { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <span class="logo">🧭</span>
+      <h1>독서 유형 분류표</h1>
+      <span class="spec">RBTI · 16유형</span>
+      <span class="sub">한 질문, 16가지 독서 성향을 한 화면에</span>
+      <span class="spacer"></span>
+      <a class="backlink" href="/" title="일반 채팅으로 돌아가기">← 채팅</a>
+    </header>
+
+    <div class="panel-box">
+      <div class="composer">
+        <input id="q" type="text" placeholder="예: 채식주의자 비슷한 소설 추천해줘  (Enter 전송)" autocomplete="off" />
+        <button class="btn-stop" id="stop" disabled>중지</button>
+        <button class="btn-send" id="send">비교</button>
+      </div>
+      <div class="controls-row">
+        <div class="status-bar" id="status"><span class="dot"></span><span id="status-text">질문을 입력하면 16유형이 동시에 답합니다.</span><span class="count" id="count"></span></div>
+        <button class="tourney-btn" id="tourney-btn" hidden>내 취향 찾기 →</button>
+        <span style="flex:1 1 auto"></span>
+        <div class="filters" id="filters"></div>
+      </div>
+    </div>
+
+    <div class="shared">
+      <button class="shared-toggle" id="shared-toggle" aria-expanded="false">
+        공유 출처 <span class="ss-count" id="ss-count">0</span><span class="chev">▸</span>
+      </button>
+      <div class="ss-chips" id="ss-chips" hidden></div>
+    </div>
+
+    <div class="matrix" id="matrix"></div>
+  </div>
+
+  <div class="tourney-backdrop" id="tourney" hidden>
+    <div class="tourney-panel" role="dialog" aria-modal="true" aria-label="취향 찾기 토너먼트">
+      <button class="t-close" id="t-close" aria-label="닫기">×</button>
+      <div class="t-head">
+        <div class="t-progress"><span id="t-bar"></span></div>
+        <div class="t-round" id="t-round"></div>
+        <div class="t-q" id="t-q">어느 쪽이 더 끌려요?</div>
+      </div>
+      <div class="t-cards" id="t-cards"></div>
+      <div class="t-result" id="t-result" hidden></div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="modal-backdrop" hidden>
+    <div class="modal" id="modal" role="dialog" aria-modal="true" aria-label="유형 상세">
+      <div class="m-head">
+        <button class="m-close" id="m-close" aria-label="닫기">×</button>
+        <div class="m-code-row"><span class="m-code" id="m-code"></span><span class="m-axis" id="m-axis"></span></div>
+        <div class="m-name" id="m-name"></div>
+      </div>
+      <div class="m-books" id="m-books"></div>
+      <div class="m-body" id="m-body"></div>
+      <div class="m-foot">
+        <div class="m-chips" id="m-chips"></div>
+        <button class="m-adopt" id="m-adopt">이 성향으로 채팅하기 →</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    "use strict";
+
+    // ── RBTI 축 정의 (persona.py AXIS_ORDER와 동형) ──
+    // code = [pattern][processing][breadth][motivation] = [C/S][A/E][D/B][I/F].
+    // 4×4: 행 = 독서패턴×정보처리(code[0..1]), 열 = 취향폭×독서동기(code[2..3]).
+    const AXES = [
+      { key: "pattern",    label: "패턴", values: ["C", "S"] },
+      { key: "processing", label: "처리", values: ["A", "E"] },
+      { key: "breadth",    label: "폭",   values: ["D", "B"] },
+      { key: "motivation", label: "동기", values: ["I", "F"] },
+    ];
+    const VAL = { C: "완독", S: "선택", A: "분석", E: "공감", D: "깊이", B: "넓이", I: "정보", F: "재미" };
+
+    // 축 색 아이덴티티: 열(취향폭×동기)별 hue 밴드, 행 = 정보처리(분석 쿨 / 공감 웜) 코드배지.
+    const COL_HUE = { DI: "#22d3ee", DF: "#a78bfa", BI: "#fbbf24", BF: "#34d399" };
+    const PROC_HUE = { A: "#3b82f6", E: "#f43f5e" };
+
+    // 16 코드 = 축값 데카르트 곱(matrix_codes()와 동일 순서 → col 인덱스와 일치).
+    const CODES = [];
+    for (const p of AXES[0].values)
+      for (const pr of AXES[1].values)
+        for (const b of AXES[2].values)
+          for (const m of AXES[3].values) CODES.push(p + pr + b + m);
+
+    const ROW_ORDER = [];
+    for (const p of AXES[0].values) for (const pr of AXES[1].values) ROW_ORDER.push(p + pr);
+    const COL_ORDER = [];
+    for (const b of AXES[2].values) for (const m of AXES[3].values) COL_ORDER.push(b + m);
+
+    function rowKey(code) { return code[0] + code[1]; }
+    function colKey(code) { return code[2] + code[3]; }
+    function deriveAxisLabel(code) {
+      return [VAL[code[0]], VAL[code[1]], VAL[code[2]], VAL[code[3]]].join("-");
+    }
+
+    const RBTI_STORAGE_KEY = "yes24_rbti"; // index.html 페르소나 저장키 재사용(채택).
+    const TYPE_LABEL = {
+      search_result: "검색결과", book_detail: "상세", detail: "상세",
+      notice: "공지", policy: "공지", page: "공지", browse: "코너", web: "웹",
+    };
+    const WEB_TYPES = new Set(["web"]);
+
+    // ── DOM ──
+    const qEl = document.getElementById("q");
+    const sendBtn = document.getElementById("send");
+    const stopBtn = document.getElementById("stop");
+    const statusBar = document.getElementById("status");
+    const statusText = document.getElementById("status-text");
+    const countEl = document.getElementById("count");
+    const sharedToggle = document.getElementById("shared-toggle");
+    const ssCount = document.getElementById("ss-count");
+    const ssChips = document.getElementById("ss-chips");
+    const filtersEl = document.getElementById("filters");
+    const matrixEl = document.getElementById("matrix");
+    const modalBackdrop = document.getElementById("modal-backdrop");
+    const modalEl = document.getElementById("modal");
+
+    // 채팅↔매트릭스 왕복(전체 페이지 네비게이션)에도 상태가 살도록 sessionStorage에 영속:
+    // 세션 id(채팅과 키 분리) + 마지막 완료 결과의 클라이언트 스냅샷(질문·16셀·출처).
+    // 서버 변경 없음 — 재방문 시 스냅샷을 복원 렌더하고, 새 질문을 보내면 대체된다.
+    const MATRIX_SESSION_KEY = "yes24_matrix_session_id";
+    const MATRIX_SNAPSHOT_KEY = "yes24_matrix_snapshot";
+    let sessionId = null;
+    try { sessionId = sessionStorage.getItem(MATRIX_SESSION_KEY) || null; } catch (e) {}
+    let lastQuestion = ""; // 이번 런의 질문(스냅샷·채택 핸드오프에 실림)
+    let controller = null;
+    let sending = false;
+    let sourcesById = new Map();
+    let cardByCode = new Map();
+    let filledCount = 0;
+    const activeFilters = {};
+
+    // ── 인용 마커/본문 렌더(index.html 로직 이식, innerHTML 금지 — XSS 방지) ──
+    function renderMarkersInto(target, text, onMarker) {
+      const re = /\[(\d+(?:\s*,\s*\d+)*)\]/g;
+      let last = 0, m;
+      while ((m = re.exec(text)) !== null) {
+        if (m.index > last) target.appendChild(document.createTextNode(text.slice(last, m.index)));
+        const ids = m[1].split(",").map((s) => s.trim()).filter(Boolean);
+        ids.forEach((sid) => {
+          const badge = document.createElement("sup");
+          badge.className = "marker";
+          badge.textContent = sid;
+          badge.addEventListener("click", (e) => { e.stopPropagation(); onMarker && onMarker(sid); });
+          target.appendChild(badge);
+        });
+        last = re.lastIndex;
+      }
+      if (last < text.length) target.appendChild(document.createTextNode(text.slice(last)));
+    }
+    function renderBody(container, text, onMarker) {
+      container.textContent = "";
+      const boldRe = /\*\*([\s\S]+?)\*\*/g;
+      let last = 0, m;
+      while ((m = boldRe.exec(text)) !== null) {
+        if (m.index > last) renderMarkersInto(container, text.slice(last, m.index), onMarker);
+        const strong = document.createElement("strong");
+        renderMarkersInto(strong, m[1], onMarker);
+        container.appendChild(strong);
+        last = boldRe.lastIndex;
+      }
+      if (last < text.length) renderMarkersInto(container, text.slice(last), onMarker);
+    }
+    function safeOpen(url) { if (url && /^https?:\/\//i.test(url)) window.open(url, "_blank", "noopener"); }
+
+    // ── W2: 표지 썸네일 ──
+    // image_url은 col done.sources[].meta.image_url로 온다(검색결과만). 없으면 우아하게 생략.
+    function coverUrl(src) {
+      const u = src && src.meta && src.meta.image_url;
+      return typeof u === "string" && /^https?:\/\//i.test(u) ? u : null;
+    }
+    function normTitle(t) {
+      return (t || "").replace(/[\s『』()（）[\]·,.:+]/g, "").toLowerCase();
+    }
+    // 대표책 제목 ↔ 출처(제목) 매칭: 정규화 후 부분집합 관계면 동일 책으로 본다.
+    function sourceForTitle(sources, title) {
+      const rn = normTitle(title);
+      if (!rn) return null;
+      return (
+        sources.find((s) => {
+          const sn = normTitle(s.title);
+          return sn && (sn.includes(rn) || rn.includes(sn));
+        }) || null
+      );
+    }
+
+    // ── 공유 출처(접이식) ──
+    function makeSharedCard(src) {
+      const isWeb = WEB_TYPES.has(src.type);
+      const card = document.createElement("div");
+      card.className = isWeb ? "ss-card web" : "ss-card";
+      const num = document.createElement("span");
+      num.className = "num";
+      num.textContent = src.id;
+      const title = document.createElement("span");
+      title.className = "title";
+      title.textContent = src.title || "(제목 없음)";
+      card.append(num, title);
+      if (src.url && /^https?:\/\//i.test(src.url)) card.addEventListener("click", () => safeOpen(src.url));
+      return card;
+    }
+    function addSharedSource(src) {
+      if (!src || src.id === undefined || sourcesById.has(String(src.id))) return;
+      sourcesById.set(String(src.id), src);
+      ssChips.appendChild(makeSharedCard(src));
+      ssCount.textContent = sourcesById.size;
+    }
+    sharedToggle.addEventListener("click", () => {
+      const open = ssChips.hasAttribute("hidden");
+      if (open) ssChips.removeAttribute("hidden"); else ssChips.setAttribute("hidden", "");
+      sharedToggle.classList.toggle("open", open);
+      sharedToggle.setAttribute("aria-expanded", String(open));
+    });
+
+    // ── 축 필터 ──
+    function buildFilters() {
+      filtersEl.textContent = "";
+      for (const axis of AXES) {
+        activeFilters[axis.key] = new Set();
+        const group = document.createElement("div");
+        group.className = "filter-axis";
+        const label = document.createElement("span");
+        label.className = "fa-label";
+        label.textContent = axis.label;
+        group.appendChild(label);
+        for (const v of axis.values) {
+          const chip = document.createElement("button");
+          chip.className = "fchip";
+          chip.textContent = VAL[v];
+          chip.title = v + " · " + VAL[v];
+          chip.addEventListener("click", () => {
+            const set = activeFilters[axis.key];
+            if (set.has(v)) set.delete(v); else set.add(v);
+            chip.classList.toggle("on", set.has(v));
+            applyFilters();
+          });
+          group.appendChild(chip);
+        }
+        filtersEl.appendChild(group);
+      }
+      const reset = document.createElement("button");
+      reset.className = "filter-reset";
+      reset.textContent = "해제";
+      reset.addEventListener("click", () => {
+        for (const axis of AXES) activeFilters[axis.key].clear();
+        filtersEl.querySelectorAll(".fchip.on").forEach((c) => c.classList.remove("on"));
+        applyFilters();
+      });
+      filtersEl.appendChild(reset);
+      // 필터 결과 카운터 — 칩 클릭의 즉각 피드백("눌렀더니 뭔가 됐다")을 수치로 보강.
+      const count = document.createElement("span");
+      count.className = "filter-count";
+      count.id = "filter-count";
+      filtersEl.appendChild(count);
+    }
+    function matchesFilters(code) {
+      for (let i = 0; i < AXES.length; i++) {
+        const set = activeFilters[AXES[i].key];
+        if (set && set.size > 0 && !set.has(code[i])) return false;
+      }
+      return true;
+    }
+    function applyFilters() {
+      let shown = 0;
+      for (const [code, card] of cardByCode) {
+        const ok = matchesFilters(code);
+        card.el.classList.toggle("dim", !ok);
+        if (ok) shown++;
+      }
+      const anyActive = AXES.some((ax) => activeFilters[ax.key] && activeFilters[ax.key].size > 0);
+      const fc = document.getElementById("filter-count");
+      if (fc) fc.textContent = anyActive ? shown + " / " + cardByCode.size + " 유형 표시" : "";
+    }
+
+    // ── 16 카드 + 축 헤더 ──
+    function buildMatrix() {
+      matrixEl.textContent = "";
+      cardByCode.clear();
+
+      const corner = document.createElement("div");
+      corner.className = "corner";
+      corner.textContent = "패턴·처리 ↓ / 폭·동기 →";
+      matrixEl.appendChild(corner);
+
+      COL_ORDER.forEach((ck, i) => {
+        const h = document.createElement("div");
+        h.className = "col-head";
+        h.style.gridColumn = String(i + 2);
+        h.style.setProperty("--col-hue", COL_HUE[ck]);
+        const main = document.createElement("div");
+        main.className = "h-main";
+        main.textContent = VAL[ck[0]] + "·" + VAL[ck[1]];
+        // 절제2: 코드쌍 서브라벨(DI) 제거 — h-main(깊이·정보)과 중복.
+        h.append(main);
+        matrixEl.appendChild(h);
+      });
+
+      ROW_ORDER.forEach((rk, i) => {
+        const h = document.createElement("div");
+        h.className = "row-head";
+        h.style.gridRow = String(i + 2);
+        h.style.setProperty("--row-hue", PROC_HUE[rk[1]]);
+        const main = document.createElement("div");
+        main.className = "h-main";
+        main.textContent = VAL[rk[0]] + "·" + VAL[rk[1]];
+        // 절제2: 코드쌍 서브라벨(CA) 제거 — h-main(완독·분석)과 중복.
+        h.append(main);
+        matrixEl.appendChild(h);
+      });
+
+      for (const code of CODES) matrixEl.appendChild(makeCell(code).el);
+    }
+
+    function makeCell(code) {
+      const gr = ROW_ORDER.indexOf(rowKey(code)) + 2;
+      const gc = COL_ORDER.indexOf(colKey(code)) + 2;
+
+      const el = document.createElement("div");
+      el.className = "cell pending";
+      el.style.gridRow = String(gr);
+      el.style.gridColumn = String(gc);
+      el.style.setProperty("--col-hue", COL_HUE[colKey(code)]);
+      el.style.setProperty("--badge-c", PROC_HUE[code[1]]);
+      // 대각(행+열) 스태거 지연 — 절제: 미세하게(28ms 간격).
+      el.style.animationDelay = ((gr - 2) + (gc - 2)) * 28 + "ms";
+
+      const head = document.createElement("div");
+      head.className = "c-head";
+      const codeRow = document.createElement("div");
+      codeRow.className = "c-code-row";
+      const codeBadge = document.createElement("span");
+      codeBadge.className = "c-code";
+      codeBadge.textContent = code;
+      // 절제2: 셀 안 축 라벨(완독-분석-깊이-정보)은 열/행 헤더와 중복 → 제거(모달에서만 표기).
+      codeRow.append(codeBadge);
+      const nameEl = document.createElement("div");
+      nameEl.className = "c-name";
+      nameEl.textContent = "생성 대기 중…";
+      head.append(codeRow, nameEl);
+
+      const body = document.createElement("div");
+      body.className = "c-body empty";
+      const sk = document.createElement("div");
+      ["skel w90", "skel w70", "skel w50"].forEach((c) => {
+        const line = document.createElement("div");
+        line.className = c;
+        sk.appendChild(line);
+      });
+      body.appendChild(sk);
+
+      const foot = document.createElement("div");
+      foot.className = "c-foot";
+
+      el.append(head, body, foot);
+
+      const handle = {
+        el, code, nameEl, body, foot,
+        name: "", axisLabel: deriveAxisLabel(code), text: "", sources: [], filled: false,
+      };
+      el.addEventListener("click", () => { if (handle.filled) openModal(handle); });
+      el.addEventListener("keydown", (e) => {
+        if (handle.filled && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openModal(handle); }
+      });
+      cardByCode.set(code, handle);
+      return handle;
+    }
+
+    // ── W1: 구조화 본문 — 한 줄 요지 + 대표책(제목·가격) ──
+    // 본문 첫 문단을 요지로, `**『제목』** (가격원)` 불릿을 대표책으로 파싱한다(백엔드 형식 무관).
+    function firstSentence(text) {
+      const line = (text.split(/\n/).find((l) => l.trim() && !l.trim().startsWith("*")) || "").trim();
+      const clean = line.replace(/\*\*/g, "").replace(/\[\d+(?:\s*,\s*\d+)*\]/g, "").trim();
+      const m = clean.match(/^(.+?[.。!?])(?:\s|$)/);
+      return (m ? m[1] : clean).slice(0, 95);
+    }
+    // 생성 형식이 free-form(볼드 불릿 또는 인라인 프로세)이라 『제목』을 형식 무관하게 모두 뽑고,
+    // 가격은 제목 인접 40자 내에서만 연결한다(엉뚱한 절의 가격을 잘못 붙이지 않게).
+    function extractPicks(text) {
+      const titleRe = /『([^』]{1,60})』/g;
+      const picks = [];
+      const seen = new Set();
+      let m;
+      while ((m = titleRe.exec(text)) !== null) {
+        const title = m[1].trim();
+        if (!title || seen.has(title)) continue;
+        seen.add(title);
+        const after = text.slice(m.index + m[0].length, m.index + m[0].length + 40);
+        const pm = after.match(/([\d,]{3,})\s*원/);
+        picks.push({ title, price: pm ? pm[1] : "" });
+      }
+      return picks;
+    }
+    function renderCellBody(card) {
+      const body = card.body;
+      body.className = "c-body structured";
+      body.textContent = "";
+
+      // 흐르는 전문 + 인용 마커([n]). 셀 높이만큼 채우고 넘치면 하단 페이드(CSS). 상세는 모달.
+      const flow = document.createElement("div");
+      flow.className = "c-flow";
+      renderBody(flow, card.text, (sid) => highlightChip(card, sid));
+      body.appendChild(flow);
+
+      const picks = extractPicks(card.text);
+      card.picks = picks;
+      card.pickEl = null;
+      card.repTitle = "";
+      // 정직 폴백 셀(책 못 찾음/추천 미완성)은 muted로 구분 + 토너먼트 후보 제외용 플래그.
+      card.isFallback =
+        picks.length === 0 && /찾지 못했어요|추천을 완성하기 어려웠어요/.test(card.text);
+      card.el.classList.toggle("fallback", card.isFallback);
+      if (picks.length) {
+        // 대표책 = 가격이 붙은 첫 책(구체 추천), 없으면 첫 책. 오연결 가격 대신 정직하게.
+        const repIdx = Math.max(0, picks.findIndex((p) => p.price));
+        const rep = picks[repIdx];
+        const pick = document.createElement("div");
+        pick.className = "c-pick";
+        const ico = document.createElement("span");
+        ico.className = "c-pick-ico";
+        ico.setAttribute("aria-hidden", "true");
+        const title = document.createElement("span");
+        title.className = "c-pick-title";
+        title.textContent = "『" + rep.title + "』";
+        title.title = rep.title;
+        pick.append(ico, title);
+        if (rep.price) {
+          const price = document.createElement("span");
+          price.className = "c-pick-price";
+          price.textContent = rep.price + "원";
+          pick.appendChild(price);
+        }
+        if (picks.length > 1) {
+          const more = document.createElement("span");
+          more.className = "c-pick-more";
+          more.textContent = "+" + (picks.length - 1);
+          more.title = "이 성향이 고른 책 " + picks.length + "권";
+          pick.appendChild(more);
+        }
+        body.appendChild(pick);
+        // done 프레임 도착 시 표지로 틱을 교체하기 위해 참조 보관.
+        card.pickEl = pick;
+        card.repTitle = rep.title;
+      }
+    }
+
+    // ── 열 채우기 ──
+    function resolveCode(data) {
+      if (typeof data.code === "string" && cardByCode.has(data.code)) return data.code;
+      if (typeof data.col === "number" && data.col >= 0 && data.col < CODES.length) return CODES[data.col];
+      return null;
+    }
+
+    function fillColumn(data) {
+      const code = resolveCode(data);
+      if (!code) return;
+      const card = cardByCode.get(code);
+      if (!card) return;
+
+      card.text = data.text || "";
+      card.filled = true;
+      card.el.classList.remove("pending");
+      card.el.classList.add("filled");
+      // 채워진 카드는 키보드로 열 수 있게(포커스 링·Enter/Space → 모달).
+      card.el.tabIndex = 0;
+      card.el.setAttribute("role", "button");
+
+      if (typeof data.axis_label === "string" && data.axis_label) {
+        card.axisLabel = data.axis_label; // 모달에서만 사용(셀엔 미표기)
+      }
+      if (typeof data.name === "string" && data.name) {
+        card.name = data.name;
+        card.nameEl.textContent = data.name;
+      } else {
+        card.nameEl.textContent = card.axisLabel;
+        card.nameEl.style.fontWeight = "600";
+      }
+
+      renderCellBody(card);
+
+      filledCount++;
+      updateCount();
+    }
+
+    function fillColumnDone(data) {
+      const code = resolveCode(data);
+      if (!code) return;
+      const card = cardByCode.get(code);
+      if (!card) return;
+      const srcs = Array.isArray(data.sources) ? data.sources : [];
+      srcs.forEach(addSharedSource);
+      card.sources = srcs;
+      renderChips(card);
+      updatePickCover(card);
+
+      // 폴백 판정: 백엔드 명시 플래그(가법)가 오면 그걸 신뢰한다(정규식이 잡담 응답의 유사 문구를
+      // 오마킹하던 것을 구조로 교정). 플래그가 없으면 renderCellBody의 정규식 결과 유지(하위호환).
+      // boolean `fallback` 우선, 없으면 `gate_reason`(널 아님=폴백)으로 파생.
+      const reason = "gate_reason" in data ? data.gate_reason : null;
+      let flag = null;
+      if (typeof data.fallback === "boolean") flag = data.fallback;
+      else if ("gate_reason" in data) flag = reason != null;
+      if (flag !== null) {
+        card.isFallback = flag;
+        card.el.classList.toggle("fallback", flag);
+        // gate_reason은 muted 셀 툴팁(hover만, 사용자 화면 비노출)으로 — 디버깅 보조.
+        if (flag && reason) card.el.title = "정직 폴백 · 사유: " + reason;
+        else card.el.removeAttribute("title");
+      }
+    }
+
+    // 대표책 틱을 표지 썸네일로 교체(있을 때만). lazy·실패 시 틱 복귀(깨진 이미지 금지).
+    function updatePickCover(card) {
+      if (!card.pickEl || !card.repTitle) return;
+      const tick = card.pickEl.querySelector(".c-pick-ico");
+      if (!tick) return;
+      const src = sourceForTitle(card.sources, card.repTitle);
+      const url = src ? coverUrl(src) : null;
+      if (!url) return; // 표지 없으면 축색 틱 유지(우아한 폴백)
+      const cover = document.createElement("img");
+      cover.className = "c-pick-cover";
+      // loading=lazy는 스크롤 없는 100vh 뷰포트에 JS로 삽입된 이미지의 IntersectionObserver를
+      // 트리거하지 못해 로드가 멈춘다(Chrome 쿼크). 표지는 done 시점(첫 페인트 이후)에 붙는
+      // 작은 항상-가시 썸네일이라 즉시 로드가 옳다. decoding=async로 디코드만 비차단.
+      cover.decoding = "async";
+      cover.alt = "";
+      cover.addEventListener("load", () => { cover.classList.add("loaded"); tick.style.display = "none"; });
+      cover.addEventListener("error", () => { cover.remove(); tick.style.display = ""; });
+      card.pickEl.insertBefore(cover, tick);
+      cover.src = url;
+    }
+
+    function renderChips(card) {
+      card.foot.textContent = "";
+      for (const src of card.sources) {
+        const chip = document.createElement("span");
+        chip.className = WEB_TYPES.has(src.type) ? "c-chip web" : "c-chip";
+        chip.textContent = src.id;
+        chip.dataset.sid = String(src.id);
+        chip.title = src.title || "";
+        chip.addEventListener("click", (e) => { e.stopPropagation(); safeOpen(src.url); });
+        card.foot.appendChild(chip);
+      }
+    }
+
+    function highlightChip(card, sid) {
+      const chip = card.foot.querySelector('.c-chip[data-sid="' + CSS.escape(String(sid)) + '"]');
+      if (!chip) return;
+      card.foot.querySelectorAll(".c-chip.hl").forEach((c) => c.classList.remove("hl"));
+      chip.classList.add("hl");
+      chip.scrollIntoView({ block: "nearest", inline: "center", behavior: "smooth" });
+      setTimeout(() => chip.classList.remove("hl"), 1400);
+    }
+
+    // 채택 시 RBTI 코드와 함께 {방금 질문, 그 셀의 대표책}을 1회성 핸드오프로 넘긴다.
+    // 채팅(index.html)이 이를 컴포저에 *보이는* 프리필로 얹는다 — 숨은 컨텍스트 주입 금지
+    // (사용자가 보는 것 = 모델이 받는 것). 키는 index.html applyMatrixHandoff와 계약.
+    const MATRIX_HANDOFF_KEY = "yes24_matrix_handoff";
+    function adoptPersona(code, card) {
+      try { localStorage.setItem(RBTI_STORAGE_KEY, code); } catch (e) {}
+      try {
+        localStorage.setItem(MATRIX_HANDOFF_KEY, JSON.stringify({
+          code,
+          question: lastQuestion,
+          pick: (card && card.repTitle) || "",
+        }));
+      } catch (e) {}
+      window.location.href = "/";
+    }
+
+    // ── 모달 ──
+    const mCode = document.getElementById("m-code");
+    const mAxis = document.getElementById("m-axis");
+    const mName = document.getElementById("m-name");
+    const mBody = document.getElementById("m-body");
+    const mBooks = document.getElementById("m-books");
+    const mChips = document.getElementById("m-chips");
+    const mAdopt = document.getElementById("m-adopt");
+
+    function openModal(card) {
+      // 모달 상단 액센트·배지색을 카드 축색과 일치.
+      modalEl.style.setProperty("--col-hue", COL_HUE[colKey(card.code)]);
+      modalEl.style.setProperty("--badge-c", PROC_HUE[card.code[1]]);
+      mCode.textContent = card.code;
+      mAxis.textContent = card.axisLabel;
+      mName.textContent = card.name || card.axisLabel;
+      renderBody(mBody, card.text, (sid) => {
+        const chip = mChips.querySelector('.c-chip[data-sid="' + CSS.escape(String(sid)) + '"]');
+        if (chip) { chip.scrollIntoView({ block: "nearest", inline: "center" }); chip.classList.add("hl"); setTimeout(() => chip.classList.remove("hl"), 1400); }
+      });
+      // W2: 이 유형이 고른 책 표지 스트립(표지 있는 출처만). 없으면 컨테이너 비어 숨김.
+      mBooks.textContent = "";
+      for (const src of card.sources) {
+        const url = coverUrl(src);
+        if (!url) continue;
+        const book = document.createElement("div");
+        book.className = "m-book";
+        const cover = document.createElement("img");
+        cover.className = "m-book-cover";
+        cover.decoding = "async";
+        cover.alt = "";
+        cover.addEventListener("load", () => cover.classList.add("loaded"));
+        cover.addEventListener("error", () => book.remove());
+        const t = document.createElement("div");
+        t.className = "m-book-title";
+        t.textContent = src.title || "";
+        book.append(cover, t);
+        book.addEventListener("click", () => safeOpen(src.url));
+        mBooks.appendChild(book);
+        cover.src = url;
+      }
+
+      mChips.textContent = "";
+      for (const src of card.sources) {
+        const chip = document.createElement("span");
+        chip.className = WEB_TYPES.has(src.type) ? "c-chip web" : "c-chip";
+        chip.textContent = src.id;
+        chip.dataset.sid = String(src.id);
+        chip.title = src.title || "";
+        chip.addEventListener("click", () => safeOpen(src.url));
+        mChips.appendChild(chip);
+      }
+      mAdopt.onclick = () => adoptPersona(card.code, card);
+      modalBackdrop.hidden = false;
+    }
+    function closeModal() { modalBackdrop.hidden = true; }
+    document.getElementById("m-close").addEventListener("click", closeModal);
+    modalBackdrop.addEventListener("click", (e) => { if (e.target === modalBackdrop) closeModal(); });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !modalBackdrop.hidden) closeModal(); });
+
+    // ── W3: 취향 픽 토너먼트 ──
+    // 매트릭스 완료 후, 이미 생성된 16답변으로 4라운드(축당 1). 각 라운드는 '한 축만 다른' 두 셀을
+    // 나란히(결정된 축=선택값, 미결정 축=디폴트로 고정) → 클릭으로 그 축 결정 → 최종 코드 유형 제시.
+    const tourneyBtn = document.getElementById("tourney-btn");
+    const tourneyBackdrop = document.getElementById("tourney");
+    const tRound = document.getElementById("t-round");
+    const tQ = document.getElementById("t-q");
+    const tBar = document.getElementById("t-bar");
+    const tCards = document.getElementById("t-cards");
+    const tResult = document.getElementById("t-result");
+    let tDecided = {};
+    let tRoundIdx = 0;
+
+    // 코드 조립: 결정된 축(i<k)=선택값, 축 k=value, 미결정 축(i>k)=combo에서. 두 셀은 축 k만 다름.
+    function buildCodeWith(axisIdx, value, combo) {
+      return AXES.map((ax, i) => {
+        if (i < axisIdx) return tDecided[ax.key];
+        if (i === axisIdx) return value;
+        return combo[ax.key];
+      }).join("");
+    }
+    // 미결정 축 조합 선택. 우선순위: ①두 셀 모두 비폴백 & 본문 다름 > ②두 셀 모두 비폴백 >
+    // ③본문 다름 > ④첫 조합. 폴백 셀을 피해(무의미 비교 방지) 의미 있는 비교쌍을 잡는다.
+    function chooseUndecidedCombo(axisIdx) {
+      let combos = [{}];
+      for (let i = axisIdx + 1; i < AXES.length; i++) {
+        const ax = AXES[i];
+        const next = [];
+        for (const c of combos) for (const v of ax.values) next.push({ ...c, [ax.key]: v });
+        combos = next;
+      }
+      const axk = AXES[axisIdx];
+      const scored = combos.map((combo) => {
+        const a = cardByCode.get(buildCodeWith(axisIdx, axk.values[0], combo));
+        const b = cardByCode.get(buildCodeWith(axisIdx, axk.values[1], combo));
+        const bothReal = !!(a && b && !a.isFallback && !b.isFallback);
+        const differ = !!(a && b && (tGist(a) !== tGist(b) || tPickTitle(a) !== tPickTitle(b)));
+        // 두 카드의 대표책이 같으면 비교 변별력이 없다 — 대표책까지 다른 조합을 최우선
+        // (기존 "본문 차이 우선"과 같은 결의 확장). 모든 조합이 같으면 기존 순위 유지.
+        const pa = tPickTitle(a), pb = tPickTitle(b);
+        const pickDiffer = !!(pa && pb && pa !== pb);
+        return { combo, bothReal, differ, pickDiffer };
+      });
+      const pick =
+        scored.find((s) => s.bothReal && s.pickDiffer) ||
+        scored.find((s) => s.bothReal && s.differ) ||
+        scored.find((s) => s.bothReal) ||
+        scored.find((s) => s.pickDiffer) ||
+        scored.find((s) => s.differ) ||
+        scored[0];
+      return pick.combo;
+    }
+    // 토너먼트 카드 미리보기 = 전문(.tc-gist가 3줄 클램프). 휴리스틱 비교도 전문 기준(정확도↑).
+    function tGist(card) { return card && card.text ? card.text.trim() : ""; }
+    function tPickTitle(card) {
+      if (!card || !card.picks || !card.picks.length) return "";
+      const idx = Math.max(0, card.picks.findIndex((p) => p.price));
+      return card.picks[idx].title;
+    }
+
+    function openTourney() {
+      tDecided = {};
+      tRoundIdx = 0;
+      tResult.hidden = true;
+      tCards.style.display = "";
+      tourneyBackdrop.hidden = false;
+      renderRound();
+    }
+    function closeTourney() { tourneyBackdrop.hidden = true; }
+
+    function renderRound() {
+      const ax = AXES[tRoundIdx];
+      tBar.style.width = (tRoundIdx / AXES.length) * 100 + "%";
+      tRound.textContent = "";
+      const rlabel = document.createElement("span");
+      rlabel.textContent = "라운드 " + (tRoundIdx + 1) + " / " + AXES.length + " · 축: ";
+      const alabel = document.createElement("span");
+      alabel.className = "t-axis";
+      alabel.textContent = ax.label;
+      tRound.append(rlabel, alabel);
+      tQ.textContent = "어느 쪽이 더 끌려요?";
+
+      tCards.textContent = "";
+      // 두 비교 셀이 실제로 다른 본문을 갖도록 미결정 축 조합을 고른다(같으면 첫 조합).
+      const combo = chooseUndecidedCombo(tRoundIdx);
+      ax.values.forEach((val) => {
+        const code = buildCodeWith(tRoundIdx, val, combo);
+        const card = cardByCode.get(code);
+        const el = document.createElement("button");
+        el.className = "t-card";
+        if (card && card.isFallback) el.classList.add("fallback"); // 방어: 폴백이 끼면 muted
+        el.style.setProperty("--pick-hue", PROC_HUE[code[1]]);
+        const diff = document.createElement("div");
+        diff.className = "tc-diff";
+        diff.textContent = val + " · " + VAL[val];
+        const name = document.createElement("div");
+        name.className = "tc-name";
+        name.textContent = card ? (card.name || card.axisLabel) : deriveAxisLabel(code);
+        const gist = document.createElement("div");
+        gist.className = "tc-gist";
+        // 셀 본문과 동일 렌더러로 [n] 마커·볼드 처리(마커 원문 "[4]" 노출 방지). 클릭 무동작.
+        const gt = tGist(card);
+        if (gt) renderBody(gist, gt); else gist.textContent = "이 성향의 추천 스타일";
+        el.append(diff, name, gist);
+        const pickTitle = tPickTitle(card);
+        if (pickTitle) {
+          const pick = document.createElement("div");
+          pick.className = "tc-pick";
+          pick.append(document.createTextNode("대표책 "));
+          const b = document.createElement("b");
+          b.textContent = "『" + pickTitle + "』";
+          pick.appendChild(b);
+          el.appendChild(pick);
+        }
+        el.addEventListener("click", () => chooseRound(val, el));
+        tCards.appendChild(el);
+      });
+    }
+
+    function chooseRound(val, el) {
+      [...tCards.children].forEach((c) => c.classList.add(c === el ? "chosen" : "notchosen"));
+      tDecided[AXES[tRoundIdx].key] = val;
+      tRoundIdx++;
+      setTimeout(() => { if (tRoundIdx < AXES.length) renderRound(); else showResult(); }, 430);
+    }
+
+    function showResult() {
+      tBar.style.width = "100%";
+      const code = AXES.map((ax) => tDecided[ax.key]).join("");
+      const card = cardByCode.get(code);
+      tCards.style.display = "none";
+      tRound.textContent = "";
+      tQ.textContent = "당신의 독서 성향은";
+      tResult.hidden = false;
+      tResult.textContent = "";
+      tResult.style.setProperty("--pick-hue", PROC_HUE[code[1]]);
+
+      const label = document.createElement("div");
+      label.className = "tr-label";
+      label.textContent = "16유형 중 당신과 가장 가까운";
+      const codeEl = document.createElement("div");
+      codeEl.className = "tr-code";
+      codeEl.textContent = code;
+      const name = document.createElement("div");
+      name.className = "tr-name";
+      name.textContent = card ? (card.name || "") : "";
+      const axisEl = document.createElement("div");
+      axisEl.className = "tr-axis";
+      axisEl.textContent = card ? card.axisLabel : deriveAxisLabel(code);
+      const gist = document.createElement("div");
+      gist.className = "tr-gist";
+      renderBody(gist, tGist(card) || ""); // 결과 카드도 마커 칩 렌더(원문 노출 방지)
+      const actions = document.createElement("div");
+      actions.className = "tr-actions";
+      const adopt = document.createElement("button");
+      adopt.className = "tr-adopt";
+      adopt.textContent = "이 성향으로 채팅하기 →";
+      adopt.addEventListener("click", () => adoptPersona(code, card));
+      const view = document.createElement("button");
+      view.className = "tr-again";
+      view.textContent = "이 유형 자세히";
+      view.addEventListener("click", () => { closeTourney(); if (card && card.filled) openModal(card); });
+      const again = document.createElement("button");
+      again.className = "tr-again";
+      again.textContent = "다시";
+      again.addEventListener("click", openTourney);
+      actions.append(adopt, view, again);
+      tResult.append(label, codeEl, name, axisEl, gist, actions);
+    }
+
+    tourneyBtn.addEventListener("click", openTourney);
+    document.getElementById("t-close").addEventListener("click", closeTourney);
+    tourneyBackdrop.addEventListener("click", (e) => { if (e.target === tourneyBackdrop) closeTourney(); });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !tourneyBackdrop.hidden) closeTourney(); });
+
+    // ── 상태 ──
+    const STATUS_TEXT = { thinking: "질문을 확인하고 있어요", generating: "16가지 독서 성향으로 살펴보고 있어요" };
+    function setStatus(stage, detail) {
+      statusBar.classList.remove("done", "error");
+      statusText.textContent = detail || STATUS_TEXT[stage] || "처리 중…";
+    }
+    function setDone() {
+      statusBar.classList.add("done");
+      statusBar.classList.remove("error");
+      statusText.textContent = "완료";
+      updateCount();
+      // 매트릭스 완료 → 취향 찾기 토너먼트 진입점. 단, 비폴백(비교 가능) 셀이 2개 이상일 때만
+      // 노출(전량/대다수 폴백 런에서 폴백끼리 무의미 비교되는 것 방지).
+      const comparable = [...cardByCode.values()].filter((c) => c.filled && !c.isFallback).length;
+      tourneyBtn.hidden = comparable < 2;
+    }
+    function setError(msg) {
+      statusBar.classList.add("error");
+      statusBar.classList.remove("done");
+      statusText.textContent = msg || "오류가 발생했어요.";
+    }
+    function updateCount() { countEl.textContent = filledCount > 0 ? filledCount + " / 16" : ""; }
+
+    // ── SSE ──
+    function parseEvent(block) {
+      let event = "message", data = "";
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data += line.slice(5).trim();
+      }
+      let parsed = {};
+      if (data) { try { parsed = JSON.parse(data); } catch (e) { parsed = {}; } }
+      return { event, data: parsed };
+    }
+    function setSending(on) {
+      sending = on;
+      sendBtn.disabled = on;
+      stopBtn.disabled = !on;
+      qEl.disabled = on;
+      if (!on) qEl.focus();
+    }
+    function resetRun() {
+      sourcesById = new Map();
+      ssChips.textContent = "";
+      ssChips.setAttribute("hidden", "");
+      sharedToggle.classList.remove("open");
+      sharedToggle.setAttribute("aria-expanded", "false");
+      ssCount.textContent = "0";
+      filledCount = 0;
+      updateCount();
+      tourneyBtn.hidden = true;
+      closeTourney();
+      buildMatrix();
+      applyFilters();
+    }
+
+    async function submit() {
+      const question = qEl.value.trim();
+      if (!question || sending) return;
+      lastQuestion = question;
+      // 새 질문 = 스냅샷 대체. 시작 시점에 지워 중단/에러 런이 옛 결과로 복원되지 않게 한다.
+      try { sessionStorage.removeItem(MATRIX_SNAPSHOT_KEY); } catch (e) {}
+      resetRun();
+      setStatus("thinking");
+      setSending(true);
+      controller = new AbortController();
+      try {
+        const payload = { question, session_id: sessionId };
+        const resp = await fetch("/chat/matrix", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+        if (!resp.ok || !resp.body) throw new Error("서버 응답 오류: " + resp.status);
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buffer.indexOf("\n\n")) >= 0) {
+            const block = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+            if (!block.trim()) continue;
+            const { event, data } = parseEvent(block);
+            handleEvent(event, data);
+          }
+        }
+      } catch (err) {
+        if (err && err.name === "AbortError") setError("비교를 중지했어요.");
+        else setError("연결에 문제가 있었어요. 잠시 후 다시 시도해 주세요.");
+      } finally {
+        controller = null;
+        setSending(false);
+      }
+    }
+
+    function handleEvent(event, data) {
+      if (event === "status") {
+        setStatus(data.stage, data.detail);
+      } else if (event === "source") {
+        addSharedSource(data);
+      } else if (event === "delta") {
+        if (data.col !== undefined) fillColumn(data);
+      } else if (event === "done") {
+        if (data.col === undefined) {
+          if (data.session_id) {
+            sessionId = data.session_id;
+            try { sessionStorage.setItem(MATRIX_SESSION_KEY, sessionId); } catch (e) {}
+          }
+          if (Array.isArray(data.sources)) data.sources.forEach(addSharedSource);
+          setDone();
+          saveSnapshot();
+        } else {
+          fillColumnDone(data);
+        }
+      } else if (event === "error") {
+        setError(data.message);
+      }
+    }
+
+    sendBtn.addEventListener("click", submit);
+    stopBtn.addEventListener("click", () => { if (controller) controller.abort(); });
+    qEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } });
+
+    // ── 결과 스냅샷(왕복 복원) ──
+    // 완료된 런의 클라이언트 상태(질문·16셀 텍스트·출처·폴백)를 sessionStorage에 저장하고,
+    // 재방문 시 서버 재호출 없이 복원 렌더한다. 새 질문을 보내면 대체(submit에서 제거).
+    function saveSnapshot() {
+      try {
+        const cells = [];
+        for (const [code, card] of cardByCode) {
+          if (!card.filled) continue;
+          cells.push({
+            code, text: card.text, name: card.name, axis_label: card.axisLabel,
+            sources: card.sources, fallback: !!card.isFallback,
+          });
+        }
+        if (!cells.length) return;
+        sessionStorage.setItem(MATRIX_SNAPSHOT_KEY, JSON.stringify({
+          question: lastQuestion,
+          shared: [...sourcesById.values()],
+          cells,
+        }));
+      } catch (e) { /* 저장 실패(용량 등)는 복원만 포기 — 런 자체엔 영향 없음 */ }
+    }
+    function restoreSnapshot() {
+      let snap = null;
+      try { snap = JSON.parse(sessionStorage.getItem(MATRIX_SNAPSHOT_KEY) || "null"); } catch (e) {}
+      if (!snap || !Array.isArray(snap.cells) || !snap.cells.length) return;
+      lastQuestion = snap.question || "";
+      qEl.value = lastQuestion;
+      (Array.isArray(snap.shared) ? snap.shared : []).forEach(addSharedSource);
+      for (const cell of snap.cells) {
+        fillColumn(cell);     // {code, text, name, axis_label} — 라이브 delta와 동일 경로
+        fillColumnDone(cell); // {code, sources, fallback} — 칩·표지·폴백 마킹 동일 경로
+      }
+      setDone();
+      statusText.textContent = "지난 비교 결과를 복원했어요 — 새 질문을 보내면 대체돼요";
+    }
+
+    buildFilters();
+    buildMatrix();
+    restoreSnapshot();
+    qEl.focus();
+  </script>
+</body>
+</html>
