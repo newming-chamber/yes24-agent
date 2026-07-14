@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -68,6 +69,12 @@ intent 분류:
 queries(검색어) 규칙 — **의도를 최대한 담는 번역**이지 단순 추출이 아닙니다:
 - 원문 단어에 얽매이지 말고 검색 의도를 가장 잘 담는 검색어를 만드세요. 원문에 없는 단어라도
   의도를 더 잘 담으면 넣으세요(예: '과학적인 책 추천' → '과학 교양' — 문제집이 아닌 교양서 의도).
+- **주관적 평가·경험 수식어는 검색어에서 빼고 주제·장르·분야의 대표어로 옮기세요.** Yes24는
+  제목·주제 색인이라 '재미있는'·'흥미로운'·'쉬운'·'감동적인'·'지루하지 않은' 같은 수식어를 그대로
+  넣으면 그 단어가 박힌 **광고성·주변부 제목만** 걸리고 정작 좋은 책은 안 잡힙니다. 좋은 책이
+  실제로 달고 있을 주제어로 번역하세요(예: '재미있는 역사책' → '세계사', '교양 세계사', '역사
+  에세이' — '재미있는'을 빼고 그 장르의 대표·교양 갈래로). 감정·수준·재미의 뉘앙스는 검색어가
+  아니라 뒤 생성 단계가 페르소나로 살립니다 — 검색은 좋은 후보를 넓게 긁어오는 게 목적입니다.
 - **단 하나의 광의 단어(소설/과학/책)로 과축약하지 마세요.** 주제·분야가 있으면 2단어 이상으로.
 - **풀을 넓히려면 서로 다른 각도로 최대 {max_queries}개**를 내세요. 넓은 풀일수록 16 유형이
   다른 책을 고를 여지가 커집니다:
@@ -184,6 +191,66 @@ def _diversify(items: list[dict], max_per_series: int) -> list[dict]:
     return kept
 
 
+# 공유 풀 노이즈 필터 — Yes24 키워드 검색이 광의 한국어 질의에 섞어 내는, 어떤 페르소나에게도
+# 좋은 추천이 될 수 없는 후보 유형을 매트릭스 풀에서 걷어낸다. 세 부류 모두 질의 무관 보편
+# 노이즈이며(특정 주제/'역사' 케이스 패치가 아님), 실효 후보 수를 높여 16 페르소나가 갈라질
+# 여지를 확보한다(계측: 분산은 실효 후보 수에 정비례).
+#   ① 외국어 원서: 가나(일본어)가 있거나 한자가 한글 이상(중국어/한문).
+#   ② 광고 스팸 제목: 판촉 브래킷([…증정]·[무료배송] 등)이 2개 이상(제목이 광고 나열).
+#   ③ 다권 전집/세트: '전 N권'·'N권 세트'·'전집' — 매트릭스는 단권 비교라 세트는 부적합.
+# 판촉어는 도서 도메인 상수(섹션 변형·시리즈 접두 잡음과 같은 층의 모듈 상수).
+_AD_PROMO_TOKENS: tuple[str, ...] = (
+    "증정", "사은품", "무료배송", "최신간", "정품", "할인", "이벤트",
+)
+_BRACKET_GROUP = re.compile(r"[\[\(【][^\]\)】]*[\]\)】]")
+_BOXSET_RE = re.compile(r"전\s?\d+\s?권|\d+\s?권\s?세트|전집|\(\s?전\s?\d+")
+
+
+def _is_foreign_title(title: str) -> bool:
+    """제목이 외국어(일본어/중국어) 원서인지 — 가나가 있거나 한자가 한글 이상."""
+    hangul = han = kana = 0
+    for ch in title:
+        try:
+            name = unicodedata.name(ch)
+        except ValueError:
+            continue
+        if "HANGUL" in name:
+            hangul += 1
+        elif "CJK UNIFIED" in name:
+            han += 1
+        elif "HIRAGANA" in name or "KATAKANA" in name:
+            kana += 1
+    return kana > 0 or (han > 0 and han >= hangul)
+
+
+def _is_ad_spam_title(title: str) -> bool:
+    """제목이 판촉 브래킷 나열(광고 스팸)인지 — 판촉어 담은 브래킷 그룹이 2개 이상."""
+    promo = sum(
+        1
+        for group in _BRACKET_GROUP.findall(title)
+        if any(tok in group for tok in _AD_PROMO_TOKENS)
+    )
+    return promo >= 2
+
+
+def _is_noise(title: str) -> bool:
+    """후보 제목이 매트릭스 풀 노이즈(외국어 원서·광고 스팸·다권 전집)인지."""
+    if not title:
+        return False
+    return (
+        _is_foreign_title(title)
+        or _is_ad_spam_title(title)
+        or bool(_BOXSET_RE.search(title))
+    )
+
+
+def _denoise(items: list[dict], enabled: bool) -> list[dict]:
+    """풀 노이즈 후보를 걷어낸다(등장 순서 보존). enabled=False면 원본 그대로."""
+    if not enabled:
+        return items
+    return [item for item in items if not _is_noise(item.get("title", ""))]
+
+
 def _valid_query(q: object, settings: Settings) -> bool:
     """검색어 하나가 유효한지 — 문자열·비어있지 않음·글자수/토큰수 상한 이내.
 
@@ -293,12 +360,17 @@ async def _build_product_pool(
                 seen_urls.add(item_url)
                 raw_items.append(item)
 
-    # 다양성 가드(시리즈 도배 차단) → 목표 크기 절단. 살아남은 아이템만 register_source로
-    # 등록한다(sources·candidates 정렬 유지 — 등록은 dedup·절단 후).
-    diversified = _diversify(raw_items, settings.matrix_pool_max_per_series)[
+    # 노이즈 필터(외국어 원서·광고스팸·전집) → 다양성 가드(시리즈 도배 차단) → 목표 크기 절단.
+    # 노이즈를 **먼저** 걷어 절단이 실효 후보를 버리지 않게 한다(노이즈가 앞줄을 채워 좋은 책이
+    # 잘려나가던 문제 방지). 살아남은 아이템만 register_source로 등록한다(정렬 유지 — 등록은 후).
+    denoised = _denoise(raw_items, settings.matrix_pool_filter_noise)
+    noise_dropped = len(raw_items) - len(denoised)
+    if noise_dropped > 0:
+        logger.info("matrix 풀 노이즈 제거: %d건", noise_dropped)
+    diversified = _diversify(denoised, settings.matrix_pool_max_per_series)[
         : settings.matrix_pool_target_size
     ]
-    dropped = len(raw_items) - len(diversified)
+    dropped = len(denoised) - len(diversified)
     if dropped > 0:
         logger.info("matrix 풀 정제: %d건 제거, 최종 %d", dropped, len(diversified))
 

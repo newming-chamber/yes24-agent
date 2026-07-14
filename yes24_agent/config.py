@@ -150,6 +150,13 @@ class Settings(BaseSettings):
     # 것(리드북 중복·자카드 겹침)을 구조로 완화한다 — 열마다 후보를 다른 위치에서 시작해 렌더하면
     # (source_id는 불변) 모델의 primacy 편향이 열마다 다른 책을 앞세운다. product 풀에만 적용.
     matrix_pool_rotate: bool = True
+    # 공유 풀 노이즈 필터 on/off. Yes24 키워드 검색이 광의 한국어 질의에 섞어 내는, 어떤 페르소나
+    # 에게도 좋은 추천이 될 수 없는 후보(외국어 원서·광고스팸 제목·다권 전집)를 매트릭스 풀에서
+    # 걷어낸다. 실측: 이 노이즈가 실효 후보를 1권까지 줄여 16셀이 유일 후보로 100% 수렴하던 질의
+    # (예: '흥미 붙일 역사책')에서, 필터가 실효 후보를 8권으로 되살려 분산을 회복시킨다(분산은
+    # 실효 후보 수에 정비례). 잘 갈리던 질의(근현대사·SF·번아웃)는 오염이 없어 무손실. product
+    # 풀에만 적용하며 채팅 yes24_search 도구는 건드리지 않는다(에이전트가 직접 큐레이션).
+    matrix_pool_filter_noise: bool = True
 
     # 세션 영속
     session_db_url: str = "sqlite+aiosqlite:///./data/sessions.db"  # async 드라이버 접미사 필수
