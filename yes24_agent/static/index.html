@@ -223,14 +223,27 @@
     .card .info { font-size: 11.5px; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .card .info.author { color: var(--muted); }
     .card .info.price { color: var(--accent); font-weight: 600; }
-
-    sup.marker {
-      color: var(--accent); font-weight: 700; font-size: 0.72em; cursor: pointer;
-      padding: 0 1px; vertical-align: super;
+    /* 출처 카드 접기: 상한 초과분은 숨기고 "더 보기" 토글로 노출. */
+    .card.src-collapsed { display: none; }
+    /* 더 보기/접기 토글 — 카드 높이에 맞춘 점선 칩(카드와 구분되되 같은 스트립에 정렬). */
+    .src-more {
+      flex: 0 0 auto; align-self: stretch; min-width: 92px; background: transparent;
+      border: 1px dashed var(--border); border-radius: 10px; padding: 8px 12px;
+      color: var(--muted); font-family: inherit; font-size: 12px; font-weight: 600;
+      cursor: pointer; white-space: nowrap; transition: color .12s, border-color .12s;
     }
-    sup.marker:hover { text-decoration: underline; }
-    /* 그룹 마커([2, 3, 4])나 인접 마커([1][2])가 한 숫자로 뭉쳐 보이지 않게 미세 간격 */
-    sup.marker + sup.marker { margin-left: 2px; }
+    .src-more:hover { color: var(--text); border-color: var(--accent); }
+    .src-more:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    /* 인용 마커 — 인접·그룹 마커([48][49][50] / [2, 3, 4])가 한 숫자로 뭉쳐 보이지 않게
+       개별 칩(옅은 배경·라운드·좌우 여백)으로 분리한다(간격만으론 위첨자 숫자가 붙어 읽힘). */
+    sup.marker {
+      display: inline-block; vertical-align: super; line-height: 1;
+      color: var(--accent); font-weight: 700; font-size: 0.66em; cursor: pointer;
+      background: var(--accent-soft); border-radius: 4px; padding: 1px 3px; margin: 0 1px;
+    }
+    sup.marker:hover { background: var(--accent); color: #fff; text-decoration: none; }
+    sup.marker + sup.marker { margin-left: 3px; }
 
     /* 마크다운 헤더(###/####) — 문서 헤딩 태그 대신 본문 대비 소폭 큰 볼드 블록(축소 스타일). */
     .bubble .md-h { font-weight: 700; margin: 10px 0 2px; line-height: 1.4; }
@@ -416,6 +429,9 @@
     };
     // 외부 웹 출처는 Yes24 출처와 시각적으로 구분해야 하므로 별도 클래스를 붙인다.
     const WEB_TYPES = new Set(["web"]);
+    // 한 턴 출처 카드가 많을 때(관찰 카드 대량) 기본 노출 개수 — 나머지는 "더 보기"로 접는다.
+    // 인용된 카드는 이 값과 무관하게 항상 노출(finalize에서 앞으로 재배치 후 접힘 계산).
+    const SOURCE_CARDS_COLLAPSED_MAX = 6;
 
     const conversation = document.getElementById("conversation");
     const input = document.getElementById("input");
@@ -690,6 +706,7 @@
       scrollToBottom();
 
       const cardMap = new Map();
+      let moreToggle = null; // 출처 카드 접기 토글 버튼(카드가 상한 초과 시에만 생성)
       let rawText = "";
       let firstDelta = false;
       let errored = false;
@@ -705,6 +722,26 @@
         const ico = activeStep.querySelector(".ico");
         if (ico) ico.textContent = "✓";
         activeStep = null;
+      }
+
+      // 출처 카드 접기: 기본 SOURCE_CARDS_COLLAPSED_MAX개(단, 인용 카드는 항상 노출)만 보이고
+      // 나머지는 "출처 M개 더 보기"로 접는다. finalize의 인용 우선 재배치 뒤 호출한다.
+      // 특정 케이스가 아니라 카드 수가 상한을 넘는 모든 턴에 일괄 적용(잡동사니 대량 노출 방지).
+      function applySourceCollapse(expanded) {
+        if (moreToggle) { moreToggle.remove(); moreToggle = null; }
+        const cards = [...sources.querySelectorAll(".card")];
+        cards.forEach((c) => c.classList.remove("src-collapsed"));
+        const citedCount = cards.filter((c) => c.classList.contains("cited")).length;
+        const visibleN = Math.max(SOURCE_CARDS_COLLAPSED_MAX, citedCount);
+        const hiddenCount = cards.length - visibleN;
+        if (hiddenCount <= 0) return; // 접을 만큼 많지 않으면 토글 없음
+        if (!expanded) cards.slice(visibleN).forEach((c) => c.classList.add("src-collapsed"));
+        moreToggle = document.createElement("button");
+        moreToggle.className = "src-more";
+        moreToggle.textContent = expanded ? "접기" : `출처 ${hiddenCount}개 더 보기`;
+        moreToggle.setAttribute("aria-expanded", String(!!expanded));
+        moreToggle.addEventListener("click", () => applySourceCollapse(!expanded));
+        sources.appendChild(moreToggle);
       }
 
       function highlightSource(id) {
@@ -1027,6 +1064,8 @@
             for (const [id, card] of cardMap) if (citedIds.has(id)) sources.appendChild(card);
             for (const [id, card] of cardMap) if (!citedIds.has(id)) sources.appendChild(card);
           }
+          // 재배치(인용 우선) 뒤 접기 적용 — 기본 N개만 노출, 나머지는 "더 보기"로 접는다.
+          applySourceCollapse(false);
           // 진행 과정 블록을 한 줄 요약으로 접는다(클릭 시 여정 재확인). 단계 수는 status
           // 단계(.step)만 세고 ack 응대는 제외한다. 기존 별도 meta 라인은 이 요약으로 통합.
           completeActiveStep();
@@ -1216,6 +1255,8 @@
     // 매트릭스 "이 성향으로 채팅하기" 핸드오프: 채택한 셀의 {질문, 답변 요지(대표책)}를
     // 컴포저에 *보이는* 프리필로 얹는다 — 숨은 컨텍스트 주입 금지(사용자가 보는 것 = 모델이
     // 받는 것). 1회성: 읽는 즉시 제거해 새로고침 시 반복 프리필을 막는다.
+    // 프리필은 진술문이 아니라 '요청문'으로 — 그대로 전송해도 에이전트가 되묻지 않고 한 턴에
+    // 완결되게(진술형 "…추천을 받았어요."는 되물어 한 턴 낭비 실측). 사용자가 보고 수정 가능.
     const MATRIX_HANDOFF_KEY = "yes24_matrix_handoff";
     (function applyMatrixHandoff() {
       let handoff = null;
@@ -1224,10 +1265,18 @@
         if (raw) { handoff = JSON.parse(raw); localStorage.removeItem(MATRIX_HANDOFF_KEY); }
       } catch (e) {}
       if (!handoff || !handoff.question) return;
-      const what = handoff.pick ? "『" + handoff.pick + "』 추천" : "답변";
-      const persona = handoff.code ? handoff.code + " 성향으로 " : "";
-      input.value = "방금 \"" + handoff.question + "\" 질문에 " + persona + what + "을 받았어요. ";
-      input.setSelectionRange(input.value.length, input.value.length); // 이어서 바로 타이핑
+      // 핸드오프 = 이 성향으로 '새 대화' 시작. UI는 빈 대화인데 sessionStorage에 직전 채팅
+      // session_id가 남아 있으면 백엔드가 이전 대화를 기억해 새 질문에 옛 맥락이 누출된다
+      // (UI는 빈 화면인데 세션은 옛것 — 상태 불일치). 진입 시 세션을 리셋해 다음 전송에서 서버가
+      // 새 session_id를 발급하도록 한다('새 대화' 버튼과 동일 의미). 성향 배지·프리필은 유지.
+      sessionId = null;
+      try { sessionStorage.removeItem(CHAT_SESSION_KEY); } catch (e) {}
+      const persona = handoff.code ? handoff.code + " 성향" : "이 성향";
+      input.value = handoff.pick
+        ? "방금 \"" + handoff.question + "\" 질문에 " + persona + "으로 『" + handoff.pick +
+          "』을 추천받았어요. 이 취향에 맞는 책을 더 추천해줘."
+        : "방금 \"" + handoff.question + "\"을 " + persona + " 관점으로 살펴봤어요. 같은 취향으로 이어서 추천해줘.";
+      input.setSelectionRange(input.value.length, input.value.length); // 이어서 바로 타이핑/수정
       input.dispatchEvent(new Event("input")); // 높이·전송버튼 상태 갱신
     })();
 

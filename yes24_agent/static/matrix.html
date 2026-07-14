@@ -156,9 +156,13 @@
     /* 활성 칩: 채움 + 은은한 링으로 "눌렸다"가 즉시 보이게. */
     .fchip.on { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 700;
       box-shadow: 0 0 0 3px var(--accent-soft); }
-    /* 필터 적용 결과 카운터("N / 16 유형 표시") — 필터 없으면 비어서 숨김. */
-    .filter-count { font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--accent); white-space: nowrap; }
-    .filter-count:empty { display: none; }
+    /* 필터 적용 결과 카운터("N / 16 유형 표시"). 필터 없으면 텍스트만 비우고 자리(min-width)는
+       상시 예약 — 카운터 등장/소멸이 우측 정렬된 필터 그룹을 넓혀 칩을 좌로 밀지 않게(시프트 0).
+       inline-block+min-width는 빈 상태에서도 박스를 유지하고, text-align:right로 우측에 고정. */
+    .filter-count {
+      font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--accent);
+      white-space: nowrap; display: inline-block; min-width: 118px; text-align: right;
+    }
     .filter-reset {
       font-size: 11.5px; color: var(--muted); background: transparent; border: 1px solid var(--border);
       border-radius: 999px; padding: 3px 10px; cursor: pointer; font-family: inherit;
@@ -322,6 +326,20 @@
     }
     sup.marker:hover { text-decoration: underline; }
     sup.marker + sup.marker { margin-left: 2px; }
+
+    /* 마크다운 블록(index.html 파서 이식) — 헤더·파이프 테이블. 크기는 em 기반이라 셀(11.5px)·
+       모달(14px)·토너먼트 요지(12px) 어느 컨테이너에서든 본문에 비례해 렌더된다. */
+    .md-h { font-weight: 700; margin: 6px 0 2px; line-height: 1.35; }
+    .md-h.l3 { font-size: 1.12em; }
+    .md-h.l4 { font-size: 1.05em; }
+    .md-h:first-child { margin-top: 0; }
+    /* 표는 컨테이너를 넘으면 표만 가로 스크롤(셀/모달은 안 넘침), 안에서 pre-wrap 해제. */
+    .md-table-wrap { overflow-x: auto; white-space: normal; margin: 5px 0; }
+    .md-table { border-collapse: collapse; font-size: 0.92em; }
+    .md-table th, .md-table td {
+      border: 1px solid var(--border); padding: 2px 6px; text-align: left; white-space: nowrap;
+    }
+    .md-table th { background: var(--head-bg); font-weight: 700; }
 
     /* ── 모션 ─────────────────────────────────────────────
        (1) 스켈레톤 대각 스태거 등장(페이지/새 질문 시 그리드가 좌상→우하 물결로 나타남)
@@ -656,18 +674,90 @@
       }
       if (last < text.length) target.appendChild(document.createTextNode(text.slice(last)));
     }
-    function renderBody(container, text, onMarker) {
-      container.textContent = "";
+    // 인라인: **볼드** 분리 후 각 구간에서 [n] 마커 배지 조립(볼드 안 마커도 정상). append만(clear X).
+    function renderInlineInto(target, text, onMarker) {
       const boldRe = /\*\*([\s\S]+?)\*\*/g;
       let last = 0, m;
       while ((m = boldRe.exec(text)) !== null) {
-        if (m.index > last) renderMarkersInto(container, text.slice(last, m.index), onMarker);
+        if (m.index > last) renderMarkersInto(target, text.slice(last, m.index), onMarker);
         const strong = document.createElement("strong");
         renderMarkersInto(strong, m[1], onMarker);
-        container.appendChild(strong);
+        target.appendChild(strong);
         last = boldRe.lastIndex;
       }
-      if (last < text.length) renderMarkersInto(container, text.slice(last), onMarker);
+      if (last < text.length) renderMarkersInto(target, text.slice(last), onMarker);
+    }
+
+    // 본문 렌더(index.html renderBody와 동일 파서 이식): 라인 단위 블록 파스 — 헤더(#{1,6})와
+    // 파이프 테이블만 블록으로 승격하고 나머지는 인라인(볼드·마커) 평문(pre-wrap). 리스트 기호 등
+    // 그 외 마크다운은 스코프 밖(chat과 동일). 특정 질문 유형 분기 없이 셀 본문 전체에 일괄 적용
+    // (웹 출처 모드에서 `### 헤더`가 리터럴로 새던 것 해소). innerHTML 금지(XSS 방지).
+    const MD_H_RE = /^(#{1,6})\s+(.*)$/;
+    const MD_PIPE_RE = /^\s*\|.*\|\s*$/;          // |로 시작·끝나는 라인만 표 후보
+    const MD_SEP_RE = /^\s*\|?[\s:|-]+\|?\s*$/;   // 구분선 |---|:--:|
+    function mdSplitCells(line) {
+      return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((s) => s.trim());
+    }
+    function renderBody(container, text, onMarker) {
+      container.textContent = "";
+      const lines = (text || "").split("\n");
+      let buf = [];
+      const flush = () => {
+        // 블록 요소가 자체 마진을 가지므로 세그먼트 가장자리 빈 줄은 접는다(이중 공백 방지).
+        while (buf.length && !buf[0].trim()) buf.shift();
+        while (buf.length && !buf[buf.length - 1].trim()) buf.pop();
+        if (buf.length) renderInlineInto(container, buf.join("\n"), onMarker);
+        buf = [];
+      };
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const hm = line.match(MD_H_RE);
+        if (hm) {
+          flush();
+          const h = document.createElement("div");
+          h.className = "md-h " + (hm[1].length <= 3 ? "l3" : "l4");
+          renderInlineInto(h, hm[2], onMarker);
+          container.appendChild(h);
+          continue;
+        }
+        // 표 = 연속 파이프 라인 2줄 이상(첫 줄만 온 스트리밍 중간 상태는 평문 유지).
+        if (MD_PIPE_RE.test(line) && MD_PIPE_RE.test(lines[i + 1] || "")) {
+          flush();
+          const rows = [];
+          while (i < lines.length && MD_PIPE_RE.test(lines[i])) { rows.push(lines[i]); i++; }
+          i--;
+          const wrap = document.createElement("div");
+          wrap.className = "md-table-wrap";
+          const table = document.createElement("table");
+          table.className = "md-table";
+          let start = 0;
+          if (rows.length >= 2 && MD_SEP_RE.test(rows[1])) {
+            const tr = document.createElement("tr");
+            for (const c of mdSplitCells(rows[0])) {
+              const th = document.createElement("th");
+              renderInlineInto(th, c, onMarker);
+              tr.appendChild(th);
+            }
+            table.appendChild(tr);
+            start = 2;
+          }
+          for (let r = start; r < rows.length; r++) {
+            if (MD_SEP_RE.test(rows[r])) continue; // 표 중간 구분선은 표시 안 함
+            const tr = document.createElement("tr");
+            for (const c of mdSplitCells(rows[r])) {
+              const td = document.createElement("td");
+              renderInlineInto(td, c, onMarker);
+              tr.appendChild(td);
+            }
+            table.appendChild(tr);
+          }
+          wrap.appendChild(table);
+          container.appendChild(wrap);
+          continue;
+        }
+        buf.push(line);
+      }
+      flush();
     }
     function safeOpen(url) { if (url && /^https?:\/\//i.test(url)) window.open(url, "_blank", "noopener"); }
 
@@ -1147,35 +1237,37 @@
     const tResult = document.getElementById("t-result");
     let tDecided = {};
     let tRoundIdx = 0;
+    let tOrder = AXES.slice(); // 이번 토너먼트의 축 결정 순서(openTourney에서 데이터 기반 재배치)
 
-    // 코드 조립: 결정된 축(i<k)=선택값, 축 k=value, 미결정 축(i>k)=combo에서. 두 셀은 축 k만 다름.
-    function buildCodeWith(axisIdx, value, combo) {
-      return AXES.map((ax, i) => {
-        if (i < axisIdx) return tDecided[ax.key];
-        if (i === axisIdx) return value;
-        return combo[ax.key];
+    // 코드 조립: 대비 축(axisKey)=value, 이미 결정된 축=선택값, 나머지 미결정 축=combo에서.
+    // 두 비교 셀은 axisKey 하나만 다르다(다른 축은 동일 맥락으로 고정). 결정된 축이 코드상
+    // 연속 prefix가 아닐 수 있어(적응형 순서) 위치가 아닌 tDecided 멤버십으로 판별한다.
+    function buildCodeWith(axisKey, value, combo) {
+      return AXES.map((ax) => {
+        if (ax.key === axisKey) return value;
+        if (ax.key in tDecided) return tDecided[ax.key];
+        return (combo && ax.key in combo) ? combo[ax.key] : ax.values[0];
       }).join("");
     }
-    // 미결정 축 조합 선택. 우선순위: ①두 셀 모두 비폴백 & 본문 다름 > ②두 셀 모두 비폴백 >
-    // ③본문 다름 > ④첫 조합. 폴백 셀을 피해(무의미 비교 방지) 의미 있는 비교쌍을 잡는다.
-    function chooseUndecidedCombo(axisIdx) {
+    // 대비 축(axisKey)을 보여줄 때 나머지 '미결정' 축 조합 중 가장 변별력 있는 쌍을 고른다.
+    // 우선순위: ①두 셀 비폴백 & 대표책 다름 > ②비폴백 & 본문 다름 > ③비폴백 > ④대표책 다름 >
+    // ⑤본문 다름 > ⑥첫 조합. 대표책이 같으면(발췌만 다른 무변별 비교) 회피, 폴백 셀도 회피.
+    function chooseUndecidedCombo(axisKey) {
+      const axk = AXES.find((a) => a.key === axisKey);
+      const undecided = AXES.filter((ax) => ax.key !== axisKey && !(ax.key in tDecided));
       let combos = [{}];
-      for (let i = axisIdx + 1; i < AXES.length; i++) {
-        const ax = AXES[i];
+      for (const ax of undecided) {
         const next = [];
         for (const c of combos) for (const v of ax.values) next.push({ ...c, [ax.key]: v });
         combos = next;
       }
-      const axk = AXES[axisIdx];
       const scored = combos.map((combo) => {
-        const a = cardByCode.get(buildCodeWith(axisIdx, axk.values[0], combo));
-        const b = cardByCode.get(buildCodeWith(axisIdx, axk.values[1], combo));
+        const a = cardByCode.get(buildCodeWith(axisKey, axk.values[0], combo));
+        const b = cardByCode.get(buildCodeWith(axisKey, axk.values[1], combo));
         const bothReal = !!(a && b && !a.isFallback && !b.isFallback);
-        const differ = !!(a && b && (tGist(a) !== tGist(b) || tPickTitle(a) !== tPickTitle(b)));
-        // 두 카드의 대표책이 같으면 비교 변별력이 없다 — 대표책까지 다른 조합을 최우선
-        // (기존 "본문 차이 우선"과 같은 결의 확장). 모든 조합이 같으면 기존 순위 유지.
         const pa = tPickTitle(a), pb = tPickTitle(b);
         const pickDiffer = !!(pa && pb && pa !== pb);
+        const differ = !!(a && b && (tGist(a) !== tGist(b) || pa !== pb));
         return { combo, bothReal, differ, pickDiffer };
       });
       const pick =
@@ -1186,6 +1278,39 @@
         scored.find((s) => s.differ) ||
         scored[0];
       return pick.combo;
+    }
+    // 축 결정 순서를 "대표책 변별 견고성" 오름차순으로 잡는다. 각 축의 견고성 = 나머지 3축의
+    // 8조합 중 두 셀(둘 다 비폴백) 대표책이 다른 조합 수. 견고한 축일수록 어떤 맥락에서도 다른
+    // 책을 내므로 조합 자유도가 0인 '마지막 라운드'에 배치하고, 특정 조합에서만 갈리는 취약한
+    // 축은 조합을 고를 수 있는 앞 라운드에 배치한다 → 마지막 라운드까지 "다른 책 쌍" 확률을
+    // 높인다(라운드 4 동일책 완화). 데이터 기반이라 특정 축 하드코딩이 아니고, 모든 축이 동률
+    // (예: 전부 같은 책)이면 안정 정렬로 AXES 원순서 유지 → 현행 동작과 동일("전부 같으면 유지").
+    function orderAxesByDifferentiation() {
+      const prevDecided = tDecided;
+      tDecided = {}; // 견고성은 결정 전(모든 축 미결정) 기준으로 산정
+      const robustness = {};
+      for (const axk of AXES) {
+        const others = AXES.filter((ax) => ax.key !== axk.key);
+        let combos = [{}];
+        for (const ax of others) {
+          const next = [];
+          for (const c of combos) for (const v of ax.values) next.push({ ...c, [ax.key]: v });
+          combos = next;
+        }
+        let n = 0;
+        for (const combo of combos) {
+          const a = cardByCode.get(buildCodeWith(axk.key, axk.values[0], combo));
+          const b = cardByCode.get(buildCodeWith(axk.key, axk.values[1], combo));
+          if (a && b && !a.isFallback && !b.isFallback) {
+            const pa = tPickTitle(a), pb = tPickTitle(b);
+            if (pa && pb && pa !== pb) n++;
+          }
+        }
+        robustness[axk.key] = n;
+      }
+      tDecided = prevDecided;
+      // 취약(작은 n) → 앞, 견고(큰 n) → 뒤. 동률은 Array.sort 안정성으로 AXES 원순서 유지.
+      return AXES.slice().sort((x, y) => robustness[x.key] - robustness[y.key]);
     }
     // 토너먼트 카드 미리보기 = 전문(.tc-gist가 3줄 클램프). 휴리스틱 비교도 전문 기준(정확도↑).
     function tGist(card) { return card && card.text ? card.text.trim() : ""; }
@@ -1198,6 +1323,7 @@
     function openTourney() {
       tDecided = {};
       tRoundIdx = 0;
+      tOrder = orderAxesByDifferentiation(); // 이번 런 답변 기준으로 축 순서 재배치
       tResult.hidden = true;
       tCards.style.display = "";
       tourneyBackdrop.hidden = false;
@@ -1206,7 +1332,7 @@
     function closeTourney() { tourneyBackdrop.hidden = true; }
 
     function renderRound() {
-      const ax = AXES[tRoundIdx];
+      const ax = tOrder[tRoundIdx];
       tBar.style.width = (tRoundIdx / AXES.length) * 100 + "%";
       tRound.textContent = "";
       const rlabel = document.createElement("span");
@@ -1218,10 +1344,10 @@
       tQ.textContent = "어느 쪽이 더 끌려요?";
 
       tCards.textContent = "";
-      // 두 비교 셀이 실제로 다른 본문을 갖도록 미결정 축 조합을 고른다(같으면 첫 조합).
-      const combo = chooseUndecidedCombo(tRoundIdx);
+      // 두 비교 셀이 실제로 다른 대표책/본문을 갖도록 미결정 축 조합을 고른다(같으면 첫 조합).
+      const combo = chooseUndecidedCombo(ax.key);
       ax.values.forEach((val) => {
-        const code = buildCodeWith(tRoundIdx, val, combo);
+        const code = buildCodeWith(ax.key, val, combo);
         const card = cardByCode.get(code);
         const el = document.createElement("button");
         el.className = "t-card";
@@ -1259,9 +1385,9 @@
       // 카드가 클릭 가능해 다른 축의 값이 밀려들 수 있으므로(예: 처리축에 'S' → 무효 코드
       // CSDF류), 축 범위 밖 값과 종료 후 클릭은 무시한다. 축값 글자가 전역 유니크(C/S·A/E·
       // D/B·I/F)라 이 검증만으로 "제 라운드의 카드"만 통과한다.
-      if (tRoundIdx >= AXES.length || !AXES[tRoundIdx].values.includes(val)) return;
+      if (tRoundIdx >= AXES.length || !tOrder[tRoundIdx].values.includes(val)) return;
       [...tCards.children].forEach((c) => c.classList.add(c === el ? "chosen" : "notchosen"));
-      tDecided[AXES[tRoundIdx].key] = val;
+      tDecided[tOrder[tRoundIdx].key] = val;
       tRoundIdx++;
       setTimeout(() => { if (tRoundIdx < AXES.length) renderRound(); else showResult(); }, 430);
     }
@@ -1375,8 +1501,12 @@
       const question = qEl.value.trim();
       if (!question || sending) return;
       lastQuestion = question;
-      // 새 질문 = 스냅샷 대체. 시작 시점에 지워 중단/에러 런이 옛 결과로 복원되지 않게 한다.
-      try { sessionStorage.removeItem(MATRIX_SNAPSHOT_KEY); } catch (e) {}
+      // 직전 완료 결과 스냅샷을 이 런 동안 보관 — 중지/실패로 끝나면 빈 그리드 대신 이 결과를
+      // 복원한다(성공 시엔 done의 saveSnapshot이 새 결과로 덮어씀). 세션 스토리지 값은 done
+      // 전까지 옛 결과 그대로 두어(즉시 제거 안 함) 새로고침 복원과도 일관되게 한다.
+      const prevSnapshotRaw = (() => {
+        try { return sessionStorage.getItem(MATRIX_SNAPSHOT_KEY); } catch (e) { return null; }
+      })();
       resetRun();
       setStatus("thinking");
       setSending(true);
@@ -1407,8 +1537,21 @@
           }
         }
       } catch (err) {
-        if (err && err.name === "AbortError") setError("비교를 중지했어요.");
-        else setError("연결에 문제가 있었어요. 잠시 후 다시 시도해 주세요.");
+        const aborted = err && err.name === "AbortError";
+        // 중지/실패 시 직전 완료 스냅샷이 있으면 복원(빈 "생성 대기 중" 그리드 방지). 사용자가
+        // 방금 입력한 질문은 보존하려 컴포저는 되채우지 않는다(restoreComposer:false).
+        const restored = restoreFromRaw(prevSnapshotRaw, { restoreComposer: false });
+        if (restored) {
+          statusBar.classList.remove("error");
+          statusBar.classList.add("done");
+          statusText.textContent = aborted
+            ? "중지했어요 — 직전 비교 결과를 유지했어요"
+            : "연결에 문제가 있었어요 — 직전 비교 결과를 유지했어요";
+        } else if (aborted) {
+          setError("비교를 중지했어요.");
+        } else {
+          setError("연결에 문제가 있었어요. 잠시 후 다시 시도해 주세요.");
+        }
       } finally {
         controller = null;
         setSending(false);
@@ -1479,19 +1622,34 @@
         }));
       } catch (e) { /* 저장 실패(용량 등)는 복원만 포기 — 런 자체엔 영향 없음 */ }
     }
-    function restoreSnapshot() {
-      let snap = null;
-      try { snap = JSON.parse(sessionStorage.getItem(MATRIX_SNAPSHOT_KEY) || "null"); } catch (e) {}
-      if (!snap || !Array.isArray(snap.cells) || !snap.cells.length) return;
+    // 스냅샷 객체를 그리드에 복원 렌더(라이브 delta와 동일 경로 fillColumn/Done 재사용).
+    // resetRun으로 그리드를 새로 깐 뒤 채우므로 진행 중/미완료 상태에서 호출해도 안전.
+    // restoreComposer:false면 컴포저는 건드리지 않는다(중지 복원 시 방금 입력한 질문 보존).
+    function renderSnapshot(snap, opts) {
+      if (!snap || !Array.isArray(snap.cells) || !snap.cells.length) return false;
+      resetRun();
+      const restoreComposer = !opts || opts.restoreComposer !== false;
       lastQuestion = snap.question || "";
-      qEl.value = lastQuestion;
+      if (restoreComposer) qEl.value = lastQuestion;
       (Array.isArray(snap.shared) ? snap.shared : []).forEach(addSharedSource);
       for (const cell of snap.cells) {
         fillColumn(cell);     // {code, text, name, axis_label} — 라이브 delta와 동일 경로
         fillColumnDone(cell); // {code, sources, fallback} — 칩·표지·폴백 마킹 동일 경로
       }
       setDone();
-      statusText.textContent = "지난 비교 결과를 복원했어요 — 새 질문을 보내면 대체돼요";
+      return true;
+    }
+    function restoreFromRaw(raw, opts) {
+      let snap = null;
+      try { snap = JSON.parse(raw || "null"); } catch (e) {}
+      return renderSnapshot(snap, opts);
+    }
+    function restoreSnapshot() {
+      let raw = null;
+      try { raw = sessionStorage.getItem(MATRIX_SNAPSHOT_KEY); } catch (e) {}
+      if (restoreFromRaw(raw, { restoreComposer: true })) {
+        statusText.textContent = "지난 비교 결과를 복원했어요 — 새 질문을 보내면 대체돼요";
+      }
     }
 
     buildFilters();
