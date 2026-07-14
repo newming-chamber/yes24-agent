@@ -130,6 +130,8 @@ async def yes24_search(query: str, section: str, tool_context: ToolContext) -> d
                 "price": item.get("price"),
                 "goods_no": item.get("goods_no"),
                 "image_url": item.get("image_url"),
+                # 평점 값 대조(product_gate 값 접지)용 — 지어낸 평점 차단에 쓰인다.
+                "rating": item.get("rating"),
             },
         )
         result = {

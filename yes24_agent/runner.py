@@ -357,6 +357,8 @@ async def run_agent_stream(
                                 "price": source.get("price"),
                                 # 표지 이미지 URL(검색 결과에만 존재). sse_source가 있을 때만 노출.
                                 "image_url": source.get("image_url"),
+                                # 평점 값(있을 때만) — product_gate 평점 값 대조용.
+                                "rating": source.get("rating"),
                             }
                             observed_sources.append(source_event)
                             emitted_output = True

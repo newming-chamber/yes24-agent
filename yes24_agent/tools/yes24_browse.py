@@ -105,6 +105,7 @@ async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
                 "rank": item.get("rank"),
                 "goods_no": item.get("goods_no"),
                 "price": item.get("price"),
+                "rating": item.get("rating"),  # 평점 값 대조(product_gate)용
             },
         )
         result = {

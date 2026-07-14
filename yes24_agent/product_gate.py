@@ -35,11 +35,6 @@ PRODUCT_SOURCE_TYPES = frozenset({"search_result", "book_detail", "browse"})
 # 이 토큰만으로는 책값인지 알 수 없어(주가·시급·칼로리도 '원') 반드시 _BOOK_CONTEXT와 함께 본다.
 _PRICE_TOKEN = re.compile(r"\d[\d,]*\s*원")
 
-# 평점 토큰: "9.5점", "평점 9.5", "★". 상품 평점도 4a의 검증 대상 상품 사실이라 가격과 같은
-# 원리로 잡는다 — 이 토큰만으로는 책 평점인지 알 수 없어(영화·시험 점수도 'N점') 반드시
-# _BOOK_CONTEXT와 함께 본다(비도서 점수 배제). 접지 없으면 지어낸 평점으로 보고 게이트 발동.
-_RATING_TOKEN = re.compile(r"\d(?:\.\d)?\s*점|평점\s*\d|★")
-
 # 저자·역자 표기(도서 상품 고유 메타). "OO 저"는 한글 이름 + 공백 + '저' 뒤에 경계가
 # 오는 형태만 잡아 "저가(低價)"·"저는" 같은 우연한 부분일치를 배제한다(주가 답변 '저가' 오탐 방지).
 _AUTHOR_MARK = re.compile(
@@ -92,9 +87,10 @@ UNSOURCED_PRODUCT_NOTICE = (
 def detect_unsourced_product_claim(text: str) -> bool:
     """답변 본문이 책 상품을 사실로 주장하는지(가격·제목+저자) 결정론으로 판정한다.
 
-    T1(가격형: 가격+도서맥락)·T2(목록형: 제목마커+저자표기)·T3(제목괄호+가격)·T4(평점형:
-    평점+도서맥락) 중 하나라도 만족하면 True. 접지 여부와 무관한 순수 텍스트 판정으로, 게이트
-    발동은 호출부가 접지(has_product_grounding)와 결합해 정한다.
+    T1(가격형: 가격+도서맥락)·T2(목록형: 제목마커+저자표기)·T3(제목괄호+가격) 중 하나라도
+    만족하면 True. 접지 여부와 무관한 순수 텍스트 판정으로, 게이트 발동은 호출부가
+    접지(has_product_grounding)와 결합해 정한다. (평점 주장은 맥락 결합이 오탐이 많아 텍스트
+    판정이 아닌 값 대조로 분리한다 — detect_unsourced_rating_claim.)
     """
     if not text:
         return False
@@ -103,10 +99,7 @@ def detect_unsourced_product_claim(text: str) -> bool:
     # T3: 『제목』·《제목》 뒤에 가격이 오면 저자 어휘가 없어도 책값 주장. "『불안이라는 위안』
     # … 16,020원"처럼 T1(도서맥락 키워드 부재)·T2(저자표기 부재)를 빠져나가던 누출을 막는다.
     t3 = bool(_BOOK_TITLE_BRACKET.search(text) and _PRICE_TOKEN.search(text))
-    # T4: 평점 토큰(9.5점·★)이 도서 맥락 안에 있으면 책 평점 주장(가격과 동일 원리). 접지 없이
-    # 지어낸 평점을 잡는다. 비도서 점수(영화·시험)는 _BOOK_CONTEXT가 없어 배제된다.
-    t4 = bool(_RATING_TOKEN.search(text) and _BOOK_CONTEXT.search(text))
-    return t1 or t2 or t3 or t4
+    return t1 or t2 or t3
 
 
 def has_product_grounding(sources: list[dict]) -> bool:
@@ -340,6 +333,130 @@ def detect_title_mismap(text: str, sources: list[dict]) -> bool:
     return False
 
 
+# ── 평점 값 대조(value grounding) — 지어낸 평점 감지 ─────────────────────────
+#
+# 배경(rev-t4): "평점 토큰+도서맥락" 정규식 결합(T4)은 오탐 7종을 냈고, 이어 외부 평점을
+# 키워드 블랙리스트로 면제하던 방식도 성장형 목록(알라딘·교보·구글맵·'관객' 누락)이라 폐기했다.
+# detect_title_mismap과 같은 원리의 **값 대조** + **양성 귀속**으로 확정한다:
+#   ① 자사(Yes24) 평점 주장인지 양성 판정 — (i) 줄에 Yes24 표기 OR (ii) 줄이 상품 출처[n] 인용
+#      OR (iii) 이번 턴 출처 0(순수 무접지). 그 외(식당·영화·타서점 평점)는 대상 아님.
+#   ② 주장 숫자가 이번 턴 출처 rating에 있으면 통과(마커 없어도 참), 없는 값만 발동(지어낸 평점).
+# 척도: "N점 만점에 M"·"M/N"에서 척도 N을 읽어 10점 척도가 아니면(5점 만점 등) 값 대조 불가로
+# 건너뛰고, 척도 토큰의 N을 값으로 오인하지 않도록 '만점에 M'의 M(실제 점수)을 우선 캡처한다.
+
+# 평점/별점 주장 앵커. 이 단어가 있어야 '평점 값 주장'으로 본다(장식 ★·'3점 슛'·배점·'회화 30점'
+# 은 앵커가 없어 배제).
+_RATING_ANCHOR = re.compile(r"평점|별점")
+# 앵커 뒤 평점 값: "평점 9.8점", "평점은 9.5", "별점 4.3". 조사·콜론·공백을 건너뛰고 숫자를 딴다.
+_RATING_VALUE = re.compile(r"(?:평점|별점)\s*(?:은|는|이|가|을|를|:)?\s*(\d+(?:\.\d+)?)")
+# "만점 …M" 실제 점수 — 척도 접두 뒤의 값. 조사 나열이 아니라 "만점 뒤 근접(≤4자) 숫자"의
+# 일반 규칙으로, "만점에 M"·"만점에서 M"·"만점 기준 M"을 모두 잡고 척도 N을 값으로 오인하지 않는다.
+_MANJEOM_SCORE = re.compile(r"만점[^\d\n]{0,4}(\d+(?:\.\d+)?)")
+# 척도 선언 — "10점 만점"(N). 10점 척도가 아니면 값 대조 불가로 건너뛴다.
+_SCALE_MANJEOM = re.compile(r"(\d+)\s*점?\s*만점")
+# 슬래시 척도 — "M/N". 날짜(2026/07)를 척도로 오인하지 않도록 분자 M을 함께 잡아, M이 평점다운
+# 수(≤10)일 때만 척도로 본다(호출부에서 검사). 척도 N은 1~2자리로 제한.
+_SCALE_SLASH = re.compile(r"(\d+(?:\.\d+)?)\s*/\s*(\d{1,2})")
+# 별점 스타 문자(앵커가 있는 줄에서만 평점 주장으로 본다).
+_STAR_RUN = re.compile(r"[★⭐]")
+# 자사(Yes24) 표기 — 양성 귀속 신호 (i).
+_YES24_MENTION = re.compile(r"yes24|예스24|예스이십사", re.IGNORECASE)
+# 절 분리(쉼표) — 귀속을 줄이 아니라 절 단위로 좁혀 혼재 오귀속을 막는다("알라딘 평점 …, Yes24
+# 판매 1위" 같은 문장에서 평점 절에 Yes24가 없으면 대상 아님).
+_CLAUSE_SPLIT = re.compile(r"[,，]")
+
+
+def _declared_scale(clause: str) -> int | None:
+    """절에서 선언된 평점 척도를 읽는다(없으면 None). "N점 만점"의 N, 또는 "M/N"의 N(단 분자
+    M이 평점다운 수 ≤10일 때만 — 날짜 2026/07을 척도로 오인하지 않게)."""
+    mj = _SCALE_MANJEOM.search(clause)
+    if mj:
+        return int(mj.group(1))
+    sl = _SCALE_SLASH.search(clause)
+    if sl and float(sl.group(1)) <= 10:
+        return int(sl.group(2))
+    return None
+
+
+def _source_rating(source: dict) -> float | None:
+    """출처 dict에서 평점 값을 뽑는다(flat 'rating' 우선, 없으면 meta.rating). 실패 시 None."""
+    raw = source.get("rating")
+    if raw is None:
+        raw = (source.get("meta") or {}).get("rating")
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _rating_grounded(claimed: float, source_ratings: list[float]) -> bool:
+    """주장 평점이 출처 평점 중 하나와 대조되는지(정규화: 9.5==9.50, 정수 주장은 반올림 관대).
+
+    오탐 0 우선: 관대하게 접지 인정(미스는 허용, 헛발동은 금지). 정수 주장(9점)은 출처값의
+    내림·올림과 맞으면 접지로 본다(9.4를 '9점'으로 옮긴 정상 서술을 헛발동하지 않게).
+    """
+    for r in source_ratings:
+        if abs(claimed - r) < 0.1:  # 9.5 vs 9.50
+            return True
+        if claimed == int(claimed) and int(claimed) in (int(r), int(r) + 1):
+            return True
+    return False
+
+
+def detect_unsourced_rating_claim(
+    text: str,
+    cited_sources: list[dict],
+    observed_sources: list[dict],
+) -> bool:
+    """자사 평점 값 주장이 이번 턴 출처의 rating과 대조되지 않으면(지어낸 평점) True.
+
+    맥락 어휘가 아니라 값 대조 + 양성 귀속으로 판정한다(위 주석 ①②). 자사 평점 주장으로 판정된
+    줄만 값 대조하고, 주장 숫자가 출처 rating에 있으면 통과, 없는 값만 발동한다. 대조할 출처
+    평점이 하나도 없어도, 상품 출처가 있으면(rating 미파싱) 검증 불가로 발동하지 않고, 출처가
+    아예 없을(무접지) 때만 지어낸 평점으로 본다.
+    """
+    if not text:
+        return False
+    source_ratings = [
+        r
+        for r in (_source_rating(s) for s in (*cited_sources, *observed_sources))
+        if r is not None
+    ]
+    has_product = has_product_grounding(cited_sources) or has_product_grounding(observed_sources)
+    zero_sources = not cited_sources and not observed_sources
+    id_to_type = {s.get("id"): s.get("type") for s in cited_sources}
+    for line in text.splitlines():
+        for clause in _CLAUSE_SPLIT.split(line):
+            if not _RATING_ANCHOR.search(clause):
+                continue
+            # ① 양성 귀속(절 단위): 자사 평점 주장인지. (i) 절에 Yes24 표기 / (ii) 절이 상품 출처[n]
+            #    인용 / (iii) 이번 턴 출처 0. 셋 다 아니면(식당·영화·타서점 평점) 대상 아님.
+            clause_ids = {int(n) for n in _CITATION_MARKER.findall(clause)}
+            cites_product = any(id_to_type.get(i) in PRODUCT_SOURCE_TYPES for i in clause_ids)
+            if not (_YES24_MENTION.search(clause) or cites_product or zero_sources):
+                continue
+            # 척도가 10점이 아니면(5점 만점 등) 10점 척도 출처와 값 대조 불가 → 건너뛴다.
+            scale = _declared_scale(clause)
+            if scale is not None and scale != 10:
+                continue
+            # ② 값 추출: "만점 …M"이면 실제 점수 M을(척도 N 오캡처 방지), 아니면 앵커 뒤 숫자.
+            claimed = [float(m.group(1)) for m in _MANJEOM_SCORE.finditer(clause)]
+            if not claimed:
+                claimed = [float(m.group(1)) for m in _RATING_VALUE.finditer(clause)]
+            if claimed:
+                for value in claimed:
+                    if source_ratings:
+                        if not _rating_grounded(value, source_ratings):
+                            return True  # 대조 가능한데 없는 값 = 지어낸 평점
+                    elif not has_product:
+                        return True  # 대조할 출처 평점도 상품 출처도 없음(무접지) = 지어낸 평점
+                    # else: 상품 출처는 있으나 rating 미파싱 → 검증 불가, 발동 안 함.
+            elif _STAR_RUN.search(clause) and not source_ratings and not has_product:
+                # 별점 ★ 주장(숫자 없음)은 척도 대조 불가 — 출처·상품 접지 전혀 없을 때만 발동.
+                return True
+    return False
+
+
 def evaluate_product_answer(
     text: str,
     *,
@@ -349,12 +466,16 @@ def evaluate_product_answer(
     """답변의 상품 주장이 근거에 어긋나는 사유를 반환한다(정상이면 None).
 
     - "mismap": 상품 주장 블록의 제목이 인용한 출처 title과 불일치(cited-but-fabricated).
-    - "unsourced": 책 상품 사실을 주장하는데 Yes24 상품 접지가 전혀 없음.
+    - "unsourced": 책 상품 사실(가격·저자·제목) 무접지, 또는 자사 평점 주장의 값이 이번 턴 출처
+      rating과 대조되지 않음(지어낸 평점 — 값 접지 실패).
     접지는 인용된 최종 출처 또는 이번 턴 관찰 출처 중 상품 출처가 있으면 인정한다(검색은 했으나
     인용을 빠뜨린 경우까지 통과시켜 오탐을 막는다). 사유가 있으면 runner가 재검색으로 정정한다.
     """
     if detect_title_mismap(text, cited_sources):
         return "mismap"
+    # 평점 값 대조: 자사 평점 주장 숫자가 이번 턴 출처 rating에 없으면 지어낸 평점(값 접지 실패).
+    if detect_unsourced_rating_claim(text, cited_sources, observed_sources):
+        return "unsourced"
     # 항목 단위 접지(부분접지 구멍 D1): 책+가격 항목의 제목이 (cited+observed) 상품 출처 어디에도
     # 없으면 지어낸 책으로 본다. detect_title_mismap(인용된 책의 제목 대조)과 아래 전체접지 검사
     # (무접지) 사이의 틈 — '일부만 접지된 추천에 섞인 지어낸 책' — 을 메운다. 검색된 책은 미인용

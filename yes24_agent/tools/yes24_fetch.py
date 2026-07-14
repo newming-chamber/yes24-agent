@@ -183,7 +183,11 @@ def _fetch_product(
         url=url,
         source_type="book_detail",
         snippet=intro,
-        meta={"price": product.get("price"), "goods_no": product.get("goods_no")},
+        meta={
+            "price": product.get("price"),
+            "goods_no": product.get("goods_no"),
+            "rating": product.get("rating"),  # 평점 값 대조(product_gate)용
+        },
     )
 
     logger.info(
@@ -199,6 +203,7 @@ def _fetch_product(
         "author": product.get("author"),
         "pub_date": product.get("pub_date"),
         "price": product.get("price"),
+        "rating": product.get("rating"),  # 평점 값 대조(product_gate)·source_event용
         "is_ebook": product.get("is_ebook"),
         "intro": intro,
         "toc": toc,

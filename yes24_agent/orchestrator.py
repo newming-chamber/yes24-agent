@@ -107,6 +107,7 @@ async def _consume_correction_turn(
                         # 빠뜨리면 그 카드는 끝까지 값이 없다(finalize 백필은 기존 카드 미갱신).
                         "author": source.get("author"),
                         "price": source.get("price"),
+                        "rating": source.get("rating"),  # product_gate 평점 값 대조용
                     }
                     observed_sink.append(source_event)
                     yield sse_source(source_event)
