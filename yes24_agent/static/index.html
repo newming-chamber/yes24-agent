@@ -232,6 +232,19 @@
     /* 그룹 마커([2, 3, 4])나 인접 마커([1][2])가 한 숫자로 뭉쳐 보이지 않게 미세 간격 */
     sup.marker + sup.marker { margin-left: 2px; }
 
+    /* 마크다운 헤더(###/####) — 문서 헤딩 태그 대신 본문 대비 소폭 큰 볼드 블록(축소 스타일). */
+    .bubble .md-h { font-weight: 700; margin: 10px 0 2px; line-height: 1.4; }
+    .bubble .md-h.l3 { font-size: 15.5px; }
+    .bubble .md-h.l4 { font-size: 14.5px; }
+    /* 파이프 테이블 — 말풍선 폭을 넘으면 표만 가로 스크롤(말풍선/페이지는 안 넘침).
+       말풍선의 pre-wrap을 표 안에서는 해제한다(셀 텍스트가 원문 공백대로 새지 않게). */
+    .bubble .md-table-wrap { overflow-x: auto; white-space: normal; margin: 8px 0; }
+    .bubble .md-table { border-collapse: collapse; font-size: 13px; }
+    .bubble .md-table th, .bubble .md-table td {
+      border: 1px solid var(--border); padding: 4px 9px; text-align: left; white-space: nowrap;
+    }
+    .bubble .md-table th { background: var(--bg); font-weight: 700; }
+
     .composer {
       flex: 0 0 auto; border-top: 1px solid var(--border); padding: 12px;
       background: var(--panel); display: flex; gap: 8px; align-items: flex-end;
@@ -728,26 +741,95 @@
         }
       }
 
-      // 본문 렌더: 먼저 **볼드**를 <strong>으로 분리하고, 각 구간(볼드 포함) 안에서
-      // 마커 배지를 조립한다. 이 순서 덕에 볼드 안의 [n]도 정상 배지로 렌더된다.
-      // 지원 마크다운은 볼드뿐 — 그 외(#, 리스트 기호)는 스코프 밖으로 평문 유지.
-      function renderBody(text) {
-        bubble.classList.remove("empty");
-        bubble.textContent = "";
+      // 인라인 렌더: **볼드**를 <strong>으로 분리하고, 각 구간(볼드 포함) 안에서 마커 배지를
+      // 조립한다. 이 순서 덕에 볼드 안의 [n]도 정상 배지로 렌더된다. innerHTML 금지(XSS 방지).
+      function renderInlineInto(target, text) {
         const boldRe = /\*\*([\s\S]+?)\*\*/g;
         let last = 0, m;
         while ((m = boldRe.exec(text)) !== null) {
           if (m.index > last) {
-            renderMarkersInto(bubble, text.slice(last, m.index));
+            renderMarkersInto(target, text.slice(last, m.index));
           }
           const strong = document.createElement("strong");
           renderMarkersInto(strong, m[1]);
-          bubble.appendChild(strong);
+          target.appendChild(strong);
           last = boldRe.lastIndex;
         }
         if (last < text.length) {
-          renderMarkersInto(bubble, text.slice(last));
+          renderMarkersInto(target, text.slice(last));
         }
+      }
+
+      // 본문 렌더: 라인 단위 블록 파스 — 헤더(###/####)와 파이프 테이블만 블록으로 올리고,
+      // 나머지는 인라인(볼드·마커) 평문 유지(pre-wrap). 그 외 마크다운(리스트 기호)은 스코프 밖.
+      // 외부 라이브러리 없음(self-contained). 스트리밍 중엔 표가 라인이 갖춰지는 대로 승격된다.
+      const MD_H_RE = /^(#{1,6})\s+(.*)$/;
+      const MD_PIPE_RE = /^\s*\|.*\|\s*$/;             // |로 시작·끝나는 라인만 표 후보
+      const MD_SEP_RE = /^\s*\|?[\s:|-]+\|?\s*$/;      // 구분선 |---|:--:|
+      function mdSplitCells(line) {
+        return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((s) => s.trim());
+      }
+      function renderBody(text) {
+        bubble.classList.remove("empty");
+        bubble.textContent = "";
+        const lines = text.split("\n");
+        let buf = [];
+        const flush = () => {
+          // 블록 요소가 자체 줄바꿈/마진을 가지므로 세그먼트 가장자리 빈 줄은 접는다(이중 공백 방지).
+          while (buf.length && !buf[0].trim()) buf.shift();
+          while (buf.length && !buf[buf.length - 1].trim()) buf.pop();
+          if (buf.length) renderInlineInto(bubble, buf.join("\n"));
+          buf = [];
+        };
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          const hm = line.match(MD_H_RE);
+          if (hm) {
+            flush();
+            const h = document.createElement("div");
+            h.className = "md-h " + (hm[1].length <= 3 ? "l3" : "l4");
+            renderInlineInto(h, hm[2]);
+            bubble.appendChild(h);
+            continue;
+          }
+          // 표 = 연속 파이프 라인 2줄 이상(스트리밍 중 첫 줄만 온 상태는 평문 유지).
+          if (MD_PIPE_RE.test(line) && MD_PIPE_RE.test(lines[i + 1] || "")) {
+            flush();
+            const rows = [];
+            while (i < lines.length && MD_PIPE_RE.test(lines[i])) { rows.push(lines[i]); i++; }
+            i--;
+            const wrap = document.createElement("div");
+            wrap.className = "md-table-wrap";
+            const table = document.createElement("table");
+            table.className = "md-table";
+            let start = 0;
+            if (rows.length >= 2 && MD_SEP_RE.test(rows[1])) {
+              const tr = document.createElement("tr");
+              for (const c of mdSplitCells(rows[0])) {
+                const th = document.createElement("th");
+                renderInlineInto(th, c);
+                tr.appendChild(th);
+              }
+              table.appendChild(tr);
+              start = 2;
+            }
+            for (let r = start; r < rows.length; r++) {
+              if (MD_SEP_RE.test(rows[r])) continue; // 표 중간 구분선은 표시 안 함
+              const tr = document.createElement("tr");
+              for (const c of mdSplitCells(rows[r])) {
+                const td = document.createElement("td");
+                renderInlineInto(td, c);
+                tr.appendChild(td);
+              }
+              table.appendChild(tr);
+            }
+            wrap.appendChild(table);
+            bubble.appendChild(wrap);
+            continue;
+          }
+          buf.push(line);
+        }
+        flush();
       }
 
       // 표지 URL은 두 형태로 온다: 스트리밍 source 이벤트는 image_url 평면 필드,
@@ -949,11 +1031,17 @@
           // 단계(.step)만 세고 ack 응대는 제외한다. 기존 별도 meta 라인은 이 요약으로 통합.
           completeActiveStep();
           const stepCount = traceBody.querySelectorAll(".step").length;
-          const parts = [];
-          if (stepCount) parts.push(`${stepCount}단계 탐색`);
-          if (cardMap.size) parts.push(`출처 ${cardMap.size}개`);
-          parts.push(`${elapsedSec.toFixed(1)}초`);
-          collapseTrace("🔍 " + parts.join(" · "));
+          // 출처 0인 턴(파라메트릭 즉답)은 "N단계 탐색"이 근거 있는 검색처럼 읽히는 착시를
+          // 만든다 — 중립 표기("응답 X초")로만 접는다. 출처가 있을 때만 탐색·출처 요약.
+          if (cardMap.size) {
+            const parts = [];
+            if (stepCount) parts.push(`${stepCount}단계 탐색`);
+            parts.push(`출처 ${cardMap.size}개`);
+            parts.push(`${elapsedSec.toFixed(1)}초`);
+            collapseTrace("🔍 " + parts.join(" · "));
+          } else {
+            collapseTrace(`응답 ${elapsedSec.toFixed(1)}초`);
+          }
           scrollToBottom();
         },
         showError(message) {
@@ -1108,6 +1196,21 @@
       input.style.height = "auto";
       input.style.height = Math.min(input.scrollHeight, 140) + "px";
       updateSendState();
+    });
+
+    // 컴포저 밖에서 타이핑 시작 → 포커스만 컴포저로 옮기고 글자 삽입은 브라우저 기본 동작에
+    // 맡긴다. 문자를 직접 삽입하는 릴레이는 공백·문장부호·Enter·한글 IME 조합을 흘리므로 금지.
+    // Enter·화살표 등 비프린터블은 릴레이하지 않는다(포커스된 버튼의 기본 동작 보존).
+    function isEditableTarget(el) {
+      return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+    }
+    document.addEventListener("keydown", (e) => {
+      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (isEditableTarget(e.target)) return;
+      if (!personaPop.hidden) return; // 팝오버 열림 — 팝오버 키 조작 우선
+      if (input.disabled) return;     // 전송 중
+      // 프린터블 1글자(공백·문장부호 포함) 또는 IME 조합 키(한글 첫 타, e.key="Process").
+      if (e.key.length === 1 || e.key === "Process") input.focus();
     });
 
     // 매트릭스 "이 성향으로 채팅하기" 핸드오프: 채택한 셀의 {질문, 답변 요지(대표책)}를

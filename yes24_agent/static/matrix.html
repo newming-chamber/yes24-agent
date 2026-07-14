@@ -1255,6 +1255,11 @@
     }
 
     function chooseRound(val, el) {
+      // 불변식: 현재 라운드 축의 허용값만 기록한다. 라운드 전환 지연(430ms) 동안 이전 라운드
+      // 카드가 클릭 가능해 다른 축의 값이 밀려들 수 있으므로(예: 처리축에 'S' → 무효 코드
+      // CSDF류), 축 범위 밖 값과 종료 후 클릭은 무시한다. 축값 글자가 전역 유니크(C/S·A/E·
+      // D/B·I/F)라 이 검증만으로 "제 라운드의 카드"만 통과한다.
+      if (tRoundIdx >= AXES.length || !AXES[tRoundIdx].values.includes(val)) return;
       [...tCards.children].forEach((c) => c.classList.add(c === el ? "chosen" : "notchosen"));
       tDecided[AXES[tRoundIdx].key] = val;
       tRoundIdx++;
@@ -1437,6 +1442,21 @@
     sendBtn.addEventListener("click", submit);
     stopBtn.addEventListener("click", () => { if (controller) controller.abort(); });
     qEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } });
+
+    // 컴포저 밖에서 타이핑 시작 → 포커스만 질문 입력으로 옮기고 글자 삽입은 브라우저 기본
+    // 동작에 맡긴다(index.html과 동일 계약 — 문자 직접 삽입 릴레이는 공백·문장부호·Enter·
+    // 한글 IME를 흘려서 금지). 모달·토너먼트가 열려 있거나(셀 Space=모달 열기 등 자체 키
+    // 조작 우선) 전송 중엔 개입하지 않는다. 비프린터블(Enter·화살표)은 릴레이 안 함.
+    function isEditableTarget(el) {
+      return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+    }
+    document.addEventListener("keydown", (e) => {
+      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+      if (isEditableTarget(e.target)) return;
+      if (!modalBackdrop.hidden || !tourneyBackdrop.hidden) return;
+      if (qEl.disabled) return;
+      if (e.key.length === 1 || e.key === "Process") qEl.focus();
+    });
 
     // ── 결과 스냅샷(왕복 복원) ──
     // 완료된 런의 클라이언트 상태(질문·16셀 텍스트·출처·폴백)를 sessionStorage에 저장하고,
