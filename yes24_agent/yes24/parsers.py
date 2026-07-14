@@ -29,6 +29,8 @@ from yes24_agent.yes24.selectors import (
     ITEM_PUBLISHER,
     ITEM_RANK,
     ITEM_RATING,
+    ITEM_REVIEW_COUNT,
+    ITEM_SALE_INDEX,
     ITEM_TITLE_LINK,
     LINK_NOISE_PATH_MARKERS,
     LINK_NOISE_SUBDOMAINS,
@@ -123,6 +125,8 @@ def parse_search(html: str, *, base_url: str, limit: int = 10) -> list[dict]:
                 "pub_date": _text_or_none(item.select_one(ITEM_PUB_DATE)),
                 "price": _parse_price(item.select_one(ITEM_PRICE)),
                 "rating": _parse_rating(item.select_one(ITEM_RATING)),
+                "sale_index": _parse_grouped_int(item.select_one(ITEM_SALE_INDEX)),
+                "review_count": _parse_grouped_int(item.select_one(ITEM_REVIEW_COUNT)),
                 "image_url": _image_url_or_none(item),
             }
         )
@@ -565,3 +569,16 @@ def _parse_rating(el) -> float | None:
         return float(text)
     except ValueError:
         return None
+
+
+def _parse_grouped_int(el) -> int | None:
+    """판매지수·리뷰수처럼 라벨·쉼표가 섞인 정수를 뽑는다("판매지수 113,304"→113304).
+
+    첫 숫자 뭉치(쉼표 포함)만 취해 앞뒤 라벨 텍스트("판매지수 "·"건")를 무시한다. 숫자가
+    없으면 None(빈 성공 위장 금지 — 형제 파서와 동일 degrade 규약)."""
+    if el is None:
+        return None
+    match = re.search(r"\d[\d,]*", el.get_text())
+    if match is None:
+        return None
+    return int(match.group(0).replace(",", ""))

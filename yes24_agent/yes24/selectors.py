@@ -39,6 +39,16 @@ ITEM_PUB_DATE = "span.authPub.info_date"
 ITEM_PRICE = ".info_price > strong.txt_num em.yes_b"
 ITEM_RATING = ".rating_grade em.yes_b"
 
+# 대중성/매력 신호(매트릭스 풀 재순위화용). 둘 다 검색 결과 HTML에 SSR로 박혀 있다.
+#   - 판매지수(`span.saleNum`, 텍스트 "판매지수 113,304"): Yes24의 판매 기반 인기 집계.
+#     매트릭스 다각 검색 union 풀을 이 값으로 순위화해 대중적·매력 있는 후보를 앞세운다
+#     (기본 검색 정렬이 이미 인기순이나, 여러 쿼리 결과를 병합하면 그 순서가 섞여 minor
+#     후보가 앞줄을 차지하던 문제 — union을 절대 판매지수로 재정렬해 해소).
+#   - 회원리뷰 수(`span.rating_rvCount` 안 `em.txC_blue`, 텍스트 "1,789"): 보조 인기 신호.
+# 값이 없는 후보(세트·신간 등)는 None으로 degrade(빈 성공 위장 금지 — 파서 형제 규약).
+ITEM_SALE_INDEX = "span.saleNum"
+ITEM_REVIEW_COUNT = "span.rating_rvCount em.txC_blue"
+
 # 검색 결과 0건(HTML 구조 파손이 아닌 진짜 "결과 없음") 신호.
 # 실측(tests/fixtures/search_empty.html, "보라색코끼리의은하수여행기xyz" 무결과 쿼리)
 # 기준: `ul#yesSchList` 컨테이너 자체가 없는 대신 `div.noData`가 나타난다.
