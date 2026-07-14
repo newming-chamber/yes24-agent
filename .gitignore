@@ -8,3 +8,13 @@ data/
 *.db
 .idea/
 .DS_Store
+
+# 로컬 전용: 테스트·QA·문서·에이전트 작업 파일 (커밋 대상 아님 — 사용자 방침)
+tests/
+qa/
+docs/
+CLAUDE.md
+.agents/
+.claude/
+.github/
+skills-lock.json
