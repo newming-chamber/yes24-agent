@@ -18,3 +18,4 @@ CLAUDE.md
 .claude/
 .github/
 skills-lock.json
+.playwright-mcp/
