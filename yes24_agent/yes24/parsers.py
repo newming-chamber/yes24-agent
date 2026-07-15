@@ -5,17 +5,16 @@
 """
 
 import re
+from collections.abc import Mapping
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
+from yes24_agent.yes24.client import is_disallowed_path
 from yes24_agent.yes24.selectors import (
-    BESTSELLER_ITEM,
-    BESTSELLER_LIST_CONTAINER,
     CREMACLUB_AUTHOR,
     CREMACLUB_GOODS_NO_LINK,
-    CREMACLUB_ITEM,
-    CREMACLUB_LIST_CONTAINER,
     CREMACLUB_RANK,
     CREMACLUB_RATING,
     CREMACLUB_TITLE_LINK,
@@ -35,8 +34,6 @@ from yes24_agent.yes24.selectors import (
     LINK_NOISE_PATH_MARKERS,
     LINK_NOISE_SUBDOMAINS,
     LINK_PRODUCT_PATH_RE,
-    NEWPRODUCT_ITEM,
-    NEWPRODUCT_LIST_CONTAINER,
     NO_RESULTS_MARKER,
     PRODUCT_AUTHOR,
     PRODUCT_GOODS_NAME_JS_RE,
@@ -57,20 +54,30 @@ from yes24_agent.yes24.selectors import (
     SEARCH_ITEM,
     SEARCH_LIST_CONTAINER,
 )
-from yes24_agent.yes24.urls import absolutize, product_url
+from yes24_agent.yes24.urls import BROWSE_SEED_URLS, absolutize, product_url
 
 # extract_links()의 도메인 허용 판정 기준. www/cremaclub/event/ssl 등 모든
 # *.yes24.com 서브도메인을 "내부"로 취급하고(개별 노이즈 서브도메인은
 # LINK_NOISE_SUBDOMAINS로 별도 배제), 그 외 도메인은 전부 외부로 간주해 배제한다.
 _YES24_ROOT_DOMAIN = "yes24.com"
 
-# section 인자 → (목록 컨테이너, 아이템 셀렉터, 순위 마커 존재 여부).
-# urls.BROWSE_SEED_URLS 키와 1:1로 대응한다. "cremaclub"는 마크업이 아예 달라
-# 별도 파싱 함수(_parse_cremaclub_list)로 처리하므로 이 표에는 없다.
-_SEARCH_STYLE_BROWSE_SECTIONS = {
-    "bestseller": (BESTSELLER_LIST_CONTAINER, BESTSELLER_ITEM, True),
-    "new": (NEWPRODUCT_LIST_CONTAINER, NEWPRODUCT_ITEM, False),
-}
+# 상품형 아이템(검색·베스트셀러·신간·크레마클럽)이 공통으로 싣는 필드 집합.
+# 마크업이 같은 검색/베스트셀러/신간은 _parse_item 하나로 뽑고, 마크업이 다른
+# 크레마클럽도 이 키 집합을 그대로 채운다(없는 필드는 None) — 도구·게이트가 파서마다
+# 다른 키 집합을 상대하지 않게 하기 위함이다(필드 소실 드리프트 원천 차단).
+_ITEM_FIELDS = (
+    "goods_no",
+    "title",
+    "url",
+    "author",
+    "publisher",
+    "pub_date",
+    "price",
+    "rating",
+    "sale_index",
+    "review_count",
+    "image_url",
+)
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -109,27 +116,10 @@ def parse_search(html: str, *, base_url: str, limit: int = 10) -> list[dict]:
 
     results: list[dict] = []
     for item in items:
-        title_el = item.select_one(ITEM_TITLE_LINK)
-        href = title_el.get("href") if title_el else None
-        title = title_el.get_text(strip=True) if title_el else None
-        if not title or not href:
+        parsed = _parse_item(item, base_url)
+        if parsed is None:
             continue
-
-        results.append(
-            {
-                "goods_no": item.get(ITEM_GOODS_NO_ATTR),
-                "title": title,
-                "url": absolutize(base_url, href),
-                "author": _author_or_none(item),
-                "publisher": _text_or_none(item.select_one(ITEM_PUBLISHER)),
-                "pub_date": _text_or_none(item.select_one(ITEM_PUB_DATE)),
-                "price": _parse_price(item.select_one(ITEM_PRICE)),
-                "rating": _parse_rating(item.select_one(ITEM_RATING)),
-                "sale_index": _parse_grouped_int(item.select_one(ITEM_SALE_INDEX)),
-                "review_count": _parse_grouped_int(item.select_one(ITEM_REVIEW_COUNT)),
-                "image_url": _image_url_or_none(item),
-            }
-        )
+        results.append(parsed)
         if len(results) >= limit:
             break
 
@@ -139,6 +129,44 @@ def parse_search(html: str, *, base_url: str, limit: int = 10) -> list[dict]:
         )
 
     return results
+
+
+def _parse_item(item, base_url: str) -> dict | None:
+    """상품 아이템(li) → dict. 제목 또는 링크가 없으면 None(건너뛸 아이템).
+
+    검색·베스트셀러·신간은 마크업이 동일(같은 ITEM_* 셀렉터)하므로 아이템 변환을 이 함수
+    하나로 공유한다. 목록마다 코드를 복제하면 한쪽에만 필드가 추가돼 조용히 소실된다
+    (실측: 브라우즈가 pub_date·image_url·sale_index·review_count를 마크업에 있는데도 안
+    뽑아, 신간 코너의 시제 접지·표지·인기 신호가 통째로 없었다).
+    """
+    title_el = item.select_one(ITEM_TITLE_LINK)
+    href = title_el.get("href") if title_el else None
+    title = title_el.get_text(strip=True) if title_el else None
+    if not title or not href:
+        return None
+
+    return _item_fields(
+        goods_no=item.get(ITEM_GOODS_NO_ATTR),
+        title=title,
+        url=absolutize(base_url, href),
+        author=_author_or_none(item),
+        publisher=_text_or_none(item.select_one(ITEM_PUBLISHER)),
+        pub_date=_text_or_none(item.select_one(ITEM_PUB_DATE)),
+        price=_parse_price(item.select_one(ITEM_PRICE)),
+        rating=_parse_rating(item.select_one(ITEM_RATING)),
+        sale_index=_parse_grouped_int(item.select_one(ITEM_SALE_INDEX)),
+        review_count=_parse_grouped_int(item.select_one(ITEM_REVIEW_COUNT)),
+        image_url=_image_url_or_none(item),
+    )
+
+
+def _item_fields(**values) -> dict:
+    """_ITEM_FIELDS 키 집합을 그대로 채운 dict를 만든다(주지 않은 필드는 None).
+
+    마크업이 다른 목록(크레마클럽)도 같은 키 집합을 내보내게 강제하는 장치다 — 도구는
+    어떤 목록에서 왔든 동일한 필드를 기대할 수 있다.
+    """
+    return {name: values.get(name) for name in _ITEM_FIELDS}
 
 
 def parse_product(html: str, *, base_url: str) -> dict:
@@ -197,36 +225,36 @@ def parse_product(html: str, *, base_url: str) -> dict:
 def parse_browse_list(html: str, *, base_url: str, section: str, limit: int = 24) -> list[dict]:
     """Yes24 섹션 목록(베스트셀러/신간/크레마클럽 인기) HTML을 파싱한다.
 
-    반환 dict 키: rank(int|None), goods_no, title, url(절대), author, publisher,
-    price(int|None), rating(float|None). 아이템 단위로 제목 또는 goods_no가 없으면
-    건너뛴다.
+    반환 dict 키: rank(int|None) + parse_search와 **동일한 상품 필드 집합**(_ITEM_FIELDS:
+    goods_no, title, url(절대), author, publisher, pub_date, price, rating, sale_index,
+    review_count, image_url). 페이지에 필드가 없으면 None이다. 아이템 단위로 제목 또는
+    링크(크레마클럽은 goods_no)가 없으면 건너뛴다.
 
-    section은 urls.BROWSE_SEED_URLS의 키와 1:1로 대응한다:
-      - "bestseller": 검색 결과와 동일한 마크업 + 순위(rank) 마커.
-      - "new": 검색 결과와 동일한 마크업, 순위는 항상 None(마커 없음).
-      - "cremaclub": 별도 마크업(cremaclub.yes24.com). URL은 `/BookClub/Detail/{id}`가
-        아니라 항상 product_url(base_url, goods_no)로 조립한 www.yes24.com 상품
-        페이지를 반환한다. publisher·price는 이 섹션에 필드 자체가 없어 항상 None.
+    파싱 스펙(마크업 종류·셀렉터·순위 마커 유무)은 **urls.BROWSE_SEED_URLS 레코드에서 읽는다**
+    — 섹션 열거를 여기 복제하지 않으므로 시드를 늘려도 파서가 갈라지지 않는다.
+      - markup="search"   : 검색 결과와 동일한 마크업(베스트셀러·신간).
+      - markup="cremaclub": 별도 마크업(cremaclub.yes24.com). URL은 `/BookClub/Detail/{id}`가
+        아니라 항상 product_url(base_url, goods_no)로 조립한 www.yes24.com 상품 페이지를
+        반환한다. publisher·pub_date·price·sale_index는 이 섹션에 필드 자체가 없어 항상 None.
 
-    지원하지 않는 section은 ValueError. 목록 컨테이너 자체가 없으면(무결과 신호도
-    없으면) HTML 구조 변경으로 보고 ParseError(parse_search와 동일 원칙).
+    표에 없는 section은 ValueError(도구는 같은 표로 사전 검증하므로 실제로는 프로그래머
+    오류만 잡는다). 목록 컨테이너 자체가 없으면(무결과 신호도 없으면) HTML 구조 변경으로
+    보고 ParseError(parse_search와 동일 원칙).
     """
-    if section == "cremaclub":
-        return _parse_cremaclub_list(html, base_url=base_url, limit=limit)
-
     try:
-        container_selector, item_selector, has_rank = _SEARCH_STYLE_BROWSE_SECTIONS[section]
+        spec = BROWSE_SEED_URLS[section]
     except KeyError as exc:
-        allowed = ", ".join([*sorted(_SEARCH_STYLE_BROWSE_SECTIONS), "cremaclub"])
+        allowed = ", ".join(sorted(BROWSE_SEED_URLS))
         raise ValueError(f"지원하지 않는 section: {section!r} (허용값: {allowed})") from exc
 
-    return _parse_search_style_browse_list(
+    # 마크업 종류 → 파서. 표에 없는 markup은 KeyError로 즉시 터진다(조용한 오분기 금지).
+    return _MARKUP_PARSERS[spec["markup"]](
         html,
         base_url=base_url,
         limit=limit,
-        container_selector=container_selector,
-        item_selector=item_selector,
-        has_rank=has_rank,
+        container_selector=spec["list_container"],
+        item_selector=spec["item"],
+        has_rank=spec["has_rank"],
     )
 
 
@@ -256,10 +284,8 @@ def _parse_search_style_browse_list(
 
     results: list[dict] = []
     for item in items:
-        title_el = item.select_one(ITEM_TITLE_LINK)
-        href = title_el.get("href") if title_el else None
-        title = title_el.get_text(strip=True) if title_el else None
-        if not title or not href:
+        parsed = _parse_item(item, base_url)
+        if parsed is None:
             continue
 
         rank = None
@@ -267,18 +293,8 @@ def _parse_search_style_browse_list(
             rank_el = item.select_one(ITEM_RANK)
             rank = _parse_int(rank_el.get_text(strip=True)) if rank_el else None
 
-        results.append(
-            {
-                "rank": rank,
-                "goods_no": item.get(ITEM_GOODS_NO_ATTR),
-                "title": title,
-                "url": absolutize(base_url, href),
-                "author": _author_or_none(item),
-                "publisher": _text_or_none(item.select_one(ITEM_PUBLISHER)),
-                "price": _parse_price(item.select_one(ITEM_PRICE)),
-                "rating": _parse_rating(item.select_one(ITEM_RATING)),
-            }
-        )
+        # rank만 가법 — 나머지 필드는 검색과 같은 _parse_item 결과 그대로다.
+        results.append({"rank": rank, **parsed})
         if len(results) >= limit:
             break
 
@@ -290,19 +306,31 @@ def _parse_search_style_browse_list(
     return results
 
 
-def _parse_cremaclub_list(html: str, *, base_url: str, limit: int) -> list[dict]:
-    """크레마클럽 인기(eBook 구독) 목록을 파싱한다. 검색/베스트셀러와 마크업이 다르다."""
+def _parse_cremaclub_list(
+    html: str,
+    *,
+    base_url: str,
+    limit: int,
+    container_selector: str,
+    item_selector: str,
+    has_rank: bool,
+) -> list[dict]:
+    """크레마클럽 인기(eBook 구독) 목록을 파싱한다. 검색/베스트셀러와 마크업이 다르다.
+
+    시그니처는 _parse_search_style_browse_list와 같다 — 섹션 레코드의 markup 값으로 둘 중
+    하나를 골라 같은 방식으로 호출한다(섹션별 if 분기 없음).
+    """
     soup = BeautifulSoup(html, "lxml")
 
-    if soup.select_one(CREMACLUB_LIST_CONTAINER) is None:
+    if soup.select_one(container_selector) is None:
         if soup.select_one(NO_RESULTS_MARKER) is not None:
             return []
         raise ParseError(
-            f"크레마클럽 목록 컨테이너({CREMACLUB_LIST_CONTAINER})와 "
+            f"크레마클럽 목록 컨테이너({container_selector})와 "
             f"무결과 신호({NO_RESULTS_MARKER}) 모두 찾을 수 없음 — HTML 구조 변경 의심"
         )
 
-    items = soup.select(CREMACLUB_ITEM)
+    items = soup.select(item_selector)
     if not items:
         return []
 
@@ -315,19 +343,25 @@ def _parse_cremaclub_list(html: str, *, base_url: str, limit: int) -> list[dict]
         if not title or not goods_no:
             continue
 
-        rank_el = item.select_one(CREMACLUB_RANK)
-        rank = _parse_int(rank_el.get_text(strip=True)) if rank_el else None
+        rank = None
+        if has_rank:
+            rank_el = item.select_one(CREMACLUB_RANK)
+            rank = _parse_int(rank_el.get_text(strip=True)) if rank_el else None
 
+        # 검색/베스트셀러와 같은 키 집합(_item_fields)을 채운다 — 이 페이지에 필드 자체가
+        # 없는 publisher·pub_date·price·sale_index는 None으로 남는다(구독형 eBook 목록).
         results.append(
             {
                 "rank": rank,
-                "goods_no": goods_no,
-                "title": title,
-                "url": product_url(base_url, goods_no),
-                "author": _text_or_none(item.select_one(CREMACLUB_AUTHOR)),
-                "publisher": None,
-                "price": None,
-                "rating": _parse_rating(item.select_one(CREMACLUB_RATING)),
+                **_item_fields(
+                    goods_no=goods_no,
+                    title=title,
+                    url=product_url(base_url, goods_no),
+                    author=_text_or_none(item.select_one(CREMACLUB_AUTHOR)),
+                    rating=_parse_rating(item.select_one(CREMACLUB_RATING)),
+                    review_count=_parse_grouped_int(item.select_one(ITEM_REVIEW_COUNT)),
+                    image_url=_image_url_or_none(item),
+                ),
             }
         )
         if len(results) >= limit:
@@ -341,6 +375,14 @@ def _parse_cremaclub_list(html: str, *, base_url: str, limit: int) -> list[dict]
     return results
 
 
+# 섹션 레코드의 markup 값(urls.BROWSE_SEED_URLS) → 파싱 함수. 두 함수는 시그니처가 같아
+# 서로 대체 가능하다 — 섹션별 if 분기 없이 이 표로만 고른다.
+_MARKUP_PARSERS = {
+    "search": _parse_search_style_browse_list,
+    "cremaclub": _parse_cremaclub_list,
+}
+
+
 def _parse_int(text: str) -> int | None:
     try:
         return int(text)
@@ -349,7 +391,12 @@ def _parse_int(text: str) -> int | None:
 
 
 def extract_links(
-    html: str, *, base_url: str, limit: int = 20, page_url: str | None = None
+    html: str,
+    *,
+    base_url: str,
+    disallowed_paths: tuple[str, ...],
+    limit: int = 20,
+    page_url: str | None = None,
 ) -> list[dict]:
     """페이지 안의 내부 링크를 추출해 에이전트가 페이지→페이지로 이동할 수 있게 한다.
 
@@ -360,8 +407,12 @@ def extract_links(
       - "product": href 경로가 `/product/goods/{id}` 패턴(대소문자 무시).
       - "page": 그 외 yes24.com 계열(서브도메인 포함) 링크 중 노이즈로 걸러지지
         않은 것. 노이즈 판정 기준은 selectors.LINK_NOISE_SUBDOMAINS/
-        LINK_NOISE_PATH_MARKERS 참고(로그인/회원/장바구니/마이페이지/캠페인/
-        이벤트 페이지를 실측으로 확인해 배제).
+        LINK_NOISE_PATH_MARKERS 참고(캠페인·이벤트 등 콘텐츠와 무관한 페이지).
+
+    `disallowed_paths`(robots.txt Disallow 경로, client와 같은 규칙을 주입)에 걸리는 링크는
+    아예 후보에서 뺀다 — 열어 봐야 client가 거절할 링크를 에이전트에게 보여줄 이유가 없다.
+    수집 금지의 **판정 자체는 client.get_text 단일 게이트**가 하고, 여기서는 같은 규칙으로
+    후보를 미리 줄일 뿐이다(노이즈 목록은 안전장치가 아니라 신호 대 잡음비 도구다).
 
     외부 도메인, `#`으로 시작하는 인페이지 앵커, `javascript:` 의사 링크는 전부
     제외한다. URL이 중복되면 문서에 먼저 등장한 것(=먼저 만난 비어있지 않은
@@ -374,9 +425,9 @@ def extract_links(
     그 페이지 고유의 유용한 하위 링크(예: `/Mall/Help/FAQ?faqGb=...` 정책 링크)가
     글로벌 네비에 밀려 limit 밖으로 잘려나가는 것을 막기 위함이다. 그 후 limit로 자른다.
 
-    이 함수는 순수 함수다(설정값을 전혀 참조하지 않는다) — 도메인 허용 정책의
-    최종 판단은 client가 하고, 여기서는 명백한 노이즈만 줄이고(도메인/경로 필터) 현재
-    페이지 맥락의 신호를 앞세워 신호 대 잡음비를 높인다.
+    이 함수는 순수 함수다(설정값을 직접 참조하지 않고 호출자가 주입한다) — 도메인·robots
+    허용 정책의 최종 판단은 client가 하고, 여기서는 그 규칙으로 후보를 줄이고 현재 페이지
+    맥락의 신호를 앞세워 신호 대 잡음비를 높인다.
     """
     soup = BeautifulSoup(html, "lxml")
 
@@ -398,6 +449,10 @@ def extract_links(
         netloc = parsed.netloc.lower()
 
         if not _is_yes24_domain(netloc) or netloc in LINK_NOISE_SUBDOMAINS:
+            continue
+
+        # 수집 금지 경로(client와 같은 규칙) → 후보에서 제외. 그 밖의 노이즈는 품질 필터다.
+        if is_disallowed_path(url, disallowed_paths):
             continue
 
         path_lower = parsed.path.lower()
@@ -582,3 +637,86 @@ def _parse_grouped_int(el) -> int | None:
     if match is None:
         return None
     return int(match.group(0).replace(",", ""))
+
+
+# ============================================================
+# 파싱된 상품 레코드 → 출처 필드 투영 (도구·매트릭스 공용)
+# ============================================================
+# 여기 있는 이유: 이 함수들은 위 파서가 만든 상품 레코드(_ITEM_FIELDS)를 입력으로 받는
+# **투영**이라, 레코드 shape을 정의하는 곳 옆에 있어야 필드가 갈라지지 않는다. 소비자
+# (yes24_search·yes24_fetch·yes24_browse·matrix/retrieval)는 전부 이 레코드의 생산자다.
+
+# KST(UTC+9). pub_status의 "오늘" 판정 기준.
+_KST = timezone(timedelta(hours=9))
+
+# "2022년 03월" / "2022년 03월 28일" 등에서 연·월 추출.
+_YEAR_MONTH_RE = re.compile(r"(\d{4})\s*년\s*(\d{1,2})\s*월")
+
+
+def pub_status(pub_date: str | None, *, now: datetime | None = None) -> str | None:
+    """출간일 문자열을 오늘 기준 시제 표현으로 변환한다.
+
+    Args:
+        pub_date: "YYYY년 MM월[ DD일]" 형식 문자열. None이거나 형식이 안 맞으면 None 반환.
+        now: 기준 시각(테스트 주입용). 생략 시 KST 현재.
+
+    Returns:
+        과거: "출간됨 (약 N년 M개월 전)" 또는 같은 달이면 "출간됨 (이번 달)".
+        미래: "출간 예정 (약 N개월 후)". 파싱 불가 시 None.
+    """
+    if not pub_date:
+        return None
+    match = _YEAR_MONTH_RE.search(pub_date)
+    if match is None:
+        return None
+
+    year, month = int(match.group(1)), int(match.group(2))
+    if not 1 <= month <= 12:
+        return None
+
+    now = now or datetime.now(_KST)
+    delta_months = (year * 12 + month) - (now.year * 12 + now.month)
+
+    if delta_months == 0:
+        return "출간됨 (이번 달)"
+    if delta_months < 0:
+        return f"출간됨 (약 {_format_span(-delta_months)} 전)"
+    return f"출간 예정 (약 {_format_span(delta_months)} 후)"
+
+
+def _format_span(months: int) -> str:
+    """개월 수를 "N년 M개월"로 포맷한다(0인 단위는 생략)."""
+    years, rem = divmod(months, 12)
+    parts: list[str] = []
+    if years:
+        parts.append(f"{years}년")
+    if rem:
+        parts.append(f"{rem}개월")
+    return " ".join(parts)
+
+
+GROUNDING_FIELDS = (
+    "goods_no",
+    "author",
+    "publisher",
+    "pub_date",
+    "price",
+    "rating",
+    "sale_index",
+    "review_count",
+    "image_url",
+)
+
+
+def product_fields(item: Mapping) -> dict:
+    """파싱된 상품 아이템에서 출처 등록·반환에 실을 공통 필드 dict를 만든다.
+
+    아이템에 없는 필드는 None으로 남는다(빈 성공 위장 금지 — 파서 degrade 규약과 동일).
+    pub_status는 pub_date에서 파생하며, 계산 불가(형식 불명·없음)면 키 자체를 넣지 않는다.
+    """
+    fields: dict = {name: item.get(name) for name in GROUNDING_FIELDS}
+
+    status = pub_status(item.get("pub_date"))
+    if status is not None:
+        fields["pub_status"] = status
+    return fields

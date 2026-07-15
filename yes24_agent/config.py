@@ -9,6 +9,7 @@ import logging
 import os
 from functools import lru_cache
 
+from google import genai
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -22,8 +23,11 @@ class Settings(BaseSettings):
     # 자율 다단계 탐색용 상위 모델(사용자 승인, 비용·지연 감수). 미명시 시 preview로 떨어짐.
     # 실측: pro는 flash의 빈응답 회귀 없이 자율 보강(정책 질문에 스스로 검색)을 안정 수행.
     model_name: str = "gemini-2.5-pro"
-    # gemini-2.5-pro는 thinking 필수(budget 0은 400 에러). -1=dynamic으로 복잡도별 자율 판단.
-    thinking_budget: int = -1
+    # gemini-2.5-pro는 thinking 필수(budget 0은 400 에러). **유한값으로 상한을 건다** — -1(dynamic)
+    # 은 모델이 생각을 얼마든 늘려 첫 토큰이 7~12초 뒤에야 나온다(성능 감사 실측: 같은 프롬프트에
+    # tb=-1 10.8s vs tb=512 4.6s, 출력 길이는 거의 동일 880 vs 824자). 512는 다단계 계획에 충분한
+    # 예산이면서 TTFT를 6~8초 줄인다. 품질 저하가 관측되면 이 값을 올린다(.env로 조정 가능).
+    thinking_budget: int = 512
     # 하이브리드 라우팅용 경량 모델(잡담·단순질의·단일조회를 즉답). 실측: flash는
     # thinking_budget=0만 안정(-1 dynamic은 주가 등에서 빈응답 회귀). pro 전역의 20~40초
     # 지연을 단순 질의에서 없애는 것이 목적(redesign-decision.md 원칙 8).
@@ -31,13 +35,30 @@ class Settings(BaseSettings):
     flash_thinking_budget: int = 0
     # 질의 난도로 flash/pro를 고르는 하이브리드 라우팅 on/off. off면 model_name(pro) 전역.
     hybrid_routing: bool = True
+    # 질의 분류기(intent·multistep·confidence) on/off. 키워드 버킷을 폐기하고 값싼 모델 1회
+    # 구조화 출력으로 대체한다 — 부류를 '의미'로 판정해 표면 문자열(합성어·부분일치)에 걸리지
+    # 않는다. off이거나 실패·저확신이면 안전한 쪽(pro + 게이트 적용)으로 폴백한다(키워드 부활 없음).
+    query_classifier: bool = True
+    # 분류 전용 모델. 비면 validator가 flash_model_name으로 채운다(단일 소스·드리프트 방지).
+    classifier_model_name: str = ""
+    classifier_timeout_s: float = 3.0  # 분류 호출 상한(초과 시 안전 폴백)
+    # 분류 결과 메모리 캐시 크기(같은 질의 재입력·재시도 시 재호출 0). 프로세스 수명 동안 유지.
+    classifier_cache_size: int = 512
+    # 인용 무결성 게이트(product_gate)의 대조 임계.
+    # 주장 제목의 토큰 중 이 비율 이상이 출처 제목에 있으면 같은 책으로 본다(축약·부제 변형 허용).
+    # 오탐(정상 인용을 오매핑으로 오판) 방지를 위해 관대하게 과반으로 둔다.
+    title_token_overlap_min: float = 0.5
+    # 평점 값 대조 허용오차. 표기 차이(9.5 vs 9.50)를 같은 값으로 보되, 지어낸 값은 걸러낸다.
+    rating_match_tolerance: float = 0.1
+
     # 에러 구동 반응형 모델 폴백: pro 경로가 Gemini 과부하/일시장애(429/5xx)로 첫 응답조차
     # 내지 못하면 flash로 딱 1회 조용히 폴백 재시도한다. 선제적 hybrid_routing과 직교한다
     # ─ 저건 질의 난도로 사전 선택, 이건 에러 후 반응. off면 기존처럼 곧장 정직 안내(error+done).
     error_fallback: bool = True
     # 인터스티셜 응대(ack) 채널: 도구를 호출하는 턴에서 첫 function_call 시점에 도구 전 공감·
     # 안내 preamble의 첫 문장(들)을 별도 `event: ack`로 즉시 흘려, 30~60s 무응대 대신 수 초 내
-    # 첫 응대가 보이게 한다. 이 상한(문자)까지 담되 문장 경계로 자른다(상한 초과분은 기존 홀드).
+    # 첫 응대가 보이게 한다. 이 상한(문자)까지 문장 경계로 담고, **나머지는 버린다** — 도구 전
+    # 발화는 진행 발화이지 본문이 아니므로 done.text에도 들어가지 않는다(원칙 4b).
     ack_max_chars: int = 120
     max_llm_calls: int = 50  # ADK RunConfig 상한
     # 조건부 standalone 질의 재작성(멀티턴 지시대명사 해소, architecture-blueprint.md P4).
@@ -58,6 +79,20 @@ class Settings(BaseSettings):
     http_concurrency: int = 5
     http_rps: float = 1.5
     http_max_retries: int = 2  # 429/5xx 지수 백오프 횟수
+    http_backoff_base_s: float = 0.5  # 지수 백오프 기준 간격(backoff_base_s * 2**attempt)
+    # 리다이렉트 홉 상한. 홉마다 도메인 검증을 통과해야 요청되므로(사전 차단) 상한은
+    # 무한 루프·체인 폭주 방지용이다.
+    http_max_redirects: int = 5
+    # 인코딩 판별 실패 허용 상한. 어떤 인코딩으로도 strict 디코드가 안 되면 cp949
+    # (errors="replace")로 폴백하는데, 그 결과의 대체 문자(U+FFFD) 비율이 이 값을 넘으면
+    # 깨진 텍스트를 성공으로 반환하지 않고 Yes24FetchError로 끊는다("조용히 성공하는 실패"
+    # 차단). 정상 페이지에도 특수문자 몇 개는 대체될 수 있어 0이 아닌 작은 여유를 둔다.
+    http_max_replacement_char_ratio: float = 0.02
+    # robots.txt가 Disallow한 경로(소문자 **경로 접두** 일치). Yes24 robots는 구경로 `/Goods/`와
+    # `/member/`를 차단하고 현행 `/product/search`·`/product/goods`는 허용한다(2026-07-07 실측).
+    # 링크 팔로우로 차단 경로가 흘러들 수 있으므로 client.get_text가 도메인 검증과 **같은 층에서**
+    # 판정해 요청 자체를 막는다(도구별 필터는 우회 경로가 생긴다 — 게이트는 한 곳).
+    yes24_disallowed_paths: list[str] = ["/goods/", "/member/"]
     search_result_limit: int = 10
     browse_result_limit: int = 10
     fetch_max_chars: int = 6000
@@ -75,13 +110,6 @@ class Settings(BaseSettings):
     # 공유 Yes24Client의 동시성 Semaphore(http_concurrency=5)와 정렬해 초과 요청이 쌓이지
     # 않게 한다. 초과 items는 이 상한까지만 처리한다(하드코딩 금지 — 원칙 6).
     fetch_many_max_items: int = 5
-    # 도구 라운드 이후 텍스트를 '도구 사이 내레이션'과 '최종 답변'으로 가르는 버퍼 임계(글자).
-    # 도구를 부르는 턴의 내레이션은 짧고(실측: inter-tool 발화 한두 문장 50~80자), 최종 답변은
-    # 길다. 버퍼가 이 임계를 넘으면 최종 답변으로 판정해 그 시점부터 라이브 토큰 스트리밍을
-    # 시작하고, 임계 미만에서 function_call이 닫으면 내레이션으로 판정해 ack로 보낸다(본문 제외).
-    # 200이면 오분류가 드물고, 드문 오판(임계 초과 후 도구 도착)은 transient 노출만 남되 done.text
-    # 에선 제외된다(runner). 스트리밍 체감이 이 제품의 핵심 UX라 도구 턴 토큰 스트리밍을 지킨다.
-    body_stream_threshold_chars: int = 200
 
     # 웹 검색 (외부 원시 검색 — Perplexity /search). 상품 정보는 여전히 Yes24 출처만 인용 가능.
     # 퍼플렉시티 /search는 결과의 snippet 필드에 페이지 콘텐츠(추출 본문)를 직접 담아준다
@@ -97,15 +125,26 @@ class Settings(BaseSettings):
     # 천장이며, 초과 시에만 발동해 문장 경계 근처에서 잘라내고 절단 표식을 남긴다.
     web_search_snippet_max_chars: int = 6000
     web_search_timeout_s: float = 10.0
+    # web_fetch 본문 상한·리드 마진. Yes24 상세용 fetch_max_chars를 빌려 쓰면 자사 페이지 예산을
+    # 바꿀 때 외부 문서 예산이 딸려 움직인다(무관한 두 결정의 커플링) — 별도 필드로 분리한다.
+    # 절단 계약(truncated·total_chars·find)은 yes24_fetch와 동일하다(같은 함수를 공유).
+    web_fetch_max_chars: int = 6000
+    web_fetch_find_lead_chars: int = 500
     perplexity_search_url: str = "https://api.perplexity.ai/search"
     # 웹 열람(web_fetch)은 여전히 Tavily /extract 사용 — 특정 URL 전문 확보용.
     tavily_extract_url: str = "https://api.tavily.com/extract"
 
     # 16뷰 매트릭스 (RBTI 시뮬레이터, retrieve-once → fan-out-generate)
-    # 공유 검색 팬아웃 횟수. 16 페르소나가 같은 질문의 같은 사실을 필요로 하므로 검색은
-    # 질문당 소수회만 실행해 Yes24 트래픽을 O(1)로 유지한다(rbti-feature-plan §3.2). 기본 1은
-    # 단일 통합검색; 2 이상이면 섹션 변형(all→book)으로 풀을 넓힌다(비용 대 다양성 트레이드오프).
-    matrix_retrieval_fanout: int = 1
+    # 공유 검색이 때릴 Yes24 검색 섹션. 매트릭스 풀은 **도서 섹션(domain=BOOK)**으로 상류에서
+    # 제약한다 — 통합검색(ALL)이 비도서 상품(교구·보드게임)을 섞어 내면 하류에 필터를 겹겹이
+    # 쌓아야 하고, 그 필터의 오탐이 풀을 16셀보다 작게 깎아 수렴을 부른다. 실측(4질의 × ALL/BOOK):
+    # BOOK 응답은 마크업이 동일해 파서가 그대로 동작하고 author·pub_date가 전 항목에 있다
+    # (비도서 0건) — 필터가 아니라 질의로 제약하는 편이 단순하고 견고하다.
+    matrix_search_section: str = "book"
+    # 검색 1건당 파싱할 후보 수. 채팅 도구(search_result_limit=10)는 에이전트가 읽을 목록이라
+    # 짧지만, 매트릭스 풀은 16셀이 갈라질 재료라 한 페이지가 주는 만큼(24건) 다 받는다 —
+    # 풀이 16보다 작으면 차별화가 구조적으로 불가능하다.
+    matrix_pool_parse_limit: int = 24
     # 16 fan-out 생성의 동시 실행 상한(asyncio.Semaphore). 지연을 낮추되 Gemini flash 레이트리밋·
     # 로컬 부하 폭발을 막는 가드. flash는 도구 없이 짧게 생성하므로 8이면 16열을 2배치로 소화.
     matrix_generation_concurrency: int = 8
@@ -143,49 +182,41 @@ class Settings(BaseSettings):
     # 각도와 '소설/에세이' 각도로 나눠 검색해 union+dedup하면 풀이 넓어져 16 페르소나가 갈라질
     # 선택지가 생긴다(rbti-feature-plan §3.2, 사용자 피드백: 16셀 수렴). 매트릭스당 이 수만큼 검색.
     matrix_retrieval_max_queries: int = 3
-    # 공유 풀 목표 크기. 다각 검색·dedup·다양성가드 후 이 수까지 담는다(10권÷16페르소나는 겹침
-    # 불가피 → 20~30으로 넓혀 페르소나별 선택이 갈라질 공간 확보). 검색 결과가 적으면 있는 만큼.
-    matrix_pool_target_size: int = 24
+    # 공유 풀 목표 크기. 다각 검색·dedup·다양성가드 후 이 수까지 담는다. **16셀보다 충분히 커야
+    # 한다** — 풀이 16보다 작으면 셀들이 같은 책을 고를 수밖에 없어 차별화가 구조적으로 불가능하고
+    # (실측: 최종 풀 12 < 16셀), 회전·축가드 같은 대증요법이 그 부족을 메우려 쌓인다.
+    matrix_pool_target_size: int = 40
     # 열별 후보 순서 로테이션 on/off. 16셀이 같은 풀의 '가장 위(가장 대중적)' 책으로 수렴하는
     # 것(리드북 중복·자카드 겹침)을 구조로 완화한다 — 열마다 후보를 다른 위치에서 시작해 렌더하면
     # (source_id는 불변) 모델의 primacy 편향이 열마다 다른 책을 앞세운다. product 풀에만 적용.
     matrix_pool_rotate: bool = True
-    # 공유 풀 노이즈 필터 on/off. Yes24 키워드 검색이 광의 한국어 질의에 섞어 내는, 어떤 페르소나
-    # 에게도 좋은 추천이 될 수 없는 후보(외국어 원서·광고스팸 제목·다권 전집)를 매트릭스 풀에서
-    # 걷어낸다. 실측: 이 노이즈가 실효 후보를 1권까지 줄여 16셀이 유일 후보로 100% 수렴하던 질의
-    # (예: '흥미 붙일 역사책')에서, 필터가 실효 후보를 8권으로 되살려 분산을 회복시킨다(분산은
-    # 실효 후보 수에 정비례). 잘 갈리던 질의(근현대사·SF·번아웃)는 오염이 없어 무손실. product
-    # 풀에만 적용하며 채팅 yes24_search 도구는 건드리지 않는다(에이전트가 직접 큐레이션).
-    matrix_pool_filter_noise: bool = True
-    # 읽기 적합성 필터 on/off. 독서(읽을거리) 목적 질문에 키워드 검색이 섞어 내는 참고·학습·수험·
-    # 사전 부류(그 장르 '읽을 책'이 아니라 주제를 '공부·연습하는 도구책' — 작법서·문제집·워크북·
-    # 회화·사전 등)를 걷어낸다. 실측: romantasy 소설 추천 질문에
-    # '웹소설 작법 가이드북'이 대표책으로,
-    # 사전·어학교재가 유입. 단 사용자가 실제로 그런 자료를 원하면(글쓰기 작법·어학 공부·시험 준비
-    # 질문) 걸러선 안 되므로 **질문에 학습·도구 의도 신호가 없을 때만** 적용한다(질문-인지형 부류
-    # 규칙, 특정 서명 나열 아님). product 풀에만 적용.
-    matrix_pool_filter_offtopic: bool = True
-    # 공유 풀 판매지수 재순위화 on/off. Yes24 검색은 쿼리별로 이미 인기순(SINDEX_ONLY)이 기본이나,
-    # 매트릭스는 서로 다른 각도의 검색어를 union하므로 그 병합 과정에서 쿼리 순서가 인기 순서를
-    # 뒤섞어, 저지수 minor 후보(예: 판매지수 42의 2천 원 단편집)가 대중적 후보(판매지수 수만 대
-    # 입문작)보다 앞줄을 차지해 목표크기 절단 시 대중작이 밀려나던 문제가 있다. on이면 denoise·
-    # dedup 후 파싱된 판매지수(파서 span.saleNum)로 union 전체를 내림차순 안정정렬해, 절단이
-    # 매력 있는 후보를 남기게 한다(값 None은 최하위). 매력 신호를 풀 선별에 반영하는 일반 레버이며
-    # 특정 주제 대응이 아니다(계측: 차별화∝풀의 매력-후보 다양성, known-limitations 매트릭스 항목).
-    matrix_pool_rank_by_popularity: bool = True
-    # 공유 풀 에디션 변형 dedup on/off. 같은 책의 판형/장정 변형(예: "채식주의자" 일반판과
-    # "채식주의자(개정판)"·"오늘부터 채식주의 (큰글자도서)")이 별개 URL이라 url-dedup을 통과해
-    # 풀에 중복으로 들어오고, 대표책이 "큰글자도서 28,000원"처럼 부가판으로 표시되던 문제가 있다.
-    # on이면 제목에서 **괄호 속 판형/장정 수식어 부류**(큰글자·리커버·개정판·양장 등)를 걷어낸
-    # 정규화 키가 같은 후보를 1종으로 접고, 대표는 부가어 없는 기본판을 우선한다(동급이면 판매지수).
-    # 시리즈 가드(_diversify)와 같은 층의 부류 규칙이며 특정 제목 나열이 아니다.
-    # product 풀에만 적용.
-    matrix_pool_dedup_editions: bool = True
+    # 풀 강등(soft penalty) 계수. 어떤 페르소나에게도 좋은 단권 추천이 되기 어려운 출품(판촉
+    # 브래킷 나열 제목·다권 세트/전집)을 **삭제하지 않고 순위만 뒤로 민다**. 하드 드롭이던 것을
+    # 강등으로 바꾼 이유: 오탐의 대가가 "책 1권 영구 소멸"에서 "순위 몇 칸 하락"으로 줄고, 신호가
+    # 소실되지 않아 풀이 얇을 때는 강등된 후보라도 16셀이 쓸 수 있다(누구도 복구할 수 없던 구조를
+    # 없앤다). 값은 순위 비교 시 감점 가중치이며, 0이면 강등 없음.
+    matrix_pool_noise_penalty: int = 1
+    # 배제 엔티티(exclude) 적용 가드. 모델이 낸 배제어가 너무 짧거나(부분 문자열이 과하게 걸림)
+    # 적용 시 후보의 이 비율을 넘게 지우면 **적용을 취소**한다 — exclude:["소설"] 한 방에 풀이
+    # 증발하는 것을 막는다(우세-부류 판정과 같은 발상: 대다수를 지우는 규칙은 규칙이 틀린 것).
+    matrix_exclude_min_chars: int = 2
+    matrix_exclude_max_drop_ratio: float = 0.5
+    # 공유 풀 캐시 엔트리 상한(LRU-ish 만료). TTL만 있고 상한이 없으면 장수 프로세스에서 질문
+    # 종류만큼 무한히 자란다.
+    matrix_cache_max_entries: int = 64
     # 게이트 발동 셀의 재생성 재시도 횟수. 셀 답이 게이트(풀 밖 책·무출처 상품사실)에 걸리면 곧장
     # 정직 폴백으로 dim 처리하는 대신, 같은 풀로 flash를 이 횟수만큼 더 생성해 본다(재검색 아님 —
     # Yes24 트래픽 0). 생성이 비결정적이라 두 번째 초안이 접지된 답을 낼 확률이 높아 셀 성공률이
     # 오른다. 발동 셀에만 들고 최대 이 횟수라 비용 가드는 유지. 0이면 재시도 없음(기존 동작).
     matrix_cell_retries: int = 1
+    # D/B(깊이/넓이) 축 추천 구성 구조 가드의 권수 경계. 4축 부호 원리를 프롬프트 서술만으로
+    # 지키지 못하는 축이 D/B다(4R 실측: 깊이 셀이 4~5권 나열·'넓은 시야' 서술로, 넓이 셀이
+    # '깊이 있는 접근' 프레이밍으로 역행 — 부적합 7건 중 5건). 셀 프롬프트에 권수 경계를 구조
+    # 신호로 명시한다: 깊이(D) 셀은 최대 depth_max_picks권만 골라 그만큼 깊게 상술, 넓이(B)
+    # 셀은 최소 breadth_min_picks권 이상(풀이 허용하는 한)을 스펙트럼으로 조망. 축 정의
+    # (깊이=소수 집중, 넓이=복수 조망)에서 도출되는 부류 규칙이며 특정 질문 대응이 아니다.
+    matrix_depth_max_picks: int = 2
+    matrix_breadth_min_picks: int = 3
 
     # 세션 영속
     session_db_url: str = "sqlite+aiosqlite:///./data/sessions.db"  # async 드라이버 접미사 필수
@@ -212,6 +243,17 @@ class Settings(BaseSettings):
         """
         if not self.matrix_generation_model:
             self.matrix_generation_model = self.flash_model_name
+        return self
+
+    @model_validator(mode="after")
+    def _default_classifier_model_to_flash(self) -> "Settings":
+        """classifier_model_name이 비면 flash_model_name으로 채운다(단일 소스).
+
+        질의 분류는 값싼 모델 고정이므로 별도 모델명 리터럴을 두지 않는다 — flash 모델을 바꾸면
+        분류기도 따라간다. 명시 오버라이드(.env)가 있으면 그 값을 존중한다.
+        """
+        if not self.classifier_model_name:
+            self.classifier_model_name = self.flash_model_name
         return self
 
 
@@ -243,3 +285,21 @@ def ensure_google_api_key_env() -> str:
         os.environ["GOOGLE_API_KEY"] = gemini_key
     os.environ.pop("GEMINI_API_KEY", None)
     return gemini_key
+
+
+# 공유 google.genai 클라이언트 싱글턴.
+# 여기 있는 이유: 소비자가 코어(query_understanding)와 matrix(generate·retrieval) 양쪽이라
+# **공통 조상인 config**가 제자리다. matrix에 두면 코어가 matrix를 import하는 역방향 의존이
+#생겨(실제로 query_understanding이 지연 import로 우회하고 있었다) 계층이 뒤집힌다.
+# ensure_google_api_key_env가 GOOGLE_API_KEY를 세팅하므로 genai.Client()가 인증된다.
+# 테스트는 호출부에 스텁을 주입해 이 팩토리를 우회한다.
+_genai_client: genai.Client | None = None
+
+
+def get_genai_client() -> genai.Client:
+    """공유 genai 클라이언트 싱글턴을 반환한다(최초 호출 시 생성·인증)."""
+    global _genai_client
+    if _genai_client is None:
+        ensure_google_api_key_env()
+        _genai_client = genai.Client()
+    return _genai_client

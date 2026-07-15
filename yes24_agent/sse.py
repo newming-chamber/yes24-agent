@@ -86,9 +86,3 @@ def sse_done(payload: dict, col: int | None = None) -> str:
 def sse_error(message: str) -> str:
     """에러 이벤트."""
     return format_sse("error", {"message": message})
-
-
-def is_done_event(sse_str: str) -> bool:
-    """스트림 펌프 종료 판정용 — `done` 이벤트인지 확인한다."""
-    first_line = sse_str.split("\n", 1)[0]
-    return first_line == "event: done"

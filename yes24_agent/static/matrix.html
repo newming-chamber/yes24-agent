@@ -209,6 +209,18 @@
       display: flex; align-items: center; justify-content: center; text-align: center;
       font-family: var(--mono); font-size: 8px; letter-spacing: 0.02em; color: var(--muted); line-height: 1.3;
     }
+    /* 그리드 위치는 CSS가 소유한다 — JS는 좌표(data-row/data-col, 0-based)만 표기하고 배치는
+       하지 않는다. 인라인 style.gridRow/Column은 캐스케이드상 미디어쿼리가 이길 수 없어
+       좁은 화면의 2열 레이아웃을 원리적으로 무력화한다(실측: 5열 유지 + 89px 슬라이버 12개).
+       1행·1열은 축 헤더 몫이므로 좌표 → 그리드 라인은 +2. */
+    .matrix :is(.col-head, .cell)[data-col="0"] { grid-column: 2; }
+    .matrix :is(.col-head, .cell)[data-col="1"] { grid-column: 3; }
+    .matrix :is(.col-head, .cell)[data-col="2"] { grid-column: 4; }
+    .matrix :is(.col-head, .cell)[data-col="3"] { grid-column: 5; }
+    .matrix :is(.row-head, .cell)[data-row="0"] { grid-row: 2; }
+    .matrix :is(.row-head, .cell)[data-row="1"] { grid-row: 3; }
+    .matrix :is(.row-head, .cell)[data-row="2"] { grid-row: 4; }
+    .matrix :is(.row-head, .cell)[data-row="3"] { grid-row: 5; }
     .col-head, .row-head {
       display: flex; align-items: center; justify-content: center; text-align: center;
       gap: 4px; overflow: hidden;
@@ -333,6 +345,10 @@
     .md-h.l3 { font-size: 1.12em; }
     .md-h.l4 { font-size: 1.05em; }
     .md-h:first-child { margin-top: 0; }
+    /* 불릿·번호 리스트 — 줄머리 마커를 <li>가 담당(웹셀 날씨 등에서 리터럴 */- 노출 방지).
+       셀·모달 어디서든 본문(em 기반)에 비례. 마커 들여쓰기는 절제. */
+    .md-list { margin: 4px 0; padding-left: 1.4em; }
+    .md-list li { margin: 1px 0; }
     /* 표는 컨테이너를 넘으면 표만 가로 스크롤(셀/모달은 안 넘침), 안에서 pre-wrap 해제. */
     .md-table-wrap { overflow-x: auto; white-space: normal; margin: 5px 0; }
     .md-table { border-collapse: collapse; font-size: 0.92em; }
@@ -511,6 +527,9 @@
       .wrap { height: auto; min-height: 100vh; overflow: visible; }
       .matrix { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: none; }
       .corner, .col-head, .row-head { display: none; }
+      /* 4×4 좌표를 버리고 자동 배치(DOM 순서 = 코드 순서)로 흐르게 한다. 위 좌표 규칙과 같은
+         명시도이고 뒤에 오므로 이긴다 — 배치가 CSS 소유라 가능한 오버라이드다. */
+      .matrix .cell[data-row], .matrix .cell[data-col] { grid-row: auto; grid-column: auto; }
       .cell { min-height: 210px; }
       .cell .c-body { -webkit-mask-image: none; mask-image: none; overflow-y: auto; }
     }
@@ -583,48 +602,25 @@
     </div>
   </div>
 
-  <script>
+  <script type="module">
     "use strict";
 
-    // ── RBTI 축 정의 (persona.py AXIS_ORDER와 동형) ──
-    // code = [pattern][processing][breadth][motivation] = [C/S][A/E][D/B][I/F].
-    // 4×4: 행 = 독서패턴×정보처리(code[0..1]), 열 = 취향폭×독서동기(code[2..3]).
-    const AXES = [
-      { key: "pattern",    label: "패턴", values: ["C", "S"] },
-      { key: "processing", label: "처리", values: ["A", "E"] },
-      { key: "breadth",    label: "폭",   values: ["D", "B"] },
-      { key: "motivation", label: "동기", values: ["I", "F"] },
-    ];
-    const VAL = { C: "완독", S: "선택", A: "분석", E: "공감", D: "깊이", B: "넓이", I: "정보", F: "재미" };
+    // 공용 모듈(단일 사본) — 마크다운·인용 렌더, SSE, RBTI 축 정의, 출처 유틸.
+    import { renderBody } from "/static/lib/md.js";
+    import { readEventStream } from "/static/lib/sse.js";
+    import {
+      AXES, VAL, CODES, ROW_ORDER, COL_ORDER, rowKey, colKey, deriveAxisLabel,
+      RBTI_STORAGE_KEY, MATRIX_HANDOFF_KEY,
+    } from "/static/lib/rbti.js";
+    import { WEB_TYPES, coverUrl, safeOpen } from "/static/lib/sources.js";
 
     // 축 색 아이덴티티: 열(취향폭×동기)별 hue 밴드, 행 = 정보처리(분석 쿨 / 공감 웜) 코드배지.
     const COL_HUE = { DI: "#22d3ee", DF: "#a78bfa", BI: "#fbbf24", BF: "#34d399" };
     const PROC_HUE = { A: "#3b82f6", E: "#f43f5e" };
 
-    // 16 코드 = 축값 데카르트 곱(matrix_codes()와 동일 순서 → col 인덱스와 일치).
-    const CODES = [];
-    for (const p of AXES[0].values)
-      for (const pr of AXES[1].values)
-        for (const b of AXES[2].values)
-          for (const m of AXES[3].values) CODES.push(p + pr + b + m);
-
-    const ROW_ORDER = [];
-    for (const p of AXES[0].values) for (const pr of AXES[1].values) ROW_ORDER.push(p + pr);
-    const COL_ORDER = [];
-    for (const b of AXES[2].values) for (const m of AXES[3].values) COL_ORDER.push(b + m);
-
-    function rowKey(code) { return code[0] + code[1]; }
-    function colKey(code) { return code[2] + code[3]; }
-    function deriveAxisLabel(code) {
-      return [VAL[code[0]], VAL[code[1]], VAL[code[2]], VAL[code[3]]].join("-");
-    }
-
-    const RBTI_STORAGE_KEY = "yes24_rbti"; // index.html 페르소나 저장키 재사용(채택).
-    const TYPE_LABEL = {
-      search_result: "검색결과", book_detail: "상세", detail: "상세",
-      notice: "공지", policy: "공지", page: "공지", browse: "코너", web: "웹",
-    };
-    const WEB_TYPES = new Set(["web"]);
+    // 튜닝 상수(매직넘버 금지) — 셀 대각 스태거 간격, 인용칩 하이라이트 유지 시간.
+    const CELL_STAGGER_MS = 28;
+    const CHIP_HIGHLIGHT_MS = 1400;
 
     // ── DOM ──
     const qEl = document.getElementById("q");
@@ -654,134 +650,13 @@
     let sourcesById = new Map();
     let cardByCode = new Map();
     let filledCount = 0;
+    let runErrored = false; // 이번 런에 error 프레임이 왔는가(터미널 done의 성공 표시를 막는다)
     const activeFilters = {};
 
-    // ── 인용 마커/본문 렌더(index.html 로직 이식, innerHTML 금지 — XSS 방지) ──
-    function renderMarkersInto(target, text, onMarker) {
-      const re = /\[(\d+(?:\s*,\s*\d+)*)\]/g;
-      let last = 0, m;
-      while ((m = re.exec(text)) !== null) {
-        if (m.index > last) target.appendChild(document.createTextNode(text.slice(last, m.index)));
-        const ids = m[1].split(",").map((s) => s.trim()).filter(Boolean);
-        ids.forEach((sid) => {
-          const badge = document.createElement("sup");
-          badge.className = "marker";
-          badge.textContent = sid;
-          badge.addEventListener("click", (e) => { e.stopPropagation(); onMarker && onMarker(sid); });
-          target.appendChild(badge);
-        });
-        last = re.lastIndex;
-      }
-      if (last < text.length) target.appendChild(document.createTextNode(text.slice(last)));
-    }
-    // 인라인: **볼드** 분리 후 각 구간에서 [n] 마커 배지 조립(볼드 안 마커도 정상). append만(clear X).
-    function renderInlineInto(target, text, onMarker) {
-      const boldRe = /\*\*([\s\S]+?)\*\*/g;
-      let last = 0, m;
-      while ((m = boldRe.exec(text)) !== null) {
-        if (m.index > last) renderMarkersInto(target, text.slice(last, m.index), onMarker);
-        const strong = document.createElement("strong");
-        renderMarkersInto(strong, m[1], onMarker);
-        target.appendChild(strong);
-        last = boldRe.lastIndex;
-      }
-      if (last < text.length) renderMarkersInto(target, text.slice(last), onMarker);
-    }
+    // 마커 승격 조건(공용 렌더러에 주입) — 공유 출처 풀에 있는 id만 인용 배지가 된다.
+    const isPooled = (sid) => sourcesById.has(String(sid));
 
-    // 본문 렌더(index.html renderBody와 동일 파서 이식): 라인 단위 블록 파스 — 헤더(#{1,6})와
-    // 파이프 테이블만 블록으로 승격하고 나머지는 인라인(볼드·마커) 평문(pre-wrap). 리스트 기호 등
-    // 그 외 마크다운은 스코프 밖(chat과 동일). 특정 질문 유형 분기 없이 셀 본문 전체에 일괄 적용
-    // (웹 출처 모드에서 `### 헤더`가 리터럴로 새던 것 해소). innerHTML 금지(XSS 방지).
-    const MD_H_RE = /^(#{1,6})\s+(.*)$/;
-    const MD_PIPE_RE = /^\s*\|.*\|\s*$/;          // |로 시작·끝나는 라인만 표 후보
-    const MD_SEP_RE = /^\s*\|?[\s:|-]+\|?\s*$/;   // 구분선 |---|:--:|
-    function mdSplitCells(line) {
-      return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((s) => s.trim());
-    }
-    function renderBody(container, text, onMarker) {
-      container.textContent = "";
-      const lines = (text || "").split("\n");
-      let buf = [];
-      const flush = () => {
-        // 블록 요소가 자체 마진을 가지므로 세그먼트 가장자리 빈 줄은 접는다(이중 공백 방지).
-        while (buf.length && !buf[0].trim()) buf.shift();
-        while (buf.length && !buf[buf.length - 1].trim()) buf.pop();
-        if (buf.length) renderInlineInto(container, buf.join("\n"), onMarker);
-        buf = [];
-      };
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        const hm = line.match(MD_H_RE);
-        if (hm) {
-          flush();
-          const h = document.createElement("div");
-          h.className = "md-h " + (hm[1].length <= 3 ? "l3" : "l4");
-          renderInlineInto(h, hm[2], onMarker);
-          container.appendChild(h);
-          continue;
-        }
-        // 표 = 연속 파이프 라인 2줄 이상(첫 줄만 온 스트리밍 중간 상태는 평문 유지).
-        if (MD_PIPE_RE.test(line) && MD_PIPE_RE.test(lines[i + 1] || "")) {
-          flush();
-          const rows = [];
-          while (i < lines.length && MD_PIPE_RE.test(lines[i])) { rows.push(lines[i]); i++; }
-          i--;
-          const wrap = document.createElement("div");
-          wrap.className = "md-table-wrap";
-          const table = document.createElement("table");
-          table.className = "md-table";
-          let start = 0;
-          if (rows.length >= 2 && MD_SEP_RE.test(rows[1])) {
-            const tr = document.createElement("tr");
-            for (const c of mdSplitCells(rows[0])) {
-              const th = document.createElement("th");
-              renderInlineInto(th, c, onMarker);
-              tr.appendChild(th);
-            }
-            table.appendChild(tr);
-            start = 2;
-          }
-          for (let r = start; r < rows.length; r++) {
-            if (MD_SEP_RE.test(rows[r])) continue; // 표 중간 구분선은 표시 안 함
-            const tr = document.createElement("tr");
-            for (const c of mdSplitCells(rows[r])) {
-              const td = document.createElement("td");
-              renderInlineInto(td, c, onMarker);
-              tr.appendChild(td);
-            }
-            table.appendChild(tr);
-          }
-          wrap.appendChild(table);
-          container.appendChild(wrap);
-          continue;
-        }
-        buf.push(line);
-      }
-      flush();
-    }
-    function safeOpen(url) { if (url && /^https?:\/\//i.test(url)) window.open(url, "_blank", "noopener"); }
-
-    // ── W2: 표지 썸네일 ──
-    // image_url은 col done.sources[].meta.image_url로 온다(검색결과만). 없으면 우아하게 생략.
-    function coverUrl(src) {
-      const u = src && src.meta && src.meta.image_url;
-      return typeof u === "string" && /^https?:\/\//i.test(u) ? u : null;
-    }
-    function normTitle(t) {
-      return (t || "").replace(/[\s『』()（）[\]·,.:+]/g, "").toLowerCase();
-    }
-    // 대표책 제목 ↔ 출처(제목) 매칭: 정규화 후 부분집합 관계면 동일 책으로 본다.
-    function sourceForTitle(sources, title) {
-      const rn = normTitle(title);
-      if (!rn) return null;
-      return (
-        sources.find((s) => {
-          const sn = normTitle(s.title);
-          return sn && (sn.includes(rn) || rn.includes(sn));
-        }) || null
-      );
-    }
-
+    // ── W2: 표지 썸네일(coverUrl은 공용 모듈) ──
     // ── 공유 출처(접이식) ──
     function makeSharedCard(src) {
       const isWeb = WEB_TYPES.has(src.type);
@@ -819,7 +694,7 @@
         group.className = "filter-axis";
         const label = document.createElement("span");
         label.className = "fa-label";
-        label.textContent = axis.label;
+        label.textContent = axis.shortLabel;
         group.appendChild(label);
         for (const v of axis.values) {
           const chip = document.createElement("button");
@@ -863,6 +738,9 @@
       for (const [code, card] of cardByCode) {
         const ok = matchesFilters(code);
         card.el.classList.toggle("dim", !ok);
+        // 필터로 걸러진 셀은 시각적으로만 흐린 게 아니라 상호작용에서도 빠진다 — inert면
+        // 탭 순서·클릭·스크린리더에서 모두 제외돼 "보이는 것 = 만질 수 있는 것"이 유지된다.
+        card.el.inert = !ok;
         if (ok) shown++;
       }
       const anyActive = AXES.some((ax) => activeFilters[ax.key] && activeFilters[ax.key].size > 0);
@@ -883,7 +761,7 @@
       COL_ORDER.forEach((ck, i) => {
         const h = document.createElement("div");
         h.className = "col-head";
-        h.style.gridColumn = String(i + 2);
+        h.dataset.col = String(i); // 배치는 CSS([data-col])가 — 인라인 grid 좌표 금지
         h.style.setProperty("--col-hue", COL_HUE[ck]);
         const main = document.createElement("div");
         main.className = "h-main";
@@ -896,7 +774,7 @@
       ROW_ORDER.forEach((rk, i) => {
         const h = document.createElement("div");
         h.className = "row-head";
-        h.style.gridRow = String(i + 2);
+        h.dataset.row = String(i);
         h.style.setProperty("--row-hue", PROC_HUE[rk[1]]);
         const main = document.createElement("div");
         main.className = "h-main";
@@ -910,17 +788,19 @@
     }
 
     function makeCell(code) {
-      const gr = ROW_ORDER.indexOf(rowKey(code)) + 2;
-      const gc = COL_ORDER.indexOf(colKey(code)) + 2;
+      const row = ROW_ORDER.indexOf(rowKey(code));
+      const col = COL_ORDER.indexOf(colKey(code));
 
       const el = document.createElement("div");
       el.className = "cell pending";
-      el.style.gridRow = String(gr);
-      el.style.gridColumn = String(gc);
+      // 좌표만 표기하고 배치는 CSS([data-row]/[data-col])에 맡긴다 — 좁은 화면에서 자동 배치로
+      // 되돌릴 수 있어야 하므로 인라인 grid 좌표를 쓰지 않는다.
+      el.dataset.row = String(row);
+      el.dataset.col = String(col);
       el.style.setProperty("--col-hue", COL_HUE[colKey(code)]);
       el.style.setProperty("--badge-c", PROC_HUE[code[1]]);
-      // 대각(행+열) 스태거 지연 — 절제: 미세하게(28ms 간격).
-      el.style.animationDelay = ((gr - 2) + (gc - 2)) * 28 + "ms";
+      // 대각(행+열) 스태거 지연 — 절제: 미세하게.
+      el.style.animationDelay = (row + col) * CELL_STAGGER_MS + "ms";
 
       const head = document.createElement("div");
       head.className = "c-head";
@@ -953,7 +833,7 @@
 
       const handle = {
         el, code, nameEl, body, foot,
-        name: "", axisLabel: deriveAxisLabel(code), text: "", sources: [], filled: false,
+        name: "", axisLabel: deriveAxisLabel(code), text: "", sources: [], picks: [], filled: false,
       };
       el.addEventListener("click", () => { if (handle.filled) openModal(handle); });
       el.addEventListener("keydown", (e) => {
@@ -963,31 +843,11 @@
       return handle;
     }
 
-    // ── W1: 구조화 본문 — 한 줄 요지 + 대표책(제목·가격) ──
-    // 본문 첫 문단을 요지로, `**『제목』** (가격원)` 불릿을 대표책으로 파싱한다(백엔드 형식 무관).
-    function firstSentence(text) {
-      const line = (text.split(/\n/).find((l) => l.trim() && !l.trim().startsWith("*")) || "").trim();
-      const clean = line.replace(/\*\*/g, "").replace(/\[\d+(?:\s*,\s*\d+)*\]/g, "").trim();
-      const m = clean.match(/^(.+?[.。!?])(?:\s|$)/);
-      return (m ? m[1] : clean).slice(0, 95);
-    }
-    // 생성 형식이 free-form(볼드 불릿 또는 인라인 프로세)이라 『제목』을 형식 무관하게 모두 뽑고,
-    // 가격은 제목 인접 40자 내에서만 연결한다(엉뚱한 절의 가격을 잘못 붙이지 않게).
-    function extractPicks(text) {
-      const titleRe = /『([^』]{1,60})』/g;
-      const picks = [];
-      const seen = new Set();
-      let m;
-      while ((m = titleRe.exec(text)) !== null) {
-        const title = m[1].trim();
-        if (!title || seen.has(title)) continue;
-        seen.add(title);
-        const after = text.slice(m.index + m[0].length, m.index + m[0].length + 40);
-        const pm = after.match(/([\d,]{3,})\s*원/);
-        picks.push({ title, price: pm ? pm[1] : "" });
-      }
-      return picks;
-    }
+    // ── W1: 구조화 본문 — 흐르는 전문 + 대표책(백엔드 picks) ──
+    // 대표책·가격·표지는 **백엔드가 col done에 실어 주는 구조화된 picks**를 그대로 그린다
+    // (picks[0]=대표책, 폴백 셀은 []). 카드 산문을 정규식으로 재파싱하지 않는다 — 같은 판정을
+    // 백엔드(인용 검증·풀 접지)와 프론트(제목 정규화·가격 인접 매칭)에 이중 구현하면 어긋나고,
+    // 프론트 파서가 실패하면 대표책·표지가 조용히 사라진다(실측: "완전한 행복 - 개정판").
     function renderCellBody(card) {
       const body = card.body;
       body.className = "c-body structured";
@@ -996,49 +856,54 @@
       // 흐르는 전문 + 인용 마커([n]). 셀 높이만큼 채우고 넘치면 하단 페이드(CSS). 상세는 모달.
       const flow = document.createElement("div");
       flow.className = "c-flow";
-      renderBody(flow, card.text, (sid) => highlightChip(card, sid));
+      renderBody(flow, card.text, { isCitation: isPooled, onMarker: (sid) => highlightChip(card, sid) });
       body.appendChild(flow);
 
-      const picks = extractPicks(card.text);
-      card.picks = picks;
-      card.pickEl = null;
-      card.repTitle = "";
-      // 정직 폴백 셀(책 못 찾음/추천 미완성)은 muted로 구분 + 토너먼트 후보 제외용 플래그.
-      card.isFallback =
-        picks.length === 0 && /찾지 못했어요|추천을 완성하기 어려웠어요/.test(card.text);
-      card.el.classList.toggle("fallback", card.isFallback);
-      if (picks.length) {
-        // 대표책 = 가격이 붙은 첫 책(구체 추천), 없으면 첫 책. 오연결 가격 대신 정직하게.
-        const repIdx = Math.max(0, picks.findIndex((p) => p.price));
-        const rep = picks[repIdx];
-        const pick = document.createElement("div");
-        pick.className = "c-pick";
-        const ico = document.createElement("span");
-        ico.className = "c-pick-ico";
-        ico.setAttribute("aria-hidden", "true");
-        const title = document.createElement("span");
-        title.className = "c-pick-title";
-        title.textContent = "『" + rep.title + "』";
-        title.title = rep.title;
-        pick.append(ico, title);
-        if (rep.price) {
-          const price = document.createElement("span");
-          price.className = "c-pick-price";
-          price.textContent = rep.price + "원";
-          pick.appendChild(price);
-        }
-        if (picks.length > 1) {
-          const more = document.createElement("span");
-          more.className = "c-pick-more";
-          more.textContent = "+" + (picks.length - 1);
-          more.title = "이 성향이 고른 책 " + picks.length + "권";
-          pick.appendChild(more);
-        }
-        body.appendChild(pick);
-        // done 프레임 도착 시 표지로 틱을 교체하기 위해 참조 보관.
-        card.pickEl = pick;
-        card.repTitle = rep.title;
+      const picks = card.picks;
+      if (!picks.length) return; // 델타 시점(아직 picks 없음)·폴백 셀 — 대표책 줄 없음
+      const rep = picks[0];
+      const pick = document.createElement("div");
+      pick.className = "c-pick";
+
+      // 표지가 있으면 표지, 없으면 축색 틱(우아한 폴백). 로드 실패 시에도 틱으로 되돌아간다.
+      const tick = document.createElement("span");
+      tick.className = "c-pick-ico";
+      tick.setAttribute("aria-hidden", "true");
+      pick.appendChild(tick);
+      const url = coverUrl(rep);
+      if (url) {
+        const cover = document.createElement("img");
+        cover.className = "c-pick-cover";
+        // loading=lazy는 스크롤 없는 100vh 뷰포트에 JS로 삽입된 이미지의 IntersectionObserver를
+        // 트리거하지 못해 로드가 멈춘다(Chrome 쿼크) — 항상 보이는 썸네일이라 즉시 로드가 옳다.
+        cover.decoding = "async";
+        cover.alt = "";
+        cover.addEventListener("load", () => { cover.classList.add("loaded"); tick.style.display = "none"; });
+        cover.addEventListener("error", () => cover.remove());
+        pick.insertBefore(cover, tick);
+        cover.src = url;
       }
+
+      const title = document.createElement("span");
+      title.className = "c-pick-title";
+      title.textContent = "『" + rep.title + "』";
+      title.title = rep.title;
+      pick.appendChild(title);
+      if (rep.price != null && rep.price !== "") {
+        const price = document.createElement("span");
+        price.className = "c-pick-price";
+        const n = Number(rep.price);
+        price.textContent = (Number.isFinite(n) && n > 0 ? n.toLocaleString("ko-KR") : String(rep.price)) + "원";
+        pick.appendChild(price);
+      }
+      if (picks.length > 1) {
+        const more = document.createElement("span");
+        more.className = "c-pick-more";
+        more.textContent = "+" + (picks.length - 1);
+        more.title = "이 성향이 고른 책 " + picks.length + "권";
+        pick.appendChild(more);
+      }
+      body.appendChild(pick);
     }
 
     // ── 열 채우기 ──
@@ -1087,44 +952,23 @@
       const srcs = Array.isArray(data.sources) ? data.sources : [];
       srcs.forEach(addSharedSource);
       card.sources = srcs;
+      // 이 셀이 고른 책(구조화) — 대표책·가격·표지의 단일 출처. 폴백 셀은 빈 목록.
+      card.picks = Array.isArray(data.picks) ? data.picks : [];
+      // 풀·picks가 갖춰졌으니 본문을 다시 렌더한다 — 델타 시점엔 아직 풀에 없어 평문으로 남았던
+      // 인용이 배지로 승격되고, 대표책 줄이 이때 붙는다.
+      renderCellBody(card);
       renderChips(card);
-      updatePickCover(card);
 
-      // 폴백 판정: 백엔드 명시 플래그(가법)가 오면 그걸 신뢰한다(정규식이 잡담 응답의 유사 문구를
-      // 오마킹하던 것을 구조로 교정). 플래그가 없으면 renderCellBody의 정규식 결과 유지(하위호환).
-      // boolean `fallback` 우선, 없으면 `gate_reason`(널 아님=폴백)으로 파생.
-      const reason = "gate_reason" in data ? data.gate_reason : null;
-      let flag = null;
-      if (typeof data.fallback === "boolean") flag = data.fallback;
-      else if ("gate_reason" in data) flag = reason != null;
-      if (flag !== null) {
-        card.isFallback = flag;
-        card.el.classList.toggle("fallback", flag);
-        // gate_reason은 muted 셀 툴팁(hover만, 사용자 화면 비노출)으로 — 디버깅 보조.
-        if (flag && reason) card.el.title = "정직 폴백 · 사유: " + reason;
-        else card.el.removeAttribute("title");
-      }
-    }
-
-    // 대표책 틱을 표지 썸네일로 교체(있을 때만). lazy·실패 시 틱 복귀(깨진 이미지 금지).
-    function updatePickCover(card) {
-      if (!card.pickEl || !card.repTitle) return;
-      const tick = card.pickEl.querySelector(".c-pick-ico");
-      if (!tick) return;
-      const src = sourceForTitle(card.sources, card.repTitle);
-      const url = src ? coverUrl(src) : null;
-      if (!url) return; // 표지 없으면 축색 틱 유지(우아한 폴백)
-      const cover = document.createElement("img");
-      cover.className = "c-pick-cover";
-      // loading=lazy는 스크롤 없는 100vh 뷰포트에 JS로 삽입된 이미지의 IntersectionObserver를
-      // 트리거하지 못해 로드가 멈춘다(Chrome 쿼크). 표지는 done 시점(첫 페인트 이후)에 붙는
-      // 작은 항상-가시 썸네일이라 즉시 로드가 옳다. decoding=async로 디코드만 비차단.
-      cover.decoding = "async";
-      cover.alt = "";
-      cover.addEventListener("load", () => { cover.classList.add("loaded"); tick.style.display = "none"; });
-      cover.addEventListener("error", () => { cover.remove(); tick.style.display = ""; });
-      card.pickEl.insertBefore(cover, tick);
-      cover.src = url;
+      // 폴백 판정의 단일 출처 = col done의 fallback 플래그(백엔드가 모든 열에 항상 싣는다:
+      // matrix_runner "fallback": column.gate_reason is not None). 본문 문구 매칭 금지.
+      // gate_reason만 있는 페이로드(구 스냅샷)는 사유 유무로 파생한다.
+      const reason = data.gate_reason != null ? data.gate_reason : null;
+      const flag = typeof data.fallback === "boolean" ? data.fallback : reason != null;
+      card.isFallback = flag;
+      card.el.classList.toggle("fallback", flag);
+      // gate_reason은 muted 셀 툴팁(hover만, 사용자 화면 비노출)으로 — 디버깅 보조.
+      if (flag && reason) card.el.title = "정직 폴백 · 사유: " + reason;
+      else card.el.removeAttribute("title");
     }
 
     function renderChips(card) {
@@ -1146,20 +990,19 @@
       card.foot.querySelectorAll(".c-chip.hl").forEach((c) => c.classList.remove("hl"));
       chip.classList.add("hl");
       chip.scrollIntoView({ block: "nearest", inline: "center", behavior: "smooth" });
-      setTimeout(() => chip.classList.remove("hl"), 1400);
+      setTimeout(() => chip.classList.remove("hl"), CHIP_HIGHLIGHT_MS);
     }
 
     // 채택 시 RBTI 코드와 함께 {방금 질문, 그 셀의 대표책}을 1회성 핸드오프로 넘긴다.
     // 채팅(index.html)이 이를 컴포저에 *보이는* 프리필로 얹는다 — 숨은 컨텍스트 주입 금지
-    // (사용자가 보는 것 = 모델이 받는 것). 키는 index.html applyMatrixHandoff와 계약.
-    const MATRIX_HANDOFF_KEY = "yes24_matrix_handoff";
+    // (사용자가 보는 것 = 모델이 받는 것). 저장 키는 공용 모듈(rbti.js)이 단일 출처.
     function adoptPersona(code, card) {
       try { localStorage.setItem(RBTI_STORAGE_KEY, code); } catch (e) {}
       try {
         localStorage.setItem(MATRIX_HANDOFF_KEY, JSON.stringify({
           code,
           question: lastQuestion,
-          pick: (card && card.repTitle) || "",
+          pick: repTitle(card),
         }));
       } catch (e) {}
       window.location.href = "/";
@@ -1181,10 +1024,10 @@
       mCode.textContent = card.code;
       mAxis.textContent = card.axisLabel;
       mName.textContent = card.name || card.axisLabel;
-      renderBody(mBody, card.text, (sid) => {
+      renderBody(mBody, card.text, { isCitation: isPooled, onMarker: (sid) => {
         const chip = mChips.querySelector('.c-chip[data-sid="' + CSS.escape(String(sid)) + '"]');
-        if (chip) { chip.scrollIntoView({ block: "nearest", inline: "center" }); chip.classList.add("hl"); setTimeout(() => chip.classList.remove("hl"), 1400); }
-      });
+        if (chip) { chip.scrollIntoView({ block: "nearest", inline: "center" }); chip.classList.add("hl"); setTimeout(() => chip.classList.remove("hl"), CHIP_HIGHLIGHT_MS); }
+      } });
       // W2: 이 유형이 고른 책 표지 스트립(표지 있는 출처만). 없으면 컨테이너 비어 숨김.
       mBooks.textContent = "";
       for (const src of card.sources) {
@@ -1265,7 +1108,7 @@
         const a = cardByCode.get(buildCodeWith(axisKey, axk.values[0], combo));
         const b = cardByCode.get(buildCodeWith(axisKey, axk.values[1], combo));
         const bothReal = !!(a && b && !a.isFallback && !b.isFallback);
-        const pa = tPickTitle(a), pb = tPickTitle(b);
+        const pa = repTitle(a), pb = repTitle(b);
         const pickDiffer = !!(pa && pb && pa !== pb);
         const differ = !!(a && b && (tGist(a) !== tGist(b) || pa !== pb));
         return { combo, bothReal, differ, pickDiffer };
@@ -1302,7 +1145,7 @@
           const a = cardByCode.get(buildCodeWith(axk.key, axk.values[0], combo));
           const b = cardByCode.get(buildCodeWith(axk.key, axk.values[1], combo));
           if (a && b && !a.isFallback && !b.isFallback) {
-            const pa = tPickTitle(a), pb = tPickTitle(b);
+            const pa = repTitle(a), pb = repTitle(b);
             if (pa && pb && pa !== pb) n++;
           }
         }
@@ -1314,10 +1157,9 @@
     }
     // 토너먼트 카드 미리보기 = 전문(.tc-gist가 3줄 클램프). 휴리스틱 비교도 전문 기준(정확도↑).
     function tGist(card) { return card && card.text ? card.text.trim() : ""; }
-    function tPickTitle(card) {
-      if (!card || !card.picks || !card.picks.length) return "";
-      const idx = Math.max(0, card.picks.findIndex((p) => p.price));
-      return card.picks[idx].title;
+    // 대표책 = picks[0](백엔드가 인용 등장 순서로 실어 준다). 프론트가 다시 고르지 않는다.
+    function repTitle(card) {
+      return card && card.picks && card.picks.length ? card.picks[0].title : "";
     }
 
     function openTourney() {
@@ -1363,9 +1205,9 @@
         gist.className = "tc-gist";
         // 셀 본문과 동일 렌더러로 [n] 마커·볼드 처리(마커 원문 "[4]" 노출 방지). 클릭 무동작.
         const gt = tGist(card);
-        if (gt) renderBody(gist, gt); else gist.textContent = "이 성향의 추천 스타일";
+        if (gt) renderBody(gist, gt, { isCitation: isPooled }); else gist.textContent = "이 성향의 추천 스타일";
         el.append(diff, name, gist);
-        const pickTitle = tPickTitle(card);
+        const pickTitle = repTitle(card);
         if (pickTitle) {
           const pick = document.createElement("div");
           pick.className = "tc-pick";
@@ -1417,7 +1259,7 @@
       axisEl.textContent = card ? card.axisLabel : deriveAxisLabel(code);
       const gist = document.createElement("div");
       gist.className = "tr-gist";
-      renderBody(gist, tGist(card) || ""); // 결과 카드도 마커 칩 렌더(원문 노출 방지)
+      renderBody(gist, tGist(card) || "", { isCitation: isPooled }); // 결과 카드도 마커 칩 렌더
       const actions = document.createElement("div");
       actions.className = "tr-actions";
       const adopt = document.createElement("button");
@@ -1465,16 +1307,6 @@
     function updateCount() { countEl.textContent = filledCount > 0 ? filledCount + " / 16" : ""; }
 
     // ── SSE ──
-    function parseEvent(block) {
-      let event = "message", data = "";
-      for (const line of block.split("\n")) {
-        if (line.startsWith("event:")) event = line.slice(6).trim();
-        else if (line.startsWith("data:")) data += line.slice(5).trim();
-      }
-      let parsed = {};
-      if (data) { try { parsed = JSON.parse(data); } catch (e) { parsed = {}; } }
-      return { event, data: parsed };
-    }
     function setSending(on) {
       sending = on;
       sendBtn.disabled = on;
@@ -1483,6 +1315,7 @@
       if (!on) qEl.focus();
     }
     function resetRun() {
+      runErrored = false;
       sourcesById = new Map();
       ssChips.textContent = "";
       ssChips.setAttribute("hidden", "");
@@ -1519,28 +1352,14 @@
           body: JSON.stringify(payload),
           signal: controller.signal,
         });
-        if (!resp.ok || !resp.body) throw new Error("서버 응답 오류: " + resp.status);
-        const reader = resp.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          let idx;
-          while ((idx = buffer.indexOf("\n\n")) >= 0) {
-            const block = buffer.slice(0, idx);
-            buffer = buffer.slice(idx + 2);
-            if (!block.trim()) continue;
-            const { event, data } = parseEvent(block);
-            handleEvent(event, data);
-          }
-        }
+        await readEventStream(resp, handleEvent);
       } catch (err) {
         const aborted = err && err.name === "AbortError";
-        // 중지/실패 시 직전 완료 스냅샷이 있으면 복원(빈 "생성 대기 중" 그리드 방지). 사용자가
-        // 방금 입력한 질문은 보존하려 컴포저는 되채우지 않는다(restoreComposer:false).
-        const restored = restoreFromRaw(prevSnapshotRaw, { restoreComposer: false });
+        const arrived = filledCount;
+        // 이번 런에 도착한 셀은 버리지 않는다 — 방금 받은 부분 결과가 옛 결과보다 사용자가
+        // 원한 답에 가깝다. 하나도 못 받았을 때만(arrived === 0) 직전 완료 스냅샷으로 되돌려
+        // 빈 "생성 대기 중" 그리드를 피한다. 방금 입력한 질문은 보존(restoreComposer:false).
+        const restored = arrived === 0 && restoreFromRaw(prevSnapshotRaw, { restoreComposer: false });
         if (restored) {
           statusBar.classList.remove("error");
           statusBar.classList.add("done");
@@ -1548,9 +1367,11 @@
             ? "중지했어요 — 직전 비교 결과를 유지했어요"
             : "연결에 문제가 있었어요 — 직전 비교 결과를 유지했어요";
         } else if (aborted) {
-          setError("비교를 중지했어요.");
+          setError(arrived ? `중지했어요 — 도착한 ${arrived}개 유형만 표시해요.` : "비교를 중지했어요.");
         } else {
-          setError("연결에 문제가 있었어요. 잠시 후 다시 시도해 주세요.");
+          setError(arrived
+            ? `연결이 끊겼어요 — 도착한 ${arrived}개 유형만 표시해요.`
+            : "연결에 문제가 있었어요. 잠시 후 다시 시도해 주세요.");
         }
       } finally {
         controller = null;
@@ -1567,17 +1388,23 @@
         if (data.col !== undefined) fillColumn(data);
       } else if (event === "done") {
         if (data.col === undefined) {
+          // 터미널 done은 **종료 신호이지 성공 신호가 아니다** — 백엔드는 error 뒤에도 스트림을
+          // 닫기 위해 글로벌 done을 보낸다. 이번 런에 error가 있었으면 "완료"로 덮어쓰지 않고
+          // (오류 상태 유지) 부분 결과로 직전 스냅샷을 갈아엎지도 않는다. session_id는 스트림
+          // 사실이라 실패해도 이어받는다.
           if (data.session_id) {
             sessionId = data.session_id;
             try { sessionStorage.setItem(MATRIX_SESSION_KEY, sessionId); } catch (e) {}
           }
           if (Array.isArray(data.sources)) data.sources.forEach(addSharedSource);
+          if (runErrored) return;
           setDone();
           saveSnapshot();
         } else {
           fillColumnDone(data);
         }
       } else if (event === "error") {
+        runErrored = true;
         setError(data.message);
       }
     }
@@ -1611,7 +1438,7 @@
           if (!card.filled) continue;
           cells.push({
             code, text: card.text, name: card.name, axis_label: card.axisLabel,
-            sources: card.sources, fallback: !!card.isFallback,
+            sources: card.sources, picks: card.picks, fallback: !!card.isFallback,
           });
         }
         if (!cells.length) return;

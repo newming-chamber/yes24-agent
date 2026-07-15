@@ -16,16 +16,11 @@ from google.adk.tools import ToolContext
 
 from yes24_agent.config import Settings, get_settings
 from yes24_agent.sources import register_source
-from yes24_agent.tools._followup import needs_search_followup
-from yes24_agent.tools._pubstatus import pub_status
 from yes24_agent.yes24.client import Yes24Client, Yes24FetchError
-from yes24_agent.yes24.parsers import ParseError, parse_search
-from yes24_agent.yes24.urls import search_url
+from yes24_agent.yes24.parsers import ParseError, parse_search, product_fields
+from yes24_agent.yes24.urls import SEARCH_SECTIONS, search_url
 
 logger = logging.getLogger(__name__)
-
-# 지원하는 section 값. 그 외 값이 오면 관대하게 "all"로 폴백한다.
-_VALID_SECTIONS = {"all", "book"}
 
 # KST(UTC+9). checked_at 타임스탬프용.
 _KST = timezone(timedelta(hours=9))
@@ -65,14 +60,15 @@ async def yes24_search(query: str, section: str, tool_context: ToolContext) -> d
 
     Returns:
         성공 시 status="ok"와 results 목록(각 항목에 인용용 source_id 포함), 검색 시각
-        checked_at, 그리고 충분성 힌트(result_count·needs_followup)를 담은 dict. 검색
-        결과가 없으면 results가 빈 목록. 실패 시 status="error"와 error_type
-        ("fetch"|"parse"), message에 더해 result_count=0·needs_followup=True(재시도 신호)를
-        담은 dict.
+        checked_at, result_count를 담은 dict. 검색 결과가 없으면 results가 빈 목록이고
+        result_count=0이다. 실패 시 status="error"와 error_type("fetch"|"parse"),
+        message에 더해 result_count=0을 담은 dict.
     """
     settings = get_settings()
 
-    if section not in _VALID_SECTIONS:
+    # 허용값은 urls의 섹션 표에서 파생한다(도구가 따로 열거하지 않는다 — 표가 늘면 자동 반영).
+    # 모르는 값이 오면 search_url의 ValueError가 도구 밖으로 새지 않도록 통합검색으로 폴백한다.
+    if section not in SEARCH_SECTIONS:
         section = "all"
 
     url = search_url(settings.yes24_base_url, query, section)
@@ -87,7 +83,6 @@ async def yes24_search(query: str, section: str, tool_context: ToolContext) -> d
             "error_type": "fetch",
             "message": f"Yes24 조회에 실패했습니다: {exc}",
             "result_count": 0,
-            "needs_followup": True,
         }
 
     try:
@@ -101,7 +96,6 @@ async def yes24_search(query: str, section: str, tool_context: ToolContext) -> d
             "error_type": "parse",
             "message": f"검색 결과를 해석하지 못했습니다: {exc}",
             "result_count": 0,
-            "needs_followup": True,
         }
 
     checked_at = datetime.now(_KST).strftime("%Y-%m-%d %H:%M")
@@ -115,45 +109,30 @@ async def yes24_search(query: str, section: str, tool_context: ToolContext) -> d
             "checked_at": checked_at,
             "message": "검색 결과 없음",
             "result_count": 0,
-            "needs_followup": True,
         }
 
     results: list[dict] = []
     for item in parsed:
+        # 등록(meta)과 반환에 같은 필드 집합을 싣는다 — 도구별 선택 누락 불가(_product_fields).
+        fields = product_fields(item)
         source_id = register_source(
             tool_context.state,
             title=item["title"],
             url=item["url"],
             source_type="search_result",
             snippet=item.get("author"),
-            meta={
-                "price": item.get("price"),
-                "goods_no": item.get("goods_no"),
-                "image_url": item.get("image_url"),
-                # 평점 값 대조(product_gate 값 접지)용 — 지어낸 평점 차단에 쓰인다.
-                "rating": item.get("rating"),
-            },
+            meta=fields,
         )
-        result = {
-            "source_id": source_id,
-            "type": "search_result",
-            "title": item["title"],
-            "url": item["url"],
-            "author": item.get("author"),
-            "publisher": item.get("publisher"),
-            "pub_date": item.get("pub_date"),
-            "price": item.get("price"),
-            "rating": item.get("rating"),
-            "image_url": item.get("image_url"),
-        }
-        status = pub_status(item.get("pub_date"))
-        if status is not None:
-            result["pub_status"] = status
-        results.append(result)
+        results.append(
+            {
+                "source_id": source_id,
+                "type": "search_result",
+                "title": item["title"],
+                "url": item["url"],
+                **fields,
+            }
+        )
 
-    needs_followup = needs_search_followup(
-        query, [r["title"] for r in results], len(results)
-    )
     logger.info("yes24_search query=%r status=ok results=%d", query, len(results))
     return {
         "status": "ok",
@@ -161,5 +140,4 @@ async def yes24_search(query: str, section: str, tool_context: ToolContext) -> d
         "results": results,
         "checked_at": checked_at,
         "result_count": len(results),
-        "needs_followup": needs_followup,
     }

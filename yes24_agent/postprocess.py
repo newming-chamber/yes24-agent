@@ -3,7 +3,7 @@
 모델(Gemini)은 프롬프트 지시만으로는 25~50%의 인용 오류율을 보이므로(Stanford/Tow Center),
 합성된 답변을 그대로 신뢰하지 않고 사후 검증한다. 존재하지 않는 source_id를 가리키는
 마커(또는 그룹형 마커 내부의 개별 id)는 본문에서 제거하고 로그를 남긴다. 이 모듈은 순수
-함수 계층으로, 다른 프로젝트 모듈(config 등)을 import하지 않는다.
+함수 계층으로, config·ADK를 import하지 않는다.
 """
 
 import logging
@@ -14,6 +14,21 @@ logger = logging.getLogger(__name__)
 
 # 대괄호+숫자(콤마로 구분된 그룹 포함)만 마커로 간주한다. `[1]`, `[1, 2]`, `[1,2,3]` 모두 매칭.
 MARKER_PATTERN = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
+
+
+def cited_ids(text: str) -> set[int]:
+    """본문이 인용한 source_id 집합(복합 마커 `[1, 2]`를 펼쳐 반환).
+
+    "본문에서 인용 id 뽑기"의 **단일 정의**다. 예전엔 이 판정이 세 모듈에 각기 구현돼 있었고
+    의미까지 달랐다(postprocess만 복합 마커 지원, product_gate·turn_assembly는 단일 `[1]`만) —
+    그 틈으로 지어낸 책에 `[1, 2]`만 달면 오매핑 검사가 인용 0건으로 읽고 **스킵**되는 우회로가
+    열렸다(검증망의 구멍이 정상 통과로 위장). 인용 마커의 문법은 한 곳에서만 정의한다.
+    """
+    return {
+        int(n)
+        for match in MARKER_PATTERN.finditer(text or "")
+        for n in match.group(1).split(",")
+    }
 # 세그먼트 근사에 쓰이는 문장 경계 문자
 SENTENCE_BOUNDARY_PATTERN = re.compile(r"[.!?\n]")
 
@@ -45,21 +60,69 @@ _TOOL_CALL_LEAK = re.compile(
 )
 
 
+# 미완성 tool-call 누출: 인자 블록이 **닫히기 전에 텍스트가 끝난** 잔재
+# (실측: ack가 "…비교해 드릴게요.call:yes24_search{query:" 로 끝남). 스트림이 도구 호출 경계에서
+# 잘리면 닫는 괄호가 없어 _TOOL_CALL_LEAK(닫힘 필수)를 빠져나간다. 절단은 반드시 **끝**에서만
+# 일어나므로 문자열 끝($)에 앵커하고, 도구 이름 + 열린 인자 블록을 함께 요구해 정상 본문을
+# 건드리지 않는다(같은 부류의 누출을 여는 쪽 신호만으로 마감한다).
+_TOOL_CALL_LEAK_TRUNCATED = re.compile(
+    r"(?:`|\[)?"  # 선택적 래핑
+    r"(?:call\s*:|tool_call\s*:|print\s*\()?\s*"  # 선택적 call:/tool_call:/print( 프리픽스
+    r"\b(?:" + "|".join(_TOOL_NAMES) + r")\b"  # 우리 도구 이름
+    r"\s*[\{(]"  # 인자 블록 시작(닫히지 않음)
+    r"[^{}()]*$",  # 닫는 괄호 없이 텍스트 끝
+    re.IGNORECASE,
+)
+
+
+# 도구 '응답' 에코 누출: 모델이 받은 함수 응답 dict를 본문 텍스트로 그대로 되풀이하는 실패모드
+# (실측 live5x A4: done.text 서두에 `{'yes24_fetch_response': {'checked_at': …}}` 한 줄).
+# 호출 서술(_TOOL_CALL_LEAK)과 달리 중첩 괄호 리터럴이라 정규식으로 전체를 안전히 잡을 수 없어
+# **줄 단위**로 걷어낸다 — 줄이 dict/JSON 리터럴로 시작하고(선두 { 또는 [) 우리 도구의 응답 키
+# (`'<tool>_response'`)를 담을 때만 제거한다(정상 산문이 도구 이름을 언급해도 리터럴 선두 조건에
+# 안 걸려 보호됨).
+_TOOL_RESPONSE_KEY = re.compile(
+    r"['\"](?:" + "|".join(_TOOL_NAMES) + r")_response['\"]"
+)
+
+
+def _is_tool_response_echo_line(line: str) -> bool:
+    """줄이 도구 응답 dict/JSON 에코인지 — 리터럴 선두({/[) + 도구 응답 키를 모두 요구한다."""
+    stripped = line.lstrip()
+    return stripped.startswith(("{", "[")) and _TOOL_RESPONSE_KEY.search(stripped) is not None
+
+
 def has_tool_call_leak(text: str) -> bool:
-    """본문에 tool-call 누출 잔재가 있는지 판정한다(스트립 여부 판단용, 부수효과 없음)."""
-    return bool(text) and _TOOL_CALL_LEAK.search(text) is not None
+    """본문에 tool-call/응답 에코 누출 잔재가 있는지 판정한다(스트립 여부 판단용, 부수효과 없음)."""
+    if not text:
+        return False
+    if _TOOL_CALL_LEAK.search(text) is not None:
+        return True
+    if _TOOL_CALL_LEAK_TRUNCATED.search(text) is not None:
+        return True
+    return any(_is_tool_response_echo_line(line) for line in text.splitlines())
 
 
 def strip_tool_call_leaks(text: str) -> tuple[str, int]:
-    """tool-call 누출 잔재를 제거한 본문과 제거 개수를 돌려준다.
+    """tool-call/응답 에코 누출 잔재를 제거한 본문과 제거 개수를 돌려준다.
 
-    Gemini가 함수 호출 대신 텍스트로 서술한 `call:yes24_search{...}` 류 잔재가 done.text로
-    새는 실패모드(출처 0·실검색 없음)를 구조로 막는다(마커 검증과 동일 정신 — 프롬프트가 아니라
-    사후 가드). 제거로 생긴 이중 공백·빈 줄만 정리하고 나머지 본문은 그대로 둔다.
+    Gemini가 함수 호출 대신 텍스트로 서술한 `call:yes24_search{...}` 류 잔재와, 함수 응답
+    dict를 본문으로 에코한 `{'yes24_fetch_response': …}` 류 줄이 done.text로 새는 실패모드를
+    구조로 막는다(마커 검증과 동일 정신 — 프롬프트가 아니라 사후 가드). 제거로 생긴 이중
+    공백·빈 줄만 정리하고 나머지 본문은 그대로 둔다.
     """
     if not text:
         return text, 0
     cleaned, count = _TOOL_CALL_LEAK.subn("", text)
+    cleaned, truncated_count = _TOOL_CALL_LEAK_TRUNCATED.subn("", cleaned)
+    count += truncated_count
+    kept_lines = []
+    for line in cleaned.splitlines():
+        if _is_tool_response_echo_line(line):
+            count += 1
+            continue
+        kept_lines.append(line)
+    cleaned = "\n".join(kept_lines)
     if count:
         cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)  # 제거 자리에 생긴 연속 공백
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)  # 3줄 이상 빈 줄 축소
@@ -153,6 +216,19 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
                 ", ".join(str(i) for i in invalid_in_marker),
                 match.group(0),
             )
+            # 마커 제거 흔적 정리(제거 시에만 동작): "…담고 있어요 [9] ." 처럼 마커를 지우면 "공백
+            # 마침표"(" .")·중복 공백("단어  단어")이 남는다. 앞 조각이 공백으로 끝나면 (1) 남은
+            # 본문 선두의 잉여 공백을 흡수(중복 공백 방지)하고, (2) 그 뒤가 문장부호면 앞 조각의
+            # 후행 공백도 제거해 고아 마침표를 없앤다. output_len·cursor를 함께 조정하므로 이후 유효
+            # 마커의 위치(supports 인덱스)는 정합을 유지한다(공백 정리만 — 정상 본문 내용 불변).
+            if cleaned_parts and cleaned_parts[-1].endswith((" ", "\t")):
+                rest = text[cursor:]
+                stripped_rest = rest.lstrip(" \t")
+                cursor += len(rest) - len(stripped_rest)  # 잉여 선두 공백 소비(미출력)
+                if stripped_rest[:1] in (".", ",", "!", "?", ";", ":", ")", "]"):
+                    trimmed = cleaned_parts[-1].rstrip(" \t")
+                    output_len -= len(cleaned_parts[-1]) - len(trimmed)
+                    cleaned_parts[-1] = trimmed
             continue
 
         if invalid_in_marker:

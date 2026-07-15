@@ -74,6 +74,26 @@ def _status_for_error(payload: dict) -> tuple[str, str]:
     return _ERROR_STATUS.get(payload.get("error_type"), _ERROR_STATUS_FALLBACK)
 
 
+# 출처 카드(sse_source)와 게이트 대조에 함께 쓰이는 출처 이벤트의 **단일 정의**. 예전엔 runner와
+# orchestrator가 이 dict를 각자 손으로 조립해, 한쪽에만 필드를 더하면 그 경로의 카드에는 값이
+# 끝까지 안 실렸다(실측 회귀). 조립을 한 곳에 두면 계약 드리프트가 구조적으로 불가능해진다.
+# 상품 결과에만 있는 필드(author·price·rating·publisher·image_url)는 웹 출처에선 None이고,
+# 프론트가 생략한다. rating·publisher는 grounding의 값 대조(지어낸 평점·판본 통칭)에도 쓰인다.
+def build_source_event(source: dict) -> dict:
+    """도구 결과 항목 하나를 SSE 출처 이벤트 dict로 만든다(카드 표시 + 게이트 대조 공용)."""
+    return {
+        "id": source.get("source_id"),
+        "title": source.get("title", ""),
+        "url": source.get("url", ""),
+        "type": source.get("type", "search_result"),
+        "author": source.get("author"),
+        "price": source.get("price"),
+        "image_url": source.get("image_url"),
+        "rating": source.get("rating"),
+        "publisher": source.get("publisher"),
+    }
+
+
 def _sources_from_response(payload: dict) -> list[dict]:
     """도구 응답에서 노출할 출처 dict 목록을 방어적으로 뽑아낸다.
 

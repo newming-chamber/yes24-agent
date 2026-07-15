@@ -1,15 +1,29 @@
-"""Yes24 URL 조립 유틸리티.
+"""Yes24 URL 조립 + 섹션 레지스트리.
 
 하드코딩 금지 원칙에 따라 base_url·section 매핑값 등은 전부 호출자가 주입한다.
+섹션(검색 domain·브라우즈 코너)은 **이 모듈의 표가 유일한 열거**다 — 도구·파서는 여기서
+파생한다(같은 섹션을 여러 곳에 나열하면 하나만 늘려도 다른 쪽이 조용히 터진다).
 """
 
 from urllib.parse import quote, urljoin
 
-# section 파라미터 → Yes24 검색 domain 쿼리값 매핑
+from yes24_agent.yes24.selectors import (
+    BESTSELLER_ITEM,
+    BESTSELLER_LIST_CONTAINER,
+    CREMACLUB_ITEM,
+    CREMACLUB_LIST_CONTAINER,
+    NEWPRODUCT_ITEM,
+    NEWPRODUCT_LIST_CONTAINER,
+)
+
+# section 파라미터 → Yes24 검색 domain 쿼리값 매핑. 검색 도구의 허용값도 이 표에서 파생한다.
 _SECTION_DOMAIN = {
     "all": "ALL",
     "book": "BOOK",
 }
+
+# yes24_search가 받는 section 허용값(별도 열거 금지 — 이 표가 단일 출처).
+SEARCH_SECTIONS = frozenset(_SECTION_DOMAIN)
 
 
 def search_url(base_url: str, query: str, section: str = "all") -> str:
@@ -70,22 +84,44 @@ POLICY_SEED_URLS: dict[str, str] = {
 }
 
 
-# 섹션 브라우징 시드 URL 맵. docs/browse-scout-report.md 라이브 조사 기준으로 확정.
-# 키는 parsers.parse_browse_list()의 section 인자와 1:1로 대응한다.
-# "cremaclub"만 cremaclub.yes24.com 서브도메인 URL이다 — robots.txt가
-# `Allow: /BookClub/`로 명시 허용했고(정찰 확인), yes24.com 서브도메인이라
-# 클라이언트 도메인 허용 정책도 통과한다.
-BROWSE_SEED_URLS: dict[str, dict[str, str]] = {
+# 섹션 브라우징 레지스트리 — **한 섹션 = 한 레코드**(URL·라벨·파싱 스펙).
+# docs/browse-scout-report.md 라이브 조사 기준으로 확정.
+# 도구(yes24_browse)의 허용 섹션, 진행 라벨, 파서의 셀렉터·마크업
+# 종류가 전부 이 표에서 파생된다 — 섹션을 여러 곳에 나열하면 시드만 추가했을 때 파서가
+# `ValueError: 지원하지 않는 section`을 도구 밖으로 던진다(도구는 예외를 던지지 않는다는
+# 계약 파손).
+#
+#   markup: "search"    검색 결과와 동일한 ITEM_* 마크업(베스트셀러·신간).
+#           "cremaclub" 마크업이 다른 별도 목록(li에 data-goods-no가 없고 가격 필드도 없음).
+#   has_rank: 순위 마커가 렌더되는 목록인지(신간은 없음).
+#
+# "cremaclub"만 cremaclub.yes24.com 서브도메인 URL이다 — robots.txt가 `Allow: /BookClub/`로
+# 명시 허용했고(정찰 확인), yes24.com 서브도메인이라 클라이언트 도메인 허용 정책도 통과한다.
+BROWSE_SEED_URLS: dict[str, dict] = {
     "bestseller": {
-        "url": "https://www.yes24.com/product/category/bestseller?CategoryNumber=001&sumgb=06",
+        "url": (
+            "https://www.yes24.com/product/category/bestseller?CategoryNumber=001&sumgb=06"
+        ),
         "label": "베스트셀러(국내도서)",
+        "markup": "search",
+        "list_container": BESTSELLER_LIST_CONTAINER,
+        "item": BESTSELLER_ITEM,
+        "has_rank": True,
     },
     "new": {
         "url": "https://www.yes24.com/product/category/newproduct?categoryNumber=001",
         "label": "신간(국내도서)",
+        "markup": "search",
+        "list_container": NEWPRODUCT_LIST_CONTAINER,
+        "item": NEWPRODUCT_ITEM,
+        "has_rank": False,
     },
     "cremaclub": {
         "url": "https://cremaclub.yes24.com/BookClub/Best",
         "label": "크레마클럽 인기(eBook 구독)",
+        "markup": "cremaclub",
+        "list_container": CREMACLUB_LIST_CONTAINER,
+        "item": CREMACLUB_ITEM,
+        "has_rank": True,
     },
 }

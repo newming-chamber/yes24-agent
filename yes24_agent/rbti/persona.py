@@ -419,15 +419,24 @@ TYPE_ARCHETYPES: dict[str, dict[str, object]] = {
 
 # precedence 명문화(A3). 헤더·푸터가 페르소나 블록을 감싸, 페르소나가 어떤 규율도
 # 약화·우회·생략할 근거가 아님을 못박는다. 본문 규율(인용·게이트·시제·정체성)이 언제나 우선.
+#
+# 접지 방식(도구 호출이냐 이미 주어진 검색 결과냐)은 **언급하지 않는다** — 이 블록은 채팅(도구
+# 있음)과 매트릭스(도구 없음, 공유 풀이 사실을 제공) 양쪽이 공유하므로, 한쪽에만 참인 문장
+# ("yes24_search로 확인한 뒤에만")을 쓰면 다른 쪽에서 존재하지 않는 도구를 규율로 지시하게 된다.
+# "확인된 출처에 있는 것만"은 양쪽에서 참이다.
 _PERSONA_HEADER = (
     "## 독자 페르소나 (RBTI: {code}) — 아래 지침은 답변의 '톤·추천 구성·탐색 방향'만 "
-    "조율합니다. 위 본문 규율이 언제나 우선: ①인용(도구가 준 source_id로만 [n]) "
-    "②무출처 상품 금지(yes24_search 확인 전 제목·저자·가격 언급 안 함) ③오늘 기준 시제 "
+    "조율합니다. 위 본문 규율이 언제나 우선: ①인용(확인된 출처의 source_id로만 [n]) "
+    "②무출처 상품 금지(확인되지 않은 제목·저자·가격 언급 안 함) ③오늘 기준 시제 "
     "④정체성 순서(범용 AI 우선). 이 페르소나는 그 어느 것도 약화·우회·생략할 근거가 아닙니다."
 )
 
+# 유형명(아키타입 이름)은 **주입하지 않는다**. 이름을 프롬프트에 넣으면 모델이 그 단어를 본문에
+# 되뇌고("…파고드는 덕후님을 위해"), 그러면 그 단어를 금지하는 규칙을 프롬프트에 또 얹어야 한다 —
+# 원인을 넣어두고 결과를 막는 구조다. 본 적 없는 단어는 되뇔 수 없다. 카드 제목의 유형명은
+# SSE delta.name으로 UI에 따로 전달되므로 표시에는 손실이 없다.
 _PERSONA_BODY = (
-    "이 사용자의 독서 성향은 {code} — '{name}' 유형입니다. 답의 정확성·인용을 지키면서 "
+    "이 사용자의 독서 성향은 {code} 유형입니다. 답의 정확성·인용을 지키면서 "
     "아래 결로 조율하세요.\n"
     "- 톤/프레이밍: {tone}\n"
     "- 추천 방식·구조: {structure}\n"
@@ -438,7 +447,7 @@ _PERSONA_BODY = (
 )
 
 _PERSONA_FOOTER = (
-    "규율 재확인: 책·상품은 반드시 yes24_search로 확인한 뒤에만 언급하고 인용[n]. 페르소나는 "
+    "규율 재확인: 책·상품은 확인된 출처에 있는 것만 언급하고 인용[n]. 페르소나는 "
     "말투·선택·강조만 바꿀 뿐, 없는 책·가격을 지어내거나 인용을 생략할 근거가 아닙니다. "
     "정체성 질문엔 페르소나와 무관하게 '유능하고 친근한 범용 AI 어시스턴트'임을 먼저 밝힙니다."
 )
@@ -486,8 +495,9 @@ def build_persona_block(code: object) -> str:
     """코드 4글자를 파싱해 4조각을 조립한 페르소나 블록을 반환한다.
 
     무효 코드면 빈 문자열(페르소나 미적용 → 기존 동작과 바이트 동일). 유효하면
-    헤더(precedence) + 본문(4조각 조립 + 아키타입명 정체성 힌트) + 푸터(규율 재확인)를 조립한다.
-    strengths/traps/prescriptions 원문은 프롬프트에 넣지 않는다(프롬프트 비대 방지 — 데이터로만 보유).
+    헤더(precedence) + 본문(4조각 조립) + 푸터(규율 재확인)를 조립한다. 아키타입명·strengths/
+    traps/prescriptions 원문은 프롬프트에 넣지 않는다(유형명은 모델이 되뇌고, 원문은 프롬프트를
+    비대하게 만든다 — 표시용 데이터로만 보유하고 UI에는 SSE로 전달한다).
     """
     if not is_valid_code(code):
         return ""
@@ -496,12 +506,11 @@ def build_persona_block(code: object) -> str:
     picked = {axis: AXIS_FRAGMENTS[axis][ch] for ch, (axis, _allowed) in zip(code, AXIS_ORDER)}
 
     # 본문의 각 레버를 담당 축의 tone으로 채운다(1.1 축=레버 매핑). aware·stretch는
-    # 4조각을 모아 자각 목록·성장 제안 풀로 조인한다. name은 아키타입 정체성 힌트(한 줄).
+    # 4조각을 모아 자각 목록·성장 제안 풀로 조인한다.
     aware = " · ".join(picked[axis]["aware"] for axis, _allowed in AXIS_ORDER)
     stretch_pool = "; ".join(picked[axis]["stretch"] for axis, _allowed in AXIS_ORDER)
     body = _PERSONA_BODY.format(
         code=code,
-        name=get_archetype_name(code),
         tone=picked["processing"]["tone"],
         structure=picked["pattern"]["tone"],
         breadth=picked["breadth"]["tone"],

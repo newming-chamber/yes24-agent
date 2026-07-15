@@ -148,15 +148,19 @@ LINK_PRODUCT_PATH_RE = r"(?i)^/product/goods/\d+"
 #     계정/거래 페이지.
 LINK_NOISE_SUBDOMAINS = frozenset({"event.yes24.com", "ssl.yes24.com"})
 
-# 경로에 아래 문자열이 포함되면(소문자 비교) 로그인/회원/장바구니/마이페이지/캠페인 등
-# 콘텐츠와 무관한 페이지로 보고 제외한다. goods_paper.html 실측 기준.
-#   - "/member/"    : /Member/FTGoMyBlog.aspx, /Member/FTMypageMain.aspx,
-#                      /Member/Join/Accept.aspx 등
+# 경로에 아래 문자열이 포함되면(소문자 비교) 콘텐츠와 무관한 페이지로 보고 제외한다.
+# goods_paper.html 실측 기준. **이것은 안전장치가 아니라 신호 대 잡음비 필터다** — 수집 금지
+# (robots) 판정은 config(yes24_disallowed_paths) → client.get_text 단일 게이트가 한다.
+# 그래서 robots·서브도메인 배제로 이미 막히는 항목(/member/·/cart/)은 여기서 지웠다.
+#
+# 남은 목록이 값을 버는지 실측(goods_paper.html, links 상한 48): 이 필터를 제거하면 상품
+# 카테고리 링크 8개가 밀려나고 그 자리를 로그인·장바구니·마이페이지·포인트/쿠폰 링크 8개가
+# 채운다(계정·거래 페이지라 에이전트가 따라가도 얻을 콘텐츠가 없다). 상한 안에서 실제
+# 콘텐츠를 잃는 순손실이라 유지한다 — 사례를 덧붙여 자라는 목록이 아니라, 전수 조사로 확인된
+# 계정/거래 경로 3종이다(늘어나면 그때는 구조 신호로 대체할 신호로 본다).
 #   - "/templates/" : /Templates/FTLogin.aspx(로그인), FTMyAccount_*(포인트/쿠폰/
-#                      기프트카드), FTCusMain.aspx(고객센터 — docs/m2-scout-report.md에서
-#                      이미 robots 차단으로 확인된 경로) 등 계정 관리 템플릿 모음
-#   - "/cart/"      : ssl. 서브도메인 배제로 이미 걸러지지만 방어적으로 중복 체크
+#                      기프트카드), FTCusMain.aspx(고객센터) 등 계정 관리 템플릿 모음
 #   - "/mypage"     : 대소문자 섞인 MyPageOrderList/MyPageOrderClaimList 등 대비
 #   - "/campaign/"  : /campaign/00_corp/..., /campaign/01_Book/yesOnly/... 등
 #                      프로모션 캠페인 페이지(event.yes24.com과 같은 성격의 노이즈)
-LINK_NOISE_PATH_MARKERS = ("/member/", "/templates/", "/cart/", "/mypage", "/campaign/")
+LINK_NOISE_PATH_MARKERS = ("/templates/", "/mypage", "/campaign/")

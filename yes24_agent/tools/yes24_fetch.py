@@ -18,10 +18,9 @@ from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
 from yes24_agent.sources import register_source
-from yes24_agent.tools._pubstatus import pub_status
 from yes24_agent.tools.yes24_search import _get_client
 from yes24_agent.yes24.client import Yes24FetchError
-from yes24_agent.yes24.parsers import ParseError, extract_links, parse_product
+from yes24_agent.yes24.parsers import ParseError, extract_links, parse_product, product_fields
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +36,44 @@ _NOISE_TAGS = ("script", "style", "noscript", "template")
 # 실질 본문 판정 임계값은 config(fetch_min_meaningful_chars)에서 주입한다.
 
 # 절단 표시 접미사·중간 시작 표시 접두사.
-_TRUNCATION_SUFFIX = "…(이하 생략)"
-_OMITTED_PREFIX = "(앞부분 생략)… "
+TRUNCATION_SUFFIX = "…(이하 생략)"
+OMITTED_PREFIX = "(앞부분 생략)… "
+
+
+def truncate(text: str, max_chars: int) -> str:
+    """text를 max_chars로 절단하고 절단 표시를 붙인다. 이미 짧으면 그대로 반환."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + TRUNCATION_SUFFIX
+
+
+def window_around_find(
+    text: str, max_chars: int, find: str | None, lead_chars: int
+) -> tuple[str, bool]:
+    """본문에서 반환할 창을 고른다. 반환: (창 텍스트, find 발견 여부).
+
+    find가 없거나 본문이 상한 이내면 앞에서부터 자른다. find가 있고 상한 밖 위치에서
+    발견되면 그 위치 lead_chars 앞에서 시작하는 창을 잘라 키워드 앞 맥락(소제목·조건
+    문장)이 함께 담기게 한다. 못 찾으면 앞부분 창으로 폴백한다.
+    """
+    if not find or len(text) <= max_chars:
+        return truncate(text, max_chars), bool(find) and find.lower() in text.lower()
+
+    pos = text.lower().find(find.lower())
+    if pos < 0:
+        return truncate(text, max_chars), False
+    if pos < max_chars:
+        return truncate(text, max_chars), True
+
+    start = max(0, pos - lead_chars)
+    window = text[start : start + max_chars].strip()
+    prefix = OMITTED_PREFIX if start > 0 else ""
+    suffix = TRUNCATION_SUFFIX if start + max_chars < len(text) else ""
+    return f"{prefix}{window}{suffix}", True
+
+
+# 외부 페이지 열람(web_fetch)도 이 두 함수를 그대로 import해 **같은 절단 계약**을 갖는다
+# (도구마다 다른 절단 규칙을 배우게 하지 않는다). 주 소비자가 여기라 여기 둔다.
 
 
 async def yes24_fetch(
@@ -108,6 +143,8 @@ def build_result_from_html(
         base_url=settings.yes24_base_url,
         limit=settings.fetch_links_limit,
         page_url=url,
+        # client가 거절할 수집 금지 경로는 애초에 후보로 내놓지 않는다(같은 규칙 주입).
+        disallowed_paths=tuple(settings.yes24_disallowed_paths),
     )
 
     # 경로 판별은 대소문자 무시 — Yes24가 상품 링크를 /Product/Goods/(대문자)로도
@@ -177,17 +214,16 @@ def _fetch_product(
     # parse_product는 title이 None이 아님을 보장하지 않으므로 인용 라벨용 방어값을 둔다.
     title = product.get("title") or "제목 미상"
 
+    # 검색·브라우즈와 같은 필드 집합(_product_fields) — 상세만 연 턴에서도 게이트가 대조할
+    # 접지 필드(publisher·rating·price·pub_status…)를 빠짐없이 싣는다.
+    fields = product_fields(product)
     source_id = register_source(
         tool_context.state,
         title=title,
         url=url,
         source_type="book_detail",
         snippet=intro,
-        meta={
-            "price": product.get("price"),
-            "goods_no": product.get("goods_no"),
-            "rating": product.get("rating"),  # 평점 값 대조(product_gate)용
-        },
+        meta=fields,
     )
 
     logger.info(
@@ -200,10 +236,7 @@ def _fetch_product(
         "title": title,
         "url": url,
         "type": "book_detail",
-        "author": product.get("author"),
-        "pub_date": product.get("pub_date"),
-        "price": product.get("price"),
-        "rating": product.get("rating"),  # 평점 값 대조(product_gate)·source_event용
+        **fields,
         "is_ebook": product.get("is_ebook"),
         "intro": intro,
         "toc": toc,
@@ -218,9 +251,6 @@ def _fetch_product(
         detail["total_chars"] = trunc.total_chars
     if find:
         detail["find_found"] = trunc.find_found
-    status = pub_status(product.get("pub_date"))
-    if status is not None:
-        detail["pub_status"] = status
     return detail
 
 
@@ -263,7 +293,7 @@ def _fetch_generic(
         }
 
     total_chars = len(text)
-    window, find_found = _window_around_find(text, max_chars, find, lead_chars)
+    window, find_found = window_around_find(text, max_chars, find, lead_chars)
 
     source_id = register_source(
         tool_context.state,
@@ -295,31 +325,6 @@ def _fetch_generic(
     if find:
         result["find_found"] = find_found
     return result
-
-
-def _window_around_find(
-    text: str, max_chars: int, find: str | None, lead_chars: int
-) -> tuple[str, bool]:
-    """본문에서 반환할 창을 고른다. 반환: (창 텍스트, find 발견 여부).
-
-    find가 없거나 본문이 상한 이내면 앞에서부터 자른다(기존 동작). find가 있고
-    상한 밖 위치에서 발견되면 그 위치 lead_chars 앞에서 시작하는 창을 잘라 키워드
-    앞 맥락(소제목·조건 문장)이 함께 담기게 한다. 못 찾으면 앞부분 창으로 폴백한다.
-    """
-    if not find or len(text) <= max_chars:
-        return _truncate(text, max_chars), bool(find) and find.lower() in text.lower()
-
-    pos = text.lower().find(find.lower())
-    if pos < 0:
-        return _truncate(text, max_chars), False
-    if pos < max_chars:
-        return _truncate(text, max_chars), True
-
-    start = max(0, pos - lead_chars)
-    window = text[start : start + max_chars].strip()
-    prefix = _OMITTED_PREFIX if start > 0 else ""
-    suffix = _TRUNCATION_SUFFIX if start + max_chars < len(text) else ""
-    return f"{prefix}{window}{suffix}", True
 
 
 class _DetailTrunc(NamedTuple):
@@ -402,15 +407,8 @@ def _take_block(
         return None, 0
     if len(text) <= remaining:
         return text, remaining - len(text)
-    window, _ = _window_around_find(text, remaining, find, lead_chars)
+    window, _ = window_around_find(text, remaining, find, lead_chars)
     return window, 0
-
-
-def _truncate(text: str, max_chars: int) -> str:
-    """text를 max_chars로 절단하고 절단 표시를 붙인다. 이미 짧으면 그대로 반환."""
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars].rstrip() + _TRUNCATION_SUFFIX
 
 
 def _normalize_whitespace(text: str) -> str:

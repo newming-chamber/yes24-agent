@@ -19,17 +19,17 @@ from google.adk.tools import ToolContext
 from yes24_agent.config import get_settings
 from yes24_agent.sources import register_source
 from yes24_agent.tools.web_search import _get_client
+from yes24_agent.tools.yes24_fetch import window_around_find
 
 logger = logging.getLogger(__name__)
 
 # KST(UTC+9). checked_at 타임스탬프용.
 _KST = timezone(timedelta(hours=9))
 
-# 절단 표시 접미사.
-_TRUNCATION_SUFFIX = "…(이하 생략)"
+# 절단·창 선택은 yes24_fetch의 함수를 그대로 쓴다(자사·외부 페이지가 같은 절단 계약).
 
 
-async def web_fetch(url: str, tool_context: ToolContext) -> dict:
+async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None) -> dict:
     """외부 웹 페이지의 전문을 읽어온다.
 
     web_search 결과의 스니펫만으로 부족할 때, 특정 페이지 url을 넣어 본문 전체를 확보한다.
@@ -38,10 +38,15 @@ async def web_fetch(url: str, tool_context: ToolContext) -> dict:
 
     Args:
         url: 읽을 외부 페이지의 절대 URL(http/https). web_search 결과의 url을 그대로 넣는다.
+        find: (선택) 본문에서 찾는 정보의 핵심 키워드. 긴 페이지는 앞부분만 잘려 오는데
+            (truncated=True), 찾는 내용이 그 안에 없으면 이 키워드로 다시 호출하면
+            **키워드가 나오는 위치부터** 본문을 잘라 돌려준다(yes24_fetch와 동일).
 
     Returns:
-        성공 시 status="ok"와 인용용 source_id, title, text(본문 전문, 상한 초과 시 절단),
-        type="web", checked_at을 담은 dict. 실패 시 status="error"와 error_type
+        성공 시 status="ok"와 인용용 source_id, title, text(본문, 상한 초과 시 절단),
+        type="web", checked_at을 담은 dict. 본문이 상한보다 길어 잘렸으면 truncated=True와
+        total_chars(전체 길이)가 함께 온다 — 찾는 내용이 안 보이면 find 키워드로 재호출해
+        뒷부분을 읽는다. 실패 시 status="error"와 error_type
         ("invalid_url"|"not_configured"|"empty"|"fetch"), message를 담은 dict.
     """
     settings = get_settings()
@@ -92,7 +97,12 @@ async def web_fetch(url: str, tool_context: ToolContext) -> dict:
         }
 
     title = results[0].get("title") or url
-    text = _truncate(raw_content, settings.fetch_max_chars)
+    total_chars = len(raw_content)
+    # yes24_fetch와 **같은 절단 계약**: 잘랐으면 잘랐다고 알리고(truncated·total_chars),
+    # find로 뒷부분을 다시 읽을 수 있게 한다(도구마다 다른 규칙 금지).
+    text, find_found = window_around_find(
+        raw_content, settings.web_fetch_max_chars, find, settings.web_fetch_find_lead_chars
+    )
     checked_at = datetime.now(_KST).strftime("%Y-%m-%d %H:%M")
 
     source_id = register_source(
@@ -103,8 +113,11 @@ async def web_fetch(url: str, tool_context: ToolContext) -> dict:
         snippet=None,
     )
 
-    logger.info("web_fetch url=%r status=ok chars=%d", url, len(text))
-    return {
+    logger.info(
+        "web_fetch url=%r status=ok chars=%d total=%d find=%r",
+        url, len(text), total_chars, find,
+    )
+    result = {
         "status": "ok",
         "source_id": source_id,
         "type": "web",
@@ -113,10 +126,10 @@ async def web_fetch(url: str, tool_context: ToolContext) -> dict:
         "text": text,
         "checked_at": checked_at,
     }
-
-
-def _truncate(text: str, max_chars: int) -> str:
-    """text를 max_chars로 절단하고 절단 표시를 붙인다. 이미 짧으면 그대로 반환."""
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars].rstrip() + _TRUNCATION_SUFFIX
+    if total_chars > settings.web_fetch_max_chars:
+        # 가법 필드: 잘리지 않은 페이지의 반환 형태는 기존과 동일하다.
+        result["truncated"] = True
+        result["total_chars"] = total_chars
+    if find:
+        result["find_found"] = find_found
+    return result

@@ -17,35 +17,22 @@ from collections.abc import AsyncIterator
 from google.adk.runners import Runner
 from google.genai import types
 
-from yes24_agent.agent import correction_agent, policy_correction_agent
+from yes24_agent.agent import build_correction_agent
 from yes24_agent.event_translate import (
     _reconcile_sources,
     _sources_from_response,
     _status_for_call,
     _status_for_error,
+    build_source_event,
 )
-from yes24_agent.policy_gate import (
-    UNSOURCED_POLICY_NOTICE,
-    evaluate_policy_answer,
-)
+from yes24_agent.grounding import evaluate
 from yes24_agent.postprocess import build_done_payload, validate_citations
-from yes24_agent.product_gate import (
-    UNSOURCED_PRODUCT_NOTICE,
-    evaluate_product_answer,
-)
 from yes24_agent.session_service import _POC_USER_ID
 from yes24_agent.sources import get_sources
 from yes24_agent.sse import sse_delta, sse_source, sse_status
-from yes24_agent.sufficiency_gate import evaluate as evaluate_sufficiency
-from yes24_agent.turn_assembly import _event_text
+from yes24_agent.turn_assembly import _event_text, _merge_restated_turns
 
 logger = logging.getLogger(__name__)
-
-# 게이트 종류 → 보정 에이전트. 정책은 yes24_fetch를 강제하는 policy_correction_agent로,
-# 그 외(product·shallow)는 검색을 강제하는 correction_agent로 재검색한다.
-_CORRECTION_AGENTS = {"policy": policy_correction_agent}
-_DEFAULT_CORRECTION_AGENT = correction_agent
-
 
 async def _consume_correction_turn(
     event_stream,
@@ -67,6 +54,10 @@ async def _consume_correction_turn(
       흘린다(메인 루프 홀드와 동일 패턴). 재검색이 만든 최종 본문은 text_sink에, 새 출처는
       observed_sink에 담는다. 같은 스트림 소비 규약(function_call→status, timeout 상한)을 따른다.
     """
+    # 본문 조립은 runner와 **같은 규약**을 쓴다: 턴 경계(function_call)로 나눠 담고 조립 시
+    # 선두 재진술을 제거한다(_merge_restated_turns). 예전엔 보정 경로만 조각을 그냥 이어붙여,
+    # 프리앰블 중복이 done.text로 새는 통로가 한쪽에만 열려 있었다(원칙 4b는 두 경로 공통이다).
+    turn_texts: list[str] = []
     partial_pieces: list[str] = []
     final_text = ""
     # 보정에서 실제 source가 1건이라도 방출된 뒤 True(출처 먼저 → 본문). stream_live일 때만 쓰인다.
@@ -79,6 +70,9 @@ async def _consume_correction_turn(
         except StopAsyncIteration:
             break
         if not event.partial and event.get_function_calls():
+            if partial_pieces:  # 도구 호출 = 텍스트 턴의 끝 → 턴 경계로 잘라 담는다.
+                turn_texts.append("".join(partial_pieces))
+                partial_pieces = []
             for call in event.get_function_calls():
                 stage, detail = _status_for_call(call)
                 yield sse_status(stage, detail)
@@ -96,19 +90,7 @@ async def _consume_correction_turn(
                     if source_id in sent_source_ids:
                         continue
                     sent_source_ids.add(source_id)
-                    source_event = {
-                        "id": source_id,
-                        "title": source.get("title", ""),
-                        "url": source.get("url", ""),
-                        "type": source.get("type", "search_result"),
-                        "image_url": source.get("image_url"),  # 검색 결과 표지(있을 때만 노출)
-                        # 재검색(correction) 카드에도 저자·가격을 노출한다(runner source_event와
-                        # 동일). 이 경로가 A의 헤드라인 케이스(감정 추천→correction 카드만 노출)라,
-                        # 빠뜨리면 그 카드는 끝까지 값이 없다(finalize 백필은 기존 카드 미갱신).
-                        "author": source.get("author"),
-                        "price": source.get("price"),
-                        "rating": source.get("rating"),  # product_gate 평점 값 대조용
-                    }
+                    source_event = build_source_event(source)
                     observed_sink.append(source_event)
                     yield sse_source(source_event)
                     # 실제 source를 방출한 직후에만 본문 라이브를 언락한다("출처 먼저" 불변식).
@@ -126,7 +108,12 @@ async def _consume_correction_turn(
             text = _event_text(event)
             if text:
                 final_text = text
-    text_sink.append(final_text or "".join(partial_pieces))
+    if partial_pieces:
+        turn_texts.append("".join(partial_pieces))
+    # 최종 집계 텍스트가 있으면 그것이 이 턴의 확정 본문이다. 없으면(partial만 온 경우) 턴별
+    # 누적을 runner와 **같은 조립기**로 병합해 선두 재진술 중복을 제거한다 — 이 경로에만 merge가
+    # 없어 프리앰블 중복이 done.text로 새는 통로가 한쪽에만 열려 있었다(원칙 4b는 두 경로 공통).
+    text_sink.append(final_text or _merge_restated_turns(turn_texts))
 
 
 async def _run_research_turn(
@@ -136,27 +123,28 @@ async def _run_research_turn(
     settings,
     *,
     agent,
-    directive: str,
+    user_message: str,
     sent_source_ids: set[int],
     observed_sources: list[dict],
     result_sink: list[tuple],
     stream_live: bool = False,
 ) -> AsyncIterator[str]:
-    """게이트 발동 시의 재검색 2차 턴을 공통으로 실행한다(무출처·정책·얕음 게이트 공용).
+    """게이트 발동 시의 재확인 2차 턴을 공통으로 실행한다(무출처·정책·미완결·얕음 공용).
 
-    도구 사용을 강제하는 보정 에이전트(agent)를 같은 세션에서 돌려(지시만으론 모델이 도구를
-    건너뛰는 비결정성 → 도구 강제로 결정론화) directive대로 재확인시키고, status·source는
-    라이브 yield한다. 본문 delta는 stream_live에 따른다(_consume_correction_turn 규약): 1차 본문
-    미노출이면 라이브 스트리밍, 노출됐으면 홀드 후 done.text 교체. 스트림이 끝나면 최신 state
-    출처로 인용을 재검증해 (corrected_text, sources2, citation2)를 result_sink에 담는다 —
-    채택/폴백 정책은 호출부(게이트 종류별)가 정한다. 재진입은 딱 1회로, 여기서 재귀하지 않는다.
+    보정 지시는 **에이전트의 시스템 지시**에 담겨 있고(build_correction_agent), 이 턴의 user
+    메시지로는 **사용자의 원 질문을 그대로** 다시 보낸다 — 사용자가 쓴 적 없는 문장이 세션
+    히스토리에 user 발화로 남지 않게 하기 위함이다(예전엔 지시문을 user 메시지로 보내 다음 턴
+    맥락이 "user: 방금 답변에는 확인하지 않은 정보가…"로 오염됐다). 도구 사용은 에이전트의
+    before_model_callback이 강제한다(지시만으론 비결정적). status·source는 라이브 yield하고, 본문
+    delta는 stream_live 규약을 따른다. 스트림이 끝나면 최신 state 출처로 인용을 재검증해
+    (corrected_text, sources2, citation2)를 result_sink에 담는다 — 채택/폴백은 호출부가 정한다.
     """
     correction_runner = Runner(
         agent=agent,
         app_name=settings.app_name,
         session_service=service,
     )
-    correction_message = types.Content(role="user", parts=[types.Part(text=directive)])
+    correction_message = types.Content(role="user", parts=[types.Part(text=user_message)])
     correction_stream = correction_runner.run_async(
         user_id=_POC_USER_ID,
         session_id=resolved_session_id,
@@ -203,6 +191,9 @@ async def apply_sufficiency_gate(
     result_sink: list[dict],
     live_streamed: bool,
     standalone_query: str = "",
+    needs_grounding: bool = False,
+    policy_turn: bool = False,
+    product_context: bool = True,
 ) -> AsyncIterator[str]:
     """충분성 게이트 판정 → (발동 시) 재검색 재진입 → 채택/폴백을 수행한다.
 
@@ -225,11 +216,15 @@ async def apply_sufficiency_gate(
     observed는 이번 턴 도구 관찰본(검색은 했으나 인용을 빠뜨린 경우까지 접지로 인정해 오탐
     방지), observed_tool_calls는 얕음 판정 힌트.
     """
-    decision = evaluate_sufficiency(
+    decision = evaluate(
         citation.text,
         cited_sources=done_payload["sources"],
         observed_sources=observed_sources,
         observed_tool_calls=observed_tool_calls,
+        citation_count=len(citation.used_source_ids),
+        needs_grounding=needs_grounding,
+        policy_turn=policy_turn,
+        product_context=product_context,
     )
     done_payload["text"] = citation.text
     if decision is None:
@@ -251,31 +246,48 @@ async def apply_sufficiency_gate(
         yield sse_status("verifying", decision.status_detail)
 
         # 보정 답 라이브 스트리밍 조건: (1) 1차 본문 미노출(홀드된 초안이라 폐기 가능) AND
-        # (2) product/policy 게이트. shallow는 제외한다 — shallow 재실패 폴백은 "원 답변 유지"
-        # (done.text=원 초안)라, 초안을 폐기(미노출)하는 스트리밍 경로면 사용자가 안 본 초안을
-        # done.text로 되살려 원칙 4b 위반. product/policy는 재실패 폴백이 안전 안내(notice)라 초안
-        # 폐기와 정합. shallow는 대개 검색 후라 live_streamed=True(홀드행)이므로 비용도 ~0.
-        stream_correction = (not live_streamed) and decision.kind != "shallow"
-        # 정책 보정은 원 질문의 주제로 앵커한다 — 재검색 턴은 새 user 메시지(directive)라, 질문을
-        # 함께 실어야 모델이 세션 히스토리 대신 이 주제에 정확히 맞는 정책 페이지를 열고 카테고리
-        # 탈선(예: 배송비 질문에 반품 페이지)을 피한다. 질문이 없으면 기존 지시 그대로.
-        directive = decision.directive
-        if decision.kind == "policy" and standalone_query.strip():
-            directive = f'사용자 질문: "{standalone_query.strip()}"\n\n{decision.directive}'
+        # (2) 재실패 폴백이 **원답 유지가 아닌** 게이트(product·policy·unfulfilled). shallow만
+        # 제외한다 — shallow의 재실패 폴백은 원답 유지라, 초안을 폐기(미노출)하는 스트리밍 경로면
+        # 사용자가 안 본 초안이 done.text로 되살아나 원칙 4b를 깬다. 미완결(unfulfilled)은 재실패
+        # 폴백이 안전 안내라 초안 폐기와 정합하고, 도구 0회 턴이라 live_streamed=False가 흔하다 —
+        # 이 경로를 스트리밍에 넣지 않으면 LLM 두 턴이 도는 내내 사용자가 delta를 하나도 못 본다.
+        # 보정 답 라이브 스트리밍: 1차 본문이 미노출이고, **재실패 폴백이 원답 유지가 아닐 때**만
+        # 초안을 폐기하고 보정 답을 흘린다. 비파괴 게이트(도구를 돌렸으나 못 찾음)는 원답을 되살릴
+        # 수 있어야 하므로 홀드→done.text 교체로 간다(사용자가 안 본 초안이 done.text가 되는 일
+        # 방지 — 원칙 4b).
+        stream_correction = (not live_streamed) and decision.destructive
         research_sink: list[tuple] = []
-        async for frame in _run_research_turn(
-            service,
-            run_config,
-            resolved_session_id,
-            settings,
-            agent=_CORRECTION_AGENTS.get(decision.kind, _DEFAULT_CORRECTION_AGENT),
-            directive=directive,
-            sent_source_ids=sent_source_ids,
-            observed_sources=observed_sources,
-            result_sink=research_sink,
-            stream_live=stream_correction,
-        ):
-            yield frame
+        try:
+            async for frame in _run_research_turn(
+                service,
+                run_config,
+                resolved_session_id,
+                settings,
+                agent=build_correction_agent(
+                    decision.directive, policy=decision.force_tool == "yes24_fetch"
+                ),
+                user_message=standalone_query,
+                sent_source_ids=sent_source_ids,
+                observed_sources=observed_sources,
+                result_sink=research_sink,
+                stream_live=stream_correction,
+            ):
+                yield frame
+        except Exception as exc:  # noqa: BLE001 — 보정 실패는 개선 실패이지 원답 폐기 사유가 아니다
+            # 보정 턴의 인프라 실패(타임아웃·429·스트림 오류)는 1차 답변의 결함이 아니다. 예외를
+            # 위로 던지면 runner 최상위 방어선이 이 턴 전체를 error+빈 done으로 마감해, 이미 만들어
+            # 둔 원 답변까지 사라진다(개선 시도의 실패가 원답을 파괴 — 게이트의 비파괴 원칙 위반).
+            # 여기서 삼키고 1차 답변을 그대로 확정한다. 본문은 done.text로 렌더되므로 delta를 새로
+            # 흘리지 않아 이중 본문 위험도 없다(보정이 일부 delta를 흘린 뒤 실패한 경우 포함).
+            logger.exception(
+                "보정 턴 실패(%s/%s) → 원 답변을 그대로 유지합니다(session_id=%s): %s",
+                decision.kind,
+                decision.reason,
+                resolved_session_id,
+                exc,
+            )
+            result_sink.append(done_payload)
+            return
         corrected_text, sources2, citation2 = research_sink[0]
         done_payload2 = build_done_payload(
             sources=sources2,
@@ -284,84 +296,51 @@ async def apply_sufficiency_gate(
             supports=citation2.supports,
         )
 
-        if decision.kind == "policy":
-            # 무출처 정책 정정: 재fetch 답이 본문을 갖고 Yes24 정책 페이지에 접지되면 채택,
-            # 아니면 규정을 지어내지 않는 안전 안내로 폴백한다(환각 정책 규정 유출 차단 최우선).
-            # **엄격 검증**(observed 접지 예외 없음): 실제 인용된 정책(notice) 출처로만 접지 인정.
-            policy_reason = evaluate_policy_answer(
-                citation2.text,
-                cited_sources=done_payload2["sources"],
-                observed_sources=[],
-            )
-            done_payload = done_payload2
-            if corrected_text and policy_reason is None:
-                done_payload["text"] = citation2.text
-                done_payload["policy_gate_researched"] = True
-                logger.warning(
-                    "정책 재fetch로 답변을 인용 %d건과 함께 재생성했습니다(session_id=%s).",
-                    len(done_payload["sources"]),
-                    resolved_session_id,
-                )
-            else:
-                done_payload["text"] = UNSOURCED_POLICY_NOTICE
-                done_payload["policy_gate_blocked"] = True
-                logger.warning(
-                    "정책 재fetch도 근거 검증 실패(%s) → 안전 안내로 폴백(session_id=%s).",
-                    policy_reason or "빈 본문",
-                    resolved_session_id,
-                )
-            result_sink.append(done_payload)
-            return
-
-        # 재검색 답의 근거 재검증. **엄격 검증**: observed 접지 예외를 쓰지 않는다(빈
-        # 리스트) — 강제검색이 "검색이 일어났다"는 사실만으로 접지로 오인돼 무관 결과를
-        # 무시한 재환각의 폴백을 놓치던 v7 실측을 고정. 실제 인용된 Yes24 상품 출처로만
-        # 접지를 인정한다.
-        corrected_reason = evaluate_product_answer(
+        # 채택/폴백 — **표 하나**로 정한다(kind별 분기·문구 선택을 게이트가 이미 끝냈다).
+        #   채택: 재확인 답이 본문을 갖고, 출처와 어긋나지 않으며, 인용 달린 출처를 실제로 가진다.
+        #   폴백: destructive면 안전 안내(Gate.notice — 원답이 환각이거나 약속문이라 남길 수 없다),
+        #         아니면 **원답 유지**(도구를 돌렸는데 못 찾은 정직한 답을 파괴하지 않는다).
+        # 재검증은 **엄격**하다(observed 접지 예외 없음): 강제 도구가 "실행됐다"는 사실만으로
+        # 접지로 오인해 재환각의 폴백을 놓치던 실측(v7)을 고정한다.
+        corrected_reason = evaluate(
             citation2.text,
             cited_sources=done_payload2["sources"],
             observed_sources=[],
+            observed_tool_calls=[],
+            citation_count=len(citation2.used_source_ids),
+            needs_grounding=needs_grounding,
+            policy_turn=policy_turn,
+            product_context=product_context,
         )
-        if decision.kind == "product":
-            # 무출처·오매핑 정정: 재검색 답이 본문을 갖고 더 이상 근거에 어긋나지 않으면
-            # 채택(상품=Yes24 인용, 사실=web_search 정보), 아니면 안전 안내로 폴백한다 —
-            # 어느 경로든 환각 상품 사실은 확정 답변에 남지 않는다(유출 차단 최우선).
+        adopt = (
+            bool(corrected_text)
+            and corrected_reason is None
+            and bool(done_payload2["sources"])
+        )
+        if adopt:
             done_payload = done_payload2
-            if corrected_text and corrected_reason is None:
-                done_payload["text"] = citation2.text
-                done_payload["product_gate_researched"] = True
-                logger.warning(
-                    "재검색으로 답변을 인용 %d건과 함께 재생성했습니다(session_id=%s).",
-                    len(done_payload["sources"]),
-                    resolved_session_id,
-                )
-            else:
-                done_payload["text"] = UNSOURCED_PRODUCT_NOTICE
-                done_payload["product_gate_blocked"] = True
-                logger.warning(
-                    "재검색도 근거 검증 실패(%s) → 안전 안내로 폴백(session_id=%s).",
-                    corrected_reason or "빈 본문",
-                    resolved_session_id,
-                )
+            done_payload["text"] = citation2.text
+            done_payload["gate_researched"] = True
+            logger.warning(
+                "재확인(%s/%s)으로 답변을 인용 %d건과 함께 재생성했습니다(session_id=%s).",
+                decision.kind,
+                decision.reason,
+                len(done_payload["sources"]),
+                resolved_session_id,
+            )
+        elif decision.destructive:
+            done_payload = done_payload2
+            done_payload["text"] = decision.notice
+            done_payload["gate_blocked"] = True
+            logger.warning(
+                "재확인(%s/%s)도 근거 검증 실패 → 안전 안내로 폴백(session_id=%s).",
+                decision.kind,
+                decision.reason,
+                resolved_session_id,
+            )
         else:
-            # 얕은 결과 재검색: 넓힌 검색이 본문을 냈고 상품 게이트에 걸리지 않으면(재환각
-            # 미유발) 그 답으로 교체한다. 그렇지 못하면(빈 본문·재검색이 상품 환각 유발)
-            # 원래 답을 그대로 둔다 — 원 답변은 이미 상품 게이트를 통과한 상태라 안전하다.
-            # 무출처 게이트와 달리 안전 안내 폴백은 없다(얕음은 환각이 아니라 커버리지
-            # 문제이므로, 최악에도 원 답변 유지가 정답).
-            if corrected_text and corrected_reason is None:
-                done_payload = done_payload2
-                done_payload["text"] = citation2.text
-                done_payload["shallow_gate_researched"] = True
-                logger.warning(
-                    "얕은 결과 재검색으로 답변을 인용 %d건과 함께 재생성했습니다"
-                    "(session_id=%s).",
-                    len(done_payload["sources"]),
-                    resolved_session_id,
-                )
-            else:
-                logger.info(
-                    "얕은 결과 재검색이 개선을 못 내 원 답변을 유지합니다(session_id=%s).",
-                    resolved_session_id,
-                )
+            logger.info(
+                "재확인이 인용 달린 개선을 못 내 원 답변을 유지합니다(비파괴, session_id=%s).",
+                resolved_session_id,
+            )
     result_sink.append(done_payload)

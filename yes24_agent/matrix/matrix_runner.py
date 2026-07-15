@@ -16,10 +16,17 @@ SSE 계약(프론트 C4/matrix-ux 계약):
     카드 통째로 1회) + 카드 정체성(code="CADI", name=아키타입명, axis_label="완독-분석-깊이-정보").
     프론트가 첫 페인트에서 카드 제목·부제를 확보하도록 정체성을 프레임에 싣는다(프론트가
     매핑표를 중복 보유하지 않게 — persona.py가 단일 소스, JS는 import 못 함).
-  - `event: done` {sources, grounding_supports, session_id, col, fallback, gate_reason}: 그 열의
-    인용 검증된 출처(공유 풀의 부분집합)·grounding_supports + **폴백 플래그**. fallback(bool)이
-    정직 폴백 셀 여부를 명시하고(프론트는 본문 정규식이 아니라 이 필드로 판정), gate_reason은
-    사유(정상 null|"mismap"|"unsourced"|"pool_escape"|"empty"|"error"). 완료 순서로 col 라우팅.
+  - `event: done` {sources, grounding_supports, session_id, col, fallback, gate_reason, picks}:
+    그 열의 인용 검증된 출처(공유 풀의 부분집합)·grounding_supports + **폴백 플래그** +
+    **구조화된 picks**. fallback(bool)이 정직 폴백 셀 여부를 명시하고, gate_reason은 사유
+    (정상 null|"mismap"|"unsourced"|"pool_escape"|"empty"|"error"). picks는 그 셀이 실제로 고른
+    책의 레코드 목록(인용 등장 순서, 대표책=picks[0]; 폴백 셀은 []) — 각 원소는
+    {source_id, title, url, price, rating, image_url, author, publisher, pub_status, …}로
+    공유 풀 후보 = product_fields 스키마 그대로다. 완료 순서로 col 라우팅.
+
+    **프론트는 카드 본문을 파싱하지 않는다.** 폴백 여부·대표책·표지·가격은 전부 이 명시 필드가
+    단일 출처다 — 같은 판정을 LLM 산문에서 정규식으로 복원하면 백엔드의 인용 검증·풀 접지 판정과
+    이중 구현이 되어 어긋나고, 파서가 실패하는 순간 대표책·표지가 통째로 사라진다.
 
 열은 생성 완료 순서로 도착하므로 col 인덱스로 카드를 채운다(순차 아님). 상품 사실은 공유 풀
 (Yes24 출처)만 근거하며, 각 열은 인용 검증·cited-fabricated·풀밖 게이트를 통과한 것만 나온다.
@@ -89,6 +96,11 @@ async def run_matrix_stream(
                 **column.done_payload,
                 "fallback": column.gate_reason is not None,
                 "gate_reason": column.gate_reason,
+                # 이 셀이 고른 책을 **구조화**해 싣는다(제목·가격·표지·source_id, 대표책=picks[0]).
+                # 프론트가 카드 산문을 정규식으로 재파싱해 『제목』+가격을 복원하던 이중 구현을
+                # 없앤다 — 같은 판정(무엇이 이 셀의 책인가)은 인용 검증·풀 접지를 거친 백엔드가
+                # 단일 출처로 답한다(fallback 플래그를 명시 필드로 만든 것과 동일한 패턴).
+                "picks": column.picks,
             }
             yield sse_done(col_done, col=column.col)
 

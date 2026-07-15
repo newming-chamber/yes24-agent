@@ -15,10 +15,9 @@ from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
 from yes24_agent.sources import register_source
-from yes24_agent.tools._pubstatus import pub_status
 from yes24_agent.tools.yes24_search import _get_client
 from yes24_agent.yes24.client import Yes24FetchError
-from yes24_agent.yes24.parsers import ParseError, parse_browse_list
+from yes24_agent.yes24.parsers import ParseError, parse_browse_list, product_fields
 from yes24_agent.yes24.urls import BROWSE_SEED_URLS
 
 logger = logging.getLogger(__name__)
@@ -40,11 +39,9 @@ async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
 
     Returns:
         성공 시 status="ok"와 section·section_label, results 목록(각 항목에 인용용
-        source_id와 순위 rank 포함), 검색 시각 checked_at, 충분성 힌트
-        (result_count·needs_followup)를 담은 dict. 코너/랭킹 조회라 목록이 비지 않으면
-        needs_followup=False(목록 자체가 답). 잘못된 section은 status="error",
-        error_type="invalid_section". 그 외 실패는 error_type("fetch"|"parse"). 모든 실패
-        응답은 result_count=0·needs_followup=True(재시도 신호)를 함께 담는다.
+        source_id와 순위 rank 포함), 검색 시각 checked_at, result_count를 담은 dict.
+        잘못된 section은 status="error", error_type="invalid_section". 그 외 실패는
+        error_type("fetch"|"parse"). 모든 실패 응답은 result_count=0을 함께 담는다.
     """
     settings = get_settings()
 
@@ -57,7 +54,6 @@ async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
             "error_type": "invalid_section",
             "message": f"유효한 섹션: {valid}",
             "result_count": 0,
-            "needs_followup": True,
         }
 
     client = _get_client(settings)
@@ -71,7 +67,6 @@ async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
             "error_type": "fetch",
             "message": f"Yes24 코너 조회에 실패했습니다: {exc}",
             "result_count": 0,
-            "needs_followup": True,
         }
 
     try:
@@ -88,43 +83,32 @@ async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
             "error_type": "parse",
             "message": f"코너 목록을 해석하지 못했습니다: {exc}",
             "result_count": 0,
-            "needs_followup": True,
         }
 
     checked_at = datetime.now(_KST).strftime("%Y-%m-%d %H:%M")
 
     results: list[dict] = []
     for item in parsed:
+        # 검색·상세와 같은 필드 집합(_product_fields) + 이 도구 고유의 rank.
+        fields = product_fields(item)
         source_id = register_source(
             tool_context.state,
             title=item["title"],
             url=item["url"],
             source_type="browse",
             snippet=item.get("author"),
-            meta={
-                "rank": item.get("rank"),
-                "goods_no": item.get("goods_no"),
-                "price": item.get("price"),
-                "rating": item.get("rating"),  # 평점 값 대조(product_gate)용
-            },
+            meta={**fields, "rank": item.get("rank")},
         )
-        result = {
-            "source_id": source_id,
-            "type": "browse",
-            "rank": item.get("rank"),
-            "title": item["title"],
-            "url": item["url"],
-            "author": item.get("author"),
-            "publisher": item.get("publisher"),
-            "price": item.get("price"),
-            "rating": item.get("rating"),
-        }
-        # 현재 브라우즈 파서는 pub_date를 주지 않아 실제로는 생략되지만, 세 도구 일관성과
-        # 향후 파서가 pub_date를 제공할 경우를 위해 동일한 가드를 둔다.
-        status = pub_status(item.get("pub_date"))
-        if status is not None:
-            result["pub_status"] = status
-        results.append(result)
+        results.append(
+            {
+                "source_id": source_id,
+                "type": "browse",
+                "rank": item.get("rank"),
+                "title": item["title"],
+                "url": item["url"],
+                **fields,
+            }
+        )
 
     logger.info("yes24_browse section=%r status=ok results=%d", section, len(results))
     return {
@@ -135,5 +119,4 @@ async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
         "checked_at": checked_at,
         "result_count": len(results),
         # 코너/랭킹 조회라 목록이 있으면 그 자체가 답 — 재검색 불필요.
-        "needs_followup": len(results) == 0,
     }

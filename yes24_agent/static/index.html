@@ -22,6 +22,11 @@
       --error-text: #b91c1c;
       --chip-bg: #ffffff;
       --card-bg: #ffffff;
+      /* 랜딩(빈 대화) 상태 — 중앙 컴포저 배치 상수 */
+      --landing-gap: 20px;              /* 인사 ↔ 컴포저 ↔ 예시 칩 사이 여백 */
+      --composer-radius-landing: 26px;  /* 랜딩의 넓은 라운드형 입력창 */
+      --landing-shift-ms: 240ms;        /* 중앙 → 하단 전환 시간 */
+      --composer-max-h: 140px;          /* 컴포저 textarea 최대 높이(자동 성장 상한, JS와 공유) */
     }
     @media (prefers-color-scheme: dark) {
       :root {
@@ -103,9 +108,12 @@
       gap: 16px;
     }
 
-    .intro { margin: auto 0; text-align: center; color: var(--muted); }
-    .intro .big { font-size: 20px; color: var(--text); font-weight: 600; margin-bottom: 4px; }
-    .intro p { font-size: 13px; margin: 4px 0 18px; }
+    .intro { margin: 0 0 var(--landing-gap); text-align: center; color: var(--muted); }
+    .intro .big {
+      font-size: clamp(20px, 5vw, 26px); color: var(--text); font-weight: 600;
+      margin-bottom: 4px; line-height: 1.35;
+    }
+    .intro p { font-size: 13px; margin: 4px 0 0; }
     .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
     .chip {
       background: var(--chip-bg); border: 1px solid var(--border); color: var(--text);
@@ -236,19 +244,30 @@
     .src-more:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
     /* 인용 마커 — 인접·그룹 마커([48][49][50] / [2, 3, 4])가 한 숫자로 뭉쳐 보이지 않게
-       개별 칩(옅은 배경·라운드·좌우 여백)으로 분리한다(간격만으론 위첨자 숫자가 붙어 읽힘). */
+       개별 칩(옅은 배경·라운드)으로 분리한다(간격만으론 위첨자 숫자가 붙어 읽힘).
+       여백은 왼쪽에만 준다: 오른쪽 여백이 있으면 뒤따르는 구두점(., 등)이 칩에서 떨어져
+       "…입니다 ¹ ." 처럼 읽힌다. 칩끼리 이어질 때만 아래 인접 규칙으로 간격을 넣는다. */
     sup.marker {
       display: inline-block; vertical-align: super; line-height: 1;
       color: var(--accent); font-weight: 700; font-size: 0.66em; cursor: pointer;
-      background: var(--accent-soft); border-radius: 4px; padding: 1px 3px; margin: 0 1px;
+      background: var(--accent-soft); border-radius: 4px; padding: 1px 3px;
+      margin: 0 0 0 1px;
     }
     sup.marker:hover { background: var(--accent); color: #fff; text-decoration: none; }
     sup.marker + sup.marker { margin-left: 3px; }
+    /* 키보드 포커스 가시성(a11y) — 클릭 가능한 것은 탭으로도 닿고 링이 보인다(matrix와 동일 계약). */
+    sup.marker:focus-visible, .card:focus-visible, .trace-head:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 2px;
+    }
 
     /* 마크다운 헤더(###/####) — 문서 헤딩 태그 대신 본문 대비 소폭 큰 볼드 블록(축소 스타일). */
     .bubble .md-h { font-weight: 700; margin: 10px 0 2px; line-height: 1.4; }
     .bubble .md-h.l3 { font-size: 15.5px; }
     .bubble .md-h.l4 { font-size: 14.5px; }
+    /* 불릿·번호 리스트 — 줄머리 마커를 <li>가 담당(리터럴 */- 노출 방지). 기본 마진은 과해서
+       절제한다(본문과 같은 리듬). 중첩 없이 한 단계만(파서가 평면 리스트만 만든다). */
+    .bubble .md-list { margin: 6px 0; padding-left: 1.5em; }
+    .bubble .md-list li { margin: 2px 0; }
     /* 파이프 테이블 — 말풍선 폭을 넘으면 표만 가로 스크롤(말풍선/페이지는 안 넘침).
        말풍선의 pre-wrap을 표 안에서는 해제한다(셀 텍스트가 원문 공백대로 새지 않게). */
     .bubble .md-table-wrap { overflow-x: auto; white-space: normal; margin: 8px 0; }
@@ -259,15 +278,23 @@
     .bubble .md-table th { background: var(--bg); font-weight: 700; }
 
     .composer {
-      flex: 0 0 auto; border-top: 1px solid var(--border); padding: 12px;
+      flex: 0 0 auto; border: 0; border-top: 1px solid var(--border); padding: 12px;
       background: var(--panel); display: flex; gap: 8px; align-items: flex-end;
       /* 대화가 입력창 아래로 흘러드는 층위감(은은한 위쪽 그림자). */
       box-shadow: 0 -10px 20px -14px rgba(0, 0, 0, 0.18);
+      /* 랜딩(중앙) ↔ 대화(하단) 전환: 위치는 JS가 FLIP으로 transform 보정하고,
+         테두리·라운드·여백은 같은 시간 동안 함께 전이된다. */
+      transition:
+        transform var(--landing-shift-ms) ease,
+        margin var(--landing-shift-ms) ease,
+        padding var(--landing-shift-ms) ease,
+        border-radius var(--landing-shift-ms) ease,
+        box-shadow var(--landing-shift-ms) ease;
     }
     .composer textarea {
       flex: 1; resize: none; border: 1px solid var(--border); border-radius: 12px;
       padding: 10px 12px; font-size: 14.5px; font-family: inherit; background: var(--bg);
-      color: var(--text); max-height: 140px; line-height: 1.5;
+      color: var(--text); max-height: var(--composer-max-h); line-height: 1.5;
       transition: border-color 0.13s ease, box-shadow 0.13s ease;
     }
     .composer textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
@@ -289,6 +316,31 @@
     .jump-latest[hidden] { display: none; }
     .btn-stop { background: transparent; color: var(--error-text); border: 1px solid var(--border) !important; }
     .btn-stop:disabled { display: none; }
+
+    /* ── 랜딩(빈 대화) 상태 ──
+       메시지가 하나도 없는 동안엔 컴포저를 하단이 아니라 화면 중앙에 띄운다:
+       [대화영역(인사, 아래정렬)] + [컴포저] + [예시 칩] + [스페이서]로, 대화영역과 스페이서가
+       남는 높이를 나눠 가지며 인사·컴포저·칩 묶음이 세로 중앙에 놓인다. 스크롤은 없다.
+       상태 판정은 "대화에 메시지가 있는가" 하나뿐이라(js: hasMessages), 첫 메시지가 붙거나
+       히스토리가 복원되면 이 클래스가 떨어지며 하단 고정 대화 레이아웃으로 돌아간다. */
+    .app.landing #conversation {
+      overflow: hidden; justify-content: flex-end; align-items: center; padding-bottom: 0;
+    }
+    .app.landing .composer {
+      border: 1px solid var(--border); border-radius: var(--composer-radius-landing);
+      margin: 0 18px; padding: 8px 8px 8px 14px;
+      box-shadow: 0 10px 30px -20px rgba(0, 0, 0, 0.45);
+    }
+    .app.landing .composer textarea {
+      border-color: transparent; background: transparent; padding: 11px 4px; min-height: 44px;
+    }
+    .app.landing .composer textarea:focus { border-color: transparent; box-shadow: none; }
+    .app.landing .btn-send { border-radius: 999px; }
+    .landing-extras { flex: 0 0 auto; padding: var(--landing-gap) 18px 0; }
+    .landing-spacer { flex: 1 1 auto; }
+    /* 대화 상태에선 랜딩 전용 요소만 감춘다(레이아웃은 기존 그대로). */
+    .app:not(.landing) .landing-extras,
+    .app:not(.landing) .landing-spacer { display: none; }
 
     /* ── 독서 성향(RBTI) 페르소나 배지 + 선택 팝오버 ──
        헤더의 배지를 누르면 4축 이지선다 팝오버가 열린다. 미선택 시엔 배지가 회색
@@ -356,7 +408,7 @@
   </style>
 </head>
 <body>
-  <div class="app">
+  <div class="app landing" id="app">
     <header>
       <span class="logo">📚</span>
       <h1>Yes24 AI 어시스턴트</h1>
@@ -383,24 +435,34 @@
       </div>
     </div>
 
-    <div id="conversation">
-      <div class="intro" id="intro">
-        <div class="big">무엇을 찾아드릴까요?</div>
-        <p>Yes24를 실시간으로 검색해 인용과 함께 답해드려요.</p>
-        <div class="chips" id="chips"></div>
-      </div>
-    </div>
+    <!-- 인사(intro)는 JS가 상수(LANDING_GREETING/LANDING_SUBTITLE)로 그린다 — 문구 단일 출처. -->
+    <div id="conversation"></div>
 
     <button id="jump-latest" class="jump-latest" hidden>↓ 최신</button>
 
-    <div class="composer">
+    <div class="composer" id="composer">
       <textarea id="input" rows="1" placeholder="메시지를 입력하세요…  (Enter 전송 · Shift+Enter 줄바꿈)"></textarea>
       <button class="btn-stop" id="stop" disabled>중지</button>
       <button class="btn-send" id="send">전송</button>
     </div>
+
+    <!-- 랜딩 전용: 컴포저 아래 예시 칩 + 중앙 정렬용 스페이서(대화 상태에선 숨김). -->
+    <div class="landing-extras" id="landing-extras">
+      <div class="chips" id="chips"></div>
+    </div>
+    <div class="landing-spacer"></div>
   </div>
 
-  <script>
+  <script type="module">
+    // 공용 모듈(단일 사본) — 마크다운·인용 렌더, SSE, RBTI 축 정의, 출처 유틸.
+    import { renderBody as renderMarkdown } from "/static/lib/md.js";
+    import { readEventStream } from "/static/lib/sse.js";
+    import {
+      AXES as RBTI_AXES, parseCode as parseRbtiCode, deriveCode,
+      RBTI_STORAGE_KEY, MATRIX_HANDOFF_KEY,
+    } from "/static/lib/rbti.js";
+    import { WEB_TYPES, coverUrl, isSafeUrl, safeOpen } from "/static/lib/sources.js";
+
     // 16유형 비교(/matrix) 네비 링크는 서버 배포 게이팅(matrix_enabled)을 따라간다.
     // 기본 hidden(fail-closed: 프로드 숨김)이고, /matrix가 살아 있을 때만(200) 노출한다.
     // 서버 플래그가 단일 진실 — 프론트는 라우트 존재 여부만 확인한다.
@@ -411,6 +473,10 @@
         .then((res) => { if (res.ok) link.hidden = false; })
         .catch(() => { /* 실패 시 숨김 유지(fail-closed) */ });
     })();
+
+    // 랜딩(빈 대화) 인사 — 문구는 여기 한 곳에서만 정의한다.
+    const LANDING_GREETING = "오늘은 어떤 책을 찾아볼까요?";
+    const LANDING_SUBTITLE = "Yes24를 실시간으로 검색해 인용과 함께 답해드려요.";
 
     const EXAMPLES = [
       "요즘 인기 에세이 추천해줘",
@@ -427,12 +493,12 @@
       search_result: "검색결과", book_detail: "상세", detail: "상세",
       notice: "공지", policy: "공지", page: "공지", browse: "코너", web: "웹",
     };
-    // 외부 웹 출처는 Yes24 출처와 시각적으로 구분해야 하므로 별도 클래스를 붙인다.
-    const WEB_TYPES = new Set(["web"]);
     // 한 턴 출처 카드가 많을 때(관찰 카드 대량) 기본 노출 개수 — 나머지는 "더 보기"로 접는다.
     // 인용된 카드는 이 값과 무관하게 항상 노출(finalize에서 앞으로 재배치 후 접힘 계산).
     const SOURCE_CARDS_COLLAPSED_MAX = 6;
 
+    const app = document.getElementById("app");
+    const composer = document.getElementById("composer");
     const conversation = document.getElementById("conversation");
     const input = document.getElementById("input");
     const sendBtn = document.getElementById("send");
@@ -449,24 +515,8 @@
     let controller = null;
     let sending = false;
 
-    // ── 독서 성향(RBTI) 페르소나 ──
-    // 4축 × 2택 = 코드 [pattern][processing][breadth][motivation] = [C/S][A/E][D/B][I/F].
-    // 배열 순서가 곧 코드 자릿수 순서다(백엔드 계약). 미선택 시 rbti를 전송하지 않아 기존 동작 유지.
-    const RBTI_AXES = [
-      { key: "pattern", label: "1. 독서 패턴", options: [
-        { code: "C", title: "정독·완독", desc: "한 권을 끝까지" },
-        { code: "S", title: "발췌·탐색", desc: "여러 권 골라 읽기" } ] },
-      { key: "processing", label: "2. 정보 처리", options: [
-        { code: "A", title: "논리·분석", desc: "근거와 구조로" },
-        { code: "E", title: "감성·공감", desc: "감정과 울림으로" } ] },
-      { key: "breadth", label: "3. 취향의 폭", options: [
-        { code: "D", title: "깊이·심화", desc: "한 분야 깊게" },
-        { code: "B", title: "넓이·확장", desc: "여러 분야 넓게" } ] },
-      { key: "motivation", label: "4. 독서 동기", options: [
-        { code: "I", title: "지식·정보", desc: "배우고 얻으려" },
-        { code: "F", title: "재미·즐거움", desc: "즐기고 몰입하려" } ] },
-    ];
-    const RBTI_STORAGE_KEY = "yes24_rbti";
+    // ── 독서 성향(RBTI) 페르소나 ── 축 정의·코드 파싱은 공용 모듈(rbti.js)이 단일 출처.
+    // (백엔드 계약 "축 순서 = 코드 자릿수"를 두 페이지가 각자 들고 있던 이원화를 제거)
 
     const personaBadge = document.getElementById("persona-badge");
     const personaLabel = document.getElementById("persona-label");
@@ -479,25 +529,6 @@
 
     let rbtiCode = null;              // 적용된 코드(요청 body에 실림) 또는 null
     let pendingSel = {};              // 팝오버 진행 중 축별 선택 { pattern:"C", ... }
-
-    // 코드 유효성: 4글자 + 축별 허용값. 무효면 null(페르소나 미적용).
-    function parseRbtiCode(code) {
-      if (typeof code !== "string" || code.length !== RBTI_AXES.length) return null;
-      const sel = {};
-      for (let i = 0; i < RBTI_AXES.length; i++) {
-        const axis = RBTI_AXES[i];
-        const ch = code[i];
-        if (!axis.options.some((o) => o.code === ch)) return null;
-        sel[axis.key] = ch;
-      }
-      return sel;
-    }
-
-    function deriveCode(sel) {
-      // 4축이 모두 선택됐을 때만 코드 문자열, 아니면 null.
-      const parts = RBTI_AXES.map((a) => sel[a.key]);
-      return parts.every(Boolean) ? parts.join("") : null;
-    }
 
     function updateBadge() {
       if (rbtiCode) {
@@ -512,12 +543,12 @@
     // 팝오버 내부(축 버튼·코드 프리뷰·적용 버튼 상태)를 pendingSel 기준으로 다시 그린다.
     function renderPopover() {
       ppAxes.textContent = "";
-      for (const axis of RBTI_AXES) {
+      RBTI_AXES.forEach((axis, i) => {
         const wrap = document.createElement("div");
         wrap.className = "pp-axis";
         const label = document.createElement("div");
         label.className = "pp-axis-label";
-        label.textContent = axis.label;
+        label.textContent = (i + 1) + ". " + axis.label;
         const opts = document.createElement("div");
         opts.className = "pp-opts";
         for (const opt of axis.options) {
@@ -538,7 +569,7 @@
         }
         wrap.append(label, opts);
         ppAxes.appendChild(wrap);
-      }
+      });
       const code = deriveCode(pendingSel);
       if (code) {
         ppCode.textContent = code.split("").join(" ");
@@ -610,9 +641,56 @@
       }
     }
 
+    // ── 랜딩 ↔ 대화 전환 ──
+    // 랜딩 여부는 파생 상태다: "대화에 메시지가 있는가" 하나로만 판정하고 별도 플래그를 두지
+    // 않는다. 덕분에 첫 전송이든, 세션 히스토리 복원이든, "새 대화"든 메시지를 넣고/비우고
+    // syncLandingMode()만 부르면 레이아웃이 따라온다(경로별 분기 없음).
+    function hasMessages() {
+      return !!conversation.querySelector(".msg");
+    }
+
+    function ensureIntro() {
+      if (document.getElementById("intro")) return;
+      const intro = document.createElement("div");
+      intro.className = "intro";
+      intro.id = "intro";
+      const big = document.createElement("div");
+      big.className = "big";
+      big.textContent = LANDING_GREETING;
+      const sub = document.createElement("p");
+      sub.textContent = LANDING_SUBTITLE;
+      intro.append(big, sub);
+      conversation.appendChild(intro);
+    }
+
     function removeIntro() {
       const intro = document.getElementById("intro");
       if (intro) intro.remove();
+    }
+
+    // 전환 애니메이션의 기준점 — 레이아웃이 바뀌기 *전*의 컴포저 위치. 랜딩이 아니거나
+    // 모션 민감 설정이면 null(= 애니메이션 없이 즉시 전환).
+    function captureComposerTop() {
+      if (!app.classList.contains("landing")) return null;
+      if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return null;
+      return composer.getBoundingClientRect().top;
+    }
+
+    // fromTop이 있으면 클래스 교체로 생긴 위치 차만큼 컴포저를 역보정했다가 0으로 되돌려
+    // 중앙 → 하단으로 미끄러지게 한다(FLIP). 레이아웃 애니메이션이라 transform만 쓴다.
+    function syncLandingMode(fromTop) {
+      const landing = !hasMessages();
+      const changed = landing !== app.classList.contains("landing");
+      app.classList.toggle("landing", landing);
+      if (landing) ensureIntro(); else removeIntro();
+      if (!changed || fromTop == null) return;
+      const delta = fromTop - composer.getBoundingClientRect().top;
+      if (!delta) return;
+      composer.style.transition = "none";
+      composer.style.transform = `translateY(${delta}px)`;
+      void composer.offsetWidth; // 리플로우 강제 → 시작 상태 확정
+      composer.style.transition = "";
+      composer.style.transform = "";
     }
 
     // 오토스크롤 존중: 사용자가 위로 스크롤하면 자동추적을 끄고, 하단 근처로 돌아오면 다시 켠다.
@@ -682,12 +760,18 @@
       const traceLabel = document.createElement("span");
       traceLabel.className = "trace-label";
       traceLabel.textContent = "진행 중…";
+      // 진행 요약은 스크린리더에 조용히 알린다(본문 델타는 낭독 폭주라 제외).
+      traceLabel.setAttribute("aria-live", "polite");
       traceHead.append(traceCaret, traceSpin, traceLabel);
+      traceHead.setAttribute("aria-expanded", "true"); // 생성 시 펼침 상태
       const traceBody = document.createElement("div");
       traceBody.className = "trace-body";
       trace.append(traceHead, traceBody);
       // 헤더 클릭 = 펼침/접힘 토글(완료 후 여정 다시 확인).
-      traceHead.addEventListener("click", () => trace.classList.toggle("open"));
+      traceHead.addEventListener("click", () => {
+        const open = trace.classList.toggle("open");
+        traceHead.setAttribute("aria-expanded", String(open));
+      });
 
       const sources = document.createElement("div");
       sources.className = "sources";
@@ -706,6 +790,11 @@
       scrollToBottom();
 
       const cardMap = new Map();
+      // 이 턴이 본 출처의 원본 페이로드(id → src). 대화 스냅샷 저장·복원의 재료다.
+      const srcById = new Map();
+      let citedList = [];      // finalize에서 확정된 인용 id(스냅샷용)
+      let elapsedSaved = 0;    // 응답 소요(초) — 스냅샷 복원 시 요약에 재사용
+      let errorText = "";      // 오류로 끝난 턴의 안내 문구(스냅샷용)
       let moreToggle = null; // 출처 카드 접기 토글 버튼(카드가 상한 초과 시에만 생성)
       let rawText = "";
       let firstDelta = false;
@@ -753,127 +842,14 @@
         card.classList.add("flash");
       }
 
-      // [n] 및 그룹 마커 [2, 3, 4]를 파란 superscript 배지로 조립해 target에 붙인다.
-      // 그룹은 내부 id별로 개별 배지를 나란히 놓아 각각 클릭할 수 있게 한다. 원문은
-      // 항상 텍스트 노드/요소로만 조립한다(innerHTML 금지 — XSS 방지).
-      function renderMarkersInto(target, text) {
-        const re = /\[(\d+(?:\s*,\s*\d+)*)\]/g;
-        let last = 0, m;
-        while ((m = re.exec(text)) !== null) {
-          if (m.index > last) {
-            target.appendChild(document.createTextNode(text.slice(last, m.index)));
-          }
-          const ids = m[1].split(",").map((s) => s.trim()).filter(Boolean);
-          ids.forEach((sid) => {
-            const badge = document.createElement("sup");
-            badge.className = "marker";
-            badge.textContent = sid;
-            badge.addEventListener("click", () => highlightSource(sid));
-            target.appendChild(badge);
-          });
-          last = re.lastIndex;
-        }
-        if (last < text.length) {
-          target.appendChild(document.createTextNode(text.slice(last)));
-        }
-      }
-
-      // 인라인 렌더: **볼드**를 <strong>으로 분리하고, 각 구간(볼드 포함) 안에서 마커 배지를
-      // 조립한다. 이 순서 덕에 볼드 안의 [n]도 정상 배지로 렌더된다. innerHTML 금지(XSS 방지).
-      function renderInlineInto(target, text) {
-        const boldRe = /\*\*([\s\S]+?)\*\*/g;
-        let last = 0, m;
-        while ((m = boldRe.exec(text)) !== null) {
-          if (m.index > last) {
-            renderMarkersInto(target, text.slice(last, m.index));
-          }
-          const strong = document.createElement("strong");
-          renderMarkersInto(strong, m[1]);
-          target.appendChild(strong);
-          last = boldRe.lastIndex;
-        }
-        if (last < text.length) {
-          renderMarkersInto(target, text.slice(last));
-        }
-      }
-
-      // 본문 렌더: 라인 단위 블록 파스 — 헤더(###/####)와 파이프 테이블만 블록으로 올리고,
-      // 나머지는 인라인(볼드·마커) 평문 유지(pre-wrap). 그 외 마크다운(리스트 기호)은 스코프 밖.
-      // 외부 라이브러리 없음(self-contained). 스트리밍 중엔 표가 라인이 갖춰지는 대로 승격된다.
-      const MD_H_RE = /^(#{1,6})\s+(.*)$/;
-      const MD_PIPE_RE = /^\s*\|.*\|\s*$/;             // |로 시작·끝나는 라인만 표 후보
-      const MD_SEP_RE = /^\s*\|?[\s:|-]+\|?\s*$/;      // 구분선 |---|:--:|
-      function mdSplitCells(line) {
-        return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((s) => s.trim());
-      }
+      // 본문 렌더 = 공용 모듈(md.js). 마커 승격 조건은 "이번 턴 출처에 있는 id"이고,
+      // 클릭 시 해당 출처 카드를 하이라이트한다(승격 규칙·공백 규칙은 모듈이 소유).
       function renderBody(text) {
         bubble.classList.remove("empty");
-        bubble.textContent = "";
-        const lines = text.split("\n");
-        let buf = [];
-        const flush = () => {
-          // 블록 요소가 자체 줄바꿈/마진을 가지므로 세그먼트 가장자리 빈 줄은 접는다(이중 공백 방지).
-          while (buf.length && !buf[0].trim()) buf.shift();
-          while (buf.length && !buf[buf.length - 1].trim()) buf.pop();
-          if (buf.length) renderInlineInto(bubble, buf.join("\n"));
-          buf = [];
-        };
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i];
-          const hm = line.match(MD_H_RE);
-          if (hm) {
-            flush();
-            const h = document.createElement("div");
-            h.className = "md-h " + (hm[1].length <= 3 ? "l3" : "l4");
-            renderInlineInto(h, hm[2]);
-            bubble.appendChild(h);
-            continue;
-          }
-          // 표 = 연속 파이프 라인 2줄 이상(스트리밍 중 첫 줄만 온 상태는 평문 유지).
-          if (MD_PIPE_RE.test(line) && MD_PIPE_RE.test(lines[i + 1] || "")) {
-            flush();
-            const rows = [];
-            while (i < lines.length && MD_PIPE_RE.test(lines[i])) { rows.push(lines[i]); i++; }
-            i--;
-            const wrap = document.createElement("div");
-            wrap.className = "md-table-wrap";
-            const table = document.createElement("table");
-            table.className = "md-table";
-            let start = 0;
-            if (rows.length >= 2 && MD_SEP_RE.test(rows[1])) {
-              const tr = document.createElement("tr");
-              for (const c of mdSplitCells(rows[0])) {
-                const th = document.createElement("th");
-                renderInlineInto(th, c);
-                tr.appendChild(th);
-              }
-              table.appendChild(tr);
-              start = 2;
-            }
-            for (let r = start; r < rows.length; r++) {
-              if (MD_SEP_RE.test(rows[r])) continue; // 표 중간 구분선은 표시 안 함
-              const tr = document.createElement("tr");
-              for (const c of mdSplitCells(rows[r])) {
-                const td = document.createElement("td");
-                renderInlineInto(td, c);
-                tr.appendChild(td);
-              }
-              table.appendChild(tr);
-            }
-            wrap.appendChild(table);
-            bubble.appendChild(wrap);
-            continue;
-          }
-          buf.push(line);
-        }
-        flush();
-      }
-
-      // 표지 URL은 두 형태로 온다: 스트리밍 source 이벤트는 image_url 평면 필드,
-      // done.sources는 meta.image_url. http(s)만 허용(안전).
-      function coverUrl(src) {
-        const u = src.image_url || (src.meta && src.meta.image_url);
-        return u && /^https?:\/\//i.test(u) ? u : null;
+        renderMarkdown(bubble, text, {
+          isCitation: (sid) => cardMap.has(String(sid)),
+          onMarker: highlightSource,
+        });
       }
 
       function makeCard(src) {
@@ -934,10 +910,16 @@
           }
         }
         card.appendChild(main);
-        // http(s) 스킴만 허용 — 출처 url(특히 web_search가 준 외부 url)에 javascript:
-        // 같은 스킴이 섞이면 window.open으로 스크립트가 실행될 수 있어 방어한다.
-        if (src.url && /^https?:\/\//i.test(src.url)) {
-          card.addEventListener("click", () => window.open(src.url, "_blank", "noopener"));
+        // 위험 스킴(javascript:) 차단은 공용 모듈(isSafeUrl/safeOpen)이 소유한다.
+        if (isSafeUrl(src.url)) {
+          const open = () => safeOpen(src.url);
+          // 클릭 가능한 것은 키보드로도 갈 수 있어야 한다(matrix 셀과 동일 계약).
+          card.tabIndex = 0;
+          card.setAttribute("role", "button");
+          card.addEventListener("click", open);
+          card.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
+          });
         }
         return card;
       }
@@ -946,6 +928,7 @@
       function collapseTrace(summary) {
         trace.classList.remove("open");
         trace.classList.add("done");
+        traceHead.setAttribute("aria-expanded", "false");
         traceLabel.textContent = summary;
       }
 
@@ -996,6 +979,7 @@
           if (cardMap.has(String(src.id))) return;
           const card = makeCard(src);
           cardMap.set(String(src.id), card);
+          srcById.set(String(src.id), src);
           sources.appendChild(card);
           scrollToBottom();
         },
@@ -1050,8 +1034,11 @@
               cardMap.set(String(src.id), card);
               sources.appendChild(card);
             }
+            srcById.set(String(src.id), src);
             citedIds.add(String(src.id));
           }
+          citedList = [...citedIds];   // 스냅샷 저장용(복원 시 강조/디밍 재현)
+          elapsedSaved = elapsedSec;
           // 인용 카드는 강조, 비인용 관찰 카드는 디밍. 인용이 하나도 없으면 디밍하지 않는다
           // (관찰만 있고 인용 0인 턴에서 전부 흐려지는 걸 방지).
           const hasCited = citedIds.size > 0;
@@ -1085,10 +1072,20 @@
         },
         showError(message) {
           errored = true;
+          errorText = message || "오류가 발생했어요.";
           completeActiveStep();
           collapseTrace("⚠️ 오류로 중단됨");
           bubble.className = "bubble error";
-          bubble.textContent = message || "오류가 발생했어요.";
+          bubble.textContent = errorText;
+          scrollToBottom();
+        },
+        markStopped() {
+          // 중지는 파괴가 아니다 — 이미 스트리밍된 본문은 사용자가 읽고 있던 답이라 지우지 않고,
+          // 진행 블록만 "중지됨"으로 접는다. 한 글자도 못 받았을 때만 안내 말풍선으로 대체한다.
+          if (!rawText) { this.showError("응답을 중지했어요."); return; }
+          completeActiveStep();
+          collapseTrace("⏹ 중지됨");
+          applySourceCollapse(false);
           scrollToBottom();
         },
         markEmptyIfUntouched() {
@@ -1098,25 +1095,71 @@
             bubble.textContent = "(응답이 없었어요)";
           }
         },
+        // 이 턴을 스냅샷 한 조각으로 — 복원은 addSource + finalize를 그대로 다시 태운다
+        // (라이브와 복원이 같은 렌더 경로). 본문도 오류도 없으면 저장할 게 없다(null).
+        toSnapshot() {
+          if (errored) return { role: "assistant", error: errorText };
+          if (!rawText) return null;
+          return {
+            role: "assistant",
+            text: rawText,
+            sources: [...srcById.values()],
+            cited_ids: citedList,
+            elapsed: elapsedSaved,
+          };
+        },
+        // 복원된 턴엔 재현할 실시간 진행 과정이 없다 — 빈 진행 블록을 남기지 않고 제거한다.
+        dropTrace() { trace.remove(); },
       };
     }
 
-    // SSE 이벤트 블록(event:/data:)을 파싱한다.
-    function parseEvent(block) {
-      let event = "message";
-      let data = "";
-      for (const line of block.split("\n")) {
-        if (line.startsWith("event:")) event = line.slice(6).trim();
-        else if (line.startsWith("data:")) data += line.slice(5).trim();
+    // ── 대화 스냅샷(재방문 복원) ──
+    // 불변식: **서버 세션이 살아 있으면 그 대화가 화면에도 있다.** 이전엔 새로고침·매트릭스
+    // 왕복 시 session_id만 남고 대화 DOM은 비어, 화면은 새 대화인데 서버는 옛 맥락을 기억하는
+    // 불일치가 났다(핸드오프 경로만 세션을 리셋한 건 한 경로짜리 사례 패치였다). 이제 두 축을
+    // 함께 유지한다: 턴이 끝날 때마다 스냅샷을 저장하고, 부팅 시 세션이 있으면 복원한다.
+    // 반대편도 닫는다 — 세션 없이 남은 기록은 이어질 대화가 없으므로 버린다.
+    // 매트릭스(yes24_matrix_snapshot)와 같은 저장소·같은 방식.
+    const CHAT_TRANSCRIPT_KEY = "yes24_chat_transcript";
+    let transcript = [];
+
+    function saveTranscript() {
+      try {
+        if (transcript.length) sessionStorage.setItem(CHAT_TRANSCRIPT_KEY, JSON.stringify(transcript));
+        else sessionStorage.removeItem(CHAT_TRANSCRIPT_KEY);
+      } catch (e) { /* 저장 실패(용량 등)는 복원만 포기 — 진행 중 대화엔 영향 없음 */ }
+    }
+    function clearTranscript() {
+      transcript = [];
+      try { sessionStorage.removeItem(CHAT_TRANSCRIPT_KEY); } catch (e) {}
+    }
+    function restoreTranscript() {
+      let saved = null;
+      try { saved = JSON.parse(sessionStorage.getItem(CHAT_TRANSCRIPT_KEY) || "null"); } catch (e) {}
+      if (!Array.isArray(saved) || !saved.length) return;
+      if (!sessionId) { clearTranscript(); return; } // 이어질 세션이 없는 기록은 폐기
+      transcript = saved;
+      for (const turn of transcript) {
+        if (turn.role === "user") { addUserMessage(turn.text || ""); continue; }
+        const asst = createAssistantMessage();
+        if (turn.error) {
+          asst.showError(turn.error);
+        } else {
+          (Array.isArray(turn.sources) ? turn.sources : []).forEach((s) => asst.addSource(s));
+          asst.finalize({ text: turn.text || "", cited_ids: turn.cited_ids || [] }, turn.elapsed || 0);
+        }
+        asst.dropTrace();
       }
-      let parsed = {};
-      if (data) {
-        try { parsed = JSON.parse(data); } catch (e) { parsed = {}; }
-      }
-      return { event, data: parsed };
     }
 
     // 전송 버튼 상태: 전송 중이거나 입력이 비면 비활성(보낼 게 없을 때 활성처럼 보이지 않게).
+    // textarea 자동 성장 상한의 단일 출처 = CSS 변수(--composer-max-h). JS가 그 값을 읽어 쓴다
+    // (두 곳에 140을 적어 두면 한쪽만 바뀌어 스크롤이 어긋난다).
+    function composerMaxHeight() {
+      const v = getComputedStyle(document.documentElement).getPropertyValue("--composer-max-h");
+      return parseFloat(v) || 0;
+    }
+
     function updateSendState() {
       sendBtn.disabled = sending || input.value.trim() === "";
     }
@@ -1133,8 +1176,11 @@
       const message = (text !== undefined ? text : input.value).trim();
       if (!message || sending) return;
 
-      removeIntro();
+      // 첫 메시지가 붙는 순간 랜딩 조건(메시지 0)이 깨진다 — 컴포저는 중앙에서 하단으로.
+      const composerTop = captureComposerTop();
       addUserMessage(message);
+      transcript.push({ role: "user", text: message });
+      syncLandingMode(composerTop);
       input.value = "";
       input.style.height = "auto";
 
@@ -1155,53 +1201,39 @@
           body: JSON.stringify(payload),
           signal: controller.signal,
         });
-        if (!resp.ok || !resp.body) {
-          throw new Error("서버 응답 오류: " + resp.status);
-        }
-
-        const reader = resp.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          let idx;
-          while ((idx = buffer.indexOf("\n\n")) >= 0) {
-            const block = buffer.slice(0, idx);
-            buffer = buffer.slice(idx + 2);
-            if (!block.trim()) continue;
-            const { event, data } = parseEvent(block);
-            if (event === "ack") {
-              asst.setAck(data.text || "");
-            } else if (event === "status") {
-              asst.setStatus(data.stage, data.detail);
-            } else if (event === "source") {
-              asst.addSource(data);
-            } else if (event === "delta") {
-              asst.appendDelta(data.text || "");
-            } else if (event === "done") {
-              if (data.session_id) {
-                sessionId = data.session_id;
-                try { sessionStorage.setItem(CHAT_SESSION_KEY, sessionId); } catch (e) {}
-              }
-              asst.finalize(data, (performance.now() - started) / 1000);
-            } else if (event === "error") {
-              asst.showError(data.message);
+        await readEventStream(resp, (event, data) => {
+          if (event === "ack") {
+            asst.setAck(data.text || "");
+          } else if (event === "status") {
+            asst.setStatus(data.stage, data.detail);
+          } else if (event === "source") {
+            asst.addSource(data);
+          } else if (event === "delta") {
+            asst.appendDelta(data.text || "");
+          } else if (event === "done") {
+            if (data.session_id) {
+              sessionId = data.session_id;
+              try { sessionStorage.setItem(CHAT_SESSION_KEY, sessionId); } catch (e) {}
             }
+            asst.finalize(data, (performance.now() - started) / 1000);
+          } else if (event === "error") {
+            asst.showError(data.message);
           }
-        }
+        });
         asst.markEmptyIfUntouched();
       } catch (err) {
         if (err && err.name === "AbortError") {
-          asst.showError("응답을 중지했어요.");
+          asst.markStopped(); // 스트리밍된 본문은 보존(중지는 파괴가 아니다)
         } else {
           asst.showError("연결에 문제가 있었어요. 잠시 후 다시 시도해 주세요.");
         }
       } finally {
         controller = null;
         setSending(false);
+        // 턴이 끝날 때마다 화면=세션 불변식을 스토리지에 반영한다(성공·중지·오류 모두).
+        const turn = asst.toSnapshot();
+        if (turn) transcript.push(turn);
+        saveTranscript();
       }
     }
 
@@ -1211,18 +1243,9 @@
       if (sending && controller) controller.abort();
       sessionId = null;
       try { sessionStorage.removeItem(CHAT_SESSION_KEY); } catch (e) {}
+      clearTranscript(); // 세션과 기록은 함께 산다·함께 죽는다(화면=세션 불변식)
       conversation.textContent = "";
-      const intro = document.createElement("div");
-      intro.className = "intro";
-      intro.id = "intro";
-      intro.innerHTML = '<div class="big">무엇을 찾아드릴까요?</div>' +
-        '<p>Yes24를 실시간으로 검색해 인용과 함께 답해드려요.</p>';
-      const chips = document.createElement("div");
-      chips.className = "chips";
-      chips.id = "chips";
-      intro.appendChild(chips);
-      conversation.appendChild(intro);
-      renderChipsInto(chips);
+      syncLandingMode(null); // 메시지 0 → 랜딩 복귀(인사 + 중앙 컴포저). 애니메이션 없음.
     });
 
     input.addEventListener("keydown", (e) => {
@@ -1233,7 +1256,7 @@
     });
     input.addEventListener("input", () => {
       input.style.height = "auto";
-      input.style.height = Math.min(input.scrollHeight, 140) + "px";
+      input.style.height = Math.min(input.scrollHeight, composerMaxHeight()) + "px";
       updateSendState();
     });
 
@@ -1257,7 +1280,7 @@
     // 받는 것). 1회성: 읽는 즉시 제거해 새로고침 시 반복 프리필을 막는다.
     // 프리필은 진술문이 아니라 '요청문'으로 — 그대로 전송해도 에이전트가 되묻지 않고 한 턴에
     // 완결되게(진술형 "…추천을 받았어요."는 되물어 한 턴 낭비 실측). 사용자가 보고 수정 가능.
-    const MATRIX_HANDOFF_KEY = "yes24_matrix_handoff";
+    // 저장 키는 공용 모듈(rbti.js)이 단일 출처 — 매트릭스와 계약.
     (function applyMatrixHandoff() {
       let handoff = null;
       try {
@@ -1281,6 +1304,12 @@
     })();
 
     renderChipsInto(chipsEl);
+    // 재방문 복원: 세션이 살아 있으면 그 대화를 화면에 되살린다. 핸드오프(위)는 세션을 비우므로
+    // 여기서 옛 기록이 폐기돼 "새 대화 + 프리필"이 된다 — 경로별 분기 없이 불변식이 처리한다.
+    restoreTranscript();
+    // 초기 레이아웃 확정: 메시지가 없으면 랜딩(인사 + 중앙 컴포저), 위에서 복원된 메시지가
+    // 있으면 랜딩을 건너뛰고 하단 컴포저 대화 상태로 그대로 간다.
+    syncLandingMode(null);
     input.focus();
     updateSendState(); // 초기: 입력이 비어 있으니 전송 비활성
   </script>

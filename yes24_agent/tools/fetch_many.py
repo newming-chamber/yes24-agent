@@ -51,17 +51,36 @@ async def fetch_many(items: list[dict], tool_context: ToolContext) -> dict:
         status="ok"와 results 목록을 담은 dict. results의 각 항목은 yes24_fetch와 동일한 형태다
         — 성공은 source_id·title·type(book_detail/notice)·본문(intro/toc/text 등), 실패는
         status="error"·error_type("fetch"|"parse"|"empty"|"invalid_url")·message. 성공 항목만
-        인용 대상(source_id)이 된다.
+        인용 대상(source_id)이 된다. 상한을 넘겨 열지 않은 항목이 있으면 dropped_count·
+        dropped_urls·message로 **무엇을 안 열었는지 명시**한다 — 그 책들이 필요하면 남은
+        url로 한 번 더 호출한다(조용히 사라지지 않는다).
     """
     settings = get_settings()
     client = _get_client(settings)
+    max_items = settings.fetch_many_max_items
 
-    capped = list(items)[: settings.fetch_many_max_items] if isinstance(items, list) else []
+    requested = list(items) if isinstance(items, list) else []
 
-    # (item, url) 계획을 세운다 — url 없는 항목은 gather에서 빼고 invalid_url 결과로 남긴다.
-    plan: list[tuple[dict, str | None]] = [
-        (it, it.get("url") if isinstance(it, dict) else None) for it in capped
-    ]
+    # 계획 수립: 상한까지만 열고, 같은 url은 한 번만 연다(같은 페이지 → 같은 결과라 재요청은
+    # Yes24 트래픽·컨텍스트 낭비). 상한 밖 항목은 **버리되 버렸다고 알린다**(fail-loud —
+    # 조용한 드롭은 "안 열린 책"을 "없는 책"으로 오인하게 만든다).
+    plan: list[tuple[dict, str | None]] = []
+    seen_urls: set[str] = set()
+    dropped_urls: list[str] = []
+    duplicate_count = 0
+
+    for item in requested:
+        url = item.get("url") if isinstance(item, dict) else None
+        if url and url in seen_urls:
+            duplicate_count += 1
+            continue
+        if len(plan) >= max_items:
+            dropped_urls.append(url or "(url 없음)")
+            continue
+        if url:
+            seen_urls.add(url)
+        plan.append((item, url))
+
     valid_urls = [url for _, url in plan if url]
 
     # 네트워크(get_text)만 동시 실행한다. return_exceptions=True로 개별 실패를 값으로 받아
@@ -98,5 +117,26 @@ async def fetch_many(items: list[dict], tool_context: ToolContext) -> dict:
 
     checked_at = datetime.now(_KST).strftime("%Y-%m-%d %H:%M")
     ok = sum(1 for r in results if r.get("status") != "error")
-    logger.info("fetch_many items=%d ok=%d", len(results), ok)
-    return {"status": "ok", "results": results, "checked_at": checked_at}
+    logger.info(
+        "fetch_many requested=%d opened=%d ok=%d dropped=%d duplicate=%d",
+        len(requested), len(results), ok, len(dropped_urls), duplicate_count,
+    )
+
+    response = {
+        "status": "ok",
+        "results": results,
+        "checked_at": checked_at,
+        "requested_count": len(requested),
+        "result_count": len(results),
+    }
+    if dropped_urls:
+        # 가법 필드: 드롭이 없으면 반환 형태는 기존과 동일하다.
+        response["dropped_count"] = len(dropped_urls)
+        response["dropped_urls"] = dropped_urls
+        response["message"] = (
+            f"한 번에 열 수 있는 상한({max_items}건)을 넘어 {len(dropped_urls)}건은 열지 "
+            "않았습니다. 그 책들이 필요하면 남은 url로 한 번 더 호출하세요."
+        )
+    if duplicate_count:
+        response["duplicate_count"] = duplicate_count
+    return response

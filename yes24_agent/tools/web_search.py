@@ -23,7 +23,6 @@ from google.adk.tools import ToolContext
 
 from yes24_agent.config import Settings, get_settings
 from yes24_agent.sources import register_source
-from yes24_agent.tools._followup import needs_search_followup
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +85,8 @@ async def web_search(query: str, tool_context: ToolContext) -> dict:
         성공 시 status="ok"와 results 목록(각 결과에 인용용 source_id·title·url·snippet·
         last_updated), 검색 시각 checked_at을 담은 dict. snippet은 스니펫이 아니라 페이지
         콘텐츠(추출 본문)라 그 자체로 종합 재료가 된다. 결과가 없으면 results가 빈 목록.
-        성공·실패 모두 충분성 힌트(result_count·needs_followup)를 함께 담는다. 실패 시
-        status="error"와 error_type("not_configured"|"fetch"), message에 더해
-        result_count=0·needs_followup=True(재시도 신호)를 담은 dict.
+        성공·실패 모두 result_count를 함께 담는다. 실패 시 status="error"와
+        error_type("not_configured"|"fetch"), message에 더해 result_count=0을 담은 dict.
     """
     settings = get_settings()
 
@@ -99,7 +97,6 @@ async def web_search(query: str, tool_context: ToolContext) -> dict:
             "error_type": "not_configured",
             "message": "웹 검색이 설정되지 않았습니다",
             "result_count": 0,
-            "needs_followup": True,
         }
 
     client = _get_client(settings)
@@ -132,7 +129,6 @@ async def web_search(query: str, tool_context: ToolContext) -> dict:
             "error_type": "fetch",
             "message": f"웹 검색 요청에 실패했습니다: {exc}",
             "result_count": 0,
-            "needs_followup": True,
         }
 
     checked_at = datetime.now(_KST).strftime("%Y-%m-%d %H:%M")
@@ -168,10 +164,6 @@ async def web_search(query: str, tool_context: ToolContext) -> dict:
             }
         )
 
-    # 관련성 근거 텍스트는 제목+스니펫(스니펫이 없으면 제목만) — 웹은 제목이 짧아
-    # 스니펫까지 봐야 핵심 토큰 커버를 제대로 판정한다.
-    followup_texts = [f"{r['title']} {r.get('snippet') or ''}" for r in results]
-    needs_followup = needs_search_followup(query, followup_texts, len(results))
     logger.info("web_search query=%r status=ok results=%d", query, len(results))
     return {
         "status": "ok",
@@ -179,5 +171,4 @@ async def web_search(query: str, tool_context: ToolContext) -> dict:
         "results": results,
         "checked_at": checked_at,
         "result_count": len(results),
-        "needs_followup": needs_followup,
     }

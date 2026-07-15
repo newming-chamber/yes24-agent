@@ -6,7 +6,7 @@
 3. validate_citations로 무효 마커 제거(채팅 postprocess 재사용).
 4. 게이트 — evaluate_product_answer(mismap/unsourced) + **assert_pool_confined**(매트릭스 고유):
    풀에 상품 출처가 있어 기존 unsourced가 못 잡는 "풀 밖 책+가격" 홀을, 주장 제목이 풀 후보
-   제목 집합에 있는지 대조해 차단한다(product_gate의 title 정규화·_title_supported 재사용).
+   제목 집합에 있는지 대조해 차단한다(product_gate의 title 정규화·title_supported 재사용).
 5. 사유가 있으면 그 셀만 정직 폴백(재검색 안 함 — 비용 가드). build_done_payload로 마감.
 
 16을 케이스로 박지 않는다 — matrix_codes()가 AXIS_ORDER의 축별 허용값을 곱해 16을 파생한다.
@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
-import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -27,54 +26,66 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 
-from yes24_agent.config import Settings
-from yes24_agent.matrix.genai_runtime import get_genai_client
-from yes24_agent.matrix.prompt import (
-    MATRIX_EMPTY_NOTICE,
-    MATRIX_FALLBACK_NOTICE,
-    MATRIX_WEB_EMPTY_NOTICE,
-    build_matrix_prompt,
-)
+from yes24_agent.config import Settings, get_genai_client
+from yes24_agent.grounding import evaluate_product_answer, title_claims, title_supported
+from yes24_agent.matrix.prompt import build_axis_guard, build_matrix_prompt, fallback_notice
 from yes24_agent.matrix.retrieval import SharedPool
 from yes24_agent.postprocess import CitationResult, build_done_payload, validate_citations
-from yes24_agent.product_gate import (
-    _ASSERTED_TITLE,
-    _clean_asserted,
-    _is_title_candidate,
-    _title_supported,
-    evaluate_product_answer,
-)
 from yes24_agent.rbti.persona import AXIS_ORDER, build_persona_block
 
 logger = logging.getLogger(__name__)
 
 _KST = timezone(timedelta(hours=9))
 
-# 요지 한 줄에서 걷어낼 마크다운/인용 접두. 카드의 "한 줄 요지"용 정리.
-_SUMMARY_STRIP = re.compile(r"^[#>*\-\s]+|\[\d+(?:\s*,\s*\d+)*\]")
 
 @dataclass(frozen=True)
 class ColumnResult:
     """한 열(RBTI 코드) 생성 결과.
 
     - code: RBTI 4글자. col: 0~15 열 인덱스(matrix_codes 순서).
-    - summary: 카드 상단 한 줄 요지. text: 카드 본문(인용 마커 포함, 무효 마커 제거됨).
+    - text: 카드 본문(인용 마커 포함, 무효 마커 제거됨).
+    - picks: 이 셀이 **실제로 고른 책**(인용 등장 순서, 중복 제거). 각 원소는 공유 풀의 후보
+      레코드 그대로 — source_id·title·url + product_fields(price·rating·image_url·author·
+      publisher·pub_status…). picks[0]이 대표책이다.
     - done_payload: 이 열의 인용 검증된 출처·grounding_supports(build_done_payload 산출).
     - gate_reason: 게이트 발동 사유(None이면 정상). "mismap"|"unsourced"|"pool_escape"|
-      "empty"|"error" — 발동 시 text는 정직 폴백으로 대체된다.
+      "empty"|"error" — 발동 시 text는 **사유에 맞는** 정직 폴백으로 대체되고 picks는 빈다.
     """
 
     code: str
     col: int
-    summary: str
     text: str
+    picks: list[dict]
     done_payload: dict
     gate_reason: str | None
+
+
+def _picks(citation: CitationResult, pool: SharedPool) -> list[dict]:
+    """이 셀이 고른 책을 **구조화된 레코드**로 뽑는다(인용 등장 순서).
+
+    프론트가 카드 산문을 정규식으로 재파싱해 『제목』+인접 가격을 복원할 필요가 없게 하는 것이
+    목적이다 — 같은 판정이 백엔드(인용 검증·풀 접지)와 프론트(정규식)에 이중 구현되면 둘이
+    어긋나고, 프론트 파서가 실패하면 대표책·표지가 통째로 사라진다. 근거는 이미 여기 있다:
+    validate_citations가 검증한 source_id(등장 순서·중복 제거)를 풀 후보에 그대로 매핑한다.
+    본문에 남은 [n]은 게이트를 통과한 것뿐이므로 picks도 접지된 책만 담는다.
+
+    web/none 풀은 도서 후보가 없어 자연히 빈 목록이다(source_id가 풀 후보에 매핑되지 않음).
+    """
+    by_id = {c["source_id"]: c for c in pool.candidates}
+    return [by_id[sid] for sid in citation.used_source_ids if sid in by_id]
 
 
 def matrix_codes() -> list[str]:
     """16 RBTI 코드를 AXIS_ORDER의 축별 허용값 데카르트 곱으로 파생한다(하드코딩 아님)."""
     return ["".join(combo) for combo in itertools.product(*(vals for _axis, vals in AXIS_ORDER))]
+
+
+def _axis_value(code: str, axis: str) -> str:
+    """RBTI 코드에서 지정 축의 값 글자를 뽑는다(AXIS_ORDER 파생 — 자리 인덱스 하드코딩 없음)."""
+    for ch, (name, _allowed) in zip(code, AXIS_ORDER):
+        if name == axis:
+            return ch
+    return ""
 
 
 def _today_kst() -> str:
@@ -83,36 +94,21 @@ def _today_kst() -> str:
     return f"{now.year}년 {now.month}월 {now.day}일"
 
 
-def _get_genai_client() -> genai.Client:
-    """공유 genai 클라이언트 싱글턴을 반환한다(retrieval과 동일 클라이언트)."""
-    return get_genai_client()
-
-
-def _summarize(text: str) -> str:
-    """본문 첫 유의미 줄을 한 줄 요지로 뽑는다(마크다운·인용 마커 제거, 80자 상한)."""
-    for line in text.splitlines():
-        stripped = _SUMMARY_STRIP.sub("", line).strip()
-        if stripped:
-            return stripped[:80]
-    return ""
-
-
 def _pool_confined(text: str, pool_titles: list[str]) -> bool:
     """본문이 주장한 모든 책 제목이 풀 후보 제목 집합에 의해 뒷받침되는지 판정한다.
 
     매트릭스 고유 가드: 풀에 상품 출처가 있어(공유 검색) product_gate의 unsourced가 발동하지
     않는 상황에서, 모델이 풀에 없는 책을 지어내(가격까지) 그럴듯하게 추천하는 "풀 밖" 환각을
-    막는다. 제목 매칭은 product_gate의 관대 매칭(_title_supported: 축약·부제 변형 허용)을
-    그대로 재사용해 정상 인용을 오탐하지 않는다. 하나라도 풀 밖 제목이면 False.
+    막는다. 무엇이 **제목 주장**인지는 product_gate.title_claims가 판정한다 — 볼드는 범용 강조
+    서식이라 항목 머리·저자 표기·출처 제목 대응 같은 구조 신호가 있을 때만 제목 주장이다. 이
+    가드를 건너뛰고 마커를 직접 훑으면 문장 중간의 강조 볼드("**압도적인 밀도**")를 책 제목으로
+    오인해 **정상 셀이 폴백으로 폐기**된다(실측). 제목 매칭도 product_gate의 관대 매칭
+    (title_supported: 축약·부제 변형 허용)을 그대로 재사용한다. 하나라도 풀 밖 제목이면 False.
     """
-    for line in text.splitlines():
-        for match in _ASSERTED_TITLE.finditer(line):
-            asserted = _clean_asserted(match)
-            if not _is_title_candidate(asserted):
-                continue
-            if not any(_title_supported(asserted, title) for title in pool_titles):
-                return False
-    return True
+    return all(
+        any(title_supported(asserted, title) for title in pool_titles)
+        for asserted in title_claims(text, pool_titles)
+    )
 
 
 def _gate_reason(text: str, citation: CitationResult, pool: SharedPool) -> str | None:
@@ -156,18 +152,18 @@ async def _call_model(client: genai.Client, settings: Settings, system: str, use
 def _fallback_column(
     pool: SharedPool, code: str, col: int, reason: str, session_id: str
 ) -> ColumnResult:
-    """정직 폴백 열을 만든다(재검색 없음). kind·풀 유무에 맞는 정직 문구를 고른다."""
-    if pool.kind == "web":
-        notice = MATRIX_WEB_EMPTY_NOTICE
-    elif not pool.candidates:
-        notice = MATRIX_EMPTY_NOTICE
-    else:
-        notice = MATRIX_FALLBACK_NOTICE
+    """정직 폴백 열을 만든다(재검색 없음). 문구는 **사유**에 맞는 것을 고른다(fallback_notice).
+
+    사유를 무시하고 kind로만 고르면, 잡담 셀이 게이트에 걸렸을 때 "Yes24에서 이 질문에 맞는 책을
+    찾지 못했어요"(검색 실패 문구)가 나간다 — 찾을 책이 애초에 없던 질문인데.
+    """
+    notice = fallback_notice(reason, kind=pool.kind, has_candidates=bool(pool.candidates))
     citation = validate_citations(notice, pool.sources)
     done_payload = build_done_payload(
         pool.sources, citation.used_source_ids, session_id, citation.supports
     )
-    return ColumnResult(code, col, _summarize(notice), notice, done_payload, reason)
+    # 폴백 셀은 고른 책이 없다(picks=[]) — 프론트가 대표책·표지를 그리지 않는 단일 신호.
+    return ColumnResult(code, col, notice, [], done_payload, reason)
 
 
 async def generate_column(
@@ -183,24 +179,52 @@ async def generate_column(
     persona = build_persona_block(code)
     # 열별 후보 회전(product 풀·설정 on) — primacy 편향으로 열마다 다른 책을 앞세워 리드 수렴 완화.
     lead_offset = col if (settings.matrix_pool_rotate and pool.kind == "product") else 0
-    system, user = build_matrix_prompt(pool, persona, today=_today_kst(), lead_offset=lead_offset)
+    # D/B 축 추천 구성 구조 가드(product 풀 전용) — 권수 경계로 축 정체성을 구성에서부터 가른다.
+    axis_guard = (
+        build_axis_guard(
+            _axis_value(code, "breadth"),
+            depth_max_picks=settings.matrix_depth_max_picks,
+            breadth_min_picks=settings.matrix_breadth_min_picks,
+        )
+        if pool.kind == "product"
+        else ""
+    )
+    system, user = build_matrix_prompt(
+        pool, persona, today=_today_kst(), lead_offset=lead_offset, axis_guard=axis_guard
+    )
 
-    try:
-        raw = await _call_model(genai_client, settings, system, user)
-    except APIError as exc:
-        logger.warning("matrix 생성 실패 code=%s: %s", code, exc)
-        return _fallback_column(pool, code, col, "error", session_id)
+    # 게이트 발동 시 재생성한다(재검색 아님 — 같은 풀로 flash만 한 번 더, Yes24 트래픽 0).
+    # 게이트는 이번 초안의 환각(풀 밖 책·무출처 상품사실)에 발동하는데 생성은 비결정적이라, 두 번째
+    # 초안은 접지된 답을 낼 확률이 높다 — 셀을 곧장 dim 폴백으로 방치("다시 살펴볼게요" 약속만 하고
+    # 이행 안 함)하는 대신 실제 한 번 더 시도해 셀 성공률을 높인다(비용 가드: 발동 셀만, 최대 N회).
+    # kind와 무관하게 재시도한다 — 잡담(none) 셀이 책을 지어내 게이트에 걸리는 경우야말로 재생성이
+    # 가장 필요한 자리인데(폴백 문구밖에 남지 않는다), 예전엔 그 경로만 재시도가 0회였다.
+    attempts = 1 + settings.matrix_cell_retries
+    reason: str | None = None
+    citation: CitationResult | None = None
+    for attempt in range(attempts):
+        try:
+            raw = await _call_model(genai_client, settings, system, user)
+        except APIError as exc:
+            logger.warning("matrix 생성 실패 code=%s: %s", code, exc)
+            return _fallback_column(pool, code, col, "error", session_id)
 
-    citation = validate_citations(raw, pool.sources)
-    reason = _gate_reason(citation.text, citation, pool)
+        citation = validate_citations(raw, pool.sources)
+        reason = _gate_reason(citation.text, citation, pool)
+        if reason is None:
+            break
+        logger.info(
+            "matrix 게이트 발동 code=%s reason=%s attempt=%d/%d",
+            code, reason, attempt + 1, attempts,
+        )
+
     if reason is not None:
-        logger.info("matrix 게이트 발동 code=%s reason=%s", code, reason)
         return _fallback_column(pool, code, col, reason, session_id)
 
     done_payload = build_done_payload(
         pool.sources, citation.used_source_ids, session_id, citation.supports
     )
-    return ColumnResult(code, col, _summarize(citation.text), citation.text, done_payload, None)
+    return ColumnResult(code, col, citation.text, _picks(citation, pool), done_payload, None)
 
 
 async def generate_matrix(
@@ -223,7 +247,7 @@ async def generate_matrix(
             yield _fallback_column(pool, code, col, pool.status, session_id)
         return
 
-    client = genai_client or _get_genai_client()
+    client = genai_client or get_genai_client()
     semaphore = asyncio.Semaphore(settings.matrix_generation_concurrency)
 
     async def _run(col: int, code: str) -> ColumnResult:
