@@ -48,8 +48,14 @@ def _status_for_call(call) -> tuple[str, str]:
             return "browsing", f"Yes24 {label} 둘러보는 중…"
         return "browsing", "Yes24 코너를 둘러보는 중…"
     if name == "web_search":
-        query = args.get("query", "")
-        return "searching_web", f"웹에서 '{query}' 관련 정보를 찾는 중…"
+        queries = args.get("queries")
+        angles = [q for q in queries if isinstance(q, str) and q.strip()] \
+            if isinstance(queries, list) else []
+        if len(angles) > 1:
+            return "searching_web", f"웹에서 {len(angles)}개 각도로 정보를 찾는 중…"
+        if angles:
+            return "searching_web", f"웹에서 '{angles[0]}' 관련 정보를 찾는 중…"
+        return "searching_web", "웹에서 정보를 찾는 중…"
     if name == "web_fetch":
         return "reading_web", "웹 페이지를 읽는 중…"
     return "working", "정보를 확인하는 중…"

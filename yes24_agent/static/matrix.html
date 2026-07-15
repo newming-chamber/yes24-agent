@@ -606,13 +606,16 @@
     "use strict";
 
     // 공용 모듈(단일 사본) — 마크다운·인용 렌더, SSE, RBTI 축 정의, 출처 유틸.
-    import { renderBody } from "/static/lib/md.js";
-    import { readEventStream } from "/static/lib/sse.js";
+    // ?v=1은 **일회성** 캐시 탈출구다: no-cache 헤더가 붙기 전 구버전을 heuristic-freshness로
+    // 붙든 브라우저가 무쿼리 URL을 재요청하지 않는 문제를, 한 번도 캐시된 적 없는 새 URL로 우회한다.
+    // 이후 모듈이 바뀌어도 이 숫자를 올릴 필요 없다 — 서버 no-cache가 매번 재검증하니까(자라지 않음).
+    import { renderBody } from "/static/lib/md.js?v=1";
+    import { readEventStream } from "/static/lib/sse.js?v=1";
     import {
       AXES, VAL, CODES, ROW_ORDER, COL_ORDER, rowKey, colKey, deriveAxisLabel,
       RBTI_STORAGE_KEY, MATRIX_HANDOFF_KEY,
-    } from "/static/lib/rbti.js";
-    import { WEB_TYPES, coverUrl, safeOpen } from "/static/lib/sources.js";
+    } from "/static/lib/rbti.js?v=1";
+    import { WEB_TYPES, coverUrl, safeOpen } from "/static/lib/sources.js?v=1";
 
     // 축 색 아이덴티티: 열(취향폭×동기)별 hue 밴드, 행 = 정보처리(분석 쿨 / 공감 웜) 코드배지.
     const COL_HUE = { DI: "#22d3ee", DF: "#a78bfa", BI: "#fbbf24", BF: "#34d399" };
@@ -859,9 +862,12 @@
       renderBody(flow, card.text, { isCitation: isPooled, onMarker: (sid) => highlightChip(card, sid) });
       body.appendChild(flow);
 
-      const picks = card.picks;
-      if (!picks.length) return; // 델타 시점(아직 picks 없음)·폴백 셀 — 대표책 줄 없음
-      const rep = picks[0];
+      // 대표책 슬롯(『』·표지·세로바)은 **책만** 채운다 — 웹 출처(뉴스·유튜브)가 섞인 비도서
+      // 질문(환율 등)에서 picks[0]이 type=web이면 『뉴스 제목』으로 책처럼 오도된다. 웹 출처는
+      // 이미 하단 인용 칩(c-foot)에 링크로 있으니 대표책 줄에서만 뺀다(type 신호로 판정).
+      const bookPicks = card.picks.filter((p) => !WEB_TYPES.has(p.type));
+      if (!bookPicks.length) return; // 델타 시점·폴백·비도서 셀 — 대표책 줄 없음
+      const rep = bookPicks[0];
       const pick = document.createElement("div");
       pick.className = "c-pick";
 
@@ -896,11 +902,11 @@
         price.textContent = (Number.isFinite(n) && n > 0 ? n.toLocaleString("ko-KR") : String(rep.price)) + "원";
         pick.appendChild(price);
       }
-      if (picks.length > 1) {
+      if (bookPicks.length > 1) {
         const more = document.createElement("span");
         more.className = "c-pick-more";
-        more.textContent = "+" + (picks.length - 1);
-        more.title = "이 성향이 고른 책 " + picks.length + "권";
+        more.textContent = "+" + (bookPicks.length - 1);
+        more.title = "이 성향이 고른 책 " + bookPicks.length + "권";
         pick.appendChild(more);
       }
       body.appendChild(pick);
@@ -1157,9 +1163,11 @@
     }
     // 토너먼트 카드 미리보기 = 전문(.tc-gist가 3줄 클램프). 휴리스틱 비교도 전문 기준(정확도↑).
     function tGist(card) { return card && card.text ? card.text.trim() : ""; }
-    // 대표책 = picks[0](백엔드가 인용 등장 순서로 실어 준다). 프론트가 다시 고르지 않는다.
+    // 대표책 = 첫 번째 **책** 픽(백엔드 인용 등장 순서). 웹 출처(type=web)는 대표책이 아니다
+    // — 비도서 질문에서 뉴스 제목이 토너먼트·핸드오프에 책처럼 새지 않게(렌더와 같은 규칙).
     function repTitle(card) {
-      return card && card.picks && card.picks.length ? card.picks[0].title : "";
+      const book = (card && card.picks || []).find((p) => !WEB_TYPES.has(p.type));
+      return book ? book.title : "";
     }
 
     function openTourney() {

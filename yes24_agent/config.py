@@ -61,15 +61,6 @@ class Settings(BaseSettings):
     # 발화는 진행 발화이지 본문이 아니므로 done.text에도 들어가지 않는다(원칙 4b).
     ack_max_chars: int = 120
     max_llm_calls: int = 50  # ADK RunConfig 상한
-    # 조건부 standalone 질의 재작성(멀티턴 지시대명사 해소, architecture-blueprint.md P4).
-    # 직전 턴이 있고 대명사/생략 신호가 있을 때만 좁은 flash 1회로 "그 책 목차"류를 명시
-    # 질의로 풀어 검색·라우팅 입력에 쓴다(사용자에게 보이는 답변·인용 계약은 불변). 리스크
-    # 높은 기능이라 기본 off로 dark-launch — 게이트가 단일턴·명시 질의를 건드리지 않아 off일
-    # 땐 기존과 바이트 단위 동일. 라이브 A/B(해소율↑·지연 회귀0)로 검증 후 on 전환.
-    standalone_rewrite: bool = False
-    # 재작성 시 참조할 직전 대화 턴 수(user+assistant 합산 상한). 맥락은 최근 몇 턴이면 충분.
-    standalone_rewrite_history_turns: int = 4
-    standalone_rewrite_timeout_s: float = 4.0  # 재작성 flash 호출 상한(초과 시 원본 fallback)
 
     # Yes24 크롤링
     yes24_base_url: str = "https://www.yes24.com"
@@ -116,6 +107,11 @@ class Settings(BaseSettings):
     # (Tavily의 snippet/raw_content 이원 구조와 달리 단일 필드). 분량은 아래 토큰 예산으로
     # 조절한다 — snippet이 곧 "종합 재료". 더 긴 전문이 필요하면 web_fetch(Tavily /extract).
     web_search_max_results: int = 8  # /search body의 max_results (퍼플렉시티 상한 20)
+    # 한 번의 web_search 호출에서 동시에 던질 검색 각도(쿼리) 수 상한. 퍼플렉시티식 질문 분해
+    # (복합·시의성·비교 질문을 여러 각도로 쪼개 병렬 검색 후 종합)의 폭. fetch_many_max_items가
+    # 상세 열람 배치에 하는 역할의 web_search판 — 컨텍스트·지연·벤더 요청 폭발을 막는 천장이며,
+    # 초과분은 조용히 버리지 않고 dropped_queries로 명시한다(fail-loud).
+    web_search_max_queries: int = 4
     web_search_max_tokens_per_page: int = 1024  # 결과당 snippet 콘텐츠 분량 상한(토큰)
     web_search_max_tokens: int = 12000  # 전체 결과 합산 콘텐츠 예산(토큰 폭발 방지)
     # 결과당 snippet 로컬 하드 상한(문자). 위 토큰 예산은 벤더(퍼플렉시티)에 보내는 요청 힌트라
@@ -165,6 +161,8 @@ class Settings(BaseSettings):
     # 활성화돼 미들웨어가 보호 경로(/ ·/matrix ·/chat/*)를 쿠키로 가린다. env `ACCESS_PASSWORD`로
     # 주입한다(하드코딩 대신 env). 진짜 인증이 아니라 데모 접근을 막는 단일 공유 비밀번호 게이트다.
     access_password: str = ""
+    # 로그인 쿠키 유효기간(초). 데모 접근 게이트라 재로그인 성가심을 줄이되 무한은 아니게 7일.
+    access_cookie_max_age_s: int = 7 * 24 * 60 * 60
     # 매트릭스 공유검색 전 경량 쿼리 정제 on/off. 채팅은 에이전트가 "핵심 제목·장르·저자만"으로
     # 검색어를 성형하지만 매트릭스는 질문을 그대로 검색해, 자연어 문장("~비슷한 소설 추천해줘")이
     # Yes24 0건 → 16카드 전부 폴백하는 데모 품질 이슈가 있다. on이면 매트릭스당 flash 1회

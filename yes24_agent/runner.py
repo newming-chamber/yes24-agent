@@ -50,7 +50,7 @@ from yes24_agent.query_understanding import (
     understand,
 )
 from yes24_agent.rbti.persona import is_valid_code
-from yes24_agent.routing import FLASH, select_route
+from yes24_agent.routing import FLASH, PRO, select_route
 from yes24_agent.session_service import (
     _POC_USER_ID,
     _get_session_lock,
@@ -201,11 +201,9 @@ async def run_agent_stream(
         # 출처를 중복시키므로 폴백하지 않고 정직 안내로 간다. (열기 thinking status는 제외.)
         emitted_output = False
 
-        # 질의이해: 값싼 모델 1회로 질의의 의미를 분류하고(intent·multistep·confidence), 필요하면
-        # 멀티턴 대명사·생략을 해소한 standalone 질의로 검색 입력을 맑힌다. 분류 실패·저확신이면
-        # 안전한 폴백(pro + 게이트 적용)으로 떨어진다 — 키워드 매칭은 쓰지 않는다.
-        history = getattr(session, "events", None) or []
-        understanding = await understand(message, history, settings)
+        # 질의이해: 값싼 모델 1회로 질의의 의미를 분류한다(intent·multistep·confidence). 분류
+        # 실패·저확신이면 안전한 폴백(pro + 게이트 적용)으로 떨어진다 — 키워드 매칭은 쓰지 않는다.
+        understanding = await understand(message, settings)
         search_query = understanding.standalone_query
         # 홀드 정책 확정: 접지가 필요 없는 질의는 첫 토큰부터 라이브로 흘린다. 접지가 필요한
         # 질의는 **그 턴이 필요로 하는 접지가 실제로 나온 뒤** 본문을 연다 — 상품 질의는 Yes24 상품
@@ -226,12 +224,11 @@ async def run_agent_stream(
         main_agent = root_agent_flash if route == FLASH else root_agent
 
         logger.info(
-            "모델 라우팅=%s intent=%s multistep=%s confident=%s rewritten=%s (session_id=%s)",
+            "모델 라우팅=%s intent=%s multistep=%s confident=%s (session_id=%s)",
             route,
             understanding.intent,
             understanding.multistep,
             understanding.confident,
-            understanding.rewritten,
             resolved_session_id,
         )
 
@@ -276,7 +273,7 @@ async def run_agent_stream(
                     if (
                         settings.error_fallback
                         and not retried_overload
-                        and active_route == "pro"
+                        and active_route == PRO
                         and not emitted_output
                         and _is_overloaded_error(exc)
                     ):
@@ -288,7 +285,7 @@ async def run_agent_stream(
                         )
                         await event_stream.aclose()
                         retried_overload = True
-                        active_route = "flash"
+                        active_route = FLASH
                         # 폐기되는 pro 시도가 홀드해 둔 본문 버퍼를 리셋한다. delta 홀드로
                         # 프리앰블이 delta 없이 버퍼에만 쌓인 채 폴백할 수 있는데
                         # (emitted_output=False라 폴백 발동), 안 지우면 폐기된 pro 프리앰블이

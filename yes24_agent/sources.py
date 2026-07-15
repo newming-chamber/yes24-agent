@@ -10,10 +10,23 @@ ADK State 주의사항: State는 dict처럼 보이지만 변경 추적이 재할
 """
 
 from collections.abc import MutableMapping
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # 세션 스코프 키 (temp: 접두사 금지 — 멀티턴에서 이전 턴 출처도 유지되어야 함)
 SOURCES_STATE_KEY = "sources"
+
+# KST(UTC+9). 도구·매트릭스가 "오늘"·검색시각(checked_at)을 계산하는 단일 기준.
+# 값 자체는 외부 사실이지만, 10개 파일에 재정의돼 있던 것을 여기 한 곳으로 모은다.
+KST = timezone(timedelta(hours=9))
+
+
+def now_checked_at() -> str:
+    """도구 결과의 checked_at(KST 기준 "YYYY-MM-DD HH:MM")을 조립한다.
+
+    7개 도구·매트릭스가 같은 문자열을 만들던 것을 단일 함수로 모은다 — 포맷이 갈라지면
+    프론트가 시각을 다르게 렌더하므로 한 곳에서만 정의한다."""
+    return datetime.now(KST).strftime("%Y-%m-%d %H:%M")
 
 
 def register_source(

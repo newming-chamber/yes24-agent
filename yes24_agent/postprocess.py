@@ -216,19 +216,25 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
                 ", ".join(str(i) for i in invalid_in_marker),
                 match.group(0),
             )
-            # 마커 제거 흔적 정리(제거 시에만 동작): "…담고 있어요 [9] ." 처럼 마커를 지우면 "공백
-            # 마침표"(" .")·중복 공백("단어  단어")이 남는다. 앞 조각이 공백으로 끝나면 (1) 남은
-            # 본문 선두의 잉여 공백을 흡수(중복 공백 방지)하고, (2) 그 뒤가 문장부호면 앞 조각의
-            # 후행 공백도 제거해 고아 마침표를 없앤다. output_len·cursor를 함께 조정하므로 이후 유효
-            # 마커의 위치(supports 인덱스)는 정합을 유지한다(공백 정리만 — 정상 본문 내용 불변).
-            if cleaned_parts and cleaned_parts[-1].endswith((" ", "\t")):
-                rest = text[cursor:]
-                stripped_rest = rest.lstrip(" \t")
-                cursor += len(rest) - len(stripped_rest)  # 잉여 선두 공백 소비(미출력)
-                if stripped_rest[:1] in (".", ",", "!", "?", ";", ":", ")", "]"):
+            # 마커 제거 흔적 정리(제거 시에만 동작): 마커를 지우면 "공백 마침표"(" .")·중복 공백
+            # ("단어  단어")이 남는다. **마커 뒤가 문장부호면** 그 앞 공백을 모두 없애 고아 마침표를
+            # 막는다 — 앞 조각의 후행 공백과 남은 본문 선두 공백 양쪽을 정리하며, 앞 조각이 공백으로
+            # 끝나지 않아도("발생합니다[9] .") 부호 앞 선두 공백을 흡수한다. 부호가 아닌 일반 단어
+            # 앞이면 앞 조각이 공백으로 끝날 때만 중복 공백을 하나로 줄인다.
+            # output_len·cursor를 함께
+            # 조정하므로 이후 유효 마커의 위치(supports 인덱스)는 정합을 유지한다(공백 정리만).
+            rest = text[cursor:]
+            stripped_rest = rest.lstrip(" \t")
+            leading_ws = len(rest) - len(stripped_rest)
+            prefix_ends_space = bool(cleaned_parts) and cleaned_parts[-1].endswith((" ", "\t"))
+            if stripped_rest[:1] in (".", ",", "!", "?", ";", ":", ")", "]"):
+                cursor += leading_ws  # 부호 앞 선두 공백 흡수(미출력)
+                if prefix_ends_space:
                     trimmed = cleaned_parts[-1].rstrip(" \t")
                     output_len -= len(cleaned_parts[-1]) - len(trimmed)
                     cleaned_parts[-1] = trimmed
+            elif prefix_ends_space and leading_ws:
+                cursor += leading_ws  # 중복 공백 → 하나로
             continue
 
         if invalid_in_marker:

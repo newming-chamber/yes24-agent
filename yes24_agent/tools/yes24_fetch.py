@@ -10,22 +10,19 @@ error_type="empty"로 정직하게 반환한다.
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
 from bs4 import BeautifulSoup
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
-from yes24_agent.sources import register_source
+from yes24_agent.sources import now_checked_at, register_source
 from yes24_agent.tools.yes24_search import _get_client
 from yes24_agent.yes24.client import Yes24FetchError
 from yes24_agent.yes24.parsers import ParseError, extract_links, parse_product, product_fields
 
 logger = logging.getLogger(__name__)
 
-# KST(UTC+9). checked_at 타임스탬프용.
-_KST = timezone(timedelta(hours=9))
 
 # 상품 상세 페이지 경로 식별자.
 _GOODS_PATH = "/product/goods/"
@@ -136,7 +133,7 @@ def build_result_from_html(
     find는 범용 어포던스로, 상세(book_detail)·공지(notice) 양쪽에 적용된다 — 상세에서는
     키워드를 포함한 블록을 예산 우선순위 앞으로 당기고, 공지에서는 키워드 주변 창을 잘라준다.
     """
-    checked_at = datetime.now(_KST).strftime("%Y-%m-%d %H:%M")
+    checked_at = now_checked_at()
 
     links = extract_links(
         html,

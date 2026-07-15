@@ -89,11 +89,10 @@ _CLASSIFY_SCHEMA = {
 class QueryUnderstanding:
     """질의이해 결과. 호출부(runner)는 이 값 타입만 보고 라우팅·게이트를 결정한다."""
 
-    standalone_query: str  # 검색·라우팅 입력으로 쓸 질의(대명사 해소 후 또는 원본)
+    standalone_query: str  # 검색·라우팅 입력으로 쓸 질의(원본)
     intent: str  # INTENTS 중 하나
     multistep: bool  # 다단계 추론이 필요한가(→ pro 라우팅)
     confident: bool  # 분류가 확실한가(실패·타임아웃·저확신이면 False)
-    rewritten: bool  # standalone 재작성이 실제로 일어났는지(로깅·A/B용)
 
     @property
     def needs_grounding(self) -> bool:
@@ -118,7 +117,6 @@ def fallback(query: str) -> QueryUnderstanding:
         intent=WEB,
         multistep=True,
         confident=False,
-        rewritten=False,
     )
 
 
@@ -228,145 +226,13 @@ async def classify(message: str, settings: Settings) -> QueryUnderstanding:
         intent=intent,
         multistep=multistep,
         confident=confident,
-        rewritten=False,
     )
 
 
-# ── 조건부 standalone 재작성 (멀티턴 대명사·생략 해소) ────────────────────────
-# 앞 맥락에 기대는 불완전 질의를 그 자체로 완결된 검색 질의로 푼다. 리스크 관리가 핵심이라
-# **게이트를 좁게**(고정밀 신호만) 두고, 재작성이 조금이라도 수상하면 원본으로 fallback한다.
-# 게이트를 통과 못 하는 단일턴·명시 질의는 원본 그대로라 기존 동작과 바이트 단위 동일하다.
+async def understand(message: str, settings: Settings) -> QueryUnderstanding:
+    """질의이해: 값싼 모델 1회로 의미(intent·multistep·confidence)를 분류한다.
 
-# 앞 턴을 되가리키는 지시대명사·생략 신호(고정밀만). "그/저/이 + 대상"류와 시점 참조어.
-# 정밀도 우선 — 이 신호가 있어도 직전 턴이 없으면 재작성하지 않는다. 순수 생략("얼마야?"처럼
-# 주어 없는 속성질문)은 오탐 위험이 커 의도적으로 제외한다(놓쳐도 원본 fallback=무해).
-_ANAPHORA = (
-    "그 책", "그책", "그 작가", "그작가", "그 저자", "그저자", "그 소설", "그 시리즈",
-    "그거", "그걸", "그것", "그건", "그게", "그 상품", "그 제품",
-    "저 책", "저거", "저것", "저 상품",
-    "이 책", "이거", "이걸", "이것", "이 상품", "이 제품",
-    "위에", "위의", "방금", "아까", "앞에서", "앞의", "걔", "얘",
-)
-
-_REWRITE_PROMPT = """다음은 사용자와 어시스턴트의 대화다. 마지막 사용자 질문을 앞 맥락의
-지시대명사·생략을 풀어 **그 자체로 완결된 검색 질의**로 다시 써라.
-
-규칙:
-- 대명사("그 책", "이거", "그 작가" 등)가 가리키는 대상을 앞 맥락에서 찾아 명시로 치환한다.
-- 새로운 정보·조건을 추가하지 말고, 질문의 의도·범위를 바꾸지 마라.
-- 이미 그 자체로 완결된 질문이면 원문을 그대로 반환한다.
-- 설명 없이 다시 쓴 질의 한 줄만 출력한다.
-
-[대화]
-{context}
-
-[마지막 사용자 질문]
-{message}
-
-[완결된 검색 질의]"""
-
-
-def needs_standalone_rewrite(message: str, has_history: bool) -> bool:
-    """재작성 게이트(순수, 부수효과 없음): 직전 턴이 있고 대명사/생략 신호가 있을 때만 True.
-
-    둘 다 충족해야 한다 — 단일턴(has_history=False)이나 명시 질의(신호 없음)는 건드리지
-    않는다(오작동 0 우선). 이 게이트가 False면 호출부는 LLM을 아예 부르지 않고 원본을 쓴다.
+    실패·저확신이면 안전한 폴백(pro + 게이트 적용)으로 떨어진다. 멀티턴 지시대명사·생략은
+    LLM이 세션 히스토리 문맥으로 직접 해소하므로 별도 재작성 단계를 두지 않는다.
     """
-    if not has_history or not message:
-        return False
-    text = message.strip()
-    return any(kw in text for kw in _ANAPHORA)
-
-
-def _format_history(history: list[types.Content], max_turns: int) -> str:
-    """세션 히스토리(최근 max_turns턴)를 재작성 프롬프트용 텍스트로 조립한다."""
-    lines: list[str] = []
-    for content in history[-max_turns:]:
-        parts = getattr(content, "parts", None) or []
-        text = " ".join(p.text for p in parts if getattr(p, "text", None)).strip()
-        if not text:
-            continue
-        speaker = "사용자" if getattr(content, "role", "") == "user" else "어시스턴트"
-        lines.append(f"{speaker}: {text}")
-    return "\n".join(lines)
-
-
-def _is_safe_rewrite(original: str, rewritten: str) -> bool:
-    """재작성 결과가 원본을 대체해도 안전한지 검사(수상하면 False → 원본 fallback).
-
-    빈 문자열·원본과 동일·과도 팽창(환각/장황)을 거른다. 애매하면 안 쓴다(보수적).
-    """
-    candidate = rewritten.strip()
-    if not candidate or candidate == original.strip():
-        return False
-    # 대명사 해소는 몇 단어 늘어나는 정도다. 원본 대비 과도하게 길면 새 정보를 지어냈다고 보고
-    # 버린다(길이 상한은 이 규칙과 함께 두는 지역 튜닝 상수).
-    return len(candidate) <= len(original.strip()) * 4 + 40
-
-
-async def _call_flash_rewrite(prompt: str, settings: Settings) -> str:
-    """좁은 flash 1회로 재작성 질의를 받는다(thinking=0, 타임아웃 하드). 실패 시 예외 전파.
-
-    별도 헬퍼로 분리해 understand()의 게이트·검증·fallback 로직을 LLM 없이 단위 테스트한다.
-    """
-    from google import genai  # 지연 import — 재작성 비활성/미발동 경로에 부담을 주지 않는다.
-
-    client = genai.Client()
-    response = await asyncio.wait_for(
-        client.aio.models.generate_content(
-            model=settings.flash_model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(
-                    thinking_budget=settings.flash_thinking_budget
-                )
-            ),
-        ),
-        timeout=settings.standalone_rewrite_timeout_s,
-    )
-    return response.text or ""
-
-
-async def understand(
-    message: str,
-    history: list[types.Content],
-    settings: Settings,
-) -> QueryUnderstanding:
-    """질의이해: 의미 분류(항상) + 조건부 standalone 재작성.
-
-    분류(classify)는 값싼 모델 1회로 intent·multistep·confidence를 얻고, 실패·저확신이면 안전한
-    폴백(pro + 게이트 적용)으로 떨어진다. 재작성은 (1) settings.standalone_rewrite가 켜져 있고
-    (2) 게이트(직전 턴+대명사 신호)를 통과할 때만 수행하며, 실패·수상하면 원본으로 회귀한다.
-    분류는 **원본 질의** 기준이다 — 재작성 규칙이 의도·범위 보존이라 부류가 바뀌지 않는다.
-    """
-    understanding = await classify(message, settings)
-
-    if not settings.standalone_rewrite:
-        return understanding
-    if not needs_standalone_rewrite(message, has_history=bool(history)):
-        return understanding
-
-    context = _format_history(history, settings.standalone_rewrite_history_turns)
-    if not context:  # 참조할 실질 맥락이 없으면 재작성 의미 없음
-        return understanding
-
-    prompt = _REWRITE_PROMPT.format(context=context, message=message.strip())
-    try:
-        candidate = await _call_flash_rewrite(prompt, settings)
-    except Exception as exc:  # noqa: BLE001 — 재작성은 부가기능, 어떤 실패도 원본으로 안전 회귀
-        logger.warning("standalone 재작성 실패, 원본 사용: %s", exc)
-        return understanding
-
-    if not _is_safe_rewrite(message, candidate):
-        logger.info("standalone 재작성 폐기(빈결과·무변화·과팽창), 원본 사용")
-        return understanding
-
-    rewritten_query = candidate.strip()
-    logger.info("standalone 재작성: %r → %r", message, rewritten_query)
-    return QueryUnderstanding(
-        standalone_query=rewritten_query,
-        intent=understanding.intent,
-        multistep=understanding.multistep,
-        confident=understanding.confident,
-        rewritten=True,
-    )
+    return await classify(message, settings)

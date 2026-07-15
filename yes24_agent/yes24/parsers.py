@@ -695,17 +695,11 @@ def _format_span(months: int) -> str:
     return " ".join(parts)
 
 
-GROUNDING_FIELDS = (
-    "goods_no",
-    "author",
-    "publisher",
-    "pub_date",
-    "price",
-    "rating",
-    "sale_index",
-    "review_count",
-    "image_url",
-)
+# 출처 등록·반환에 실을 접지 필드 = 상품 레코드(_ITEM_FIELDS)에서 출처 식별자(title·url)만 뺀
+# 나머지. 손으로 재나열하면 _ITEM_FIELDS에 필드를 늘렸을 때 여기서 소실된다(drift) —
+# 파생으로 묶는다.
+_SOURCE_IDENTITY_FIELDS = ("title", "url")
+GROUNDING_FIELDS = tuple(f for f in _ITEM_FIELDS if f not in _SOURCE_IDENTITY_FIELDS)
 
 
 def product_fields(item: Mapping) -> dict:

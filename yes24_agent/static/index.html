@@ -455,13 +455,16 @@
 
   <script type="module">
     // 공용 모듈(단일 사본) — 마크다운·인용 렌더, SSE, RBTI 축 정의, 출처 유틸.
-    import { renderBody as renderMarkdown } from "/static/lib/md.js";
-    import { readEventStream } from "/static/lib/sse.js";
+    // ?v=1은 **일회성** 캐시 탈출구다: no-cache 헤더가 붙기 전 구버전을 heuristic-freshness로
+    // 붙든 브라우저가 무쿼리 URL을 재요청하지 않는 문제를, 한 번도 캐시된 적 없는 새 URL로 우회한다.
+    // 이후 모듈이 바뀌어도 이 숫자를 올릴 필요 없다 — 서버 no-cache가 매번 재검증하니까(자라지 않음).
+    import { renderBody as renderMarkdown } from "/static/lib/md.js?v=1";
+    import { readEventStream } from "/static/lib/sse.js?v=1";
     import {
       AXES as RBTI_AXES, parseCode as parseRbtiCode, deriveCode,
       RBTI_STORAGE_KEY, MATRIX_HANDOFF_KEY,
-    } from "/static/lib/rbti.js";
-    import { WEB_TYPES, coverUrl, isSafeUrl, safeOpen } from "/static/lib/sources.js";
+    } from "/static/lib/rbti.js?v=1";
+    import { WEB_TYPES, coverUrl, isSafeUrl, safeOpen } from "/static/lib/sources.js?v=1";
 
     // 16유형 비교(/matrix) 네비 링크는 서버 배포 게이팅(matrix_enabled)을 따라간다.
     // 기본 hidden(fail-closed: 프로드 숨김)이고, /matrix가 살아 있을 때만(200) 노출한다.

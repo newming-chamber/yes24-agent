@@ -9,12 +9,11 @@ yes24_search와 마찬가지로 결과를 세션 state의 출처 레지스트리
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
 
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
-from yes24_agent.sources import register_source
+from yes24_agent.sources import now_checked_at, register_source
 from yes24_agent.tools.yes24_search import _get_client
 from yes24_agent.yes24.client import Yes24FetchError
 from yes24_agent.yes24.parsers import ParseError, parse_browse_list, product_fields
@@ -22,8 +21,6 @@ from yes24_agent.yes24.urls import BROWSE_SEED_URLS
 
 logger = logging.getLogger(__name__)
 
-# KST(UTC+9). checked_at 타임스탬프용.
-_KST = timezone(timedelta(hours=9))
 
 
 async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
@@ -85,7 +82,7 @@ async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
             "result_count": 0,
         }
 
-    checked_at = datetime.now(_KST).strftime("%Y-%m-%d %H:%M")
+    checked_at = now_checked_at()
 
     results: list[dict] = []
     for item in parsed:

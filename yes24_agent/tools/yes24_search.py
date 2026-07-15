@@ -10,20 +10,17 @@
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
 
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import Settings, get_settings
-from yes24_agent.sources import register_source
+from yes24_agent.sources import now_checked_at, register_source
 from yes24_agent.yes24.client import Yes24Client, Yes24FetchError
 from yes24_agent.yes24.parsers import ParseError, parse_search, product_fields
 from yes24_agent.yes24.urls import SEARCH_SECTIONS, search_url
 
 logger = logging.getLogger(__name__)
 
-# KST(UTC+9). checked_at 타임스탬프용.
-_KST = timezone(timedelta(hours=9))
 
 # 모듈 레벨 공유 클라이언트 (lazy 싱글턴). Yes24Client는 스로틀·동시성 상태를
 # 내부에 들고 있으므로 프로세스 전체가 하나의 인스턴스를 공유해야 예의 있는 트래픽이 된다.
@@ -98,7 +95,7 @@ async def yes24_search(query: str, section: str, tool_context: ToolContext) -> d
             "result_count": 0,
         }
 
-    checked_at = datetime.now(_KST).strftime("%Y-%m-%d %H:%M")
+    checked_at = now_checked_at()
 
     if not parsed:
         logger.info("yes24_search query=%r status=ok results=0", query)

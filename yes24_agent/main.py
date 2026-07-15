@@ -42,10 +42,23 @@ _LOGIN_HTML = Path(__file__).parent / "static" / "login.html"
 # 코드를 이 디렉터리 한 사본으로 모으고 index/matrix가 /static/lib/*.js로 임포트한다.
 _STATIC_LIB_DIR = Path(__file__).parent / "static" / "lib"
 
+
+class _NoCacheStaticFiles(StaticFiles):
+    """항상 재검증시키는 정적 파일 서버(Cache-Control: no-cache).
+
+    페이지 HTML은 FileResponse라 매번 새로 읽히는데, 거기서 import한 ES 모듈만 브라우저
+    캐시에 눌러앉아 구버전이 실행되는 문제가 있었다(마크다운 리터럴 누출의 정체). no-cache는
+    조건부 요청(ETag/Last-Modified 304)으로 값싸게 최신을 보장한다 — 버전 쿼리를 파일마다
+    붙여 관리하는 대신 서버 한 곳에서 끝낸다.
+    """
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
 # 로그인월이 켜져도 통과시키는 예외 경로(헬스체크·로그인 페이지 자체).
 _ACCESS_EXEMPT_PATHS = frozenset({"/health", "/login"})
-# 로그인 쿠키 유효기간(초). 데모 접근 게이트라 재로그인 성가심을 줄이되 무한은 아니게 7일.
-_ACCESS_COOKIE_MAX_AGE = 7 * 24 * 60 * 60
 
 # --- 공유 패스워드 로그인월(토큰·검증) ---
 # 진짜 인증 시스템이 아니라 데모 접근을 막는 단일 공유 비밀번호 게이트다(config.access_password).
@@ -169,7 +182,7 @@ def create_app() -> FastAPI:
                 resp.set_cookie(
                     ACCESS_COOKIE,
                     expected_token(settings.access_password),
-                    max_age=_ACCESS_COOKIE_MAX_AGE,
+                    max_age=settings.access_cookie_max_age_s,
                     httponly=True,
                     samesite="lax",
                 )
@@ -179,7 +192,9 @@ def create_app() -> FastAPI:
 
     # 공용 프론트 모듈만 노출한다(페이지 HTML은 각 라우트가 담당). 로그인월이 켜져 있으면 이
     # 경로도 미들웨어 게이트를 통과해야 한다(같은 출처 fetch라 쿠키가 함께 간다).
-    app.mount("/static/lib", StaticFiles(directory=_STATIC_LIB_DIR), name="static-lib")
+    # no-cache로 항상 재검증시킨다 — 페이지 HTML(FileResponse)은 매번 새로 읽는데 import된 ES
+    # 모듈만 브라우저에 눌러앉아 구버전이 실행되던 문제를 막는다(버전 쿼리 없이 단일 지점 해결).
+    app.mount("/static/lib", _NoCacheStaticFiles(directory=_STATIC_LIB_DIR), name="static-lib")
 
     @app.get("/")
     async def index() -> FileResponse:
