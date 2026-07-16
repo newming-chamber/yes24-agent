@@ -66,6 +66,12 @@ def sse_delta(text: str, col: int | None = None, extra: dict | None = None) -> s
     return format_sse("delta", _with_col(data, col))
 
 
+def sse_reset() -> str:
+    """스트리밍 중 도구 호출로 진행 발화가 폐기될 때, 프론트가 지금까지 흘린 본문 버블을
+    비우게 하는 이벤트. 최종 답변만 남기기 위해(진행 발화는 본문 소유권 없음, 원칙 4b)."""
+    return format_sse("reset", {})
+
+
 def sse_done(payload: dict, col: int | None = None) -> str:
     """최종 출처 목록·grounding_supports·session_id를 담은 종료 이벤트."""
     return format_sse("done", _with_col(payload, col))

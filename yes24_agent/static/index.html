@@ -949,6 +949,13 @@
           renderBody(rawText);
           scrollToBottom();
         },
+        // 스트리밍 중 진행발화가 폐기될 때(백엔드 reset 이벤트) 흘린 본문 버블을 비우고
+        // 다음 스트림을 새로 시작한다. 최종 답변만 남기기 위해(진행 발화는 본문 소유권 없음).
+        resetBody() {
+          rawText = "";
+          firstDelta = false;
+          renderBody("");
+        },
         finalize(payload, elapsedSec) {
           // error로 끝난 턴이면(백엔드가 error 뒤 done을 함께 보냄) 빨간 안내 말풍선을
           // 그대로 두고 "응답 X초" meta를 붙이지 않는다.
@@ -1167,6 +1174,8 @@
             asst.addSource(data);
           } else if (event === "delta") {
             asst.appendDelta(data.text || "");
+          } else if (event === "reset") {
+            asst.resetBody();
           } else if (event === "done") {
             if (data.session_id) {
               sessionId = data.session_id;

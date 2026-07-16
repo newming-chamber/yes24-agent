@@ -46,7 +46,14 @@ from yes24_agent.sources import (
     get_sources,
     merge_turn_source_records,
 )
-from yes24_agent.sse import sse_delta, sse_done, sse_error, sse_source, sse_status
+from yes24_agent.sse import (
+    sse_delta,
+    sse_done,
+    sse_error,
+    sse_reset,
+    sse_source,
+    sse_status,
+)
 from yes24_agent.turn_assembly import _event_text
 
 logger = logging.getLogger(__name__)
@@ -180,6 +187,11 @@ async def run_agent_stream(
         current_turn: list[str] = []
         final_text = ""
         requires_grounding = False
+        # 이번 턴에 partial 본문 조각을 실제로 delta로 흘려보냈는지(퍼플렉시티식 토큰 스트리밍).
+        # True면 마감에서 최종 본문을 단일 delta로 다시 보내지 않고(중복 방지) done만 방출한다.
+        # 도구 호출로 진행발화가 폐기되거나 오버로드 재시도로 시도가 폐기되면 sse_reset 후 False로
+        # 되돌려, 프론트가 흘린 버블을 비우고 다음 스트림을 깨끗한 화면에서 시작하게 한다.
+        streamed_body = False
         # 모든 턴의 본문은 최종 인용 검증까지 홀드한다. 분류가 외부 근거 필요성을 오판해도
         # 도구 사용 가능 에이전트가 질문 자체를 보고 검색할 수 있어야 한다.
         # 반응형 폴백의 안전 조건: 사용자에게 보이는 프레임(delta·source·도구/에러 status)을
@@ -253,6 +265,11 @@ async def run_agent_stream(
                         turn_texts = []
                         current_turn = []
                         final_text = ""
+                        # 폐기되는 시도가 이미 본문을 스트림했으면 프론트 버블을 비워, 재시도가
+                        # 깨끗한 화면에서 시작하게 한다(중복 본문 방지).
+                        if streamed_body:
+                            yield sse_reset()
+                            streamed_body = False
                         # 같은 세션·같은 메시지를 같은 pro로 재실행한다. 이전 시도가 이미 이 user
                         # 메시지를 세션에 append했으므로 히스토리에 user 턴이 한 번 더 붙지만
                         # (ADK가 매 run_async 시작에 append), 아무 응답도 못 낸 실패라 중복
@@ -279,6 +296,10 @@ async def run_agent_stream(
                 if not event.partial and event.get_function_calls():
                     # 도구 호출 전 텍스트는 진행 발화이므로 최종 본문 소유권이 없다.
                     current_turn = []
+                    # 이 진행 발화를 이미 토큰으로 흘렸으면 프론트 버블을 비운다(최종 답변만 남김).
+                    if streamed_body:
+                        yield sse_reset()
+                        streamed_body = False
                     for call in event.get_function_calls():
                         stage, detail = _status_for_call(call)
                         emitted_output = True
@@ -320,11 +341,16 @@ async def run_agent_stream(
                                 observed_sources.append(source_event)
                     continue
 
-                # 3) partial은 도구 호출 여부가 확정될 때까지 사용자에게 노출하지 않는다.
+                # 3) partial 토큰 조각을 곧바로 delta로 흘려보낸다(퍼플렉시티/ChatGPT식 스트리밍).
+                #    조각은 current_turn에도 누적해 홀드 경로 fallback을 유지하고, 도구 호출이
+                #    뒤따라 진행발화로 판명되면 sse_reset으로 프론트 버블을 비운다(원칙 4b).
                 if event.partial:
                     chunk = _event_text(event)
                     if chunk:
                         current_turn.append(chunk)
+                        emitted_output = True
+                        streamed_body = True
+                        yield sse_delta(chunk)
                     continue
 
                 # 4) 최종 집계 텍스트 → partial이 없던 경로의 본문 확정.
@@ -406,9 +432,13 @@ async def run_agent_stream(
                 final_done["text"] = _EMPTY_RESPONSE_FALLBACK
             for source in final_done.get("sources", []):
                 yield sse_source(source)
-            remaining_delta = _final_body_delta(final_done)
-            if remaining_delta:
-                yield sse_delta(remaining_delta)
+            # 이미 토큰째 흘린 본문(streamed_body=True)이면 최종 단일 delta를 생략한다 — done.text
+            # (검증본)를 프론트 finalize가 흘린 rawText와 대조해 조용히 교체(인용 마커 정리 반영).
+            # 비스트리밍·aggregate-only·최후방어 경로에서만 최종 delta를 방출한다.
+            if not streamed_body:
+                remaining_delta = _final_body_delta(final_done)
+                if remaining_delta:
+                    yield sse_delta(remaining_delta)
             yield sse_done(final_done)
 
         except asyncio.TimeoutError:
@@ -419,6 +449,10 @@ async def run_agent_stream(
             )
             error_text = "응답이 너무 지연되고 있어요. 잠시 후 다시 시도해 주세요."
             yield sse_error(error_text)
+            # 이미 토큰을 흘렸으면 프론트 버블을 비우고 best_effort를 새로 흘린다(중복 방지).
+            if streamed_body:
+                yield sse_reset()
+                streamed_body = False
             best_effort = _best_effort_text(turn_texts, current_turn, final_text)
             _, error_done = _finalize_answer(
                 best_effort,
@@ -443,6 +477,10 @@ async def run_agent_stream(
             logger.exception("스트림 처리 중 예외 발생: %s", exc)
             error_text = "일시적인 오류가 발생했어요. 잠시 후 다시 시도해 주세요."
             yield sse_error(error_text)
+            # 이미 토큰을 흘렸으면 프론트 버블을 비우고 best_effort를 새로 흘린다(중복 방지).
+            if streamed_body:
+                yield sse_reset()
+                streamed_body = False
             best_effort = _best_effort_text(turn_texts, current_turn, final_text)
             _, error_done = _finalize_answer(
                 best_effort,
