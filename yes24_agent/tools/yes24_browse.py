@@ -94,6 +94,7 @@ async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
             url=item["url"],
             source_type="browse",
             snippet=item.get("author"),
+            checked_at=checked_at,
             meta={**fields, "rank": item.get("rank")},
         )
         results.append(
@@ -103,6 +104,7 @@ async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
                 "rank": item.get("rank"),
                 "title": item["title"],
                 "url": item["url"],
+                "checked_at": checked_at,
                 **fields,
             }
         )

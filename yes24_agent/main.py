@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from hashlib import sha256
 from pathlib import Path
 from secrets import compare_digest
+from typing import Annotated
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -22,7 +23,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, StringConstraints
 
 from yes24_agent.config import ensure_google_api_key_env, get_settings
 from yes24_agent.matrix.matrix_runner import run_matrix_stream
@@ -32,7 +33,7 @@ from yes24_agent.tools.yes24_search import aclose_shared_client as aclose_yes24_
 
 logger = logging.getLogger(__name__)
 
-# 테스트용 웹 채팅 UI(단일 self-contained HTML). 인증 없음 — 개발/데모 용도.
+# 웹 채팅 UI(단일 self-contained HTML).
 _INDEX_HTML = Path(__file__).parent / "static" / "index.html"
 # 16뷰 RBTI 매트릭스 시뮬레이터 UI(C4/matrix-ux 소유). 인증 없음 — 개발/데모 용도.
 _MATRIX_HTML = Path(__file__).parent / "static" / "matrix.html"
@@ -91,10 +92,13 @@ def password_matches(candidate: str, password: str) -> bool:
     return compare_digest(candidate.encode("utf-8"), password.encode("utf-8"))
 
 
+NonBlankText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
 class ChatRequest(BaseModel):
     """`/chat/stream` 요청 본문."""
 
-    message: str
+    message: NonBlankText
     session_id: str | None = None
     # RBTI 독서 페르소나 코드(4글자, 예: "CADI"). 없거나 무효면 페르소나 미적용(기존 동작).
     rbti: str | None = None
@@ -103,7 +107,7 @@ class ChatRequest(BaseModel):
 class MatrixRequest(BaseModel):
     """`/chat/matrix` 요청 본문(16뷰 매트릭스 시뮬레이터)."""
 
-    question: str
+    question: NonBlankText
     session_id: str | None = None
 
 
@@ -198,7 +202,7 @@ def create_app() -> FastAPI:
 
     @app.get("/")
     async def index() -> FileResponse:
-        """테스트용 웹 채팅 UI를 반환한다(로그인월 활성 시 쿠키 필요)."""
+        """웹 채팅 UI를 반환한다(로그인월 활성 시 쿠키 필요)."""
         return FileResponse(_INDEX_HTML, media_type="text/html")
 
     # RBTI 16뷰 매트릭스는 배포 게이팅(matrix_enabled). off면 /matrix·/chat/matrix 라우트를

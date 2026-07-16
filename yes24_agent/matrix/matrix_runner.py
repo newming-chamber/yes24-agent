@@ -1,9 +1,8 @@
 """C3 — 16뷰 매트릭스 SSE 스트림 오케스트레이션.
 
-`/chat/matrix` 엔드포인트의 심장. 공유 검색 1회(build_shared_pool) → 16 fan-out 생성
-(generate_matrix)을 SSE 프레임으로 번역해 yield한다. 채팅 runner를 재사용하지 않는 별도
-경로다(도구 루프·게이트 재진입 없음 — 매트릭스는 생성 단계에 도구가 없고, 셀 게이트는
-재검색 대신 정직 폴백).
+`/chat/matrix` 엔드포인트의 심장. Yes24 공유 검색·상세 열람·구조화 선택 1회
+(build_shared_pool) → 서버 렌더링 16뷰(generate_matrix)를 SSE 프레임으로 번역해 yield한다.
+채팅 runner를 재사용하지 않는 도서 탐색 전용 경로다.
 
 SSE 계약(프론트 C4/matrix-ux 계약):
 - **글로벌 프레임**(col 필드 없음 — /chat/stream과 동형):
@@ -18,18 +17,16 @@ SSE 계약(프론트 C4/matrix-ux 계약):
     매핑표를 중복 보유하지 않게 — persona.py가 단일 소스, JS는 import 못 함).
   - `event: done` {sources, grounding_supports, session_id, col, fallback, gate_reason, picks}:
     그 열의 인용 검증된 출처(공유 풀의 부분집합)·grounding_supports + **폴백 플래그** +
-    **구조화된 picks**. fallback(bool)이 정직 폴백 셀 여부를 명시하고, gate_reason은 사유
-    (정상 null|"mismap"|"unsourced"|"pool_escape"|"empty"|"error"). picks는 그 셀이 실제로 고른
-    책의 레코드 목록(인용 등장 순서, 대표책=picks[0]; 폴백 셀은 []) — 각 원소는
-    {source_id, title, url, price, rating, image_url, author, publisher, pub_status, …}로
-    공유 풀 후보 = product_fields 스키마 그대로다. 완료 순서로 col 라우팅.
+    **구조화된 picks**. fallback(bool)이 정직 폴백 셀 여부를 명시하고, gate_reason은
+    정상 null 또는 "empty"|"error"다. picks는 그 셀이 실제로 고른 책의 id 목록이며
+    대표책은 picks[0]이다. 폴백 셀은 빈 목록이다.
 
     **프론트는 카드 본문을 파싱하지 않는다.** 폴백 여부·대표책·표지·가격은 전부 이 명시 필드가
     단일 출처다 — 같은 판정을 LLM 산문에서 정규식으로 복원하면 백엔드의 인용 검증·풀 접지 판정과
     이중 구현이 되어 어긋나고, 파서가 실패하는 순간 대표책·표지가 통째로 사라진다.
 
-열은 생성 완료 순서로 도착하므로 col 인덱스로 카드를 채운다(순차 아님). 상품 사실은 공유 풀
-(Yes24 출처)만 근거하며, 각 열은 인용 검증·cited-fabricated·풀밖 게이트를 통과한 것만 나온다.
+열은 서버에서 코드·col 순서로 렌더되며 프론트는 col 인덱스로 카드를 채운다. 상품 사실은 공유 풀
+(Yes24 출처)만 근거하며, 각 열의 인용 마커는 실제 공유 출처 id와 대조된다.
 """
 
 from __future__ import annotations
@@ -39,6 +36,7 @@ import uuid
 from collections.abc import AsyncIterator
 
 from yes24_agent.config import get_settings
+from yes24_agent.event_translate import project_public_source
 from yes24_agent.matrix.generate import generate_matrix
 from yes24_agent.matrix.retrieval import build_shared_pool
 from yes24_agent.rbti.persona import axis_label, get_archetype_name
@@ -47,9 +45,7 @@ from yes24_agent.sse import sse_delta, sse_done, sse_error, sse_source, sse_stat
 logger = logging.getLogger(__name__)
 
 
-async def run_matrix_stream(
-    question: str, session_id: str | None = None
-) -> AsyncIterator[str]:
+async def run_matrix_stream(question: str, session_id: str | None = None) -> AsyncIterator[str]:
     """질문 1건에 대한 16뷰 매트릭스를 SSE 프레임 문자열로 스트리밍한다.
 
     어떤 예외가 나도 제너레이터가 예외로 죽지 않고 error + 글로벌 done으로 마감한다
@@ -58,12 +54,18 @@ async def run_matrix_stream(
     settings = get_settings()
     resolved_session_id = session_id or uuid.uuid4().hex
 
-    def _terminal_done(sources: list[dict]) -> str:
+    def _public_without_snippet(source: dict) -> dict:
+        return {
+            key: value for key, value in project_public_source(source).items() if key != "snippet"
+        }
+
+    def _terminal_done(sources: list[dict], models: dict[str, str] | None = None) -> str:
         return sse_done(
             {
-                "sources": sources,
+                "sources": [_public_without_snippet(source) for source in sources],
                 "grounding_supports": [],
                 "session_id": resolved_session_id,
+                "models": models or {},
             }
         )
 
@@ -71,16 +73,16 @@ async def run_matrix_stream(
         yield sse_status("thinking", "질문을 확인하고 있어요")
 
         pool = await build_shared_pool(question, settings)
+        selected_ids = {pick.source_id for picks in pool.picks.values() for pick in picks}
+        visible_sources = [source for source in pool.sources if source.get("id") in selected_ids]
 
         # 공유 풀 출처를 글로벌로 먼저 방출한다(16열이 공유 — "출처 먼저 → 본문").
-        for source in pool.sources:
-            yield sse_source(source)
+        for source in visible_sources:
+            yield sse_source(_public_without_snippet(source))
 
         yield sse_status("generating", "16가지 독서 성향으로 살펴보고 있어요")
 
-        async for column in generate_matrix(
-            pool, settings, session_id=resolved_session_id
-        ):
+        async for column in generate_matrix(pool, session_id=resolved_session_id):
             # 카드 정체성(제목=아키타입명, 부제=축라벨)을 delta에 실어 첫 페인트에서 확보하게
             # 한다. persona.py 헬퍼가 단일 소스 — 프론트가 col↔코드 매핑표를 중복 보유하지 않음.
             identity = {
@@ -94,9 +96,12 @@ async def run_matrix_stream(
             # 함께 실어 muted 사유 표시에 쓴다. 정상 열은 fallback=false·gate_reason=null.
             col_done = {
                 **column.done_payload,
+                "sources": [
+                    {"id": source["id"]} for source in column.done_payload.get("sources", [])
+                ],
                 "fallback": column.gate_reason is not None,
                 "gate_reason": column.gate_reason,
-                # 이 셀이 고른 책을 **구조화**해 싣는다(제목·가격·표지·source_id, 대표책=picks[0]).
+                # 이 셀이 고른 책의 id를 **구조화**해 싣는다(대표책=picks[0]).
                 # 프론트가 카드 산문을 정규식으로 재파싱해 『제목』+가격을 복원하던 이중 구현을
                 # 없앤다 — 같은 판정(무엇이 이 셀의 책인가)은 인용 검증·풀 접지를 거친 백엔드가
                 # 단일 출처로 답한다(fallback 플래그를 명시 필드로 만든 것과 동일한 패턴).
@@ -104,7 +109,13 @@ async def run_matrix_stream(
             }
             yield sse_done(col_done, col=column.col)
 
-        yield _terminal_done(pool.sources)
+        models = dict(pool.models)
+        if pool.status == "ok":
+            models["generation"] = "server-rendered"
+        yield _terminal_done(
+            visible_sources,
+            models,
+        )
 
     except Exception as exc:  # noqa: BLE001 — SSE 스트림 최상위 방어선(글로벌 done 1회 불변식)
         logger.exception("매트릭스 스트림 처리 중 예외: %s", exc)

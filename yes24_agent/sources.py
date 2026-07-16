@@ -15,10 +15,25 @@ from typing import Any
 
 # 세션 스코프 키 (temp: 접두사 금지 — 멀티턴에서 이전 턴 출처도 유지되어야 함)
 SOURCES_STATE_KEY = "sources"
+PRODUCT_SOURCE_TYPES = frozenset({"search_result", "book_detail", "browse"})
+PRODUCT_DETAIL_SOURCE_TYPES = frozenset({"book_detail"})
+POLICY_SOURCE_TYPES = frozenset({"notice"})
+WEB_SOURCE_TYPES = frozenset({"web"})
 
 # KST(UTC+9). 도구·매트릭스가 "오늘"·검색시각(checked_at)을 계산하는 단일 기준.
 # 값 자체는 외부 사실이지만, 10개 파일에 재정의돼 있던 것을 여기 한 곳으로 모은다.
 KST = timezone(timedelta(hours=9))
+
+
+def today_kst() -> str:
+    """현재 KST 날짜를 에이전트 프롬프트와 최신성 검색이 공유하는 형식으로 반환한다."""
+    now = datetime.now(KST)
+    return f"{now.year}년 {now.month}월 {now.day}일"
+
+
+def today_kst_iso() -> str:
+    """현재 KST 날짜를 source 시점 필드와 대조할 ISO 날짜로 반환한다."""
+    return datetime.now(KST).date().isoformat()
 
 
 def now_checked_at() -> str:
@@ -29,6 +44,86 @@ def now_checked_at() -> str:
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M")
 
 
+def _merge_evidence_segments(existing: object, incoming: object) -> list[dict]:
+    """같은 출처를 여러 창에서 읽은 근거 구간을 ID 기준으로 합친다."""
+    merged: dict[object, dict] = {}
+    for segments in (existing, incoming):
+        if not isinstance(segments, list):
+            continue
+        for segment in segments:
+            if not isinstance(segment, dict) or segment.get("segment_id") is None:
+                continue
+            merged.setdefault(segment["segment_id"], segment)
+    return list(merged.values())
+
+
+def _merge_source_observations(existing: dict, incoming: dict) -> dict:
+    """같은 범위의 동일 출처 관측을 합치되 상품 상세 충실도를 보존한다."""
+    existing_is_detail = existing.get("type") in PRODUCT_DETAIL_SOURCE_TYPES
+    incoming_is_product_summary = (
+        incoming.get("type") in PRODUCT_SOURCE_TYPES
+        and incoming.get("type") not in PRODUCT_DETAIL_SOURCE_TYPES
+    )
+    if existing_is_detail and incoming_is_product_summary:
+        lower_fidelity, higher_fidelity = incoming, existing
+    else:
+        lower_fidelity, higher_fidelity = existing, incoming
+
+    merged = dict(lower_fidelity)
+    merged.update({key: value for key, value in higher_fidelity.items() if value is not None})
+
+    lower_meta = lower_fidelity.get("meta") if isinstance(lower_fidelity.get("meta"), dict) else {}
+    higher_meta = (
+        higher_fidelity.get("meta") if isinstance(higher_fidelity.get("meta"), dict) else {}
+    )
+    merged_meta = {
+        **lower_meta,
+        **{key: value for key, value in higher_meta.items() if value is not None},
+    }
+    if higher_fidelity.get("type") in PRODUCT_DETAIL_SOURCE_TYPES:
+        merged_meta.update(
+            {
+                key: higher_fidelity[key]
+                for key in merged_meta
+                if higher_fidelity.get(key) is not None
+            }
+        )
+    if merged_meta:
+        merged["meta"] = merged_meta
+    if higher_fidelity.get("type") in PRODUCT_DETAIL_SOURCE_TYPES:
+        merged.update(merged_meta)
+        merged.update(
+            {
+                key: value
+                for key, value in higher_fidelity.items()
+                if value is not None and key != "meta"
+            }
+        )
+
+    evidence_segments = _merge_evidence_segments(
+        existing.get("_evidence_segments"),
+        incoming.get("_evidence_segments"),
+    )
+    if evidence_segments:
+        merged["_evidence_segments"] = evidence_segments
+    return merged
+
+
+def merge_registry_source_records(existing: dict, incoming: dict) -> dict:
+    """세션 레지스트리의 동일 URL 관측을 누적한다.
+
+    레지스트리는 source id와 이미 읽은 상세를 멀티턴에 걸쳐 보존하는 카탈로그다. 이 결과를
+    이번 턴 근거로 직접 사용하지 않고, current-turn 스냅샷은 `merge_turn_source_records`로
+    별도 조립한다.
+    """
+    return _merge_source_observations(existing, incoming)
+
+
+def merge_turn_source_records(existing: dict, incoming: dict) -> dict:
+    """이번 턴 스트림에서 직접 관측한 동일 출처만 합친다."""
+    return _merge_source_observations(existing, incoming)
+
+
 def register_source(
     state: MutableMapping[str, Any],
     *,
@@ -36,24 +131,44 @@ def register_source(
     url: str,
     source_type: str,
     snippet: str | None = None,
+    checked_at: str | None = None,
     meta: dict | None = None,
 ) -> int:
     """출처를 등록하고 source_id를 반환한다.
 
-    동일 url이 이미 등록돼 있으면 새로 추가하지 않고 기존 source_id를 반환한다.
+    동일 URL은 source_id를 유지하고 관측을 병합한다. 상품 상세는 이후 검색 목록 관측보다
+    정보 충실도가 높으므로 유형·본문·canonical 메타를 유지한다.
+
+    `None`은 이번 도구가 해당 필드를 관측하지 않았다는 뜻이므로 기존 값을 유지한다. 같은
+    충실도의 새 관측과 새 상세는 기존 값을 갱신하고, 검색 요약은 저장된 상세를 낮추지 않는다.
     """
     existing = state.get(SOURCES_STATE_KEY, [])
-    for source in existing:
+    for index, source in enumerate(existing):
         if source["url"] == url:
+            incoming = {
+                "id": source["id"],
+                "title": title or None,
+                "url": url,
+                "type": source_type,
+                "snippet": snippet,
+                "checked_at": checked_at,
+                "meta": meta,
+            }
+            updated = merge_registry_source_records(source, incoming)
+            if updated != source:
+                refreshed = list(existing)
+                refreshed[index] = updated
+                state[SOURCES_STATE_KEY] = refreshed
             return source["id"]
 
-    new_id = len(existing) + 1
+    new_id = max((source.get("id", 0) for source in existing), default=0) + 1
     new_source = {
         "id": new_id,
         "title": title,
         "url": url,
         "type": source_type,
         "snippet": snippet,
+        "checked_at": checked_at,
         "meta": meta,
     }
     # 재할당 패턴: 기존 리스트를 변형하지 않고 새 리스트를 만들어 대입한다.

@@ -78,9 +78,17 @@ def product_url(base_url: str, goods_no: str) -> str:
 # links로 돌려주므로, 어느 카테고리로 들어갈지는 에이전트가 **그때그때 페이지에서 읽은
 # 실제 링크로 판단**한다(따라가기 1~2회). 정적 맵은 Yes24 메뉴 개편 시 조용히 썩고,
 # 부분 시드는 빠진 카테고리 질문(실측: 무이자 할부 카드)이 "못 찾음"으로 새는 문제가 있었다.
-POLICY_SEED_URLS: dict[str, str] = {
-    "공지사항": "https://www.yes24.com/mall/help/notice",
-    "고객센터 FAQ 입구(전체 카테고리 메뉴)": "https://www.yes24.com/Mall/Help/FAQ",
+POLICY_SEEDS: dict[str, dict[str, str]] = {
+    "notice": {
+        "label": "공지사항",
+        "url": "https://www.yes24.com/mall/help/notice",
+        "role": "document",
+    },
+    "faq": {
+        "label": "고객센터 FAQ 입구(전체 카테고리 메뉴)",
+        "url": "https://www.yes24.com/Mall/Help/FAQ",
+        "role": "directory",
+    },
 }
 
 

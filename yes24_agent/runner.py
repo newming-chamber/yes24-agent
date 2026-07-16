@@ -19,7 +19,11 @@ from google.adk.runners import Runner
 from google.genai import types
 from google.genai.errors import APIError
 
-from yes24_agent.agent import root_agent, root_agent_flash
+from yes24_agent.adk_stream import iter_adk_events
+from yes24_agent.agent import (
+    root_agent,
+    root_agent_flash,
+)
 from yes24_agent.config import get_settings
 from yes24_agent.event_translate import (
     _reconcile_sources,
@@ -29,38 +33,39 @@ from yes24_agent.event_translate import (
     build_source_event,
 )
 from yes24_agent.grounding import (
-    POLICY_SOURCE_TYPES,
-    PRODUCT_SOURCE_TYPES,
-    has_price_claim,
     has_product_grounding,
 )
 from yes24_agent.orchestrator import apply_sufficiency_gate
+from yes24_agent.policy_flow import run_policy_evidence_turn
 from yes24_agent.postprocess import (
     build_done_payload,
-    has_tool_call_leak,
-    strip_tool_call_leaks,
     validate_citations,
 )
+from yes24_agent.product_flow import run_product_selection_turn
 from yes24_agent.query_understanding import (
     GROUNDED_INTENTS,
     POLICY,
     PRODUCT,
     RECENCY,
-    WEB,
+    evidence_policy,
     understand,
 )
 from yes24_agent.rbti.persona import is_valid_code
+from yes24_agent.recency_flow import run_recency_evidence_turn
 from yes24_agent.routing import FLASH, PRO, select_route
 from yes24_agent.session_service import (
     _POC_USER_ID,
     _get_session_lock,
     _get_session_service,
     _resolve_session,
-    _session_locks,  # noqa: F401 — 테스트가 runner_module 경유로 락 dict를 초기화(동일 객체 참조)
 )
-from yes24_agent.sources import get_sources
-from yes24_agent.sse import sse_ack, sse_delta, sse_done, sse_error, sse_source, sse_status
-from yes24_agent.turn_assembly import _event_text, _merge_restated_turns, extract_ack
+from yes24_agent.sources import (
+    WEB_SOURCE_TYPES,
+    get_sources,
+    merge_turn_source_records,
+)
+from yes24_agent.sse import sse_delta, sse_done, sse_error, sse_source, sse_status
+from yes24_agent.turn_assembly import _event_text
 
 logger = logging.getLogger(__name__)
 
@@ -87,31 +92,84 @@ def _is_overloaded_error(exc: BaseException) -> bool:
     return isinstance(exc, APIError) and getattr(exc, "code", None) in _OVERLOAD_STATUS_CODES
 
 
-def _best_effort_done(
-    turn_texts: list[str],
-    current_turn: list[str],
-    saw_partial_text: bool,
-    final_text: str,
-    observed_sources: list[dict],
+def _finalize_answer(
+    text: str,
+    sources: list[dict],
     session_id: str,
-) -> dict:
-    """실패 마감용 done 페이로드 — 그 시점까지 확보된 최선의 본문·출처를 싣는다.
-
-    스트림 후처리(재조립·세션 재조회·인용 검증·게이트) 어디서 터져도, 모델이 이미 만들어 낸
-    본문을 버리지 않는다("비파괴"를 게이트 안이 아니라 파이프라인 전체의 계약으로). 본문은 정상
-    경로와 **같은 조립기**를 쓰고(_merge_restated_turns — 프리앰블 재진술 제거), 인용은 관찰
-    출처로 검증한다(무효 마커는 정상 경로와 동일하게 제거되므로 환각 인용이 새지 않는다).
-    확보된 본문이 없으면 빈 text를 담아 호출부의 최후 방어 안내가 채우게 둔다.
-    """
-    pieces = [*turn_texts, "".join(current_turn)] if current_turn else list(turn_texts)
-    text = _merge_restated_turns(pieces) if saw_partial_text else final_text
-    citation = validate_citations(text or "", observed_sources)
-    return build_done_payload(
-        sources=observed_sources,
+    *,
+    require_evidence: bool = False,
+    fallback_text: str = "",
+) -> tuple[object, dict]:
+    """평상·예외·타임아웃이 공통으로 거치는 최종 인용 조립기."""
+    citation = validate_citations(text or "", sources)
+    if require_evidence and not citation.meaningful_support_count:
+        citation = validate_citations(fallback_text, sources)
+    payload = build_done_payload(
+        sources=sources,
         used_source_ids=citation.used_source_ids,
         session_id=session_id,
         supports=citation.supports,
-    ) | {"text": citation.text}
+    )
+    payload["text"] = citation.text
+    return citation, payload
+
+
+def _best_effort_text(
+    turn_texts: list[str],
+    current_turn: list[str],
+    final_text: str,
+) -> str:
+    """실패 시점까지 확보한 본문을 정상 경로와 같은 규약으로 조립한다.
+
+    스트림 후처리(재조립·세션 재조회·인용 검증·게이트) 어디서 터져도, 모델이 이미 만들어 낸
+    본문을 버리지 않는다("비파괴"를 게이트 안이 아니라 파이프라인 전체의 계약으로). aggregate
+    final response를 우선하고, 없을 때만 partial 조각을 조립한다. 확보된 본문이 없으면 빈 문자열을
+    반환해 호출부의 최후 방어가 채우게 둔다.
+    """
+    pieces = [*turn_texts, "".join(current_turn)] if current_turn else list(turn_texts)
+    return final_text or "".join(pieces)
+
+
+def _attach_source_time(payload: dict, *, required: bool) -> dict:
+    """요청된 경우 최종 인용 출처별 시점 메타를 구조 payload에 보존한다."""
+    if not required:
+        return payload
+    sources = payload.get("sources")
+    sources = sources if isinstance(sources, list) else []
+    source_time: list[dict] = []
+    for source in sources:
+        source_id = source.get("id")
+        if not isinstance(source_id, int):
+            continue
+        record = {
+            "source_id": source_id,
+            **{
+                key: str(source[key])
+                for key in ("published_at", "last_updated", "checked_at")
+                if source.get(key)
+            },
+        }
+        if len(record) > 1:
+            source_time.append(record)
+    payload["source_time"] = source_time
+    return payload
+
+
+def _final_body_delta(payload: dict) -> str:
+    """홀드가 끝난 최종 본문을 단일 delta로 반환한다."""
+    return payload.get("text") if isinstance(payload.get("text"), str) else ""
+
+
+def _previous_user_message(session) -> str | None:
+    """현재 요청 직전의 마지막 사용자 텍스트를 세션 이벤트 경계에서 가져온다."""
+    for event in reversed(session.events):
+        content = event.content
+        if content is None or content.role != "user":
+            continue
+        text = "".join(part.text or "" for part in content.parts or [])
+        if text.strip():
+            return text
+    return None
 
 
 async def run_agent_stream(
@@ -137,25 +195,26 @@ async def run_agent_stream(
         try:
             service = _get_session_service()
             session = await _resolve_session(service, session_id)
-            # RBTI 페르소나 코드를 세션 state에 out-of-band로 반영한다. content 없는
-            # system 이벤트의 state_delta로 써(ADK 2.3.0 append_event 실측 확인) LLM 턴
-            # 히스토리를 오염시키지 않는다. 유효 코드가 새로 들어온 경우만 write하고,
-            # 이미 같은 코드면 중복 이벤트를 남기지 않는다. rbti=None/무효면 write skip →
-            # 세션 state에 rbti 키가 없어 _instruction_provider가 페르소나를 붙이지 않는다
-            # (기존과 바이트 동일). 실패 시 아래 except가 done 1회 불변식을 지킨다.
-            if rbti and is_valid_code(rbti):
-                code = rbti.upper()
-                if session.state.get("rbti") != code:
-                    await service.append_event(
-                        session,
-                        Event(author="system", actions=EventActions(state_delta={"rbti": code})),
-                    )
+            # 현재 UI 요청을 RBTI state의 정본으로 본다. 유효 코드는 저장하고 None·무효 코드는
+            # 기존 값을 명시적으로 지워, 이전 요청의 페르소나가 다음 기본 채팅에 남지 않게 한다.
+            code = rbti if is_valid_code(rbti) else None
+            if session.state.get("rbti") != code:
+                await service.append_event(
+                    session,
+                    Event(author="system", actions=EventActions(state_delta={"rbti": code})),
+                )
         except Exception as exc:  # noqa: BLE001 — 스트림 시작 전 방어선(done 1회 불변식 보장)
             logger.exception("세션 준비 실패: %s", exc)
-            yield sse_error("대화 세션을 준비하지 못했어요. 잠시 후 다시 시도해 주세요.")
-            yield sse_done(
-                {"sources": [], "grounding_supports": [], "session_id": session_id or ""}
+            error_text = "대화 세션을 준비하지 못했어요. 잠시 후 다시 시도해 주세요."
+            yield sse_error(error_text)
+            _, error_done = _finalize_answer(
+                error_text,
+                [],
+                session_id or "",
             )
+            error_done["model"] = None
+            yield sse_delta(error_done["text"])
+            yield sse_done(error_done)
             return
 
         resolved_session_id = session.id
@@ -163,7 +222,6 @@ async def run_agent_stream(
         # 제출 즉시 체감 반응(<200ms 목표) — 첫 status를 곧바로 흘려보낸다.
         yield sse_status("thinking", "질문을 확인하고 있어요")
 
-        sent_source_ids: set[int] = set()
         # 스트림에서 관찰한 출처를 누적한다. 병렬 도구 실행 시 세션 state가 유실될 수
         # 있어(_reconcile_sources 참고), done 조립의 유실 방지용 완전한 사본으로 쓴다.
         observed_sources: list[dict] = []
@@ -171,57 +229,42 @@ async def run_agent_stream(
         # needs_followup·status). 충분성 게이트가 "마지막 검색이 얕았는지(결과 0건)"를 판정해
         # 재검색을 트리거하는 데 쓴다 — 지금까진 도구가 반환만 하고 아무도 읽지 않던 힌트다.
         observed_tool_calls: list[dict] = []
-        # done.text 조립용 턴별 누적. pro 계열 모델은 도구 호출 사이 각 LLM 턴을 처음부터
-        # 다시 생성하며 선두 프리앰블을 재진술한다 → 턴 경계(function_call)로 나눠 두고
-        # 조립 시 재진술을 제거한다(_merge_restated_turns). current_turn은 진행 중 턴의 조각.
+        # done.text 조립용 턴별 누적. 도구 호출 전 텍스트는 턴 경계에서 버리고 최종 모델 턴만
+        # 조립한다. current_turn은 진행 중 턴의 조각이다.
         turn_texts: list[str] = []
         current_turn: list[str] = []
-        saw_partial_text = False
         final_text = ""
-        # 본문 홀드 정책 — **질의가 접지를 요구하는가** 하나로 가른다(길이 임계·버퍼 카운터 없음).
-        #  - 접지 불필요(잡담·정체성·일반지식 = 대다수): 첫 토큰부터 라이브 스트리밍. 출처가 아예
-        #    없으므로 "출처 먼저 → 본문" 제약이 원천 성립불가 — 홀드가 기여하는 바가 0인데도 예전
-        #    길이 임계(200자)는 짧은 답을 통째로 홀드해 delta 1건으로 뱉었다(실측: 12턴 중 6턴이
-        #    first_delta == done, 환율 턴은 16.4초 백지 후 한 덩어리).
-        #  - 접지 필요(상품·정책·시의성): 도구 결과(source)가 나가기 전까지 홀드하고, 첫 출처가
-        #    방출된 뒤부터 라이브로 흘린다. 도구 전 텍스트는 진행 발화이므로 ack로 빠진다.
-        # 실제 값은 질의이해(understand) 직후에 정해진다.
-        stream_body_live = False
-        # 인터스티셜 응대(ack): function_call 직전의 버퍼 텍스트(프리앰블·도구 사이 내레이션)를
-        # `event: ack`로 흘린다. 도구를 부른 턴만 ack가 뜨고(무도구·잡담·정체성 턴은 function_call이
-        # 없어 자동 배제), ack로 간 텍스트는 done.text 조립에서 빠진다(4b 불변).
-        # 본문을 루프에서 실제로 라이브 delta로 흘렸는지. 무도구 잡담·비스트리밍 폴백처럼 홀드된
-        # 터미널 본문은 여기서 flush하지 않고 게이트 단계(apply_sufficiency_gate)가 단일 지점에서
-        # 방출한다. 이 값을 게이트에 넘겨: 미노출(False)이면 재검색 답을 라이브 스트리밍, 노출(True)
-        # 이면 재검색 답을 홀드→done.text 교체(이중 본문 방지)로 가른다.
-        live_streamed = False
+        requires_grounding = False
+        # 모든 턴의 본문은 최종 인용 검증까지 홀드한다. 분류가 외부 근거 필요성을 오판해도
+        # 도구 사용 가능 에이전트가 질문 자체를 보고 검색할 수 있어야 한다.
         # 반응형 폴백의 안전 조건: 사용자에게 보이는 프레임(delta·source·도구/에러 status)을
         # 하나라도 흘렸는지. 오버로드가 첫 LLM 호출 전에 나면(아직 아무것도 안 보임) flash로
         # 조용히 재시도해도 중복 노출·모순이 없다. 반대로 이미 뭔가 흘렸으면 재시도가 본문·
         # 출처를 중복시키므로 폴백하지 않고 정직 안내로 간다. (열기 thinking status는 제외.)
         emitted_output = False
 
-        # 질의이해: 값싼 모델 1회로 질의의 의미를 분류한다(intent·multistep·confidence). 분류
-        # 실패·저확신이면 안전한 폴백(pro + 게이트 적용)으로 떨어진다 — 키워드 매칭은 쓰지 않는다.
-        understanding = await understand(message, settings)
+        # 질의이해: 값싼 모델 1회로 질의의 의미를 분류한다(intent·multistep·confidence).
+        # ambiguous는 pro 모델을 쓰되 유효 grounded intent의 typed evidence 경계를 유지한다.
+        # product의 하위 selection/detail 판정도 저확신이므로 product typed 경계가 맡는다.
+        # intent 자체를 신뢰할 수 없는 unavailable만 세션 문맥을 가진 pro 루트가 직접 처리한다.
+        understanding = await understand(
+            message,
+            settings,
+            _previous_user_message(session),
+        )
+        run_config = RunConfig(
+            streaming_mode=StreamingMode.SSE,
+            max_llm_calls=settings.max_llm_calls,
+        )
+        requires_grounding = understanding.needs_grounding
+        evidence = evidence_policy(understanding)
         search_query = understanding.standalone_query
-        # 홀드 정책 확정: 접지가 필요 없는 질의는 첫 토큰부터 라이브로 흘린다. 접지가 필요한
-        # 질의는 **그 턴이 필요로 하는 접지가 실제로 나온 뒤** 본문을 연다 — 상품 질의는 Yes24 상품
-        # 출처, 정책 질의는 정책 페이지(notice), 그 외(시의성)는 아무 출처나. 웹 검색만 하고 책값을
-        # 지어낸 초안이 delta로 새지 않도록(그 초안은 게이트가 폐기한다) 접지 타입을 구분한다.
-        stream_body_live = not understanding.needs_grounding
-        if understanding.intent == PRODUCT:
-            unlock_types = PRODUCT_SOURCE_TYPES
-        elif understanding.intent == POLICY:
-            unlock_types = POLICY_SOURCE_TYPES
-        else:
-            unlock_types = None  # 아무 출처나 나오면 연다
-
-        # 하이브리드 모델 라우팅: 확신 있는 단일단계 질의만 flash(빠른 즉답)로 내리고, 다단계·
-        # 저확신·분류 실패는 pro로 남긴다(select_route). 무출처 게이트의 재검색은 이와 별개로
-        # 항상 pro(correction_agent)라 정확성이 보장된다.
+        typed_intent_available = understanding.classification_state != "unavailable"
+        # 하이브리드 모델 라우팅: 확신 있는 단일단계 질의만 flash(빠른 즉답)로 내리고,
+        # 다단계·저확신 질의는 pro로 보낸다(select_route).
         route = select_route(understanding, hybrid_routing=settings.hybrid_routing)
         main_agent = root_agent_flash if route == FLASH else root_agent
+        active_model = str(main_agent.model)
 
         logger.info(
             "모델 라우팅=%s intent=%s multistep=%s confident=%s (session_id=%s)",
@@ -232,14 +275,92 @@ async def run_agent_stream(
             resolved_session_id,
         )
 
+        if typed_intent_available and understanding.intent == PRODUCT and (
+            understanding.product_selection
+            or understanding.product_detail_required
+            or not understanding.confident
+        ):
+            product_sink: list[dict] = []
+            yield sse_status("verifying", "상품 상세 근거를 확인하고 있어요")
+            async for frame in run_product_selection_turn(
+                service,
+                run_config,
+                resolved_session_id,
+                settings,
+                user_message=search_query,
+                observed_sources=observed_sources,
+                result_sink=product_sink,
+                expected_constraints=understanding.product_constraints,
+                expected_count=understanding.requested_product_count,
+                observed_tool_calls=observed_tool_calls,
+            ):
+                yield frame
+            product_done = product_sink[0]
+            _attach_source_time(
+                product_done,
+                required=understanding.source_time_required,
+            )
+            for source in product_done.get("sources", []):
+                yield sse_source(source)
+            if product_done.get("text"):
+                yield sse_delta(product_done["text"])
+            yield sse_done(product_done)
+            return
+
+        if typed_intent_available and understanding.intent == POLICY:
+            policy_sink: list[dict] = []
+            yield sse_status("verifying", "Yes24 정책 원문을 확인하고 있어요")
+            async for frame in run_policy_evidence_turn(
+                service,
+                run_config,
+                resolved_session_id,
+                settings,
+                user_message=search_query,
+                observed_sources=observed_sources,
+                result_sink=policy_sink,
+            ):
+                yield frame
+            policy_done = policy_sink[0]
+            _attach_source_time(
+                policy_done,
+                required=understanding.source_time_required,
+            )
+            for source in policy_done.get("sources", []):
+                yield sse_source(source)
+            if policy_done.get("text"):
+                yield sse_delta(policy_done["text"])
+            yield sse_done(policy_done)
+            return
+
+        if typed_intent_available and understanding.intent == RECENCY:
+            recency_sink: list[dict] = []
+            yield sse_status("verifying", "최신 웹 근거를 확인하고 있어요")
+            async for frame in run_recency_evidence_turn(
+                service,
+                run_config,
+                resolved_session_id,
+                settings,
+                user_message=search_query,
+                observed_sources=observed_sources,
+                result_sink=recency_sink,
+            ):
+                yield frame
+            recency_done = recency_sink[0]
+            _attach_source_time(
+                recency_done,
+                required=understanding.source_time_required,
+            )
+            for source in recency_done.get("sources", []):
+                yield sse_source(source)
+            if recency_done.get("text"):
+                yield sse_delta(recency_done["text"])
+            yield sse_done(recency_done)
+            return
+
         runner = Runner(
             agent=main_agent,
             app_name=settings.app_name,
             session_service=service,
-        )
-        run_config = RunConfig(
-            streaming_mode=StreamingMode.SSE,
-            max_llm_calls=settings.max_llm_calls,
         )
         new_message = types.Content(role="user", parts=[types.Part(text=search_query)])
 
@@ -248,21 +369,19 @@ async def run_agent_stream(
         active_route = route
         retried_overload = False
 
-        # 이벤트 간격에 sse_timeout_s 상한을 건다. LLM/도구가 연결만 수락하고 응답을
-        # 멈추면(스톨) async for가 무한 대기하므로, __anext__를 wait_for로 감싸 다음
-        # 이벤트가 제때 오지 않으면 error+done으로 마감한다.
+        # 이벤트 간격에 sse_timeout_s 상한을 건다. ADK 스트림은 하나의 고정 task가 소비해
+        # 여러 yield에 걸친 OpenTelemetry context의 소유권을 보존한다.
         event_stream = runner.run_async(
             user_id=_POC_USER_ID,
             session_id=resolved_session_id,
             new_message=new_message,
             run_config=run_config,
         )
+        timed_event_stream = iter_adk_events(event_stream, timeout_s=settings.sse_timeout_s)
         try:
             while True:
                 try:
-                    event = await asyncio.wait_for(
-                        event_stream.__anext__(), timeout=settings.sse_timeout_s
-                    )
+                    event = await timed_event_stream.__anext__()
                 except StopAsyncIteration:
                     break
                 except APIError as exc:
@@ -283,26 +402,22 @@ async def run_agent_stream(
                             getattr(exc, "code", "?"),
                             resolved_session_id,
                         )
+                        await timed_event_stream.aclose()
                         await event_stream.aclose()
                         retried_overload = True
                         active_route = FLASH
-                        # 폐기되는 pro 시도가 홀드해 둔 본문 버퍼를 리셋한다. delta 홀드로
-                        # 프리앰블이 delta 없이 버퍼에만 쌓인 채 폴백할 수 있는데
-                        # (emitted_output=False라 폴백 발동), 안 지우면 폐기된 pro 프리앰블이
-                        # flash 답변 대신 done.text로 샌다. 출처는 방출 시 emitted_output을
-                        # 켜므로 이 경로엔 없다(있으면 폴백 자체가 차단됨).
+                        fallback_agent = root_agent_flash
+                        active_model = str(fallback_agent.model)
+                        # 폐기되는 pro 시도가 홀드한 버퍼를 리셋한다.
                         turn_texts = []
                         current_turn = []
-                        saw_partial_text = False
                         final_text = ""
-                        stream_body_live = False
-                        live_streamed = False
                         # 같은 세션·같은 메시지를 flash로 재실행한다. pro 시도가 이미 이 user
                         # 메시지를 세션에 append했으므로 히스토리에 user 턴이 한 번 더 붙지만
                         # (ADK가 매 run_async 시작에 append), 아무 응답도 못 낸 실패라 중복
                         # 노출·본문 모순은 없다 ─ 드문 과부하 시의 경미한 히스토리 중복이다.
                         fallback_runner = Runner(
-                            agent=root_agent_flash,
+                            agent=fallback_agent,
                             app_name=settings.app_name,
                             session_service=service,
                         )
@@ -312,40 +427,17 @@ async def run_agent_stream(
                             new_message=new_message,
                             run_config=run_config,
                         )
+                        timed_event_stream = iter_adk_events(
+                            event_stream, timeout_s=settings.sse_timeout_s
+                        )
                         continue
                     raise
 
                 # 1) function call(집계본) → 도구별 진행 status. partial 조각은 args가
                 #    불완전하므로 무시하고 non-partial 집계 이벤트에서만 args를 읽는다.
                 if not event.partial and event.get_function_calls():
-                    # 도구 호출 = 텍스트 턴의 끝. 이 시점의 버퍼는 '도구 호출 직전 텍스트'다.
-                    # 두 경로로 갈린다:
-                    #  (a) 아직 스트리밍 전(임계 미만) → 내레이션 확정 → ack로만 방출하고 done.text
-                    #      에서 제외한다(도구 사이 진행 발화가 본문 서두를 오염시키던 결함 소멸).
-                    #  (b) 이미 라이브 스트리밍 중(임계 초과 후 도구 도착 = 드문 오판) → 이 버퍼는
-                    #      최종이 아님이 확정 → done.text에서 제외한다(이미 나간 delta는 transient
-                    #      수용). 다음 도구-후 텍스트를 위해 스트리밍 상태를 리셋한다.
-                    preamble = "".join(current_turn)
+                    # 도구 호출 전 텍스트는 진행 발화이므로 최종 본문 소유권이 없다.
                     current_turn = []
-                    if stream_body_live:
-                        # (b) 스트리밍 중 도구 도착: 리셋만(ack 없음 — 이미 delta로 흘렀다).
-                        stream_body_live = False
-                    elif preamble:
-                        # (a) preamble의 첫 문장(들)을 응대로 흘리되, 무출처 상품사실(가격·제목)이
-                        # 섞였으면 방출하지 않는다(게이트 우회 차단). 방출하든 억제하든 이 텍스트는
-                        # 진행 발화이므로 done.text(turn_texts)에는 넣지 않는다.
-                        # ack도 본문과 같은 누출 가드를 통과시킨다 — 이 버퍼는 정의상 function_call
-                        # 직전에서 잘린 텍스트라 tool-call 서술이 미완성 인자 블록째로 남기 쉽다
-                        # (실측: "…비교해 드릴게요.call:yes24_search{query:"). done.text에 이미 적용
-                        # 중인 스트립을 사용자 노출 경로 전체로 확대한다(원칙 4b: 디버그·도구 발화
-                        # 본문 혼입 금지).
-                        preamble, _ = strip_tool_call_leaks(preamble)
-                        ack_text, _ = extract_ack(preamble, settings.ack_max_chars)
-                        # ack은 도구 결과가 오기 **전** 발화라 어떤 가격도 접지될 수 없다 —
-                        # 가격을 말하면 방출하지 않는다(게이트 우회 차단).
-                        if ack_text.strip() and not has_price_claim(ack_text):
-                            emitted_output = True
-                            yield sse_ack(ack_text.strip())
                     for call in event.get_function_calls():
                         stage, detail = _status_for_call(call)
                         emitted_output = True
@@ -374,59 +466,41 @@ async def run_agent_stream(
                             yield sse_status(stage, detail)
                             continue
                         sources_in_payload = _sources_from_response(payload)
-                        # 이 턴이 필요로 하는 접지가 나왔으면(중복 payload여도 앞서 방출됨) "출처
-                        # 먼저 → 본문" 순서가 충족됐으므로 본문 라이브를 연다.
-                        if any(
-                            unlock_types is None
-                            or src.get("type", "search_result") in unlock_types
-                            for src in sources_in_payload
-                        ):
-                            stream_body_live = True
                         for source in sources_in_payload:
                             source_id = source.get("source_id")
-                            if source_id in sent_source_ids:
-                                continue
-                            sent_source_ids.add(source_id)
                             source_event = build_source_event(source)
-                            observed_sources.append(source_event)
-                            emitted_output = True
-                            yield sse_source(source_event)
+                            for index, observed in enumerate(observed_sources):
+                                if observed.get("id") == source_id:
+                                    observed_sources[index] = merge_turn_source_records(
+                                        observed, source_event
+                                    )
+                                    break
+                            else:
+                                observed_sources.append(source_event)
                     continue
 
-                # 3) partial 텍스트 조각 → 버퍼에 누적. 라이브가 열려 있으면(접지 불필요 턴이거나
-                #    출처가 이미 나간 뒤) 곧바로 흘리고, 아니면 홀드한다.
+                # 3) partial은 도구 호출 여부가 확정될 때까지 사용자에게 노출하지 않는다.
                 if event.partial:
                     chunk = _event_text(event)
                     if chunk:
-                        saw_partial_text = True
                         current_turn.append(chunk)
-                        if stream_body_live:
-                            emitted_output = True
-                            if not live_streamed:
-                                # 홀드해 둔 누적분을 먼저 flush한 뒤 이어 흘린다(출처 방출 직후).
-                                live_streamed = True
-                                yield sse_delta("".join(current_turn))
-                            else:
-                                yield sse_delta(chunk)
                     continue
 
-                # 4) 최종 집계 텍스트 → 본문 확정(조립용). 여기서는 방출하지 않는다 — 터미널 본문
-                #    (무도구 잡담·비스트리밍 폴백처럼 홀드된 본문)의 flush는 게이트 단계가 단일
-                #    지점에서 처리한다(게이트 미발동 시 flush, 발동 시 폐기 후 보정 답 스트리밍).
+                # 4) 최종 집계 텍스트 → partial이 없던 경로의 본문 확정.
                 if event.is_final_response():
                     text = _event_text(event)
                     if text:
                         final_text = text
 
-            # 스트림 완료: 세션을 다시 조회해 최신 state의 출처로 인용을 검증한다.
-            # done.text는 사용자가 delta로 실제 본 텍스트를 담되(도구 호출 전 프리앰블 포함),
-            # pro 계열 모델이 도구 호출 사이 턴마다 되풀이한 선두 재진술을 제거한 판본을 쓴다.
-            # partial을 하나라도 봤으면 턴별 누적을 병합(_merge_restated_turns)하고,
-            # 비스트리밍 폴백(partial 없음)일 때만 최종 집계 텍스트를 쓴다.
+            # 스트림 완료: 이번 턴 function_response에서 관측한 출처로 인용을 검증한다. 세션
+            # state 재조회는 병렬 도구 실행 때 레지스트리 유실 수를 계측하는 데만 쓴다.
+            # aggregate final response가 최종 본문의 정본이다. partial은 aggregate가 비는
+            # 비스트리밍/중단 경로에서만 fallback으로 조립한다(보정 턴과 같은 소유권 규약).
             if current_turn:
                 turn_texts.append("".join(current_turn))
                 current_turn = []
-            answer_text = _merge_restated_turns(turn_texts) if saw_partial_text else final_text
+            streamed_text = "".join(turn_texts)
+            answer_text = final_text or streamed_text
             refreshed = await service.get_session(
                 app_name=settings.app_name,
                 user_id=_POC_USER_ID,
@@ -434,10 +508,16 @@ async def run_agent_stream(
             )
             state = refreshed.state if refreshed is not None else {}
             state_sources = get_sources(state)
-            sources = _reconcile_sources(state_sources, observed_sources)
+            current_source_ids = {
+                source["id"] for source in observed_sources if source.get("id") is not None
+            }
+            sources = _reconcile_sources(observed_sources)
 
             # 병렬 도구 state 유실 관측용 메트릭: state가 잃었지만 스트림엔 있던 출처 수.
-            recovered = len(sources) - len(state_sources)
+            state_source_ids = {
+                source["id"] for source in state_sources if source.get("id") is not None
+            }
+            recovered = len(current_source_ids - state_source_ids)
             if recovered > 0:
                 logger.warning(
                     "세션 state에서 유실된 출처 %d개를 스트림 관찰본으로 복구했습니다"
@@ -446,7 +526,12 @@ async def run_agent_stream(
                     resolved_session_id,
                 )
 
-            citation = validate_citations(answer_text, sources)
+            citation, done_payload = _finalize_answer(
+                answer_text,
+                sources,
+                resolved_session_id,
+            )
+            done_payload["model"] = active_model
             if citation.removed_markers:
                 # 결정론 메트릭: 무효 인용을 몇 개 잘라냈는지 + 그 시점 유효 출처 id를 남긴다.
                 # 유효 id를 함께 찍어, 마커 소실의 원인이 (a)모델이 실제 source_id가 아닌
@@ -465,83 +550,78 @@ async def run_agent_stream(
             # 태웠는데, 그러면 관측 데이터가 거짓이 되고 서로 다른 원인이 한 kind로 뭉개져 폴백까지
             # 잘못 상속됐다(미완결의 원답=약속문인데 shallow의 "원답 유지"를 물려받아 약속문이 최종
             # 확정). 이제 runner는 사실만 전달한다.
-            #  - 이번 턴 상품 출처를 실제로 관측했다 → 상품 턴이 확실하다.
-            #  - 아니면 분류가 접지 필요 부류(product·policy·recency)라고 확신하면 그대로 따른다.
-            #  - 분류를 신뢰할 수 없을 때만(안전 폴백) 세션에 이미 근거가 있는지를 본다 — 있으면
-            #    앞 턴이 이미 근거와 함께 이행한 대화의 후속 발화로 보고 배제한다(작별·소감 턴을
-            #    재검색이 새 추천으로 갈아치우던 파괴적 오탐 차단).
-            if has_product_grounding(observed_sources):
-                needs_grounding = True
-            elif understanding.confident:
-                needs_grounding = understanding.intent in GROUNDED_INTENTS
-            else:
-                needs_grounding = not has_product_grounding(sources)
-            # 정책 질의 턴인가 — 정책 규정을 답하려면 Yes24 정책 페이지 접지를 요구하는 조건.
-            policy_turn = understanding.intent == POLICY
-            # 상품 사실 게이트의 면제 조건(fail-closed): **웹 사실 질의임을 확신할 때만** 끈다.
-            # 주가·시급·뉴스 답변은 줄머리 볼드 + 가격("**최저임금** … 10,320원")이 책 추천과
-            # 마크업 구조가 같아, 턴 맥락 없이는 구별할 수 없다. 분류가 애매하면 켠 채로 둔다.
-            product_context = not (
-                understanding.confident and understanding.intent in (WEB, RECENCY)
+            # 확신된 접지 부류거나 이번 턴 상품·웹 출처를 실제 관측한 경우만 게이트에 넘긴다.
+            # ambiguous/unavailable의 synthetic WEB 폴백만으로 명료화 답을 폐기하지 않는다.
+            observed_grounding = has_product_grounding(observed_sources) or any(
+                source.get("type") in WEB_SOURCE_TYPES for source in observed_sources
             )
-
-            # 답이 tool-call 서술뿐이라 스트립 후 본문이 빈 경우도 "도구를 안 부른 미완결"이다 —
-            # 게이트가 인용 0 + 도구 호출 0으로 그렇게 판정하므로 별도 신호 주입이 필요 없다.
-            if has_tool_call_leak(answer_text):
-                logger.warning(
-                    "tool-call 서술 누출을 본문에서 제거했습니다(session_id=%s).",
-                    resolved_session_id,
-                )
-
-            done_payload = build_done_payload(
-                sources=sources,
-                used_source_ids=citation.used_source_ids,
-                session_id=resolved_session_id,
-                supports=citation.supports,
+            needs_grounding = observed_grounding or (
+                typed_intent_available and understanding.intent in GROUNDED_INTENTS
             )
-
-            # 충분성 게이트 판정 → (발동 시) 재검색 재진입 → 채택/폴백은 orchestrator가 맡는다.
-            # 게이트는 터미널 본문 방출의 단일 지점이기도 하다: 홀드된 본문(무도구 초안 등)의 flush,
-            # 또는 게이트 발동 시 초안 폐기 후 보정 답 스트리밍을 live_streamed로 판단한다. 이
-            # 제너레이터가 흘리는 프레임(delta·verifying status·재검색 source)을 그대로 중계하고,
-            # 최종 done_payload를 result_sink로 돌려받아 sse_done으로 마감한다(인용·재진입 불변).
-            gate_sink: list[dict] = []
-            async for frame in apply_sufficiency_gate(
-                citation,
-                done_payload,
-                service=service,
-                run_config=run_config,
-                resolved_session_id=resolved_session_id,
-                settings=settings,
-                observed_sources=observed_sources,
-                observed_tool_calls=observed_tool_calls,
-                sent_source_ids=sent_source_ids,
-                result_sink=gate_sink,
-                live_streamed=live_streamed,
-                standalone_query=search_query,
-                needs_grounding=needs_grounding,
-                policy_turn=policy_turn,
-                product_context=product_context,
+            # 분류 장애 턴에서 루트가 Yes24 상품 출처를 실제 관측했다면 generic gate보다 먼저
+            # typed 상품 경계로 한 번만 보낸다. 그 밖의 답만 generic sufficiency gate가 맡는다.
+            if (
+                understanding.classification_state == "unavailable"
+                and has_product_grounding(observed_sources)
             ):
-                yield frame
+                product_sink: list[dict] = []
+                yield sse_status("verifying", "상품 상세 근거를 확인하고 있어요")
+                async for frame in run_product_selection_turn(
+                    service,
+                    run_config,
+                    resolved_session_id,
+                    settings,
+                    user_message=search_query,
+                    observed_sources=observed_sources,
+                    result_sink=product_sink,
+                    expected_constraints=understanding.product_constraints,
+                    expected_count=understanding.requested_product_count,
+                    observed_tool_calls=observed_tool_calls,
+                ):
+                    yield frame
+                final_done = product_sink[0]
+            else:
+                gate_sink: list[dict] = []
+                async for frame in apply_sufficiency_gate(
+                    citation,
+                    done_payload,
+                    service=service,
+                    run_config=run_config,
+                    resolved_session_id=resolved_session_id,
+                    settings=settings,
+                    observed_sources=observed_sources,
+                    observed_tool_calls=observed_tool_calls,
+                    result_sink=gate_sink,
+                    standalone_query=search_query,
+                    needs_grounding=needs_grounding,
+                    required_source_types=evidence.required_source_types,
+                    force_tool=evidence.force_tool,
+                ):
+                    yield frame
+                final_done = gate_sink[0]
 
             # 최후 방어: 게이트까지 지나고도 done.text가 비면 빈 응답을 그대로 내보내지 않는다.
             # 라이브로 아무것도 안 흘렸으면 delta로도 흘려 프론트가 "(응답이 없었어요)" 대신 이
             # 안내를 렌더하게 한다. 원인 규명용으로 상태를 로그에 남긴다(빈 성공 위장 금지 정신).
-            final_done = gate_sink[0]
             if not (final_done.get("text") or "").strip():
                 logger.warning(
                     "done.text가 비어 최후 방어 안내로 대체합니다"
-                    "(session_id=%s live_streamed=%s tools=%d sources=%d rbti=%s).",
+                    "(session_id=%s tools=%d sources=%d rbti=%s).",
                     resolved_session_id,
-                    live_streamed,
                     len(observed_tool_calls),
                     len(sources),
                     bool(rbti),
                 )
                 final_done["text"] = _EMPTY_RESPONSE_FALLBACK
-                if not live_streamed:
-                    yield sse_delta(_EMPTY_RESPONSE_FALLBACK)
+            _attach_source_time(
+                final_done,
+                required=understanding.source_time_required,
+            )
+            for source in final_done.get("sources", []):
+                yield sse_source(source)
+            remaining_delta = _final_body_delta(final_done)
+            if remaining_delta:
+                yield sse_delta(remaining_delta)
             yield sse_done(final_done)
 
         except asyncio.TimeoutError:
@@ -550,13 +630,27 @@ async def run_agent_stream(
                 settings.sse_timeout_s,
                 resolved_session_id,
             )
-            yield sse_error("응답이 너무 지연되고 있어요. 잠시 후 다시 시도해 주세요.")
-            yield sse_done(
-                _best_effort_done(
-                    turn_texts, current_turn, saw_partial_text, final_text,
-                    observed_sources, resolved_session_id,
-                )
+            error_text = "응답이 너무 지연되고 있어요. 잠시 후 다시 시도해 주세요."
+            yield sse_error(error_text)
+            best_effort = _best_effort_text(turn_texts, current_turn, final_text)
+            _, error_done = _finalize_answer(
+                best_effort,
+                observed_sources,
+                resolved_session_id,
+                require_evidence=requires_grounding or bool(observed_tool_calls),
+                fallback_text=error_text,
             )
+            error_done["model"] = active_model
+            _attach_source_time(
+                error_done,
+                required=understanding.source_time_required,
+            )
+            for source in error_done.get("sources", []):
+                yield sse_source(source)
+            remaining_delta = _final_body_delta(error_done)
+            if remaining_delta:
+                yield sse_delta(remaining_delta)
+            yield sse_done(error_done)
         except Exception as exc:  # noqa: BLE001 — SSE 스트림 최상위 방어선(마지막 수단)
             # 어떤 예외든 제너레이터를 예외로 종료시키지 않고 사용자에게 error를 알린 뒤 done으로
             # 스트림을 정상 마감한다. **빈 done으로 마감하지 않는다**: 모델이 완주한 뒤 재조립·세션
@@ -564,15 +658,30 @@ async def run_agent_stream(
             # 사용자에게 나간 본문 0자). 게이트에만 있던 비파괴 원칙을 파이프라인 전체로 올려,
             # 그 시점까지 확보한 최선의 본문·출처로 마감한다. 스택트레이스는 반드시 로그에 남긴다.
             logger.exception("스트림 처리 중 예외 발생: %s", exc)
-            yield sse_error("일시적인 오류가 발생했어요. 잠시 후 다시 시도해 주세요.")
-            yield sse_done(
-                _best_effort_done(
-                    turn_texts, current_turn, saw_partial_text, final_text,
-                    observed_sources, resolved_session_id,
-                )
+            error_text = "일시적인 오류가 발생했어요. 잠시 후 다시 시도해 주세요."
+            yield sse_error(error_text)
+            best_effort = _best_effort_text(turn_texts, current_turn, final_text)
+            _, error_done = _finalize_answer(
+                best_effort,
+                observed_sources,
+                resolved_session_id,
+                require_evidence=requires_grounding or bool(observed_tool_calls),
+                fallback_text=error_text,
             )
+            error_done["model"] = active_model
+            _attach_source_time(
+                error_done,
+                required=understanding.source_time_required,
+            )
+            for source in error_done.get("sources", []):
+                yield sse_source(source)
+            remaining_delta = _final_body_delta(error_done)
+            if remaining_delta:
+                yield sse_delta(remaining_delta)
+            yield sse_done(error_done)
         finally:
             # 타임아웃·클라이언트 중단 시 미소진 제너레이터의 자원을 정리한다.
+            await timed_event_stream.aclose()
             await event_stream.aclose()
     finally:
         if lock is not None:

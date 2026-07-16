@@ -16,6 +16,7 @@ import httpx
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
+from yes24_agent.evidence_segments import build_evidence_segments, qualify_evidence_segments
 from yes24_agent.sources import now_checked_at, register_source
 from yes24_agent.tools.web_search import _get_client
 from yes24_agent.tools.yes24_fetch import window_around_find
@@ -44,16 +45,36 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
         type="web", checked_at을 담은 dict. 본문이 상한보다 길어 잘렸으면 truncated=True와
         total_chars(전체 길이)가 함께 온다 — 찾는 내용이 안 보이면 find 키워드로 재호출해
         뒷부분을 읽는다. 실패 시 status="error"와 error_type
-        ("invalid_url"|"not_configured"|"empty"|"fetch"), message를 담은 dict.
+        ("invalid_url"|"invalid_find"|"not_configured"|"empty"|"fetch"), message를 담은 dict.
     """
     settings = get_settings()
 
-    scheme = urlparse(url).scheme.lower()
+    if not isinstance(url, str) or not url.strip():
+        logger.info("web_fetch url=%r status=error error_type=invalid_url", url)
+        return {
+            "status": "error",
+            "error_type": "invalid_url",
+            "message": "url은 빈 문자열이 아닌 http/https URL이어야 합니다",
+        }
+    if find is not None and not isinstance(find, str):
+        logger.info("web_fetch url=%r status=error error_type=invalid_find", url)
+        return {
+            "status": "error",
+            "error_type": "invalid_find",
+            "url": url,
+            "message": "find는 문자열이어야 합니다",
+        }
+
+    try:
+        scheme = urlparse(url).scheme.lower()
+    except ValueError:
+        scheme = ""
     if scheme not in ("http", "https"):
         logger.info("web_fetch url=%r status=error error_type=invalid_url", url)
         return {
             "status": "error",
             "error_type": "invalid_url",
+            "url": url,
             "message": "http/https URL만 열람할 수 있습니다",
         }
 
@@ -62,6 +83,7 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
         return {
             "status": "error",
             "error_type": "not_configured",
+            "url": url,
             "message": "웹 열람이 설정되지 않았습니다",
         }
 
@@ -74,26 +96,48 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
         data = response.json()
         if not isinstance(data, dict):
             raise ValueError(f"응답이 JSON 객체가 아닙니다: {type(data).__name__}")
+        results = data.get("results")
+        if results is None:
+            results = []
+        if not isinstance(results, list):
+            raise ValueError(f"results가 목록이 아닙니다: {type(results).__name__}")
+        first = results[0] if results else None
+        if first is not None and not isinstance(first, dict):
+            raise ValueError(
+                f"results[0]이 객체가 아닙니다: {type(first).__name__}"
+            )
+        raw_content = first.get("raw_content") if first is not None else None
+        if raw_content is not None and not isinstance(raw_content, str):
+            raise ValueError(
+                f"results[0].raw_content가 문자열이 아닙니다: "
+                f"{type(raw_content).__name__}"
+            )
+        extracted_title = first.get("title") if first is not None else None
+        if extracted_title is not None and not isinstance(extracted_title, str):
+            raise ValueError(
+                f"results[0].title이 문자열이 아닙니다: "
+                f"{type(extracted_title).__name__}"
+            )
     except (httpx.HTTPError, ValueError) as exc:
         logger.info("web_fetch url=%r status=error error_type=fetch", url)
         return {
             "status": "error",
             "error_type": "fetch",
+            "url": url,
             "message": f"웹 페이지 열람에 실패했습니다: {exc}",
         }
 
-    results = data.get("results") or []
-    raw_content = results[0].get("raw_content") if results else None
     if not raw_content:
         # 추출 실패(failed_results)거나 본문이 비어 있음 — 빈 성공 위장 금지.
         logger.info("web_fetch url=%r status=error error_type=empty", url)
         return {
             "status": "error",
             "error_type": "empty",
+            "url": url,
             "message": "이 페이지에서 읽을 수 있는 본문을 추출하지 못했습니다",
         }
 
-    title = results[0].get("title") or url
+    title = extracted_title or url
     total_chars = len(raw_content)
     # yes24_fetch와 **같은 절단 계약**: 잘랐으면 잘랐다고 알리고(truncated·total_chars),
     # find로 뒷부분을 다시 읽을 수 있게 한다(도구마다 다른 규칙 금지).
@@ -107,7 +151,8 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
         title=title,
         url=url,
         source_type="web",
-        snippet=None,
+        snippet=text,
+        checked_at=checked_at,
     )
 
     logger.info(
@@ -120,7 +165,12 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
         "type": "web",
         "title": title,
         "url": url,
+        "snippet": text,
         "text": text,
+        "evidence_segments": qualify_evidence_segments(
+            build_evidence_segments(text),
+            source_id,
+        ),
         "checked_at": checked_at,
     }
     if total_chars > settings.web_fetch_max_chars:

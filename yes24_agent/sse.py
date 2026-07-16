@@ -24,15 +24,6 @@ def sse_status(stage: str, detail: str = "") -> str:
     return format_sse("status", {"stage": stage, "detail": detail})
 
 
-def sse_ack(text: str) -> str:
-    """인터스티셜 응대(ack) 이벤트 — 도구 호출 전 공감·안내 첫 문장을 별도 채널로 즉시 흘린다.
-
-    본문(delta)·done.text와 분리된 표시 전용 채널이다(4b 불변: done.text에 미포함). 프론트는
-    답변 버블 위 은은한 응대 라인으로 띄운다. status(진행 라벨)와 별도 — "응대 → 검색 중 → 본문".
-    """
-    return format_sse("ack", {"text": text})
-
-
 # 16뷰 매트릭스(/chat/matrix)용 가법 kwarg `col`. col=None(기본)이면 페이로드에 키를 넣지
 # 않아 /chat/stream 프레임과 **바이트 동일**하다(단일 채팅·스트리밍 팀 무영향). col 지정 시에만
 # payload에 "col":k(0~15)를 실어, 매트릭스 프론트가 프레임을 열별로 라우팅한다.
@@ -42,12 +33,9 @@ def _with_col(data: dict, col: int | None) -> dict:
 
 
 def sse_source(source: dict, col: int | None = None) -> str:
-    """출처 확보 즉시 노출하는 이벤트. id/title/url/type(+표지 image_url, +저자·가격)만 추출한다.
+    """최종 인용 검증을 통과한 출처 이벤트를 공개 DTO로 직렬화한다.
 
-    image_url·author·price는 **있을 때만** 실어(상품 검색 결과), 없는 출처(web·notice 등)의
-    프레임은 이전과 바이트 동일하게 유지한다(가법 필드, 기존 계약 불변). author·price는 카드가
-    스트리밍 시점부터 저자·가격을 보이게 하려는 것 — 카드는 이 관찰 이벤트에서 그려져 done까지
-    유지되므로, 여기서 빠뜨리면 비인용 카드는 끝까지 저자·가격이 없다.
+    image_url·author·price는 있는 상품 출처에만 싣고, 웹·정책 출처에서는 생략한다.
     """
     data = {
         "id": source["id"],

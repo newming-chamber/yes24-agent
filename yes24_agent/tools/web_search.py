@@ -8,8 +8,8 @@ Perplexity /search는 요약(answer)이 아니라 **원시 검색 결과**(제�
 각 결과의 snippet 필드에 페이지 콘텐츠(추출 본문, max_tokens_per_page로 분량 조절)가
 직접 담기므로 Tavily의 snippet/raw_content 이원 구조가 단일 필드로 통합된다 — snippet이
 곧 종합 재료다. 에이전트가 여러 결과를 직접 종합해 답하며, snippet보다 더 긴 전문이
-필요하면 그 url을 web_fetch(Tavily /extract)로 읽는다. 각 결과에는 신선도 신호 last_updated를
-함께 실어 시의성 질문에서 최신 우선에 쓸 수 있게 한다.
+필요하면 그 url을 web_fetch(Tavily /extract)로 읽는다. 각 결과에는 문서 발행 시점
+published_at과 출처 갱신 시점 last_updated를 분리해 싣는다.
 
 **퍼플렉시티식 멀티쿼리 병렬 검색**: 이 도구는 한 번에 여러 검색 각도(queries)를 받아
 asyncio.gather로 **동시에** 검색하고 결과를 합쳐 돌려준다. 복합·시의성·비교 질문을 하나의
@@ -31,15 +31,88 @@ source_id가 유일·단조로 부여된다(fetch_many와 동일 규약, 병렬 
 
 import asyncio
 import logging
+from urllib.parse import urlsplit
 
 import httpx
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import Settings, get_settings
+from yes24_agent.evidence_segments import build_evidence_segments, qualify_evidence_segments
 from yes24_agent.sources import now_checked_at, register_source
 from yes24_agent.tools.yes24_fetch import truncate
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_domain_filters(domains: list[str] | None) -> list[str]:
+    """명시 도메인 필터를 Perplexity 문법의 단일 polarity 목록으로 검증한다."""
+    if domains is None:
+        return []
+    if not isinstance(domains, list):
+        raise ValueError("domains는 도메인 문자열 목록이어야 합니다")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    polarities: set[bool] = set()
+    for raw in domains:
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("domains의 각 항목은 비어 있지 않은 문자열이어야 합니다")
+        value = raw.strip().lower()
+        excluded = value.startswith("-")
+        domain = value[1:] if excluded else value
+        if any(marker in domain for marker in ("://", "/", "?", "#", "@", ":")):
+            raise ValueError("domains에는 프로토콜·경로·포트 없이 hostname만 넣어야 합니다")
+        domain = domain.rstrip(".")
+        try:
+            ascii_domain = domain.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise ValueError("domains에 유효하지 않은 hostname이 있습니다") from exc
+        labels = ascii_domain.split(".")
+        if len(labels) < 2 or len(ascii_domain) > 253:
+            raise ValueError("domains에는 완전한 hostname을 넣어야 합니다")
+        if any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or any(not (character.isalnum() or character == "-") for character in label)
+            for label in labels
+        ):
+            raise ValueError("domains에 유효하지 않은 hostname이 있습니다")
+
+        polarities.add(excluded)
+        normalized_filter = f"-{ascii_domain}" if excluded else ascii_domain
+        if normalized_filter not in seen:
+            seen.add(normalized_filter)
+            normalized.append(normalized_filter)
+
+    if len(polarities) > 1:
+        raise ValueError("domains의 포함 필터와 제외 필터를 한 요청에 섞을 수 없습니다")
+    return normalized
+
+
+def _url_in_domain_scope(url: str, domain_filters: list[str]) -> bool:
+    """반환 URL hostname이 요청한 allowlist/denylist 경계를 만족하는지 판정한다."""
+    try:
+        parsed = urlsplit(url)
+        raw_hostname = parsed.hostname
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"} or raw_hostname is None:
+        return False
+    try:
+        hostname = raw_hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return False
+    if not domain_filters:
+        return True
+    excluded = domain_filters[0].startswith("-")
+    scoped_domains = [entry[1:] if excluded else entry for entry in domain_filters]
+    matched = any(
+        hostname == domain or hostname.endswith(f".{domain}")
+        for domain in scoped_domains
+    )
+    return not matched if excluded else matched
 
 
 def _truncate_snippet(snippet: str | None, max_chars: int) -> str | None:
@@ -75,7 +148,11 @@ async def aclose_shared_client() -> None:
 
 
 async def _search_one(
-    query: str, client: httpx.AsyncClient, headers: dict, settings: Settings
+    query: str,
+    client: httpx.AsyncClient,
+    headers: dict,
+    settings: Settings,
+    domain_filters: list[str],
 ) -> dict:
     """한 검색 각도(query)로 Perplexity /search를 호출해 **원시 결과만** 돌려준다(등록 없음).
 
@@ -93,6 +170,8 @@ async def _search_one(
         "max_tokens_per_page": settings.web_search_max_tokens_per_page,
         "max_tokens": settings.web_search_max_tokens,
     }
+    if domain_filters:
+        payload["search_domain_filter"] = domain_filters
     try:
         response = await client.post(
             settings.perplexity_search_url, json=payload, headers=headers
@@ -103,6 +182,26 @@ async def _search_one(
             # 유효 JSON이지만 객체가 아닌 본문(배열·null·스칼라)이면 data.get()이
             # AttributeError로 도구 밖 탈출한다 — 여기서 막아 fetch 에러로 처리.
             raise ValueError(f"응답이 JSON 객체가 아닙니다: {type(data).__name__}")
+        raw = data.get("results")
+        if raw is None:
+            raw = []
+        if not isinstance(raw, list):
+            raise ValueError(f"results가 목록이 아닙니다: {type(raw).__name__}")
+        for index, item in enumerate(raw):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"results[{index}]가 객체가 아닙니다: {type(item).__name__}"
+                )
+            url = item.get("url")
+            if not isinstance(url, str) or not url.strip():
+                raise ValueError(f"results[{index}].url이 유효한 문자열이 아닙니다")
+            for field in ("title", "snippet", "body", "last_updated", "date"):
+                value = item.get(field)
+                if value is not None and not isinstance(value, str):
+                    raise ValueError(
+                        f"results[{index}].{field}가 문자열이 아닙니다: "
+                        f"{type(value).__name__}"
+                    )
     except (httpx.HTTPError, ValueError) as exc:
         # httpx.HTTPError: 타임아웃·전송 오류·raise_for_status의 HTTPStatusError 포함.
         # ValueError: 응답이 JSON이 아니거나(response.json()) JSON 객체가 아닐 때.
@@ -113,39 +212,47 @@ async def _search_one(
             "error_type": "fetch",
             "message": f"웹 검색 요청에 실패했습니다: {exc}",
         }
-    return {"query": query, "status": "ok", "raw": data.get("results") or []}
+    return {"query": query, "status": "ok", "raw": raw}
 
 
-async def web_search(queries: list[str], tool_context: ToolContext) -> dict:
+async def web_search(
+    queries: list[str],
+    tool_context: ToolContext,
+    domains: list[str] | None = None,
+) -> dict:
     """웹에서 원시 검색 결과(제목·URL·스니펫) 목록을 가져온다(여러 각도를 한 번에 병렬 검색).
 
     Yes24로 답할 수 없는 외부·최신 정보(뉴스·스포츠·주가·날씨·시사·인물·상식 등)가
     필요할 때 쓴다. 각 결과의 snippet에는 해당 페이지에서 추출한 본문이 담기므로, 여러
     결과의 snippet을 종합해 그대로 답한다. snippet만으로 부족해 특정 페이지의 더 긴 전문이
-    필요하면 그 url을 web_fetch에 넣어 읽는다. 각 결과의 last_updated(최종 갱신일)를 보고
-    시의성 질문에선 최신 결과를 우선한다. 가격·재고·구매 링크 같은 상품 정보를 얻는 용도가
-    아니다(그것은 Yes24 검색으로). 잡담이나 Yes24로 충분한 질문엔 쓰지 않는다.
+    필요하면 그 url을 web_fetch에 넣어 읽는다. 각 결과의 published_at(문서 발행 시점)과
+    last_updated(출처 갱신 시점)를 구분해 시의성을 판단한다. 가격·재고·구매 링크 같은 상품
+    정보를 얻는 용도가 아니다(그것은 Yes24 검색으로). 잡담이나 Yes24로 충분한 질문엔 쓰지 않는다.
 
-    **여러 각도를 한 번에**: 복합·시의성·비교 질문은 하나의 좁은 쿼리로 뭉개지 말고, 서로
-    다른 각도의 검색어 여러 개를 queries 리스트에 담아 한 번에 넘긴다 — 각도들은 동시에 검색돼
-    한 번의 지연으로 폭넓게 수집되고, 에이전트가 그 원시 결과를 교차 종합한다(퍼플렉시티식
-    질문 분해 → 병렬 검색 → 직접 종합). 예: "월드컵 4강 결과와 다음 상대·일정" →
-    ["월드컵 4강 경기 결과", "대한민국 대표팀 다음 경기 상대", "월드컵 남은 경기 일정"].
-    단순·단일 각도 질문은 원소 하나짜리 리스트로 넘기면 된다(예: ["삼성전자 주가"]).
+    복합·시의성·비교 질문은 서로 독립적인 검색 각도를 queries에 함께 담을 수 있다. 각도들은
+    동시에 검색되며, 단순 질문은 하나의 원소만 전달한다. 같은 목적의 표현만 바꾼 중복 검색은
+    만들지 않고 서로 다른 요구나 충돌 확인에 필요한 각도만 사용한다. 사용자가 여러 사이트를
+    함께 근거로 요구했다면 각 사이트를 실제로 찾는 독립 검색 각도를 두고, 결과가 반환된 사이트만
+    사용했다고 말한다.
 
     Args:
-        queries: 검색 각도(검색어) 리스트. 각 원소는 알고 싶은 내용을 담은 자연스러운
-            질문·키워드다. 복합 질문은 3~4개의 서로 다른 각도로 분해해 담고(상한을 넘는
-            각도는 dropped_queries로 알린 뒤 처리에서 제외), 단순 질문은 원소 하나만 담는다.
+        queries: 검색 각도 리스트. 각 원소는 독립적으로 확인할 질문이나 키워드다. 상한을 넘는
+            각도는 dropped_queries로 알리고 처리에서 제외한다. 현재·상대 시점 질문에는 해소한
+            절대 날짜를 각 검색어에 포함한다.
+        domains: 사용자가 구체적으로 지정한 사이트 hostname의 선택적 목록. 포함 범위는
+            `["news.example", "wire.example"]`, 특정 사이트 제외는 `["-example.com"]`처럼
+            전달하며 포함과 제외를 섞지 않는다. 출처 범주를 임의 hostname 목록으로 바꾸지 않는다.
 
     Returns:
         성공 시 status="ok"와 results 목록(모든 각도의 결과를 url 기준으로 병합·중복제거,
-        각 결과에 인용용 source_id·title·url·snippet·last_updated와 어느 각도에서 나왔는지
-        queries), 각 각도의 성공/실패를 담은 searches 요약, 검색 시각 checked_at을 담은 dict.
+        각 결과에 인용용 source_id·title·url·snippet·published_at·last_updated와 어느 각도에서
+        나왔는지(queries), 각 각도의 성공/실패를 담은 searches 요약, 검색 시각 checked_at을 담은
+        dict.
         snippet은 스니펫이 아니라 페이지 콘텐츠(추출 본문)라 그 자체로 종합 재료가 된다.
         상한을 넘겨 검색하지 않은 각도가 있으면 dropped_count·dropped_queries로 명시한다.
         성공·실패 모두 result_count를 함께 담는다. 모든 각도가 실패했을 때만 status="error"와
-        error_type("not_configured"|"fetch"), message에 더해 result_count=0을 담은 dict.
+        error_type("not_configured"|"empty_query"|"fetch"), message에 더해
+        result_count=0을 담은 dict.
     """
     settings = get_settings()
 
@@ -155,6 +262,17 @@ async def web_search(queries: list[str], tool_context: ToolContext) -> dict:
             "status": "error",
             "error_type": "not_configured",
             "message": "웹 검색이 설정되지 않았습니다",
+            "result_count": 0,
+        }
+
+    try:
+        domain_filters = _normalize_domain_filters(domains)
+    except ValueError as exc:
+        logger.info("web_search status=error error_type=invalid_domains")
+        return {
+            "status": "error",
+            "error_type": "invalid_domains",
+            "message": str(exc),
             "result_count": 0,
         }
 
@@ -195,7 +313,7 @@ async def web_search(queries: list[str], tool_context: ToolContext) -> dict:
     # 네트워크(/search POST)만 동시 실행한다(각도별 병렬). 등록은 아래 순차 루프에서 — 레이스 0.
     # _search_one이 예상 오류를 이미 error dict로 삼키므로 예상 밖 예외만 gather 밖으로 올라온다.
     searched = await asyncio.gather(
-        *(_search_one(q, client, headers, settings) for q in planned)
+        *(_search_one(q, client, headers, settings, domain_filters) for q in planned)
     )
 
     checked_at = now_checked_at()
@@ -216,7 +334,21 @@ async def web_search(queries: list[str], tool_context: ToolContext) -> dict:
         matched = 0
         for item in outcome["raw"]:
             url = item.get("url")
-            if not url:
+            if not url or not _url_in_domain_scope(url, domain_filters):
+                continue
+            content = next(
+                (
+                    value
+                    for value in (item.get("snippet"), item.get("body"))
+                    if isinstance(value, str) and value.strip()
+                ),
+                None,
+            )
+            snippet = _truncate_snippet(
+                content,
+                settings.web_search_snippet_max_chars,
+            )
+            if not isinstance(snippet, str) or not snippet.strip():
                 continue
             matched += 1
             existing = url_to_index.get(url)
@@ -229,18 +361,19 @@ async def web_search(queries: list[str], tool_context: ToolContext) -> dict:
             title = item.get("title") or url
             # snippet 로컬 하드 상한(벤더 토큰 예산 초과분 방어). 등록·반환 모두 절단본으로
             # 통일해 세션 출처와 도구 결과의 snippet이 어긋나지 않게 한다.
-            snippet = _truncate_snippet(
-                item.get("snippet"), settings.web_search_snippet_max_chars
-            )
-            # 최종 갱신일(신선도 신호). 없으면 발행일(date)로 보완, 둘 다 없으면 None.
-            last_updated = item.get("last_updated") or item.get("date")
+            published_at = item.get("date")
+            last_updated = item.get("last_updated")
+            evidence_segments = build_evidence_segments(snippet)
             source_id = register_source(
                 tool_context.state,
                 title=title,
                 url=url,
                 source_type="web",
                 snippet=snippet,
+                checked_at=checked_at,
+                meta={"published_at": published_at, "last_updated": last_updated},
             )
+            evidence_segments = qualify_evidence_segments(evidence_segments, source_id)
             url_to_index[url] = len(results)
             results.append(
                 {
@@ -249,11 +382,21 @@ async def web_search(queries: list[str], tool_context: ToolContext) -> dict:
                     "title": title,
                     "url": url,
                     "snippet": snippet,
+                    "checked_at": checked_at,
+                    "published_at": published_at,
                     "last_updated": last_updated,
+                    "evidence_segments": evidence_segments,
                     "queries": [query],
                 }
             )
-        searches.append({"query": query, "status": "ok", "result_count": matched})
+        searches.append(
+            {
+                "query": query,
+                "status": "ok",
+                "result_count": matched,
+                "raw_result_count": len(outcome["raw"]),
+            }
+        )
 
     ok_count = sum(1 for s in searches if s["status"] == "ok")
     if ok_count == 0:

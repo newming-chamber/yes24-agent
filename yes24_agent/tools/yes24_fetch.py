@@ -16,10 +16,23 @@ from bs4 import BeautifulSoup
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
+from yes24_agent.evidence_segments import (
+    build_entry_evidence_segments,
+    build_evidence_segments,
+    build_field_evidence_segments,
+    qualify_evidence_segments,
+)
+from yes24_agent.product_selection import PRODUCT_RATIONALE_FIELDS
 from yes24_agent.sources import now_checked_at, register_source
 from yes24_agent.tools.yes24_search import _get_client
 from yes24_agent.yes24.client import Yes24FetchError
-from yes24_agent.yes24.parsers import ParseError, extract_links, parse_product, product_fields
+from yes24_agent.yes24.parsers import (
+    ParseError,
+    extract_faq_entries,
+    extract_links,
+    parse_product,
+    product_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +54,10 @@ def truncate(text: str, max_chars: int) -> str:
     """text를 max_chars로 절단하고 절단 표시를 붙인다. 이미 짧으면 그대로 반환."""
     if len(text) <= max_chars:
         return text
-    return text[:max_chars].rstrip() + TRUNCATION_SUFFIX
+    content_budget = max_chars - len(TRUNCATION_SUFFIX)
+    if content_budget <= 0:
+        return TRUNCATION_SUFFIX[:max_chars]
+    return text[:content_budget].rstrip() + TRUNCATION_SUFFIX
 
 
 def window_around_find(
@@ -63,10 +79,49 @@ def window_around_find(
         return truncate(text, max_chars), True
 
     start = max(0, pos - lead_chars)
-    window = text[start : start + max_chars].strip()
     prefix = OMITTED_PREFIX if start > 0 else ""
     suffix = TRUNCATION_SUFFIX if start + max_chars < len(text) else ""
+    content_budget = max_chars - len(prefix) - len(suffix)
+    if content_budget <= 0:
+        return (prefix + suffix)[:max_chars], True
+    window = text[start : start + content_budget].strip()
     return f"{prefix}{window}{suffix}", True
+
+
+def _render_faq_entries(entries: list[dict[str, str]]) -> str:
+    return "\n\n".join(
+        f"질문: {entry['question']}\n답변: {entry['answer']}" for entry in entries
+    )
+
+
+def _select_complete_faq_entries(
+    entries: list[dict[str, str]], max_chars: int, find: str | None
+) -> tuple[list[dict[str, str]], str, bool]:
+    """FAQ entry 경계를 깨지 않고 반환 예산 안의 연속 entry를 고른다."""
+    full_text = _render_faq_entries(entries)
+    find_found = bool(find) and find.casefold() in full_text.casefold()
+    if len(full_text) <= max_chars:
+        return entries, full_text, find_found
+
+    start = 0
+    if find and find_found:
+        needle = find.casefold()
+        start = next(
+            index
+            for index, entry in enumerate(entries)
+            if needle in _render_faq_entries([entry]).casefold()
+        )
+
+    selected: list[dict[str, str]] = []
+    selected_chars = 0
+    for entry in entries[start:]:
+        entry_text = _render_faq_entries([entry])
+        added_chars = len(entry_text) + (2 if selected else 0)
+        if selected_chars + added_chars > max_chars:
+            break
+        selected.append(entry)
+        selected_chars += added_chars
+    return selected, _render_faq_entries(selected), find_found
 
 
 # 외부 페이지 열람(web_fetch)도 이 두 함수를 그대로 import해 **같은 절단 계약**을 갖는다
@@ -212,20 +267,25 @@ def _fetch_product(
     title = product.get("title") or "제목 미상"
 
     # 검색·브라우즈와 같은 필드 집합(_product_fields) — 상세만 연 턴에서도 게이트가 대조할
-    # 접지 필드(publisher·rating·price·pub_status…)를 빠짐없이 싣는다.
+    # 접지 필드(publisher·rating·price·pub_date…)를 빠짐없이 싣는다.
     fields = product_fields(product)
+    content = "\n\n".join(block for block in (intro, toc, pub_review, *weekly_reviews) if block)
     source_id = register_source(
         tool_context.state,
         title=title,
         url=url,
         source_type="book_detail",
-        snippet=intro,
+        snippet=content,
+        checked_at=checked_at,
         meta=fields,
     )
 
     logger.info(
         "yes24_fetch url=%r status=ok type=book_detail total=%d truncated=%s find=%r",
-        url, trunc.total_chars, trunc.truncated, find,
+        url,
+        trunc.total_chars,
+        trunc.truncated,
+        find,
     )
     detail = {
         "status": "ok",
@@ -233,6 +293,7 @@ def _fetch_product(
         "title": title,
         "url": url,
         "type": "book_detail",
+        "snippet": content,
         **fields,
         "is_ebook": product.get("is_ebook"),
         "intro": intro,
@@ -242,6 +303,7 @@ def _fetch_product(
         "links": links,
         "checked_at": checked_at,
     }
+    detail["evidence_segments"] = build_field_evidence_segments(detail, PRODUCT_RATIONALE_FIELDS)
     if trunc.truncated:
         # 가법 필드: 잘리지 않은 상세의 반환 형태는 기존과 동일하다.
         detail["truncated"] = True
@@ -276,7 +338,12 @@ def _fetch_generic(
 
     title = _text_or_none(soup.title) or url
     body = soup.body if soup.body is not None else soup
-    text = _normalize_whitespace(body.get_text(" ", strip=True))
+    faq_entries = extract_faq_entries(soup)
+    text = (
+        _render_faq_entries(faq_entries)
+        if faq_entries
+        else _normalize_whitespace(body.get_text(" ", strip=True))
+    )
 
     if len(text) < min_meaningful_chars:
         logger.info("yes24_fetch url=%r status=error error_type=empty chars=%d", url, len(text))
@@ -290,20 +357,42 @@ def _fetch_generic(
         }
 
     total_chars = len(text)
-    window, find_found = window_around_find(text, max_chars, find, lead_chars)
+    if faq_entries:
+        selected_entries, window, find_found = _select_complete_faq_entries(
+            faq_entries, max_chars, find
+        )
+        if not selected_entries:
+            logger.info(
+                "yes24_fetch url=%r status=error error_type=content_too_large total=%d",
+                url,
+                total_chars,
+            )
+            return {
+                "status": "error",
+                "error_type": "content_too_large",
+                "message": "완전한 FAQ 질문·답변 항목이 본문 반환 상한을 초과했습니다.",
+            }
+        evidence_segments = build_entry_evidence_segments(selected_entries)
+    else:
+        window, find_found = window_around_find(text, max_chars, find, lead_chars)
+        evidence_segments = build_evidence_segments(window)
 
     source_id = register_source(
         tool_context.state,
         title=title,
         url=url,
         source_type="notice",
-        snippet=None,
-        meta=None,
+        snippet=window,
+        checked_at=checked_at,
     )
+    evidence_segments = qualify_evidence_segments(evidence_segments, source_id)
 
     logger.info(
         "yes24_fetch url=%r status=ok type=notice chars=%d total=%d find=%r",
-        url, len(window), total_chars, find,
+        url,
+        len(window),
+        total_chars,
+        find,
     )
     result = {
         "status": "ok",
@@ -311,7 +400,9 @@ def _fetch_generic(
         "title": title,
         "url": url,
         "type": "notice",
+        "snippet": window,
         "text": window,
+        "evidence_segments": evidence_segments,
         "links": links,
         "checked_at": checked_at,
     }
@@ -373,8 +464,18 @@ def _truncate_detail_blocks(
     intro_out = toc_out = pub_review_out = None
     weekly_out: list[str] = []
     remaining = max_chars
+    emitted = False
     for kind, text in named:
-        taken, remaining = _take_block(text, remaining, find, lead_chars)
+        separator_chars = len("\n\n") if emitted else 0
+        taken, block_remaining = _take_block(
+            text,
+            max(0, remaining - separator_chars),
+            find,
+            lead_chars,
+        )
+        if taken:
+            remaining = block_remaining
+            emitted = True
         if kind == "intro":
             intro_out = taken
         elif kind == "toc":

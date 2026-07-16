@@ -9,10 +9,8 @@ from yes24_agent.rbti.persona import (
     AXIS_FRAGMENTS,
     AXIS_ORDER,
     AXIS_VALUE_LABELS_KO,
-    TYPE_ARCHETYPES,
     axis_label,
     build_persona_block,
-    get_archetype,
     get_archetype_name,
     is_valid_code,
 )
@@ -21,10 +19,8 @@ __all__ = [
     "AXIS_FRAGMENTS",
     "AXIS_ORDER",
     "AXIS_VALUE_LABELS_KO",
-    "TYPE_ARCHETYPES",
     "axis_label",
     "build_persona_block",
-    "get_archetype",
     "get_archetype_name",
     "is_valid_code",
 ]

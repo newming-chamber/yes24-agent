@@ -9,6 +9,7 @@ InMemorySessionService로 폴백해 서버 기동을 항상 보장하고, 같은
 import asyncio
 import logging
 from pathlib import Path
+from weakref import WeakValueDictionary
 
 from google.adk.sessions import (
     BaseSessionService,
@@ -30,8 +31,9 @@ _session_service: BaseSessionService | None = None
 # 세션별 직렬화 락. 같은 session_id로 동시 요청(전송 버튼 더블클릭 등)이 들어오면
 # 두 run_async가 같은 세션에 동시에 이벤트를 append해 DatabaseSessionService의
 # stale-writer 검출(ValueError)로 스트림이 중간에 죽는다. 세션별 락으로 순차 처리한다.
-# POC 스코프에서 락 dict는 무한정 커질 수 있으나(세션당 1개) 실사용 규모에서 무시 가능.
-_session_locks: dict[str, asyncio.Lock] = {}
+# 실행 중이거나 대기 중인 코루틴이 lock을 강하게 참조하며, 사용이 끝난 lock은
+# 레지스트리에서 자동 제거된다.
+_session_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
 
 def _get_session_lock(session_id: str) -> asyncio.Lock:

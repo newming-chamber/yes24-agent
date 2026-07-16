@@ -6,6 +6,8 @@
 스트림 관찰본으로 보정한다(_reconcile_sources).
 """
 
+from yes24_agent.sources import merge_turn_source_records
+from yes24_agent.yes24.parsers import GROUNDING_FIELDS
 from yes24_agent.yes24.urls import BROWSE_SEED_URLS
 
 
@@ -49,8 +51,11 @@ def _status_for_call(call) -> tuple[str, str]:
         return "browsing", "Yes24 코너를 둘러보는 중…"
     if name == "web_search":
         queries = args.get("queries")
-        angles = [q for q in queries if isinstance(q, str) and q.strip()] \
-            if isinstance(queries, list) else []
+        angles = (
+            [q for q in queries if isinstance(q, str) and q.strip()]
+            if isinstance(queries, list)
+            else []
+        )
         if len(angles) > 1:
             return "searching_web", f"웹에서 {len(angles)}개 각도로 정보를 찾는 중…"
         if angles:
@@ -85,19 +90,35 @@ def _status_for_error(payload: dict) -> tuple[str, str]:
 # 끝까지 안 실렸다(실측 회귀). 조립을 한 곳에 두면 계약 드리프트가 구조적으로 불가능해진다.
 # 상품 결과에만 있는 필드(author·price·rating·publisher·image_url)는 웹 출처에선 None이고,
 # 프론트가 생략한다. rating·publisher는 grounding의 값 대조(지어낸 평점·판본 통칭)에도 쓰인다.
-def build_source_event(source: dict) -> dict:
-    """도구 결과 항목 하나를 SSE 출처 이벤트 dict로 만든다(카드 표시 + 게이트 대조 공용)."""
-    return {
-        "id": source.get("source_id"),
+_PUBLIC_SOURCE_FIELDS = (
+    *GROUNDING_FIELDS,
+    "rank",
+    "is_ebook",
+    "snippet",
+    "published_at",
+    "last_updated",
+    "checked_at",
+)
+
+
+def project_public_source(source: dict) -> dict:
+    """내부 출처를 API의 단일 public source DTO로 투영한다."""
+    meta = source.get("meta") if isinstance(source.get("meta"), dict) else {}
+    event = {
+        "id": source.get("id", source.get("source_id")),
         "title": source.get("title", ""),
         "url": source.get("url", ""),
         "type": source.get("type", "search_result"),
-        "author": source.get("author"),
-        "price": source.get("price"),
-        "image_url": source.get("image_url"),
-        "rating": source.get("rating"),
-        "publisher": source.get("publisher"),
     }
+    for field in _PUBLIC_SOURCE_FIELDS:
+        if field in source:
+            event[field] = source[field]
+        elif field in meta:
+            event[field] = meta[field]
+    return event
+
+
+build_source_event = project_public_source
 
 
 def _sources_from_response(payload: dict) -> list[dict]:
@@ -118,8 +139,8 @@ def _sources_from_response(payload: dict) -> list[dict]:
     return [c for c in candidates if isinstance(c, dict) and c.get("source_id") is not None]
 
 
-def _reconcile_sources(state_sources: list[dict], observed_sources: list[dict]) -> list[dict]:
-    """done 조립·인용 검증에 쓸 최종 출처 목록을 만든다(부류 방어).
+def _reconcile_sources(observed_sources: list[dict]) -> list[dict]:
+    """이번 턴의 done 조립·인용 검증에 쓸 출처 스냅샷을 만든다.
 
     ADK 2.3.0은 한 턴에 나온 병렬 function call을 asyncio.gather로 동시 실행하고,
     각 도구의 state_delta를 deep_merge_dicts가 **리스트 키에 대해 last-wins로 덮어쓴다**
@@ -127,17 +148,13 @@ def _reconcile_sources(state_sources: list[dict], observed_sources: list[dict]) 
     한 도구의 출처가 통째로 유실될 수 있고, postprocess가 유효한 [n] 인용을 잘라낸다.
 
     반면 병렬 function_response는 merge 시 parts가 모두 보존되므로, 런너가 스트림에서
-    관찰해 누적한 출처(observed)는 유실되지 않는다. 두 출처를 id 기준으로 합쳐 유실 부류를
-    막는다: 공통 id는 state를 우선(snippet/meta가 더 풍부), state가 잃은 id는 observed로
-    채운다. id 오름차순으로 정렬해 반환한다(멀티턴 이전 턴 출처도 state에 포함돼 유지된다).
+    관찰해 누적한 출처(observed)는 유실되지 않는다. 따라서 근거 스냅샷은 observed만 id 기준으로
+    합친다. 세션 레지스트리를 섞지 않아 과거 상세·가격이 새 검색 관측을 덮거나 이번 턴 상세
+    게이트를 통과시키지 못하게 한다.
     """
     by_id: dict[int, dict] = {}
     for src in observed_sources:
         sid = src.get("id")
         if sid is not None:
-            by_id.setdefault(sid, src)
-    for src in state_sources:
-        sid = src.get("id")
-        if sid is not None:
-            by_id[sid] = src
+            by_id[sid] = merge_turn_source_records(by_id.get(sid, {}), src)
     return [by_id[key] for key in sorted(by_id)]

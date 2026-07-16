@@ -18,6 +18,11 @@ from yes24_agent.yes24.selectors import (
     CREMACLUB_RANK,
     CREMACLUB_RATING,
     CREMACLUB_TITLE_LINK,
+    FAQ_ANSWER,
+    FAQ_ENTRY,
+    FAQ_ENTRY_LISTS,
+    FAQ_QUESTION,
+    FAQ_QUESTION_DECORATION,
     ITEM_AUTHOR,
     ITEM_AUTHOR_TOGGLE,
     ITEM_GOODS_NO_ATTR,
@@ -40,6 +45,7 @@ from yes24_agent.yes24.selectors import (
     PRODUCT_GOODS_NO_JS_RE,
     PRODUCT_INTRO,
     PRODUCT_IS_EBOOK_JS_RE,
+    PRODUCT_PAGE_COUNT_FIELD,
     PRODUCT_PUB_DATE,
     PRODUCT_PUB_REVIEW,
     PRODUCT_PUBLISHER,
@@ -48,6 +54,9 @@ from yes24_agent.yes24.selectors import (
     PRODUCT_REVIEW_WEEK_FULL_TEXT,
     PRODUCT_REVIEW_WEEK_ITEM,
     PRODUCT_SALE_PRICE_JS_RE,
+    PRODUCT_SPECIFICATION_LABEL,
+    PRODUCT_SPECIFICATION_ROWS,
+    PRODUCT_SPECIFICATION_VALUE,
     PRODUCT_TEXTAREA_CONTENT,
     PRODUCT_TITLE,
     PRODUCT_TOC,
@@ -74,6 +83,7 @@ _ITEM_FIELDS = (
     "pub_date",
     "price",
     "rating",
+    "page_count",
     "sale_index",
     "review_count",
     "image_url",
@@ -209,17 +219,36 @@ def parse_product(html: str, *, base_url: str) -> dict:
         "goods_no": goods_no,
         "title": title,
         "url": product_url(base_url, goods_no) if goods_no else None,
-        "author": _text_or_none(soup.select_one(PRODUCT_AUTHOR)),
+        "author": _author_text_or_none(soup.select_one(PRODUCT_AUTHOR)),
         "publisher": _text_or_none(soup.select_one(PRODUCT_PUBLISHER)),
         "pub_date": _text_or_none(soup.select_one(PRODUCT_PUB_DATE)),
         "price": price,
         "rating": _parse_rating(soup.select_one(PRODUCT_RATING)),
+        "page_count": _parse_page_count(soup),
         "is_ebook": is_ebook,
         "intro": _extract_infoset_text(soup, PRODUCT_INTRO),
         "toc": _extract_infoset_text(soup, PRODUCT_TOC),
         "pub_review": _extract_infoset_text(soup, PRODUCT_PUB_REVIEW),
         "weekly_reviews": _extract_weekly_reviews(soup),
     }
+
+
+def _parse_page_count(soup: BeautifulSoup) -> int | None:
+    """품목정보 표의 쪽수 값을 정수로 반환하고 행/값이 없으면 None으로 둔다."""
+    for row in soup.select(PRODUCT_SPECIFICATION_ROWS):
+        label = _text_or_none(row.select_one(PRODUCT_SPECIFICATION_LABEL))
+        value = _text_or_none(row.select_one(PRODUCT_SPECIFICATION_VALUE))
+        if label is None or value is None:
+            continue
+        fields = (field.strip() for field in label.split(","))
+        values = (field_value.strip() for field_value in value.split("|"))
+        specifications = dict(zip(fields, values))
+        raw_count = specifications.get(PRODUCT_PAGE_COUNT_FIELD)
+        if raw_count is None:
+            continue
+        normalized = "".join(character for character in raw_count if character.isdecimal())
+        return int(normalized) if normalized.isdigit() else None
+    return None
 
 
 def parse_browse_list(html: str, *, base_url: str, section: str, limit: int = 24) -> list[dict]:
@@ -470,6 +499,29 @@ def extract_links(
     return (products + _context_first(pages, page_url))[:limit]
 
 
+def extract_faq_entries(soup: BeautifulSoup) -> list[dict[str, str]]:
+    """첫 번째 비어 있지 않은 FAQ 목록을 질문·답변 entry 구조로 추출한다."""
+    for list_selector in FAQ_ENTRY_LISTS:
+        container = soup.select_one(list_selector)
+        if container is None:
+            continue
+        entries: list[dict[str, str]] = []
+        for entry in container.select(FAQ_ENTRY):
+            question = entry.select_one(FAQ_QUESTION)
+            answer = entry.select_one(FAQ_ANSWER)
+            if question is None or answer is None:
+                continue
+            for decoration in question.select(FAQ_QUESTION_DECORATION):
+                decoration.decompose()
+            question_text = _normalize_whitespace(question.get_text(" ", strip=True))
+            answer_text = _normalize_whitespace(answer.get_text(" ", strip=True))
+            if question_text and answer_text:
+                entries.append({"question": question_text, "answer": answer_text})
+        if entries:
+            return entries
+    return []
+
+
 def _context_first(pages: list[dict], page_url: str | None) -> list[dict]:
     """page 링크를 현재 페이지 맥락의 하위 링크가 앞서도록 안정 정렬한다.
 
@@ -573,7 +625,11 @@ def _author_or_none(item) -> str | None:
     또 저자 사이 콤마는 별개 텍스트노드(", ")라 get_text(" ")가 "홍창숙 , 김경은"처럼 콤마 앞에
     공백을 넣는다 — 카드 표시 품질을 위해 콤마 주변 공백을 "이름, 이름"으로 정규화한다.
     """
-    el = item.select_one(ITEM_AUTHOR)
+    return _author_text_or_none(item.select_one(ITEM_AUTHOR))
+
+
+def _author_text_or_none(el) -> str | None:
+    """저자 요소에서 펼침 UI를 제거하고 이름 목록만 반환한다."""
     if el is None:
         return None
     for toggle in el.select(ITEM_AUTHOR_TOGGLE):
@@ -649,8 +705,11 @@ def _parse_grouped_int(el) -> int | None:
 # KST(UTC+9). pub_status의 "오늘" 판정 기준.
 _KST = timezone(timedelta(hours=9))
 
-# "2022년 03월" / "2022년 03월 28일" 등에서 연·월 추출.
-_YEAR_MONTH_RE = re.compile(r"(\d{4})\s*년\s*(\d{1,2})\s*월")
+# "2022년 03월" / "2022년 03월 28일"의 연·월과 선택적 일자를 추출한다.
+_PUBLICATION_DATE_RE = re.compile(
+    r"(?P<year>\d{4})\s*년\s*(?P<month>\d{1,2})\s*월"
+    r"(?:\s*(?P<day>\d{1,2})\s*일)?"
+)
 
 
 def pub_status(pub_date: str | None, *, now: datetime | None = None) -> str | None:
@@ -662,20 +721,36 @@ def pub_status(pub_date: str | None, *, now: datetime | None = None) -> str | No
 
     Returns:
         과거: "출간됨 (약 N년 M개월 전)" 또는 같은 달이면 "출간됨 (이번 달)".
-        미래: "출간 예정 (약 N개월 후)". 파싱 불가 시 None.
+        일자가 오늘이면 "출간됨 (오늘)", 같은 달 미래면 "출간 예정 (N일 후)".
+        그 밖의 미래는 "출간 예정 (약 N개월 후)". 파싱 불가 시 None.
     """
     if not pub_date:
         return None
-    match = _YEAR_MONTH_RE.search(pub_date)
+    match = _PUBLICATION_DATE_RE.search(pub_date)
     if match is None:
         return None
 
-    year, month = int(match.group(1)), int(match.group(2))
+    year = int(match.group("year"))
+    month = int(match.group("month"))
     if not 1 <= month <= 12:
         return None
 
     now = now or datetime.now(_KST)
-    delta_months = (year * 12 + month) - (now.year * 12 + now.month)
+    current_date = now.astimezone(_KST).date() if now.tzinfo else now.date()
+    delta_months = (year * 12 + month) - (
+        current_date.year * 12 + current_date.month
+    )
+    raw_day = match.group("day")
+    if raw_day is not None:
+        try:
+            publication_date = datetime(year, month, int(raw_day)).date()
+        except ValueError:
+            return None
+        delta_days = (publication_date - current_date).days
+        if delta_days == 0:
+            return "출간됨 (오늘)"
+        if delta_months == 0 and delta_days > 0:
+            return f"출간 예정 ({delta_days}일 후)"
 
     if delta_months == 0:
         return "출간됨 (이번 달)"

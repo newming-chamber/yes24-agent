@@ -118,6 +118,7 @@ async def yes24_search(query: str, section: str, tool_context: ToolContext) -> d
             url=item["url"],
             source_type="search_result",
             snippet=item.get("author"),
+            checked_at=checked_at,
             meta=fields,
         )
         results.append(
@@ -126,6 +127,7 @@ async def yes24_search(query: str, section: str, tool_context: ToolContext) -> d
                 "type": "search_result",
                 "title": item["title"],
                 "url": item["url"],
+                "checked_at": checked_at,
                 **fields,
             }
         )

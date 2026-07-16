@@ -69,6 +69,13 @@ PRODUCT_PUBLISHER = ".gd_pub"
 PRODUCT_PUB_DATE = ".gd_date"
 PRODUCT_RATING = ".gd_lnkRate em.yes_b"
 
+# 종이책 쪽수는 품목정보 표의 이름/값 행에 있다. 목록 페이지에는 이 표가 없으므로 상세
+# 열람에서만 채우고, 해당 행이 없는 eBook은 None으로 둔다.
+PRODUCT_SPECIFICATION_ROWS = "#infoset_specific table.tb_vertical tr"
+PRODUCT_SPECIFICATION_LABEL = "th[scope=row]"
+PRODUCT_SPECIFICATION_VALUE = "td"
+PRODUCT_PAGE_COUNT_FIELD = "쪽수"
+
 # 가격·goods_no·eBook 여부는 상세페이지 인라인 <script> 전역변수를 정규식으로 추출한다.
 # CSS 방식(예: em.yes_b)은 상세페이지에서 "함께 사면 좋은 상품" 번들가·중고가까지
 # 섞여 나와 오염 위험이 크다(docs/m2-scout-report.md 참조). JS 변수는 항상 SSR로
@@ -164,3 +171,11 @@ LINK_NOISE_SUBDOMAINS = frozenset({"event.yes24.com", "ssl.yes24.com"})
 #   - "/campaign/"  : /campaign/00_corp/..., /campaign/01_Book/yesOnly/... 등
 #                      프로모션 캠페인 페이지(event.yes24.com과 같은 성격의 노이즈)
 LINK_NOISE_PATH_MARKERS = ("/templates/", "/mypage", "/campaign/")
+
+# 고객센터 FAQ 목록. 현재 카테고리 결과를 우선하고, 서버가 그 목록을 비워 렌더한 페이지는
+# 동일 문서의 FAQ 목록으로 폴백한다. 파서는 첫 번째로 실제 entry가 있는 컨테이너 하나만 쓴다.
+FAQ_ENTRY_LISTS = ("#faqCateList", "#faqTop10List")
+FAQ_ENTRY = "dl.yesToggleDl"
+FAQ_QUESTION = "dt a"
+FAQ_QUESTION_DECORATION = "em.bgYUI"
+FAQ_ANSWER = "dd .csCView_cont"

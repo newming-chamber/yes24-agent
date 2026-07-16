@@ -1,7 +1,7 @@
 <!doctype html>
 <!--
   16뷰 RBTI 매트릭스 시뮬레이터 UI (C4/matrix-ux 소유).
-  한 질문 → 16 RBTI 페르소나의 답변을 4×4 그리드로 **한 화면에 동시** 전시·비교한다.
+  Yes24 도서 탐색 질문 → 16 RBTI 성향의 선택을 4×4 그리드로 **한 화면에 동시** 전시·비교한다.
   자기완결 HTML/CSS/JS(외부 CDN 없음). SSE 계약은 matrix_runner.py 상단 docstring 참조.
 
   계약 요약:
@@ -142,6 +142,7 @@
     .status-bar.error .dot { background: var(--error-text); animation: none; }
     @keyframes pulse { 0%,100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); } 50% { opacity: 0.55; box-shadow: 0 0 0 5px transparent; } }
     .status-bar .count { font-family: var(--mono); font-size: 11px; color: var(--text); font-weight: 600; letter-spacing: 0.02em; }
+    .status-bar .models { font-family: var(--mono); font-size: 10px; color: var(--muted); }
 
     .filters { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .filter-axis { display: flex; align-items: center; gap: 4px; }
@@ -316,7 +317,6 @@
     .cell .c-pick-cover.loaded { opacity: 1; }
     .cell .c-pick-title { font-size: 11.5px; font-weight: 700; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1 1 auto; }
     .cell .c-pick-price { font-family: var(--mono); font-size: 10px; font-weight: 700; color: var(--col-hue, var(--accent)); white-space: nowrap; flex: 0 0 auto; }
-    .cell .c-pick-more { font-family: var(--mono); font-size: 9px; font-weight: 700; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; flex: 0 0 auto; }
 
     .cell .c-foot {
       flex: 0 0 auto; padding: 4px 8px 6px; display: flex; align-items: center; gap: 4px;
@@ -544,19 +544,19 @@
       <span class="logo">🧭</span>
       <h1>독서 유형 분류표</h1>
       <span class="spec">RBTI · 16유형</span>
-      <span class="sub">한 질문, 16가지 독서 성향을 한 화면에</span>
+      <span class="sub">Yes24 도서 질문을 16가지 독서 성향으로 비교</span>
       <span class="spacer"></span>
       <a class="backlink" href="/" title="일반 채팅으로 돌아가기">← 채팅</a>
     </header>
 
     <div class="panel-box">
       <div class="composer">
-        <input id="q" type="text" placeholder="예: 채식주의자 비슷한 소설 추천해줘  (Enter 전송)" autocomplete="off" />
+        <input id="q" type="text" placeholder="도서 탐색 전용 · 예: 채식주의자 비슷한 소설 추천해줘" autocomplete="off" />
         <button class="btn-stop" id="stop" disabled>중지</button>
         <button class="btn-send" id="send">비교</button>
       </div>
       <div class="controls-row">
-        <div class="status-bar" id="status"><span class="dot"></span><span id="status-text">질문을 입력하면 16유형이 동시에 답합니다.</span><span class="count" id="count"></span></div>
+        <div class="status-bar" id="status"><span class="dot"></span><span id="status-text">Yes24 도서 질문을 입력하면 16유형이 함께 비교합니다.</span><span class="count" id="count"></span><span class="models" id="model-info" hidden></span></div>
         <button class="tourney-btn" id="tourney-btn" hidden>내 취향 찾기 →</button>
         <span style="flex:1 1 auto"></span>
         <div class="filters" id="filters"></div>
@@ -632,6 +632,7 @@
     const statusBar = document.getElementById("status");
     const statusText = document.getElementById("status-text");
     const countEl = document.getElementById("count");
+    const modelInfo = document.getElementById("model-info");
     const sharedToggle = document.getElementById("shared-toggle");
     const ssCount = document.getElementById("ss-count");
     const ssChips = document.getElementById("ss-chips");
@@ -654,6 +655,7 @@
     let cardByCode = new Map();
     let filledCount = 0;
     let runErrored = false; // 이번 런에 error 프레임이 왔는가(터미널 done의 성공 표시를 막는다)
+    let runModels = {};
     const activeFilters = {};
 
     // 마커 승격 조건(공용 렌더러에 주입) — 공유 출처 풀에 있는 id만 인용 배지가 된다.
@@ -680,6 +682,16 @@
       sourcesById.set(String(src.id), src);
       ssChips.appendChild(makeSharedCard(src));
       ssCount.textContent = sourcesById.size;
+    }
+    function resolveSourceReferences(references) {
+      const resolved = [];
+      if (!Array.isArray(references)) return resolved;
+      for (const reference of references) {
+        if (!reference || reference.id === undefined) continue;
+        const source = sourcesById.get(String(reference.id));
+        if (source !== undefined) resolved.push(source);
+      }
+      return resolved;
     }
     sharedToggle.addEventListener("click", () => {
       const open = ssChips.hasAttribute("hidden");
@@ -846,9 +858,9 @@
       return handle;
     }
 
-    // ── W1: 구조화 본문 — 흐르는 전문 + 대표책(백엔드 picks) ──
-    // 대표책·가격·표지는 **백엔드가 col done에 실어 주는 구조화된 picks**를 그대로 그린다
-    // (picks[0]=대표책, 폴백 셀은 []). 카드 산문을 정규식으로 재파싱하지 않는다 — 같은 판정을
+    // ── W1: 구조화 본문 — 흐르는 전문 + 선택한 책(백엔드 picks) ──
+    // 책·가격·표지는 **백엔드가 col done에 실어 주는 구조화된 picks**를 그대로 그린다.
+    // 카드 산문을 정규식으로 재파싱하지 않는다 — 같은 판정을
     // 백엔드(인용 검증·풀 접지)와 프론트(제목 정규화·가격 인접 매칭)에 이중 구현하면 어긋나고,
     // 프론트 파서가 실패하면 대표책·표지가 조용히 사라진다(실측: "완전한 행복 - 개정판").
     function renderCellBody(card) {
@@ -862,54 +874,48 @@
       renderBody(flow, card.text, { isCitation: isPooled, onMarker: (sid) => highlightChip(card, sid) });
       body.appendChild(flow);
 
-      // 대표책 슬롯(『』·표지·세로바)은 **책만** 채운다 — 웹 출처(뉴스·유튜브)가 섞인 비도서
+      // 선택 책 슬롯(『』·표지·세로바)은 **책만** 채운다 — 웹 출처(뉴스·유튜브)가 섞인 비도서
       // 질문(환율 등)에서 picks[0]이 type=web이면 『뉴스 제목』으로 책처럼 오도된다. 웹 출처는
       // 이미 하단 인용 칩(c-foot)에 링크로 있으니 대표책 줄에서만 뺀다(type 신호로 판정).
       const bookPicks = card.picks.filter((p) => !WEB_TYPES.has(p.type));
-      if (!bookPicks.length) return; // 델타 시점·폴백·비도서 셀 — 대표책 줄 없음
-      const rep = bookPicks[0];
-      const pick = document.createElement("div");
-      pick.className = "c-pick";
+      if (!bookPicks.length) return; // 델타 시점·폴백·비도서 셀 — 선택 책 줄 없음
+      for (const selected of bookPicks) {
+        const pick = document.createElement("div");
+        pick.className = "c-pick";
 
-      // 표지가 있으면 표지, 없으면 축색 틱(우아한 폴백). 로드 실패 시에도 틱으로 되돌아간다.
-      const tick = document.createElement("span");
-      tick.className = "c-pick-ico";
-      tick.setAttribute("aria-hidden", "true");
-      pick.appendChild(tick);
-      const url = coverUrl(rep);
-      if (url) {
-        const cover = document.createElement("img");
-        cover.className = "c-pick-cover";
-        // loading=lazy는 스크롤 없는 100vh 뷰포트에 JS로 삽입된 이미지의 IntersectionObserver를
-        // 트리거하지 못해 로드가 멈춘다(Chrome 쿼크) — 항상 보이는 썸네일이라 즉시 로드가 옳다.
-        cover.decoding = "async";
-        cover.alt = "";
-        cover.addEventListener("load", () => { cover.classList.add("loaded"); tick.style.display = "none"; });
-        cover.addEventListener("error", () => cover.remove());
-        pick.insertBefore(cover, tick);
-        cover.src = url;
-      }
+        // 표지가 있으면 표지, 없으면 축색 틱(우아한 폴백). 로드 실패 시에도 틱으로 되돌아간다.
+        const tick = document.createElement("span");
+        tick.className = "c-pick-ico";
+        tick.setAttribute("aria-hidden", "true");
+        pick.appendChild(tick);
+        const url = coverUrl(selected);
+        if (url) {
+          const cover = document.createElement("img");
+          cover.className = "c-pick-cover";
+          // loading=lazy는 스크롤 없는 100vh 뷰포트에 JS로 삽입된 이미지의 IntersectionObserver를
+          // 트리거하지 못해 로드가 멈춘다(Chrome 쿼크) — 항상 보이는 썸네일이라 즉시 로드가 옳다.
+          cover.decoding = "async";
+          cover.alt = "";
+          cover.addEventListener("load", () => { cover.classList.add("loaded"); tick.style.display = "none"; });
+          cover.addEventListener("error", () => cover.remove());
+          pick.insertBefore(cover, tick);
+          cover.src = url;
+        }
 
-      const title = document.createElement("span");
-      title.className = "c-pick-title";
-      title.textContent = "『" + rep.title + "』";
-      title.title = rep.title;
-      pick.appendChild(title);
-      if (rep.price != null && rep.price !== "") {
-        const price = document.createElement("span");
-        price.className = "c-pick-price";
-        const n = Number(rep.price);
-        price.textContent = (Number.isFinite(n) && n > 0 ? n.toLocaleString("ko-KR") : String(rep.price)) + "원";
-        pick.appendChild(price);
+        const title = document.createElement("span");
+        title.className = "c-pick-title";
+        title.textContent = "『" + selected.title + "』";
+        title.title = selected.title;
+        pick.appendChild(title);
+        if (selected.price != null && selected.price !== "") {
+          const price = document.createElement("span");
+          price.className = "c-pick-price";
+          const n = Number(selected.price);
+          price.textContent = (Number.isFinite(n) && n > 0 ? n.toLocaleString("ko-KR") : String(selected.price)) + "원";
+          pick.appendChild(price);
+        }
+        body.appendChild(pick);
       }
-      if (bookPicks.length > 1) {
-        const more = document.createElement("span");
-        more.className = "c-pick-more";
-        more.textContent = "+" + (bookPicks.length - 1);
-        more.title = "이 성향이 고른 책 " + bookPicks.length + "권";
-        pick.appendChild(more);
-      }
-      body.appendChild(pick);
     }
 
     // ── 열 채우기 ──
@@ -955,11 +961,10 @@
       if (!code) return;
       const card = cardByCode.get(code);
       if (!card) return;
-      const srcs = Array.isArray(data.sources) ? data.sources : [];
-      srcs.forEach(addSharedSource);
+      const srcs = resolveSourceReferences(data.sources);
       card.sources = srcs;
       // 이 셀이 고른 책(구조화) — 대표책·가격·표지의 단일 출처. 폴백 셀은 빈 목록.
-      card.picks = Array.isArray(data.picks) ? data.picks : [];
+      card.picks = resolveSourceReferences(data.picks);
       // 풀·picks가 갖춰졌으니 본문을 다시 렌더한다 — 델타 시점엔 아직 풀에 없어 평문으로 남았던
       // 인용이 배지로 승격되고, 대표책 줄이 이때 붙는다.
       renderCellBody(card);
@@ -1086,82 +1091,17 @@
     const tResult = document.getElementById("t-result");
     let tDecided = {};
     let tRoundIdx = 0;
-    let tOrder = AXES.slice(); // 이번 토너먼트의 축 결정 순서(openTourney에서 데이터 기반 재배치)
+    let tOrder = AXES.slice();
 
-    // 코드 조립: 대비 축(axisKey)=value, 이미 결정된 축=선택값, 나머지 미결정 축=combo에서.
-    // 두 비교 셀은 axisKey 하나만 다르다(다른 축은 동일 맥락으로 고정). 결정된 축이 코드상
-    // 연속 prefix가 아닐 수 있어(적응형 순서) 위치가 아닌 tDecided 멤버십으로 판별한다.
-    function buildCodeWith(axisKey, value, combo) {
+    // 대비 축만 두 값으로 바꾸고, 결정된 축은 선택값, 나머지는 AXES의 첫 값으로 고정한다.
+    function buildCodeWith(axisKey, value) {
       return AXES.map((ax) => {
         if (ax.key === axisKey) return value;
         if (ax.key in tDecided) return tDecided[ax.key];
-        return (combo && ax.key in combo) ? combo[ax.key] : ax.values[0];
+        return ax.values[0];
       }).join("");
     }
-    // 대비 축(axisKey)을 보여줄 때 나머지 '미결정' 축 조합 중 가장 변별력 있는 쌍을 고른다.
-    // 우선순위: ①두 셀 비폴백 & 대표책 다름 > ②비폴백 & 본문 다름 > ③비폴백 > ④대표책 다름 >
-    // ⑤본문 다름 > ⑥첫 조합. 대표책이 같으면(발췌만 다른 무변별 비교) 회피, 폴백 셀도 회피.
-    function chooseUndecidedCombo(axisKey) {
-      const axk = AXES.find((a) => a.key === axisKey);
-      const undecided = AXES.filter((ax) => ax.key !== axisKey && !(ax.key in tDecided));
-      let combos = [{}];
-      for (const ax of undecided) {
-        const next = [];
-        for (const c of combos) for (const v of ax.values) next.push({ ...c, [ax.key]: v });
-        combos = next;
-      }
-      const scored = combos.map((combo) => {
-        const a = cardByCode.get(buildCodeWith(axisKey, axk.values[0], combo));
-        const b = cardByCode.get(buildCodeWith(axisKey, axk.values[1], combo));
-        const bothReal = !!(a && b && !a.isFallback && !b.isFallback);
-        const pa = repTitle(a), pb = repTitle(b);
-        const pickDiffer = !!(pa && pb && pa !== pb);
-        const differ = !!(a && b && (tGist(a) !== tGist(b) || pa !== pb));
-        return { combo, bothReal, differ, pickDiffer };
-      });
-      const pick =
-        scored.find((s) => s.bothReal && s.pickDiffer) ||
-        scored.find((s) => s.bothReal && s.differ) ||
-        scored.find((s) => s.bothReal) ||
-        scored.find((s) => s.pickDiffer) ||
-        scored.find((s) => s.differ) ||
-        scored[0];
-      return pick.combo;
-    }
-    // 축 결정 순서를 "대표책 변별 견고성" 오름차순으로 잡는다. 각 축의 견고성 = 나머지 3축의
-    // 8조합 중 두 셀(둘 다 비폴백) 대표책이 다른 조합 수. 견고한 축일수록 어떤 맥락에서도 다른
-    // 책을 내므로 조합 자유도가 0인 '마지막 라운드'에 배치하고, 특정 조합에서만 갈리는 취약한
-    // 축은 조합을 고를 수 있는 앞 라운드에 배치한다 → 마지막 라운드까지 "다른 책 쌍" 확률을
-    // 높인다(라운드 4 동일책 완화). 데이터 기반이라 특정 축 하드코딩이 아니고, 모든 축이 동률
-    // (예: 전부 같은 책)이면 안정 정렬로 AXES 원순서 유지 → 현행 동작과 동일("전부 같으면 유지").
-    function orderAxesByDifferentiation() {
-      const prevDecided = tDecided;
-      tDecided = {}; // 견고성은 결정 전(모든 축 미결정) 기준으로 산정
-      const robustness = {};
-      for (const axk of AXES) {
-        const others = AXES.filter((ax) => ax.key !== axk.key);
-        let combos = [{}];
-        for (const ax of others) {
-          const next = [];
-          for (const c of combos) for (const v of ax.values) next.push({ ...c, [ax.key]: v });
-          combos = next;
-        }
-        let n = 0;
-        for (const combo of combos) {
-          const a = cardByCode.get(buildCodeWith(axk.key, axk.values[0], combo));
-          const b = cardByCode.get(buildCodeWith(axk.key, axk.values[1], combo));
-          if (a && b && !a.isFallback && !b.isFallback) {
-            const pa = repTitle(a), pb = repTitle(b);
-            if (pa && pb && pa !== pb) n++;
-          }
-        }
-        robustness[axk.key] = n;
-      }
-      tDecided = prevDecided;
-      // 취약(작은 n) → 앞, 견고(큰 n) → 뒤. 동률은 Array.sort 안정성으로 AXES 원순서 유지.
-      return AXES.slice().sort((x, y) => robustness[x.key] - robustness[y.key]);
-    }
-    // 토너먼트 카드 미리보기 = 전문(.tc-gist가 3줄 클램프). 휴리스틱 비교도 전문 기준(정확도↑).
+    // 토너먼트 카드 미리보기 = 전문(.tc-gist가 3줄 클램프).
     function tGist(card) { return card && card.text ? card.text.trim() : ""; }
     // 대표책 = 첫 번째 **책** 픽(백엔드 인용 등장 순서). 웹 출처(type=web)는 대표책이 아니다
     // — 비도서 질문에서 뉴스 제목이 토너먼트·핸드오프에 책처럼 새지 않게(렌더와 같은 규칙).
@@ -1173,7 +1113,7 @@
     function openTourney() {
       tDecided = {};
       tRoundIdx = 0;
-      tOrder = orderAxesByDifferentiation(); // 이번 런 답변 기준으로 축 순서 재배치
+      tOrder = AXES.slice();
       tResult.hidden = true;
       tCards.style.display = "";
       tourneyBackdrop.hidden = false;
@@ -1194,10 +1134,8 @@
       tQ.textContent = "어느 쪽이 더 끌려요?";
 
       tCards.textContent = "";
-      // 두 비교 셀이 실제로 다른 대표책/본문을 갖도록 미결정 축 조합을 고른다(같으면 첫 조합).
-      const combo = chooseUndecidedCombo(ax.key);
       ax.values.forEach((val) => {
-        const code = buildCodeWith(ax.key, val, combo);
+        const code = buildCodeWith(ax.key, val);
         const card = cardByCode.get(code);
         const el = document.createElement("button");
         el.className = "t-card";
@@ -1292,7 +1230,7 @@
     document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !tourneyBackdrop.hidden) closeTourney(); });
 
     // ── 상태 ──
-    const STATUS_TEXT = { thinking: "질문을 확인하고 있어요", generating: "16가지 독서 성향으로 살펴보고 있어요" };
+    const STATUS_TEXT = { thinking: "Yes24 도서 근거를 확인하고 있어요", generating: "16가지 독서 성향으로 살펴보고 있어요" };
     function setStatus(stage, detail) {
       statusBar.classList.remove("done", "error");
       statusText.textContent = detail || STATUS_TEXT[stage] || "처리 중…";
@@ -1312,7 +1250,14 @@
       statusBar.classList.remove("done");
       statusText.textContent = msg || "오류가 발생했어요.";
     }
-    function updateCount() { countEl.textContent = filledCount > 0 ? filledCount + " / 16" : ""; }
+    function updateCount() { countEl.textContent = filledCount > 0 ? filledCount + " / " + CODES.length : ""; }
+    function setModels(models) {
+      runModels = models && typeof models === "object" ? { ...models } : {};
+      const labels = { research: "연구", selection: "선택", generation: "생성" };
+      const text = Object.entries(runModels).map(([key, value]) => `${labels[key] || key} ${value}`).join(" · ");
+      modelInfo.textContent = text;
+      modelInfo.hidden = !text;
+    }
 
     // ── SSE ──
     function setSending(on) {
@@ -1324,6 +1269,7 @@
     }
     function resetRun() {
       runErrored = false;
+      setModels({});
       sourcesById = new Map();
       ssChips.textContent = "";
       ssChips.setAttribute("hidden", "");
@@ -1405,6 +1351,7 @@
             try { sessionStorage.setItem(MATRIX_SESSION_KEY, sessionId); } catch (e) {}
           }
           if (Array.isArray(data.sources)) data.sources.forEach(addSharedSource);
+          setModels(data.models);
           if (runErrored) return;
           setDone();
           saveSnapshot();
@@ -1453,6 +1400,7 @@
         sessionStorage.setItem(MATRIX_SNAPSHOT_KEY, JSON.stringify({
           question: lastQuestion,
           shared: [...sourcesById.values()],
+          models: runModels,
           cells,
         }));
       } catch (e) { /* 저장 실패(용량 등)는 복원만 포기 — 런 자체엔 영향 없음 */ }
@@ -1465,6 +1413,7 @@
       resetRun();
       const restoreComposer = !opts || opts.restoreComposer !== false;
       lastQuestion = snap.question || "";
+      setModels(snap.models);
       if (restoreComposer) qEl.value = lastQuestion;
       (Array.isArray(snap.shared) ? snap.shared : []).forEach(addSharedSource);
       for (const cell of snap.cells) {
