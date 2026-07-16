@@ -31,20 +31,12 @@ from yes24_agent.event_translate import (
     _status_for_error,
     build_source_event,
 )
-from yes24_agent.policy_flow import run_policy_evidence_turn
 from yes24_agent.postprocess import (
     build_done_payload,
     validate_citations,
 )
-from yes24_agent.product_flow import run_product_selection_turn
-from yes24_agent.query_understanding import (
-    POLICY,
-    PRODUCT,
-    RECENCY,
-    understand,
-)
+from yes24_agent.query_understanding import understand
 from yes24_agent.rbti.persona import is_valid_code
-from yes24_agent.recency_flow import run_recency_evidence_turn
 from yes24_agent.session_service import (
     _POC_USER_ID,
     _get_session_lock,
@@ -234,10 +226,9 @@ async def run_agent_stream(
         # 출처를 중복시키므로 폴백하지 않고 정직 안내로 간다. (열기 thinking status는 제외.)
         emitted_output = False
 
-        # 질의이해: 값싼 모델 1회로 질의의 의미를 분류한다(intent·multistep·confidence).
-        # ambiguous는 pro 모델을 쓰되 유효 grounded intent의 typed evidence 경계를 유지한다.
-        # product의 하위 selection/detail 판정도 저확신이므로 product typed 경계가 맡는다.
-        # intent 자체를 신뢰할 수 없는 unavailable만 세션 문맥을 가진 pro 루트가 직접 처리한다.
+        # 질의이해: 값싼 모델 1회로 질의의 의미를 분류한다(needs_grounding·standalone_query·
+        # source_time_required). typed dispatch는 삭제했으므로 모든 질의가 아래 단일 root_agent
+        # (pro) 루프로 간다 — intent/multistep/confident는 로깅 관측용으로만 남는다.
         understanding = await understand(
             message,
             settings,
@@ -249,7 +240,6 @@ async def run_agent_stream(
         )
         requires_grounding = understanding.needs_grounding
         search_query = understanding.standalone_query
-        typed_intent_available = understanding.classification_state != "unavailable"
         # 단일 pro 경로: flash/pro 하이브리드 라우팅을 폐기하고 모든 질의를 pro로 처리한다.
         # 난도별 추론량 조절은 thinking_budget=-1(Gemini 동적 추론)에 위임한다.
         main_agent = root_agent
@@ -262,88 +252,6 @@ async def run_agent_stream(
             understanding.confident,
             resolved_session_id,
         )
-
-        if typed_intent_available and understanding.intent == PRODUCT and (
-            understanding.product_selection
-            or understanding.product_detail_required
-            or not understanding.confident
-        ):
-            product_sink: list[dict] = []
-            yield sse_status("verifying", "상품 상세 근거를 확인하고 있어요")
-            async for frame in run_product_selection_turn(
-                service,
-                run_config,
-                resolved_session_id,
-                settings,
-                user_message=search_query,
-                observed_sources=observed_sources,
-                result_sink=product_sink,
-                expected_constraints=understanding.product_constraints,
-                expected_count=understanding.requested_product_count,
-                observed_tool_calls=observed_tool_calls,
-            ):
-                yield frame
-            product_done = product_sink[0]
-            _attach_source_time(
-                product_done,
-                required=understanding.source_time_required,
-            )
-            for source in product_done.get("sources", []):
-                yield sse_source(source)
-            if product_done.get("text"):
-                yield sse_delta(product_done["text"])
-            yield sse_done(product_done)
-            return
-
-        if typed_intent_available and understanding.intent == POLICY:
-            policy_sink: list[dict] = []
-            yield sse_status("verifying", "Yes24 정책 원문을 확인하고 있어요")
-            async for frame in run_policy_evidence_turn(
-                service,
-                run_config,
-                resolved_session_id,
-                settings,
-                user_message=search_query,
-                observed_sources=observed_sources,
-                result_sink=policy_sink,
-            ):
-                yield frame
-            policy_done = policy_sink[0]
-            _attach_source_time(
-                policy_done,
-                required=understanding.source_time_required,
-            )
-            for source in policy_done.get("sources", []):
-                yield sse_source(source)
-            if policy_done.get("text"):
-                yield sse_delta(policy_done["text"])
-            yield sse_done(policy_done)
-            return
-
-        if typed_intent_available and understanding.intent == RECENCY:
-            recency_sink: list[dict] = []
-            yield sse_status("verifying", "최신 웹 근거를 확인하고 있어요")
-            async for frame in run_recency_evidence_turn(
-                service,
-                run_config,
-                resolved_session_id,
-                settings,
-                user_message=search_query,
-                observed_sources=observed_sources,
-                result_sink=recency_sink,
-            ):
-                yield frame
-            recency_done = recency_sink[0]
-            _attach_source_time(
-                recency_done,
-                required=understanding.source_time_required,
-            )
-            for source in recency_done.get("sources", []):
-                yield sse_source(source)
-            if recency_done.get("text"):
-                yield sse_delta(recency_done["text"])
-            yield sse_done(recency_done)
-            return
 
         runner = Runner(
             agent=main_agent,
@@ -529,9 +437,10 @@ async def run_agent_stream(
                     sorted(s["id"] for s in sources),
                 )
 
-            # generic 루트 답변을 그대로 마감한다. 충분성 게이트·강제 재진입(correction)은
-            # 삭제했다 — 접지 backstop은 별도 모듈인 인용 검증(validate_citations)이 맡고,
-            # typed-flow(product/policy/recency)는 위에서 자기 검증으로 이미 처리했다.
+            # 단일 root_agent(pro) 루프의 답변을 그대로 마감한다. typed-flow(product/policy/
+            # recency)·충분성 게이트·강제 재진입(correction)은 삭제했다 — 모든 질의가 ADK Runner
+            # 네이티브 도구 루프를 타고, 접지 backstop은 별도 모듈인 인용 검증(validate_citations)
+            # 이 맡는다.
             final_done = done_payload
 
             # 최후 방어: 마감 후에도 done.text가 비면 빈 응답을 그대로 내보내지 않는다.

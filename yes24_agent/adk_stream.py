@@ -3,8 +3,6 @@
 import asyncio
 from collections.abc import AsyncIterator
 
-SET_MODEL_RESPONSE_TOOL_NAME = "set_model_response"
-
 _END = object()
 
 

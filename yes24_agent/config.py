@@ -30,9 +30,8 @@ class Settings(BaseSettings):
     # 분류 전용 모델의 기본값 소스(classifier_model_name·matrix_generation_model validator가
     # 소비). 하이브리드 라우팅 폐기로 라우팅 소비처는 사라졌다.
     flash_model_name: str = "gemini-2.5-flash"
-    # flash 분류·격리 JSON 호출(query_understanding 분류기·generate_isolated_json)의 추론 예산.
-    # flash는 budget=0만 안정(-1 dynamic은 빈응답 회귀). 하이브리드 라우팅은 폐기됐지만 이 값은
-    # 여전히 분류기·격리 표현 호출이 소비한다(W3/W4에서 정리 예정).
+    # flash 질의 분류(query_understanding 분류기)의 추론 예산. flash는 budget=0만 안정
+    # (-1 dynamic은 빈응답 회귀). typed-flow의 격리 JSON 소비처는 삭제됐고 분류기만 남는다.
     flash_thinking_budget: int = 0
     # 질의 분류기(intent·multistep·confidence) on/off. 키워드 버킷을 폐기하고 값싼 모델 1회
     # 구조화 출력으로 대체한다 — 부류를 '의미'로 판정해 표면 문자열(합성어·부분일치)에 걸리지
