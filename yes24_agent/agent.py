@@ -7,8 +7,13 @@
 
 from google.adk.agents import LlmAgent
 from google.adk.agents.readonly_context import ReadonlyContext
+from google.genai import types
 
-from yes24_agent.agent_runtime import build_llm_agent, persona_tool_directive
+from yes24_agent.agent_runtime import (
+    build_llm_agent,
+    current_turn_has_function_response,
+    persona_tool_directive,
+)
 from yes24_agent.config import get_settings
 from yes24_agent.rbti.persona import build_persona_block
 from yes24_agent.sources import today_kst
@@ -65,9 +70,10 @@ _PROMPT_CORE_TEMPLATE = """당신은 유능하고 친근한 범용 AI 어시스�
   검색 범위에서 일치 항목을 확인하지 못했다고 한정해 말합니다.
 
 ## 근거가 필요한 경우
-- 책·상품의 제목·저자·출판사·가격·평점·판매·순위·구매 정보는 반드시 이번 턴에 관측한 Yes24
-  결과에 근거합니다. 모델 기억이나 이전 턴 출처로 현재 상품 사실을 새로 만들지 마세요. 가격과
-  구매 정보는 외부 웹 출처로 답하지 않습니다.
+- Yes24 상품 사실(가격·평점·재고·판매순위·구매)과 Yes24 정책·규정은 당신이 알 수 없는 값입니다.
+  아무리 유명한 책·잘 아는 규정이라도, 답하기 전에 **반드시** `yes24_search`나 `yes24_fetch`로
+  이번 턴에 확인하고 그 결과의 `source_id`를 `[n]`으로 인용하세요. 검색하지 않은 가격·평점·정책이나
+  존재하지 않는 출처 번호를 지어내지 말고, 가격·구매 정보는 외부 웹 출처로 답하지 않습니다.
 - 당신은 Yes24의 현재 정책·이용 규정을 알지 못합니다. 반품·교환·배송·환불·결제 규정은 회사마다
   다르고 수시로 바뀌므로, 오늘 날씨나 뉴스처럼 반드시 도구로 확인해야 하는 정보입니다. 일반 상식이나
   기억은 Yes24의 실제 규정과 다를 수 있어 그대로 답하면 틀립니다. 그러니 Yes24 정책 질문에는 답하기
@@ -197,6 +203,27 @@ def _instruction_provider(ctx: ReadonlyContext) -> str:
     return _build_root_context_prompt(ctx)
 
 
+def _force_tool_first_turn(callback_context, llm_request):
+    """레퍼런스 표준(tool_choice=required)을 ADK로 구현 — 첫 모델 턴에 도구 호출을 강제한다.
+
+    tool_choice=auto(모델 자율)는 모델이 "안다"고 확신하면 검색을 스킵하고 자체 지식으로
+    답하는 실패(예: 유명 책 가격 환각)가 잦다(업계 공통). 그래서 이번 턴에 아직 도구 응답이
+    없으면(=첫 턴) `FunctionCallingConfigMode.ANY`로 도구 호출을 강제해 모델이 직답하지
+    못하게 하고, Yes24·웹 사실은 검색·인용, 순수 대화는 `reply_directly`로 명시 선택하게 한다.
+    도구가 이미 실행됐으면(응답 존재) `AUTO`로 풀어 결과를 종합해 답하게 한다(출처 최대화)."""
+    mode = (
+        types.FunctionCallingConfigMode.AUTO
+        if current_turn_has_function_response(llm_request)
+        else types.FunctionCallingConfigMode.ANY
+    )
+    config = llm_request.config or types.GenerateContentConfig()
+    config.tool_config = types.ToolConfig(
+        function_calling_config=types.FunctionCallingConfig(mode=mode)
+    )
+    llm_request.config = config
+    return None
+
+
 def create_agent() -> LlmAgent:
     """단일 루트(pro) LlmAgent를 생성한다.
 
@@ -210,6 +237,7 @@ def create_agent() -> LlmAgent:
         name="yes24_assistant",
         description="범용 질문에 답하고 Yes24 상품·정책과 웹 사실을 근거로 종합하는 어시스턴트.",
         instruction=_instruction_provider,
+        before_model_callback=_force_tool_first_turn,
     )
 
 

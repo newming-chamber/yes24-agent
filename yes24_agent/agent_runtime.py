@@ -5,6 +5,7 @@ from google.genai import types
 
 from yes24_agent.rbti.persona import axis_label
 from yes24_agent.tools.fetch_many import fetch_many
+from yes24_agent.tools.reply_directly import reply_directly
 from yes24_agent.tools.web_fetch import web_fetch
 from yes24_agent.tools.web_search import web_search
 from yes24_agent.tools.yes24_browse import yes24_browse
@@ -18,6 +19,7 @@ AGENT_TOOLS = (
     yes24_browse,
     web_search,
     web_fetch,
+    reply_directly,
 )
 YES24_SEARCH_ONLY = ["yes24_search"]
 WEB_SEARCH_ONLY = ["web_search"]
