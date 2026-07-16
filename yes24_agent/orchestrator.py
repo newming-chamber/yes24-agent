@@ -18,7 +18,7 @@ from yes24_agent.agent_runtime import (
 )
 from yes24_agent.config import get_settings
 from yes24_agent.grounding import evaluate
-from yes24_agent.postprocess import build_done_payload, build_evidence_unavailable_payload
+from yes24_agent.postprocess import build_done_payload
 from yes24_agent.research_turn import run_research_turn
 from yes24_agent.sse import sse_status
 
@@ -140,20 +140,15 @@ async def apply_sufficiency_gate(
         if not research_sink:
             raise ValueError("보정 턴이 결과를 만들지 못했습니다")
         corrected_text, sources2, citation2, _submission = research_sink[0]
-    except Exception as exc:  # noqa: BLE001 — 접지 필수 경로를 안전 응답으로 마감한다
+    except Exception as exc:  # noqa: BLE001 — 보정 실패 시 원답을 파괴하지 않고 그대로 유지한다
         logger.exception(
-            "보정 턴 실패(%s/%s) → 근거 없음으로 마감합니다(session_id=%s): %s",
+            "보정 턴 실패(%s/%s) → 원답을 그대로 유지합니다(session_id=%s): %s",
             decision.kind,
             decision.reason,
             resolved_session_id,
             exc,
         )
-        result_sink.append(
-            build_evidence_unavailable_payload(
-                resolved_session_id,
-                model=str(correction_agent.model),
-            )
-        )
+        result_sink.append(done_payload)
         return
 
     done_payload2 = build_done_payload(
@@ -179,12 +174,7 @@ async def apply_sufficiency_gate(
         return
 
     logger.warning(
-        "재확인이 유의미한 근거를 내지 못해 근거 없음으로 마감합니다(session_id=%s).",
+        "재확인이 유의미한 근거를 내지 못해 원답을 그대로 유지합니다(session_id=%s).",
         resolved_session_id,
     )
-    result_sink.append(
-        build_evidence_unavailable_payload(
-            resolved_session_id,
-            model=str(correction_agent.model),
-        )
-    )
+    result_sink.append(done_payload)

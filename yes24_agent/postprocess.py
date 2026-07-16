@@ -18,9 +18,6 @@ logger = logging.getLogger(__name__)
 # 서버가 붙인 ASCII 대괄호+숫자만 마커로 간주한다. 원문 안의 예약 문법은
 # `escape_citation_markers`가 전각 괄호로 바꿔 모델/도구 데이터와 서버 마커를 구분한다.
 MARKER_PATTERN = re.compile(r"(?<!\\)\[(\d+(?:\s*,\s*\d+)*)\]")
-EVIDENCE_UNAVAILABLE_TEXT = (
-    "근거를 확인하지 못해 답을 단정하지 않았어요. 잠시 후 다시 시도해 주세요."
-)
 
 
 def escape_citation_markers(text: str) -> str:
@@ -270,11 +267,3 @@ def build_done_payload(
         # 프론트가 본문 마커와 출처 카드를 연결하는 표시용 메타다.
         "cited_ids": [source_id for source_id in used_source_ids if source_id in by_id],
     }
-
-
-def build_evidence_unavailable_payload(session_id: str, *, model: str | None = None) -> dict:
-    """접지가 필수인 경로의 보정 실패를 무출처 안전 응답으로 마감한다."""
-    payload = build_done_payload([], [], session_id, [])
-    payload["text"] = EVIDENCE_UNAVAILABLE_TEXT
-    payload["model"] = model
-    return payload
