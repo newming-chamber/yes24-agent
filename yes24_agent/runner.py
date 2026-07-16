@@ -35,7 +35,6 @@ from yes24_agent.postprocess import (
     build_done_payload,
     validate_citations,
 )
-from yes24_agent.query_understanding import understand
 from yes24_agent.rbti.persona import is_valid_code
 from yes24_agent.session_service import (
     _POC_USER_ID,
@@ -113,46 +112,9 @@ def _best_effort_text(
     return final_text or "".join(pieces)
 
 
-def _attach_source_time(payload: dict, *, required: bool) -> dict:
-    """요청된 경우 최종 인용 출처별 시점 메타를 구조 payload에 보존한다."""
-    if not required:
-        return payload
-    sources = payload.get("sources")
-    sources = sources if isinstance(sources, list) else []
-    source_time: list[dict] = []
-    for source in sources:
-        source_id = source.get("id")
-        if not isinstance(source_id, int):
-            continue
-        record = {
-            "source_id": source_id,
-            **{
-                key: str(source[key])
-                for key in ("published_at", "last_updated", "checked_at")
-                if source.get(key)
-            },
-        }
-        if len(record) > 1:
-            source_time.append(record)
-    payload["source_time"] = source_time
-    return payload
-
-
 def _final_body_delta(payload: dict) -> str:
     """홀드가 끝난 최종 본문을 단일 delta로 반환한다."""
     return payload.get("text") if isinstance(payload.get("text"), str) else ""
-
-
-def _previous_user_message(session) -> str | None:
-    """현재 요청 직전의 마지막 사용자 텍스트를 세션 이벤트 경계에서 가져온다."""
-    for event in reversed(session.events):
-        content = event.content
-        if content is None or content.role != "user":
-            continue
-        text = "".join(part.text or "" for part in content.parts or [])
-        if text.strip():
-            return text
-    return None
 
 
 async def run_agent_stream(
@@ -226,32 +188,18 @@ async def run_agent_stream(
         # 출처를 중복시키므로 폴백하지 않고 정직 안내로 간다. (열기 thinking status는 제외.)
         emitted_output = False
 
-        # 질의이해: 값싼 모델 1회로 질의의 의미를 분류한다(needs_grounding·standalone_query·
-        # source_time_required). typed dispatch는 삭제했으므로 모든 질의가 아래 단일 root_agent
-        # (pro) 루프로 간다 — intent/multistep/confident는 로깅 관측용으로만 남는다.
-        understanding = await understand(
-            message,
-            settings,
-            _previous_user_message(session),
-        )
         run_config = RunConfig(
             streaming_mode=StreamingMode.SSE,
             max_llm_calls=settings.max_llm_calls,
         )
-        requires_grounding = understanding.needs_grounding
-        search_query = understanding.standalone_query
+        # 사전 질의분류기(query_understanding)는 삭제했다 — 라우팅·게이트·typed dispatch가
+        # W1~W3에서 사라지며 분류 출력의 소비처가 없어졌다. 강한 pro 단일 루프가 질문 자체를
+        # 보고 도구를 스스로 당기므로 사용자 원문을 그대로 검색어로 넘긴다(원래도 pass-through).
+        search_query = message
         # 단일 pro 경로: flash/pro 하이브리드 라우팅을 폐기하고 모든 질의를 pro로 처리한다.
-        # 난도별 추론량 조절은 thinking_budget=-1(Gemini 동적 추론)에 위임한다.
+        # 난도별 추론량 조절은 thinking_budget(Gemini 동적 추론)에 위임한다.
         main_agent = root_agent
         active_model = str(main_agent.model)
-
-        logger.info(
-            "intent=%s multistep=%s confident=%s (session_id=%s)",
-            understanding.intent,
-            understanding.multistep,
-            understanding.confident,
-            resolved_session_id,
-        )
 
         runner = Runner(
             agent=main_agent,
@@ -456,10 +404,6 @@ async def run_agent_stream(
                     bool(rbti),
                 )
                 final_done["text"] = _EMPTY_RESPONSE_FALLBACK
-            _attach_source_time(
-                final_done,
-                required=understanding.source_time_required,
-            )
             for source in final_done.get("sources", []):
                 yield sse_source(source)
             remaining_delta = _final_body_delta(final_done)
@@ -484,10 +428,6 @@ async def run_agent_stream(
                 fallback_text=error_text,
             )
             error_done["model"] = active_model
-            _attach_source_time(
-                error_done,
-                required=understanding.source_time_required,
-            )
             for source in error_done.get("sources", []):
                 yield sse_source(source)
             remaining_delta = _final_body_delta(error_done)
@@ -512,10 +452,6 @@ async def run_agent_stream(
                 fallback_text=error_text,
             )
             error_done["model"] = active_model
-            _attach_source_time(
-                error_done,
-                required=understanding.source_time_required,
-            )
             for source in error_done.get("sources", []):
                 yield sse_source(source)
             remaining_delta = _final_body_delta(error_done)

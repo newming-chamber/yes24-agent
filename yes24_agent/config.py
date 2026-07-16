@@ -27,27 +27,9 @@ class Settings(BaseSettings):
     # -1(동적)은 실측상 첫 토큰 ~10.8s로 512(~4.6s) 대비 2배+ 느려(모든 질의에 최대 추론)
     # "쉬운 건 빠르게" 실익이 없어 검증된 512로 고정(.env 조정 가능).
     thinking_budget: int = 512
-    # 분류 전용 모델의 기본값 소스(classifier_model_name·matrix_generation_model validator가
-    # 소비). 하이브리드 라우팅 폐기로 라우팅 소비처는 사라졌다.
+    # 매트릭스 생성 모델의 기본값 소스(matrix_generation_model validator가 소비). flash/pro
+    # 하이브리드 라우팅·사전 질의분류기를 폐기하며 채팅 경로의 flash 소비처는 사라졌다.
     flash_model_name: str = "gemini-2.5-flash"
-    # flash 질의 분류(query_understanding 분류기)의 추론 예산. flash는 budget=0만 안정
-    # (-1 dynamic은 빈응답 회귀). typed-flow의 격리 JSON 소비처는 삭제됐고 분류기만 남는다.
-    flash_thinking_budget: int = 0
-    # 질의 분류기(intent·multistep·confidence) on/off. 키워드 버킷을 폐기하고 값싼 모델 1회
-    # 구조화 출력으로 대체한다 — 부류를 '의미'로 판정해 표면 문자열(합성어·부분일치)에 걸리지
-    # 않는다. off이거나 실패·저확신이면 안전한 쪽(pro + 게이트 적용)으로 폴백한다(키워드 부활 없음).
-    query_classifier: bool = True
-    # 분류 전용 모델. 비면 validator가 flash_model_name으로 채운다(단일 소스·드리프트 방지).
-    classifier_model_name: str = ""
-    classifier_timeout_s: float = 3.0  # 분류 호출 상한(초과 시 안전 폴백)
-    # 분류 결과 메모리 캐시 크기(같은 질의 재입력·재시도 시 재호출 0). 프로세스 수명 동안 유지.
-    classifier_cache_size: int = 512
-    # 인용 무결성 게이트(product_gate)의 대조 임계.
-    # 주장 제목의 토큰 중 이 비율 이상이 출처 제목에 있으면 같은 책으로 본다(축약·부제 변형 허용).
-    # 오탐(정상 인용을 오매핑으로 오판) 방지를 위해 관대하게 과반으로 둔다.
-    title_token_overlap_min: float = 0.5
-    # 평점 값 대조 허용오차. 표기 차이(9.5 vs 9.50)를 같은 값으로 보되, 지어낸 값은 걸러낸다.
-    rating_match_tolerance: float = 0.1
 
     # 에러 구동 반응형 재시도: pro 경로가 Gemini 과부하/일시장애(429/5xx)로 첫 응답조차 내지
     # 못하면 같은 pro로 딱 1회 조용히 재시도한다. off면 곧장 정직 안내(error+done).
@@ -138,9 +120,6 @@ class Settings(BaseSettings):
     # 짧지만, 매트릭스 풀은 16셀이 갈라질 재료라 한 페이지가 주는 만큼(24건) 다 받는다 —
     # 풀이 16보다 작으면 차별화가 구조적으로 불가능하다.
     matrix_pool_parse_limit: int = 24
-    # 16 fan-out 생성의 동시 실행 상한(asyncio.Semaphore). 지연을 낮추되 Gemini flash 레이트리밋·
-    # 로컬 부하 폭발을 막는 가드. flash는 도구 없이 짧게 생성하므로 8이면 16열을 2배치로 소화.
-    matrix_generation_concurrency: int = 8
     # 매트릭스 생성 전용 모델. **항상 flash 고정**(비용 가드 — 16배 생성을 pro로 돌리지 않음).
     # 빈 문자열이면 아래 validator가 flash_model_name으로 채워(단일 소스), 모델명 드리프트를 막는다.
     matrix_generation_model: str = ""
@@ -169,10 +148,6 @@ class Settings(BaseSettings):
     # 하나라도 초과하면 모델이 검색어가 아니라 문장·설명을 냈다는 신호로 보고 원 질문으로 폴백한다.
     matrix_refine_max_chars: int = 40
     matrix_refine_max_words: int = 8
-    # 공유 풀 다양성 가드: 같은 시리즈/제목 접두(첫 토큰 정규화)당 풀에 담을 상한. 광의 검색어
-    # (예: '과학')가 문제집·시리즈("수능특강 …")로 풀을 도배하면 16셀이 전부 같은 부류를 추천하게
-    # 되므로, 첫 토큰이 같은 후보를 이 수만큼만 남겨 다양성을 확보한다(어떤 검색어에서도 작동).
-    matrix_pool_max_per_series: int = 2
     # 풀 확대: refine이 서로 다른 의미 각도로 낼 수 있는 검색어 개수 상한. 같은 주제를 '교양/입문'
     # 각도와 '소설/에세이' 각도로 나눠 검색해 union+dedup하면 풀이 넓어져 16 페르소나가 갈라질
     # 선택지가 생긴다(rbti-feature-plan §3.2, 사용자 피드백: 16셀 수렴). 매트릭스당 이 수만큼 검색.
@@ -181,37 +156,9 @@ class Settings(BaseSettings):
     # 한다** — 풀이 16보다 작으면 셀들이 같은 책을 고를 수밖에 없어 차별화가 구조적으로 불가능하고
     # (실측: 최종 풀 12 < 16셀), 회전·축가드 같은 대증요법이 그 부족을 메우려 쌓인다.
     matrix_pool_target_size: int = 40
-    # 열별 후보 순서 로테이션 on/off. 16셀이 같은 풀의 '가장 위(가장 대중적)' 책으로 수렴하는
-    # 것(리드북 중복·자카드 겹침)을 구조로 완화한다 — 열마다 후보를 다른 위치에서 시작해 렌더하면
-    # (source_id는 불변) 모델의 primacy 편향이 열마다 다른 책을 앞세운다. product 풀에만 적용.
-    matrix_pool_rotate: bool = True
-    # 풀 강등(soft penalty) 계수. 어떤 페르소나에게도 좋은 단권 추천이 되기 어려운 출품(판촉
-    # 브래킷 나열 제목·다권 세트/전집)을 **삭제하지 않고 순위만 뒤로 민다**. 하드 드롭이던 것을
-    # 강등으로 바꾼 이유: 오탐의 대가가 "책 1권 영구 소멸"에서 "순위 몇 칸 하락"으로 줄고, 신호가
-    # 소실되지 않아 풀이 얇을 때는 강등된 후보라도 16셀이 쓸 수 있다(누구도 복구할 수 없던 구조를
-    # 없앤다). 값은 순위 비교 시 감점 가중치이며, 0이면 강등 없음.
-    matrix_pool_noise_penalty: int = 1
-    # 배제 엔티티(exclude) 적용 가드. 모델이 낸 배제어가 너무 짧거나(부분 문자열이 과하게 걸림)
-    # 적용 시 후보의 이 비율을 넘게 지우면 **적용을 취소**한다 — exclude:["소설"] 한 방에 풀이
-    # 증발하는 것을 막는다(우세-부류 판정과 같은 발상: 대다수를 지우는 규칙은 규칙이 틀린 것).
-    matrix_exclude_min_chars: int = 2
-    matrix_exclude_max_drop_ratio: float = 0.5
     # 공유 풀 캐시 엔트리 상한(LRU-ish 만료). TTL만 있고 상한이 없으면 장수 프로세스에서 질문
     # 종류만큼 무한히 자란다.
     matrix_cache_max_entries: int = 64
-    # 게이트 발동 셀의 재생성 재시도 횟수. 셀 답이 게이트(풀 밖 책·무출처 상품사실)에 걸리면 곧장
-    # 정직 폴백으로 dim 처리하는 대신, 같은 풀로 flash를 이 횟수만큼 더 생성해 본다(재검색 아님 —
-    # Yes24 트래픽 0). 생성이 비결정적이라 두 번째 초안이 접지된 답을 낼 확률이 높아 셀 성공률이
-    # 오른다. 발동 셀에만 들고 최대 이 횟수라 비용 가드는 유지. 0이면 재시도 없음(기존 동작).
-    matrix_cell_retries: int = 1
-    # D/B(깊이/넓이) 축 추천 구성 구조 가드의 권수 경계. 4축 부호 원리를 프롬프트 서술만으로
-    # 지키지 못하는 축이 D/B다(4R 실측: 깊이 셀이 4~5권 나열·'넓은 시야' 서술로, 넓이 셀이
-    # '깊이 있는 접근' 프레이밍으로 역행 — 부적합 7건 중 5건). 셀 프롬프트에 권수 경계를 구조
-    # 신호로 명시한다: 깊이(D) 셀은 최대 depth_max_picks권만 골라 그만큼 깊게 상술, 넓이(B)
-    # 셀은 최소 breadth_min_picks권 이상(풀이 허용하는 한)을 스펙트럼으로 조망. 축 정의
-    # (깊이=소수 집중, 넓이=복수 조망)에서 도출되는 부류 규칙이며 특정 질문 대응이 아니다.
-    matrix_depth_max_picks: int = 2
-    matrix_breadth_min_picks: int = 3
 
     # 세션 영속
     session_db_url: str = "sqlite+aiosqlite:///./data/sessions.db"  # async 드라이버 접미사 필수
@@ -238,17 +185,6 @@ class Settings(BaseSettings):
         """
         if not self.matrix_generation_model:
             self.matrix_generation_model = self.flash_model_name
-        return self
-
-    @model_validator(mode="after")
-    def _default_classifier_model_to_flash(self) -> "Settings":
-        """classifier_model_name이 비면 flash_model_name으로 채운다(단일 소스).
-
-        질의 분류는 값싼 모델 고정이므로 별도 모델명 리터럴을 두지 않는다 — flash 모델을 바꾸면
-        분류기도 따라간다. 명시 오버라이드(.env)가 있으면 그 값을 존중한다.
-        """
-        if not self.classifier_model_name:
-            self.classifier_model_name = self.flash_model_name
         return self
 
 
@@ -283,9 +219,9 @@ def ensure_google_api_key_env() -> str:
 
 
 # 공유 google.genai 클라이언트 싱글턴.
-# 여기 있는 이유: 소비자가 코어(query_understanding)와 matrix(generate·retrieval) 양쪽이라
-# **공통 조상인 config**가 제자리다. matrix에 두면 코어가 matrix를 import하는 역방향 의존이
-#생겨(실제로 query_understanding이 지연 import로 우회하고 있었다) 계층이 뒤집힌다.
+# 여기 있는 이유: 소비자가 matrix(generate·retrieval·planning)이고 config가 그 공통 조상이라
+# **여기가 제자리**다. matrix에 두면 다른 코어 모듈이 matrix를 import하는 역방향 의존이 생겨
+# 계층이 뒤집힌다.
 # ensure_google_api_key_env가 GOOGLE_API_KEY를 세팅하므로 genai.Client()가 인증된다.
 # 테스트는 호출부에 스텁을 주입해 이 팩토리를 우회한다.
 _genai_client: genai.Client | None = None
