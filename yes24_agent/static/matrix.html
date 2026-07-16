@@ -1093,13 +1093,78 @@
     let tRoundIdx = 0;
     let tOrder = AXES.slice();
 
-    // 대비 축만 두 값으로 바꾸고, 결정된 축은 선택값, 나머지는 AXES의 첫 값으로 고정한다.
-    function buildCodeWith(axisKey, value) {
+    // 코드 조립: 대비 축(axisKey)=value, 이미 결정된 축=선택값, 나머지 미결정 축=combo에서.
+    // 두 비교 셀은 axisKey 하나만 다르다(다른 축은 동일 맥락으로 고정). 결정된 축이 코드상
+    // 연속 prefix가 아닐 수 있어(적응형 순서) 위치가 아닌 tDecided 멤버십으로 판별한다.
+    function buildCodeWith(axisKey, value, combo) {
       return AXES.map((ax) => {
         if (ax.key === axisKey) return value;
         if (ax.key in tDecided) return tDecided[ax.key];
-        return ax.values[0];
+        return (combo && ax.key in combo) ? combo[ax.key] : ax.values[0];
       }).join("");
+    }
+    // 대비 축(axisKey)을 보여줄 때 나머지 '미결정' 축 조합 중 가장 변별력 있는 쌍을 고른다.
+    // 우선순위: ①두 셀 비폴백 & 대표책 다름 > ②비폴백 & 본문 다름 > ③비폴백 > ④대표책 다름 >
+    // ⑤본문 다름 > ⑥첫 조합. 대표책이 같으면(발췌만 다른 무변별 비교) 회피, 폴백 셀도 회피.
+    function chooseUndecidedCombo(axisKey) {
+      const axk = AXES.find((a) => a.key === axisKey);
+      const undecided = AXES.filter((ax) => ax.key !== axisKey && !(ax.key in tDecided));
+      let combos = [{}];
+      for (const ax of undecided) {
+        const next = [];
+        for (const c of combos) for (const v of ax.values) next.push({ ...c, [ax.key]: v });
+        combos = next;
+      }
+      const scored = combos.map((combo) => {
+        const a = cardByCode.get(buildCodeWith(axisKey, axk.values[0], combo));
+        const b = cardByCode.get(buildCodeWith(axisKey, axk.values[1], combo));
+        const bothReal = !!(a && b && !a.isFallback && !b.isFallback);
+        const pa = repTitle(a), pb = repTitle(b);
+        const pickDiffer = !!(pa && pb && pa !== pb);
+        const differ = !!(a && b && (tGist(a) !== tGist(b) || pa !== pb));
+        return { combo, bothReal, differ, pickDiffer };
+      });
+      const pick =
+        scored.find((s) => s.bothReal && s.pickDiffer) ||
+        scored.find((s) => s.bothReal && s.differ) ||
+        scored.find((s) => s.bothReal) ||
+        scored.find((s) => s.pickDiffer) ||
+        scored.find((s) => s.differ) ||
+        scored[0];
+      return pick.combo;
+    }
+    // 축 결정 순서를 "대표책 변별 견고성" 오름차순으로 잡는다. 각 축의 견고성 = 나머지 3축의
+    // 8조합 중 두 셀(둘 다 비폴백) 대표책이 다른 조합 수. 견고한 축일수록 어떤 맥락에서도 다른
+    // 책을 내므로 조합 자유도가 0인 '마지막 라운드'에 배치하고, 특정 조합에서만 갈리는 취약한
+    // 축은 조합을 고를 수 있는 앞 라운드에 배치한다 → 마지막 라운드까지 "다른 책 쌍" 확률을
+    // 높인다(라운드 4 동일책 완화). 데이터 기반이라 특정 축 하드코딩이 아니고, 모든 축이 동률
+    // (예: 전부 같은 책)이면 안정 정렬로 AXES 원순서 유지 → 현행 동작과 동일("전부 같으면 유지").
+    function orderAxesByDifferentiation() {
+      const prevDecided = tDecided;
+      tDecided = {}; // 견고성은 결정 전(모든 축 미결정) 기준으로 산정
+      const robustness = {};
+      for (const axk of AXES) {
+        const others = AXES.filter((ax) => ax.key !== axk.key);
+        let combos = [{}];
+        for (const ax of others) {
+          const next = [];
+          for (const c of combos) for (const v of ax.values) next.push({ ...c, [ax.key]: v });
+          combos = next;
+        }
+        let n = 0;
+        for (const combo of combos) {
+          const a = cardByCode.get(buildCodeWith(axk.key, axk.values[0], combo));
+          const b = cardByCode.get(buildCodeWith(axk.key, axk.values[1], combo));
+          if (a && b && !a.isFallback && !b.isFallback) {
+            const pa = repTitle(a), pb = repTitle(b);
+            if (pa && pb && pa !== pb) n++;
+          }
+        }
+        robustness[axk.key] = n;
+      }
+      tDecided = prevDecided;
+      // 취약(작은 n) → 앞, 견고(큰 n) → 뒤. 동률은 Array.sort 안정성으로 AXES 원순서 유지.
+      return AXES.slice().sort((x, y) => robustness[x.key] - robustness[y.key]);
     }
     // 토너먼트 카드 미리보기 = 전문(.tc-gist가 3줄 클램프).
     function tGist(card) { return card && card.text ? card.text.trim() : ""; }
@@ -1113,7 +1178,7 @@
     function openTourney() {
       tDecided = {};
       tRoundIdx = 0;
-      tOrder = AXES.slice();
+      tOrder = orderAxesByDifferentiation(); // 이번 런 답변 기준으로 축 순서 재배치
       tResult.hidden = true;
       tCards.style.display = "";
       tourneyBackdrop.hidden = false;
@@ -1134,8 +1199,10 @@
       tQ.textContent = "어느 쪽이 더 끌려요?";
 
       tCards.textContent = "";
+      // 두 비교 셀이 실제로 다른 대표책/본문을 갖도록 미결정 축 조합을 고른다(같으면 첫 조합).
+      const combo = chooseUndecidedCombo(ax.key);
       ax.values.forEach((val) => {
-        const code = buildCodeWith(ax.key, val);
+        const code = buildCodeWith(ax.key, val, combo);
         const card = cardByCode.get(code);
         const el = document.createElement("button");
         el.className = "t-card";
