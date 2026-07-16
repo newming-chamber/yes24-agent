@@ -177,16 +177,15 @@ async def run_agent_stream(
         # 스트림에서 관찰한 출처를 누적한다. 병렬 도구 실행 시 세션 state가 유실될 수
         # 있어(_reconcile_sources 참고), done 조립의 유실 방지용 완전한 사본으로 쓴다.
         observed_sources: list[dict] = []
-        # 이번 턴 검색성 도구 호출의 충분성 힌트를 누적한다(tool_name·result_count·
-        # needs_followup·status). 충분성 게이트가 "마지막 검색이 얕았는지(결과 0건)"를 판정해
-        # 재검색을 트리거하는 데 쓴다 — 지금까진 도구가 반환만 하고 아무도 읽지 않던 힌트다.
+        # 이번 턴 검색성 도구 호출의 힌트를 누적한다(tool_name·result_count·needs_followup·
+        # status). 지금은 에러/타임아웃 마감 경로의 require_evidence 판정과 로그 카운트에만 쓴다
+        # (충분성 게이트는 W2에서 삭제됨 — 얕은검색 재검색 트리거는 더 이상 없다).
         observed_tool_calls: list[dict] = []
         # done.text 조립용 턴별 누적. 도구 호출 전 텍스트는 턴 경계에서 버리고 최종 모델 턴만
         # 조립한다. current_turn은 진행 중 턴의 조각이다.
         turn_texts: list[str] = []
         current_turn: list[str] = []
         final_text = ""
-        requires_grounding = False
         # 이번 턴에 partial 본문 조각을 실제로 delta로 흘려보냈는지(퍼플렉시티식 토큰 스트리밍).
         # True면 마감에서 최종 본문을 단일 delta로 다시 보내지 않고(중복 방지) done만 방출한다.
         # 도구 호출로 진행발화가 폐기되거나 오버로드 재시도로 시도가 폐기되면 sse_reset 후 False로
@@ -458,7 +457,7 @@ async def run_agent_stream(
                 best_effort,
                 observed_sources,
                 resolved_session_id,
-                require_evidence=requires_grounding or bool(observed_tool_calls),
+                require_evidence=bool(observed_tool_calls),
                 fallback_text=error_text,
             )
             error_done["model"] = active_model
@@ -486,7 +485,7 @@ async def run_agent_stream(
                 best_effort,
                 observed_sources,
                 resolved_session_id,
-                require_evidence=requires_grounding or bool(observed_tool_calls),
+                require_evidence=bool(observed_tool_calls),
                 fallback_text=error_text,
             )
             error_done["model"] = active_model
