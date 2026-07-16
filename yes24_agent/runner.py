@@ -31,10 +31,6 @@ from yes24_agent.event_translate import (
     _status_for_error,
     build_source_event,
 )
-from yes24_agent.grounding import (
-    has_product_grounding,
-)
-from yes24_agent.orchestrator import apply_sufficiency_gate
 from yes24_agent.policy_flow import run_policy_evidence_turn
 from yes24_agent.postprocess import (
     build_done_payload,
@@ -42,11 +38,9 @@ from yes24_agent.postprocess import (
 )
 from yes24_agent.product_flow import run_product_selection_turn
 from yes24_agent.query_understanding import (
-    GROUNDED_INTENTS,
     POLICY,
     PRODUCT,
     RECENCY,
-    evidence_policy,
     understand,
 )
 from yes24_agent.rbti.persona import is_valid_code
@@ -58,7 +52,6 @@ from yes24_agent.session_service import (
     _resolve_session,
 )
 from yes24_agent.sources import (
-    WEB_SOURCE_TYPES,
     get_sources,
     merge_turn_source_records,
 )
@@ -255,7 +248,6 @@ async def run_agent_stream(
             max_llm_calls=settings.max_llm_calls,
         )
         requires_grounding = understanding.needs_grounding
-        evidence = evidence_policy(understanding)
         search_query = understanding.standalone_query
         typed_intent_available = understanding.classification_state != "unavailable"
         # 단일 pro 경로: flash/pro 하이브리드 라우팅을 폐기하고 모든 질의를 pro로 처리한다.
@@ -537,63 +529,12 @@ async def run_agent_stream(
                     sorted(s["id"] for s in sources),
                 )
 
-            # 이 턴의 답이 도구 접지를 요구하는가 — 게이트에 넘길 **구조 신호**(관측 사실 + 분류).
-            # 게이트는 이 값과 유효 인용 수·실제 도구 호출 기록만으로 원인을 가른다(미완결 vs 얕음).
-            # 예전엔 여기서 없었던 도구 호출 레코드를 지어내 observed_tool_calls에 넣어 얕음 경로를
-            # 태웠는데, 그러면 관측 데이터가 거짓이 되고 서로 다른 원인이 한 kind로 뭉개져 폴백까지
-            # 잘못 상속됐다(미완결의 원답=약속문인데 shallow의 "원답 유지"를 물려받아 약속문이 최종
-            # 확정). 이제 runner는 사실만 전달한다.
-            # 확신된 접지 부류거나 이번 턴 상품·웹 출처를 실제 관측한 경우만 게이트에 넘긴다.
-            # ambiguous/unavailable의 synthetic WEB 폴백만으로 명료화 답을 폐기하지 않는다.
-            observed_grounding = has_product_grounding(observed_sources) or any(
-                source.get("type") in WEB_SOURCE_TYPES for source in observed_sources
-            )
-            needs_grounding = observed_grounding or (
-                typed_intent_available and understanding.intent in GROUNDED_INTENTS
-            )
-            # 분류 장애 턴에서 루트가 Yes24 상품 출처를 실제 관측했다면 generic gate보다 먼저
-            # typed 상품 경계로 한 번만 보낸다. 그 밖의 답만 generic sufficiency gate가 맡는다.
-            if (
-                understanding.classification_state == "unavailable"
-                and has_product_grounding(observed_sources)
-            ):
-                product_sink: list[dict] = []
-                yield sse_status("verifying", "상품 상세 근거를 확인하고 있어요")
-                async for frame in run_product_selection_turn(
-                    service,
-                    run_config,
-                    resolved_session_id,
-                    settings,
-                    user_message=search_query,
-                    observed_sources=observed_sources,
-                    result_sink=product_sink,
-                    expected_constraints=understanding.product_constraints,
-                    expected_count=understanding.requested_product_count,
-                    observed_tool_calls=observed_tool_calls,
-                ):
-                    yield frame
-                final_done = product_sink[0]
-            else:
-                gate_sink: list[dict] = []
-                async for frame in apply_sufficiency_gate(
-                    citation,
-                    done_payload,
-                    service=service,
-                    run_config=run_config,
-                    resolved_session_id=resolved_session_id,
-                    settings=settings,
-                    observed_sources=observed_sources,
-                    observed_tool_calls=observed_tool_calls,
-                    result_sink=gate_sink,
-                    standalone_query=search_query,
-                    needs_grounding=needs_grounding,
-                    required_source_types=evidence.required_source_types,
-                    force_tool=evidence.force_tool,
-                ):
-                    yield frame
-                final_done = gate_sink[0]
+            # generic 루트 답변을 그대로 마감한다. 충분성 게이트·강제 재진입(correction)은
+            # 삭제했다 — 접지 backstop은 별도 모듈인 인용 검증(validate_citations)이 맡고,
+            # typed-flow(product/policy/recency)는 위에서 자기 검증으로 이미 처리했다.
+            final_done = done_payload
 
-            # 최후 방어: 게이트까지 지나고도 done.text가 비면 빈 응답을 그대로 내보내지 않는다.
+            # 최후 방어: 마감 후에도 done.text가 비면 빈 응답을 그대로 내보내지 않는다.
             # 라이브로 아무것도 안 흘렸으면 delta로도 흘려 프론트가 "(응답이 없었어요)" 대신 이
             # 안내를 렌더하게 한다. 원인 규명용으로 상태를 로그에 남긴다(빈 성공 위장 금지 정신).
             if not (final_done.get("text") or "").strip():
