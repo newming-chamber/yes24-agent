@@ -194,10 +194,10 @@ def _instruction_provider(ctx: ReadonlyContext) -> str:
 
 
 def create_agent() -> LlmAgent:
-    """상위(pro) 루트 LlmAgent를 생성한다.
+    """단일 루트(pro) LlmAgent를 생성한다.
 
-    thinking_budget은 config에서 주입한다(-1=dynamic: 복잡도별 자동 추론). 하이브리드
-    라우팅 off이거나 질의가 '다단계'로 분류될 때 쓰는 정확성 우선 경로다.
+    thinking_budget은 config에서 주입한다(-1=Gemini 동적 추론: 복잡도별 자동). 모든
+    질의를 이 단일 pro 경로로 처리한다(flash/pro 하이브리드 라우팅 폐기).
     """
     settings = get_settings()
     return build_llm_agent(
@@ -209,22 +209,4 @@ def create_agent() -> LlmAgent:
     )
 
 
-def create_flash_agent() -> LlmAgent:
-    """경량(flash) 루트 LlmAgent를 생성한다 — 하이브리드 라우팅의 빠른 기본 경로.
-
-    잡담·단순 사실질문·단일 상품조회·후속처럼 다단계가 필요 없는 질의를 즉답한다.
-    flash는 thinking_budget=0만 안정적이므로(실측: -1 dynamic은 주가 등에서 빈응답 회귀)
-    config의 flash_thinking_budget(=0)을 주입한다.
-    """
-    settings = get_settings()
-    return build_llm_agent(
-        model=settings.flash_model_name,
-        thinking_budget=settings.flash_thinking_budget,
-        name="yes24_assistant",
-        description="단순 질의를 빠르게 처리하는 범용 어시스턴트의 경량 실행 경로.",
-        instruction=_instruction_provider,
-    )
-
-
 root_agent = create_agent()
-root_agent_flash = create_flash_agent()

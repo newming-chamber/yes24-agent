@@ -22,7 +22,6 @@ from google.genai.errors import APIError
 from yes24_agent.adk_stream import iter_adk_events
 from yes24_agent.agent import (
     root_agent,
-    root_agent_flash,
 )
 from yes24_agent.config import get_settings
 from yes24_agent.event_translate import (
@@ -52,7 +51,6 @@ from yes24_agent.query_understanding import (
 )
 from yes24_agent.rbti.persona import is_valid_code
 from yes24_agent.recency_flow import run_recency_evidence_turn
-from yes24_agent.routing import FLASH, PRO, select_route
 from yes24_agent.session_service import (
     _POC_USER_ID,
     _get_session_lock,
@@ -260,15 +258,13 @@ async def run_agent_stream(
         evidence = evidence_policy(understanding)
         search_query = understanding.standalone_query
         typed_intent_available = understanding.classification_state != "unavailable"
-        # 하이브리드 모델 라우팅: 확신 있는 단일단계 질의만 flash(빠른 즉답)로 내리고,
-        # 다단계·저확신 질의는 pro로 보낸다(select_route).
-        route = select_route(understanding, hybrid_routing=settings.hybrid_routing)
-        main_agent = root_agent_flash if route == FLASH else root_agent
+        # 단일 pro 경로: flash/pro 하이브리드 라우팅을 폐기하고 모든 질의를 pro로 처리한다.
+        # 난도별 추론량 조절은 thinking_budget=-1(Gemini 동적 추론)에 위임한다.
+        main_agent = root_agent
         active_model = str(main_agent.model)
 
         logger.info(
-            "모델 라우팅=%s intent=%s multistep=%s confident=%s (session_id=%s)",
-            route,
+            "intent=%s multistep=%s confident=%s (session_id=%s)",
             understanding.intent,
             understanding.multistep,
             understanding.confident,
@@ -364,9 +360,8 @@ async def run_agent_stream(
         )
         new_message = types.Content(role="user", parts=[types.Part(text=search_query)])
 
-        # 반응형 폴백 상태: 지금 스트림이 어느 모델 경로인지, 폴백을 이미 1회 썼는지.
-        # 재시도는 pro→flash 딱 1회로 고정한다(무한 재시도 금지).
-        active_route = route
+        # 반응형 재시도 상태: 과부하 재시도를 이미 1회 썼는지. 재시도는 같은 pro로
+        # 딱 1회로 고정한다(무한 재시도 금지).
         retried_overload = False
 
         # 이벤트 간격에 sse_timeout_s 상한을 건다. ADK 스트림은 하나의 고정 task가 소비해
@@ -385,19 +380,18 @@ async def run_agent_stream(
                 except StopAsyncIteration:
                     break
                 except APIError as exc:
-                    # 반응형 폴백: pro가 Gemini 과부하/일시장애로, 아직 사용자에게 아무것도
-                    # 안 흘린 상태에서 실패하면 flash로 딱 1회 조용히 재시도한다. 그 외(이미
-                    # 뭔가 흘림·이미 flash·과부하 아님·재시도 소진·기능 off)는 재-raise해
-                    # 아래 정직 안내(error+done) 방어선으로 넘긴다.
+                    # 반응형 재시도: pro가 Gemini 과부하/일시장애로, 아직 사용자에게 아무것도
+                    # 안 흘린 상태에서 실패하면 같은 pro로 딱 1회 조용히 재시도한다. 그 외(이미
+                    # 뭔가 흘림·과부하 아님·재시도 소진·기능 off)는 재-raise해 아래 정직
+                    # 안내(error+done) 방어선으로 넘긴다.
                     if (
                         settings.error_fallback
                         and not retried_overload
-                        and active_route == PRO
                         and not emitted_output
                         and _is_overloaded_error(exc)
                     ):
                         logger.warning(
-                            "Gemini 과부하/일시장애(code=%s) 감지 → flash로 폴백 재시도"
+                            "Gemini 과부하/일시장애(code=%s) 감지 → pro로 재시도"
                             "(session_id=%s).",
                             getattr(exc, "code", "?"),
                             resolved_session_id,
@@ -405,14 +399,13 @@ async def run_agent_stream(
                         await timed_event_stream.aclose()
                         await event_stream.aclose()
                         retried_overload = True
-                        active_route = FLASH
-                        fallback_agent = root_agent_flash
+                        fallback_agent = root_agent
                         active_model = str(fallback_agent.model)
                         # 폐기되는 pro 시도가 홀드한 버퍼를 리셋한다.
                         turn_texts = []
                         current_turn = []
                         final_text = ""
-                        # 같은 세션·같은 메시지를 flash로 재실행한다. pro 시도가 이미 이 user
+                        # 같은 세션·같은 메시지를 같은 pro로 재실행한다. 이전 시도가 이미 이 user
                         # 메시지를 세션에 append했으므로 히스토리에 user 턴이 한 번 더 붙지만
                         # (ADK가 매 run_async 시작에 append), 아무 응답도 못 낸 실패라 중복
                         # 노출·본문 모순은 없다 ─ 드문 과부하 시의 경미한 히스토리 중복이다.

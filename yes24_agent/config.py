@@ -23,18 +23,17 @@ class Settings(BaseSettings):
     # 자율 다단계 탐색용 상위 모델(사용자 승인, 비용·지연 감수). 미명시 시 preview로 떨어짐.
     # 실측: pro는 flash의 빈응답 회귀 없이 자율 보강(정책 질문에 스스로 검색)을 안정 수행.
     model_name: str = "gemini-2.5-pro"
-    # gemini-2.5-pro는 thinking 필수(budget 0은 400 에러). **유한값으로 상한을 건다** — -1(dynamic)
-    # 은 모델이 생각을 얼마든 늘려 첫 토큰이 7~12초 뒤에야 나온다(성능 감사 실측: 같은 프롬프트에
-    # tb=-1 10.8s vs tb=512 4.6s, 출력 길이는 거의 동일 880 vs 824자). 512는 다단계 계획에 충분한
-    # 예산이면서 TTFT를 6~8초 줄인다. 품질 저하가 관측되면 이 값을 올린다(.env로 조정 가능).
+    # pro 단일 경로의 고정 추론 예산. flash/pro 하이브리드 라우팅을 폐기하며 이 값으로 통일한다.
+    # -1(동적)은 실측상 첫 토큰 ~10.8s로 512(~4.6s) 대비 2배+ 느려(모든 질의에 최대 추론)
+    # "쉬운 건 빠르게" 실익이 없어 검증된 512로 고정(.env 조정 가능).
     thinking_budget: int = 512
-    # 하이브리드 라우팅용 경량 모델(잡담·단순질의·단일조회를 즉답). 실측: flash는
-    # thinking_budget=0만 안정(-1 dynamic은 주가 등에서 빈응답 회귀). pro 전역의 20~40초
-    # 지연을 단순 질의에서 없애는 것이 목적(redesign-decision.md 원칙 8).
+    # 분류 전용 모델의 기본값 소스(classifier_model_name·matrix_generation_model validator가
+    # 소비). 하이브리드 라우팅 폐기로 라우팅 소비처는 사라졌다.
     flash_model_name: str = "gemini-2.5-flash"
+    # flash 분류·격리 JSON 호출(query_understanding 분류기·generate_isolated_json)의 추론 예산.
+    # flash는 budget=0만 안정(-1 dynamic은 빈응답 회귀). 하이브리드 라우팅은 폐기됐지만 이 값은
+    # 여전히 분류기·격리 표현 호출이 소비한다(W3/W4에서 정리 예정).
     flash_thinking_budget: int = 0
-    # 질의 난도로 flash/pro를 고르는 하이브리드 라우팅 on/off. off면 model_name(pro) 전역.
-    hybrid_routing: bool = True
     # 질의 분류기(intent·multistep·confidence) on/off. 키워드 버킷을 폐기하고 값싼 모델 1회
     # 구조화 출력으로 대체한다 — 부류를 '의미'로 판정해 표면 문자열(합성어·부분일치)에 걸리지
     # 않는다. off이거나 실패·저확신이면 안전한 쪽(pro + 게이트 적용)으로 폴백한다(키워드 부활 없음).
@@ -51,9 +50,8 @@ class Settings(BaseSettings):
     # 평점 값 대조 허용오차. 표기 차이(9.5 vs 9.50)를 같은 값으로 보되, 지어낸 값은 걸러낸다.
     rating_match_tolerance: float = 0.1
 
-    # 에러 구동 반응형 모델 폴백: pro 경로가 Gemini 과부하/일시장애(429/5xx)로 첫 응답조차
-    # 내지 못하면 flash로 딱 1회 조용히 폴백 재시도한다. 선제적 hybrid_routing과 직교한다
-    # ─ 저건 질의 난도로 사전 선택, 이건 에러 후 반응. off면 기존처럼 곧장 정직 안내(error+done).
+    # 에러 구동 반응형 재시도: pro 경로가 Gemini 과부하/일시장애(429/5xx)로 첫 응답조차 내지
+    # 못하면 같은 pro로 딱 1회 조용히 재시도한다. off면 곧장 정직 안내(error+done).
     error_fallback: bool = True
     # 인터스티셜 응대(ack) 채널: 도구를 호출하는 턴에서 첫 function_call 시점에 도구 전 공감·
     # 안내 preamble의 첫 문장(들)을 별도 `event: ack`로 즉시 흘려, 30~60s 무응대 대신 수 초 내
