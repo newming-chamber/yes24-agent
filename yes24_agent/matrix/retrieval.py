@@ -69,6 +69,12 @@ class SharedPool:
 _pool_cache: dict[str, tuple[float, SharedPool]] = {}
 
 
+def clear_pool_cache() -> None:
+    """공유 풀 캐시를 비운다(테스트 격리·운영 리셋용). 전역 _pool_cache는 살아있으므로
+    캐시 hit/miss가 테스트 간 새지 않도록 이 공개 훅으로 리셋한다."""
+    _pool_cache.clear()
+
+
 def _cache_key(question: str) -> str:
     """캐시 조회용 정규화 키 — 앞뒤 공백 제거, 연속 공백 축약, 소문자화."""
     return " ".join(question.split()).lower()
