@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import re
 import time
 from dataclasses import dataclass, field, replace
 
@@ -118,6 +119,96 @@ async def _search_once(query: str, settings: Settings) -> list[dict] | None:
         return None
 
 
+# 캐시 키·저자 정규화용 연속 공백 축약, 저자 병기(한자/영문 괄호) 제거 패턴.
+_WHITESPACE_RE = re.compile(r"\s+")
+_BRACKET_GROUP = re.compile(r"[\[\(【][^\]\)】]*[\]\)】]")
+
+# 에디션 변형 dedup — 같은 책의 판형/장정 변형("채식주의자"·"채식주의자(개정판)"·"채식주의자
+# (큰글자도서)")이 별개 URL이라 url-dedup을 통과해 풀에 중복 유입되는 것을 접는다.
+#
+# 판형 수식어 목록은 두지 않는다 — **코어 제목**(부제·괄호·시리즈 라벨 앞까지)이 이미 그 부가
+# 텍스트를 잘라내므로, "같은 저자 + 같은 코어 제목"이면 같은 책이다. 목록 없이 부류 전체를 덮는다.
+#
+# 코어 제목 경계 — 이 구분자 앞까지가 '책 본제목'이고 뒤는 부제·시리즈 라벨·원제 병기·부록
+# 안내 등 부가 텍스트다.
+_CORE_TITLE_BOUNDARY = re.compile(r"\s[-–—]\s|\s?[\(\[【]|★|\s외\s|[:：/·]")
+# 제목 맨 앞의 브래킷 접두("[중고] …"·"(개정판) …"). 코어 추출 전에 떼지 않으면 경계가 첫
+# 글자에 걸려 코어가 빈 문자열이 되고, 저자-코어 병합 경로가 통째로 무력해진다.
+_LEADING_BRACKETS = re.compile(r"^\s*(?:[\[\(【][^\]\)】]*[\]\)】]\s*)+")
+# 저자 표기에서 떼어낼 역할어·병기(원제 한자/영문 괄호). 같은 저자의 다른 표기("김춘광 저"·
+# "김춘광 (金春光) 저")를 한 키로 모으기 위한 정규화.
+_AUTHOR_ROLE_STRIP = re.compile(r"(저|글|지음|엮음|옮김|그림|편|역|등저|외)\b")
+# 판형이 아니라 **다른 판본/상품**을 뜻하는 구별 마커. 이게 있으면 저자-코어 대조 병합을 막아
+# 원서↔번역·낱권↔합본·세트 같은 진짜 다른 상품이 잘못 합쳐지지 않게 한다(오병합 방지).
+_DISTINGUISHING_MARKER = re.compile(
+    r"원서|원문|영문판|영어판|일문판|중문판|세트|전집|합본|상권|하권|\d+\s*권"
+)
+
+
+def _norm_author(author: str | None) -> str:
+    """저자 표기 정규화 — 첫 저자만, 한자/영문 병기·역할어 제거, 소문자·공백정리.
+
+    "김춘광 저"·"김춘광 (金春光) 저"를 같은 "김춘광"으로 모으되, 동명이서(異書)를 가르는 데
+    쓰이므로 다저자는 첫 저자로 대표한다(편집·선집 구분은 별 문제 — 서로 다른 책이면 코어제목
+    또는 저자가 어차피 다르다)."""
+    if not author:
+        return ""
+    first = re.split(r"[/,]", author, maxsplit=1)[0]
+    first = _BRACKET_GROUP.sub(" ", first)  # (金春光) 등 병기 제거
+    first = _AUTHOR_ROLE_STRIP.sub(" ", first)
+    return _WHITESPACE_RE.sub(" ", first).strip().lower()
+
+
+def _core_title(title: str) -> str:
+    """책 본제목(부제·시리즈·원제 병기·부록 안내 앞까지)을 정규화해 반환한다.
+
+    선행 브래킷 접두를 먼저 떼어(그러지 않으면 코어가 비어버린다) 경계까지를 코어로 삼고,
+    공백·대소문자를 정규화한다. 비교는 공백 무시(같은 책의 붙여쓰기 변형을 흡수)."""
+    text = _LEADING_BRACKETS.sub("", title or "")
+    boundary = _CORE_TITLE_BOUNDARY.search(text)
+    core = text[: boundary.start()] if boundary else text
+    return _WHITESPACE_RE.sub("", core).strip().lower()
+
+
+def _dedup_key(item: dict) -> tuple[str, str]:
+    """후보의 동일도서 그룹 키 — (정규화 저자, 코어 제목).
+
+    저자와 코어 제목이 둘 다 잡히고 구별 마커(원서·세트·낱권 등 **다른 상품**을 뜻하는 표기)가
+    없을 때만 병합 대상이다. 그 밖(저자 없음·코어 없음·구별 마커)은 **제목 전문**을 키로 삼는다 —
+    완전히 같은 제목이 아니면 병합하지 않는다는 뜻이며, 별개 도서를 잘못 접는 위험을 0으로 둔다.
+    """
+    title = item.get("title", "")
+    author = _norm_author(item.get("author"))
+    core = _core_title(title)
+    if author and len(core) >= 2 and not _DISTINGUISHING_MARKER.search(title):
+        return author, core
+    return "", _WHITESPACE_RE.sub("", title).lower()
+
+
+def _dedup_editions(items: list[dict]) -> list[dict]:
+    """같은 책의 변형(판형·부제·시리즈 라벨·원제 병기)을 1종으로 접는다(첫 등장 위치 보존).
+
+    그룹 대표는 판매지수(대중성)가 큰 쪽, 동급이면 부가 텍스트가 적은(짧은) 제목 — 카드가
+    "(큰글자도서) 28,000원"·"… 외 단편 17작품 ★ 부록…" 같은 부가판 제목으로 뜨는 것을 막는다.
+    대표는 **선택**일 뿐 제목을 재작성하지 않는다(없는 제목을 지어내지 않음).
+    """
+
+    def _better(candidate: dict, current: dict) -> bool:
+        cand_sale = candidate.get("sale_index") or -1
+        cur_sale = current.get("sale_index") or -1
+        if cand_sale != cur_sale:
+            return cand_sale > cur_sale
+        return len(candidate.get("title", "")) < len(current.get("title", ""))
+
+    reps: dict[tuple[str, str], dict] = {}
+    for item in items:
+        key = _dedup_key(item)
+        current = reps.get(key)
+        if current is None or _better(item, current):
+            reps[key] = item
+    return list(reps.values())
+
+
 def _assemble_product_pool(
     question: str,
     items: list[dict],
@@ -201,14 +292,18 @@ async def _build_product_pool(
             by_url[item_url] = observed
             raw_items.append(observed)
 
+    # 같은 책의 판형·부제·시리즈 변형(별개 URL이라 url-dedup을 통과)을 1종으로 접는다 —
+    # target_size 절단 직전에 수행해 중복 판본이 풀의 유효 폭을 좀먹지 않게 한다.
+    deduped = _dedup_editions(raw_items)
     logger.info(
-        "matrix 풀 정제: raw=%d 최종=%d",
+        "matrix 풀 정제: raw=%d dedup→%d 최종=%d",
         len(raw_items),
-        min(len(raw_items), settings.matrix_pool_target_size),
+        len(deduped),
+        min(len(deduped), settings.matrix_pool_target_size),
     )
     return _assemble_product_pool(
         question,
-        raw_items,
+        deduped,
         settings,
         checked_at,
         saw_error=saw_error,
