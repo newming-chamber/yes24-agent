@@ -10,7 +10,6 @@ import os
 from functools import lru_cache
 
 from google import genai
-from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,18 +26,10 @@ class Settings(BaseSettings):
     # -1(동적)은 실측상 첫 토큰 ~10.8s로 512(~4.6s) 대비 2배+ 느려(모든 질의에 최대 추론)
     # "쉬운 건 빠르게" 실익이 없어 검증된 512로 고정(.env 조정 가능).
     thinking_budget: int = 512
-    # 매트릭스 생성 모델의 기본값 소스(matrix_generation_model validator가 소비). flash/pro
-    # 하이브리드 라우팅·사전 질의분류기를 폐기하며 채팅 경로의 flash 소비처는 사라졌다.
-    flash_model_name: str = "gemini-2.5-flash"
 
     # 에러 구동 반응형 재시도: pro 경로가 Gemini 과부하/일시장애(429/5xx)로 첫 응답조차 내지
     # 못하면 같은 pro로 딱 1회 조용히 재시도한다. off면 곧장 정직 안내(error+done).
     error_fallback: bool = True
-    # 인터스티셜 응대(ack) 채널: 도구를 호출하는 턴에서 첫 function_call 시점에 도구 전 공감·
-    # 안내 preamble의 첫 문장(들)을 별도 `event: ack`로 즉시 흘려, 30~60s 무응대 대신 수 초 내
-    # 첫 응대가 보이게 한다. 이 상한(문자)까지 문장 경계로 담고, **나머지는 버린다** — 도구 전
-    # 발화는 진행 발화이지 본문이 아니므로 done.text에도 들어가지 않는다(원칙 4b).
-    ack_max_chars: int = 120
     max_llm_calls: int = 50  # ADK RunConfig 상한
 
     # Yes24 크롤링
@@ -64,6 +55,13 @@ class Settings(BaseSettings):
     # 판정해 요청 자체를 막는다(도구별 필터는 우회 경로가 생긴다 — 게이트는 한 곳).
     yes24_disallowed_paths: list[str] = ["/goods/", "/member/"]
     search_result_limit: int = 10
+    # 한 번의 yes24_search 호출에서 동시에 던질 검색 각도(쿼리) 수 상한. 탐색 각도 하나당
+    # LLM 왕복을 1회씩 소모하던 직렬 구조가 추천 경로 지연의 최대 덩어리였다(2026-07-20 실측:
+    # 검색만 5라운드 직렬). web_search_max_queries가 웹 검색에 하는 역할의 Yes24판 —
+    # 컨텍스트·지연·Yes24 요청 폭발을 막는 천장이며, 그 대칭으로 같은 기본값을 쓴다.
+    # 공유 Yes24Client의 동시성 Semaphore(http_concurrency=5) 안에 들어가는 폭이기도 하다.
+    # 초과분은 조용히 버리지 않고 dropped_queries로 명시한다(fail-loud).
+    yes24_search_max_queries: int = 4
     browse_result_limit: int = 10
     fetch_max_chars: int = 6000
     # yes24_fetch 결과에 싣는 페이지 내 이동 링크 후보 상한. FAQ 입구 같은 내비 허브는
@@ -120,11 +118,6 @@ class Settings(BaseSettings):
     # 짧지만, 매트릭스 풀은 16셀이 갈라질 재료라 한 페이지가 주는 만큼(24건) 다 받는다 —
     # 풀이 16보다 작으면 차별화가 구조적으로 불가능하다.
     matrix_pool_parse_limit: int = 24
-    # 매트릭스 생성 전용 모델. **항상 flash 고정**(비용 가드 — 16배 생성을 pro로 돌리지 않음).
-    # 빈 문자열이면 아래 validator가 flash_model_name으로 채워(단일 소스), 모델명 드리프트를 막는다.
-    matrix_generation_model: str = ""
-    # flash는 thinking_budget=0만 안정적(실측: -1 dynamic 빈응답 회귀). 매트릭스도 동일 규약.
-    matrix_generation_thinking_budget: int = 0
     # 질문별 공유 풀 캐시 TTL(초). 같은 질문 재렌더·축필터 조작 시 Yes24 재타격 없이 풀 재사용
     # (rbti-feature-plan §3.2-4). 짧게 두어 신선도를 지키되 데모 중 반복 렌더는 캐시로 흡수한다.
     matrix_cache_ttl_s: float = 300.0
@@ -139,10 +132,21 @@ class Settings(BaseSettings):
     access_password: str = ""
     # 로그인 쿠키 유효기간(초). 데모 접근 게이트라 재로그인 성가심을 줄이되 무한은 아니게 7일.
     access_cookie_max_age_s: int = 7 * 24 * 60 * 60
+    # refine·selection 모두 채팅과 같은 pro(model_name)를 쓴다. refine은 추상·분위기형 추천에서
+    # 취향을 좁히는 구체 검색씨앗(대표 저자·작품·하위장르)을 내야 하는데, flash는 추론 여지가
+    # 있어도 이를 불안정하게 내(넓은 카테고리어 '한국 소설'로 흘러 베스트셀러·참고서 잡탕 풀)
+    # pro가 필요하다(실측). refine·selection 각 1회뿐이라 16배 비용 가드는 성립하지 않는다.
+    # 추론 예산은 채팅의 thinking_budget(512 — 짧은 답변 지연 튜닝값)과 분리한다: 16코드 차별화
+    # 배정과 다각 검색축 설계는 조합 탐색이 커서, 동일 풀 A/B 실측(2026-07-20)으로 512는 축약
+    # 수렴(selection unique 1~6·미러 빈발, refine 작가씨앗 쏠림 2/4)했고 2048은 selection
+    # unique 4~8(미러 1/8), refine 유형 믹스 4/4로 안정됐다. 매트릭스당 2회뿐이라 비용은
+    # 위와 같은 논리로 무시 가능하다.
+    matrix_planning_thinking_budget: int = 2048
     # 매트릭스 공유검색 전 경량 쿼리 정제 on/off. 채팅은 에이전트가 "핵심 제목·장르·저자만"으로
     # 검색어를 성형하지만 매트릭스는 질문을 그대로 검색해, 자연어 문장("~비슷한 소설 추천해줘")이
-    # Yes24 0건 → 16카드 전부 폴백하는 데모 품질 이슈가 있다. on이면 매트릭스당 flash 1회
-    # (16× 아님)로 수식어를 걷고 핵심 검색어를 뽑는다. 실패·빈 결과면 원 질문 폴백(안전).
+    # Yes24 0건 → 16카드 전부 폴백하는 데모 품질 이슈가 있다. on이면 매트릭스당 정제 1회
+    # (16× 아님, 위 주석대로 pro)로 수식어를 걷고 핵심 검색어를 뽑는다. 실패·빈 결과면 원 질문
+    # 폴백(안전).
     matrix_query_refine: bool = True
     # 정제 결과의 상한(글자수·공백 토큰 수). 정상 검색어(제목·저자·장르 몇 단어)는 짧아, 둘 중
     # 하나라도 초과하면 모델이 검색어가 아니라 문장·설명을 냈다는 신호로 보고 원 질문으로 폴백한다.
@@ -163,30 +167,48 @@ class Settings(BaseSettings):
     # 세션 영속
     session_db_url: str = "sqlite+aiosqlite:///./data/sessions.db"  # async 드라이버 접미사 필수
 
+    # 운영자 데이터 조회(admin). 빈 문자열이면 **라우트 미등록**(404) — matrix_enabled와 같은
+    # 패턴으로, 설정하지 않은 환경엔 admin이 존재조차 하지 않는다. 값은 env `ADMIN_PASSWORD`로
+    # 주입하며, 채팅 로그인월(access_password)과 별도 비밀번호다(데모 접근 ≠ 운영 데이터 열람).
+    admin_password: str = ""
+    # 세션 목록 한 페이지 크기. 페이지당 세션 수만큼 이벤트 수·미리보기 조회가 따라붙어
+    # (인덱스 조회지만) 왕복이 늘므로, 한 화면에 담기는 정도로 둔다.
+    admin_page_size: int = 50
+    # 본문 검색 시 events 스캔에서 거둘 세션 id 상한. LIKE는 인덱스를 못 타 전체 스캔이라
+    # (실측 ~0.3s/16k행) 히트가 많을 때 IN 절이 무한히 커지지 않게 천장을 둔다.
+    admin_search_max_sessions: int = 500
+    # 목록 미리보기(첫 사용자 발화)를 찾으려 세션 앞에서 읽을 이벤트 수. 첫 이벤트가 사용자
+    # 발화인 게 보통이라 몇 건이면 충분하다 — 세션 전체를 읽으면 목록 한 장이 수십 MB가 된다.
+    admin_preview_scan_events: int = 3
+    admin_preview_max_chars: int = 140
+    # 상세 타임라인이 한 번에 싣는 이벤트 수 상한(초장기 세션의 응답 폭발 방지).
+    admin_session_max_events: int = 300
+    # 타임라인 part 하나의 본문 상한(문자). 도구 결과는 실측 최대 671KB라 상한 없이는 상세
+    # 응답이 수 MB가 된다. 초과분은 조용히 버리지 않고 truncated·total_chars로 표시한다.
+    admin_part_max_chars: int = 4000
+
     # 서버
     host: str = "0.0.0.0"
     port: int = 8010
     cors_origins: list[str] = ["http://localhost:3000"]  # `*`+credentials 조합 금지 — 명시 목록
     sse_timeout_s: float = 180.0
     app_name: str = "yes24-agent"
+    # 요청 본문 상한(문자). ChatRequest.message·MatrixRequest.question에 pydantic max_length로
+    # 걸어 초장문 입력을 422로 구조적으로 거절한다(키워드 탐지 아님) — 컨텍스트·토큰 폭발과
+    # 악의적 대용량 페이로드를 입구에서 막는다. 정상 대화·질문은 수백 자라 넉넉한 천장이다.
+    request_max_chars: int = 4000
+
+    # 관측성(파일 로깅). log_file_path가 빈 문자열이면 stdout만(로컬 개발 기본), 값이 있으면
+    # 그 경로에 RotatingFileHandler를 얹어 stdout+파일 이중 기록해 배포 후 사후 디버깅을 남긴다.
+    # 크기·백업 수도 config로 둬 하드코딩을 피한다(원칙 6).
+    log_file_path: str = ""
+    log_max_bytes: int = 10 * 1024 * 1024  # 로그 파일 회전 임계 크기(바이트)
+    log_backup_count: int = 5  # 회전 보관 백업 파일 수
 
     # 시크릿 (.env에서만 로드)
     gemini_api_key: str = ""
     perplexity_api_key: str = ""  # web_search(퍼플렉시티 /search)용 — Bearer 토큰
     tavily_api_key: str = ""  # web_fetch(Tavily /extract)용
-
-    @model_validator(mode="after")
-    def _default_matrix_model_to_flash(self) -> "Settings":
-        """matrix_generation_model이 비면 flash_model_name으로 채운다(단일 소스).
-
-        매트릭스 생성은 항상 flash 고정이므로 별도 모델명 리터럴을 두지 않고 flash_model_name을
-        그대로 참조한다 — flash 모델을 바꾸면 매트릭스도 자동으로 따라가 드리프트가 없다. 명시
-        오버라이드(.env)가 있으면 그 값을 존중한다.
-        """
-        if not self.matrix_generation_model:
-            self.matrix_generation_model = self.flash_model_name
-        return self
-
 
 @lru_cache
 def get_settings() -> Settings:

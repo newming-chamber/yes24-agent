@@ -9,6 +9,7 @@ import hmac
 import logging
 from contextlib import asynccontextmanager
 from hashlib import sha256
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from secrets import compare_digest
 from typing import Annotated
@@ -25,6 +26,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, StringConstraints
 
+from yes24_agent.admin import register_admin
 from yes24_agent.config import ensure_google_api_key_env, get_settings
 from yes24_agent.matrix.matrix_runner import run_matrix_stream
 from yes24_agent.runner import run_agent_stream
@@ -92,7 +94,17 @@ def password_matches(candidate: str, password: str) -> bool:
     return compare_digest(candidate.encode("utf-8"), password.encode("utf-8"))
 
 
-NonBlankText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+# 요청 본문 텍스트 제약: 공백 트림 후 비어 있지 않고, config 상한(request_max_chars)을
+# 넘지 않아야 한다. 초과 시 pydantic이 422를 내 초장문 입력을 입구에서 구조적으로 거절한다
+# (키워드 탐지가 아니라 길이 제약). 상한은 하드코딩 대신 config에서 읽는다.
+NonBlankText = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=get_settings().request_max_chars,
+    ),
+]
 
 
 class ChatRequest(BaseModel):
@@ -118,11 +130,25 @@ def _configure_logging() -> None:
     경고 같은 앱 INFO 로그가 묻힌다. basicConfig로 콘솔 핸들러를 보장하고
     (핸들러가 이미 있으면 no-op) 앱 로거 레벨을 INFO로 명시한다. httpx 등
     서드파티 요청 소음은 WARNING으로 억제한다.
+
+    config.log_file_path가 설정돼 있으면 같은 포맷의 RotatingFileHandler를 root에
+    덧붙여 stdout+파일 이중 기록한다(배포 후 사후 디버깅). 크기·백업 수도 config에서
+    읽어 하드코딩을 피한다. 파일 경로가 비면 stdout만(로컬 개발 기본).
     """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    settings = get_settings()
+    log_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    logging.basicConfig(level=logging.INFO, format=log_format)
+    if settings.log_file_path:
+        path = Path(settings.log_file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            path,
+            maxBytes=settings.log_max_bytes,
+            backupCount=settings.log_backup_count,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(logging.Formatter(log_format))
+        logging.getLogger().addHandler(file_handler)
     logging.getLogger("yes24_agent").setLevel(logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -215,6 +241,9 @@ def create_app() -> FastAPI:
         async def matrix_ui() -> FileResponse:
             """16뷰 RBTI 매트릭스 시뮬레이터 UI를 반환한다(인증 없음)."""
             return FileResponse(_MATRIX_HTML, media_type="text/html")
+
+    # 운영자 데이터 조회(admin). admin_password가 비어 있으면 라우트를 등록하지 않는다(404).
+    register_admin(app, settings)
 
     @app.get("/health")
     async def health() -> dict:

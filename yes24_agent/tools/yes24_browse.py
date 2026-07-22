@@ -86,7 +86,7 @@ async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
 
     results: list[dict] = []
     for item in parsed:
-        # 검색·상세와 같은 필드 집합(_product_fields) + 이 도구 고유의 rank.
+        # 검색·상세와 같은 필드 집합(product_fields) + 이 도구 고유의 rank.
         fields = product_fields(item)
         source_id = register_source(
             tool_context.state,
@@ -117,5 +117,4 @@ async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
         "results": results,
         "checked_at": checked_at,
         "result_count": len(results),
-        # 코너/랭킹 조회라 목록이 있으면 그 자체가 답 — 재검색 불필요.
     }

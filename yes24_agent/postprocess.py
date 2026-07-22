@@ -8,7 +8,6 @@
 
 import logging
 import re
-from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from yes24_agent.event_translate import project_public_source
@@ -25,23 +24,36 @@ def escape_citation_markers(text: str) -> str:
     return MARKER_PATTERN.sub(lambda match: f"［{match.group(1)}］", text)
 
 
-def render_cited_source_texts(selected_texts: Mapping[int, Sequence[str]]) -> str:
-    """서버가 선택한 출처별 원문에 예약 마커를 이스케이프하고 인용을 붙인다."""
-    return "\n\n".join(
-        f"{escape_citation_markers(' '.join(texts))} [{source_id}]"
-        for source_id, texts in selected_texts.items()
-    )
+# 코드 스팬(펜스 블록 ```…``` · 인라인 코드 `…`)은 프로즈가 아니라 그대로 표시되는 리터럴
+# 영역이다. 그 안의 `[0]`·`[1, 2]`는 배열 인덱스·수식이지 인용 마커가 아니다. 인용 마커는
+# 프로즈 계층의 관례이므로, 마커 검증은 코드 스팬을 제외한 프로즈에서만 한다 — 코드 vs 프로즈
+# 분할이 인용마커 오탐 방지의 본질이며, 특정 부호·키워드를 열거하지 않는 구조 술어다.
+_FENCE_PATTERN = re.compile(
+    r"^[ \t]*(`{3,}|~{3,}).*?(?:\n[ \t]*\1[ \t]*$|\Z)", re.MULTILINE | re.DOTALL
+)
+_INLINE_CODE_PATTERN = re.compile(r"(`+)[^\n]*?\1")
 
 
-def cited_ids(text: str) -> set[int]:
-    """본문이 인용한 source_id 집합(복합 마커 `[1, 2]`를 펼쳐 반환).
+def _code_span_ranges(text: str) -> list[tuple[int, int]]:
+    """본문에서 코드 스팬(펜스 블록·인라인 코드)의 문자 구간 `[start, end)`를 찾는다.
 
-    "본문에서 인용 id 뽑기"의 **단일 정의**다. 예전엔 이 판정이 세 모듈에 각기 구현돼 있었고
-    의미까지 달랐다. 인용 마커 문법은 이 함수 한 곳에서만 정의한다.
+    펜스 블록을 먼저 찾아 같은 길이 공백으로 가린 뒤 인라인 코드를 찾는다. 그래야 인라인 백틱
+    스캔이 펜스 블록 내부를 가로지르지 않고, 문자 인덱스는 원문과 그대로 정렬된다. 인라인은
+    줄 안에서만 짝을 맞춰(줄바꿈 불포함) 떠도는 백틱이 프로즈 영역을 통째로 삼키지 않게 한다.
     """
-    return {
-        int(n) for match in MARKER_PATTERN.finditer(text or "") for n in match.group(1).split(",")
-    }
+    ranges: list[tuple[int, int]] = []
+    masked = list(text)
+    for match in _FENCE_PATTERN.finditer(text):
+        ranges.append((match.start(), match.end()))
+        masked[match.start() : match.end()] = " " * (match.end() - match.start())
+    for match in _INLINE_CODE_PATTERN.finditer("".join(masked)):
+        ranges.append((match.start(), match.end()))
+    return ranges
+
+
+def _within_code_span(pos: int, ranges: list[tuple[int, int]]) -> bool:
+    """`pos`가 코드 스팬 구간 안에 있으면 참 — 그 자리의 `[n]`은 인용 마커로 취급하지 않는다."""
+    return any(start <= pos < end for start, end in ranges)
 
 
 # 소수점은 문장 경계가 아니다. 점 양쪽이 모두 숫자인 경우만 제외하고 나머지 문장부호를 찾는다.
@@ -94,8 +106,11 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
     유효하지 않은 id는 경고 로그를 남기고 `removed_markers`에 기록한다.
     반환되는 `supports`의 인덱스는 (재작성·제거 반영 후) 최종 본문 기준이다.
 
+    코드 스팬(펜스 블록·인라인 코드) 안의 `[n]`은 배열 인덱스·수식이므로 마커 검증에서
+    제외하고 원문 그대로 보존한다(`_code_span_ranges`).
     """
     valid_ids = {source["id"] for source in sources}
+    code_ranges = _code_span_ranges(text)
 
     cleaned_parts: list[str] = []
     # (최종 본문 기준 마커 시작/끝 인덱스, 마커에 담긴 유효 source_id 목록)
@@ -108,6 +123,11 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
     output_len = 0  # 지금까지 만들어진 cleaned 본문의 길이
 
     for match in MARKER_PATTERN.finditer(text):
+        if _within_code_span(match.start(), code_ranges):
+            # 코드/인라인 코드 안의 `[n]`은 배열 인덱스·수식이지 인용 마커가 아니다. 커서를
+            # 진전시키지 않고 건너뛰어, 이 대괄호가 다음 프로즈 마커의 prefix(또는 말미)에
+            # 원문 그대로 실려 나가게 둔다.
+            continue
         raw_ids = [int(part) for part in match.group(1).split(",")]
 
         prefix = text[cursor : match.start()]

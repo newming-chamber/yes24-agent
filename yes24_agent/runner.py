@@ -4,9 +4,9 @@
 이벤트(function call/response, partial/final text)를 프론트 계약(status/source/
 delta/done/error)의 SSE 프레임으로 번역해 yield한다.
 
-인용 환각 차단은 여기서 마무리된다: 스트림이 끝나면 세션 state를 다시 조회해
-누적된 출처와 답변 본문의 `[n]` 마커를 대조(validate_citations)하고, 검증된
-결과만 done 이벤트에 담는다.
+인용 환각 차단은 여기서 마무리된다: 스트림이 끝나면 이번 턴에 관측한 출처와
+답변 본문의 `[n]` 마커를 대조(validate_citations)하고, 검증된 결과만 done
+이벤트에 담는다.
 """
 
 import asyncio
@@ -43,7 +43,6 @@ from yes24_agent.session_service import (
     _resolve_session,
 )
 from yes24_agent.sources import (
-    get_sources,
     merge_turn_source_records,
 )
 from yes24_agent.sse import (
@@ -54,14 +53,29 @@ from yes24_agent.sse import (
     sse_source,
     sse_status,
 )
-from yes24_agent.turn_assembly import _event_text
 
 logger = logging.getLogger(__name__)
 
 # Gemini 과부하/일시장애로 판정하는 HTTP 상태코드(반응형 폴백 트리거). 429=RESOURCE_EXHAUSTED
 # (레이트리밋·쿼터), 503=UNAVAILABLE(과부하), 500/502/504=일시 서버 오류, 529=Overloaded.
-# 400(bad request)·403·404 등 영구 오류는 제외 ─ 폴백해도 소용없어 정직 안내로 보낸다.
+# 400(bad request)·403·404 등 영구 오류는 제외 ─ 재시도해도 소용없어 정직 안내로 보낸다.
 _OVERLOAD_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 529})
+
+
+def _event_text(event) -> str:
+    """ADK 이벤트 content에서 **본문** 텍스트 파트만 손실 없이 이어붙인다(사고 파트 제외).
+
+    `include_thoughts=True`면 ADK가 사고 요약을 `thought=True` 파트로 같은 content에 실어
+    보낸다(streaming_utils.py에서 `_thought_text`를 별도 버퍼링한 뒤 집계 응답의 parts에
+    본문과 나란히 담는다). 본문 소유권은 thought가 아닌 파트에만 있으므로 여기서 거른다 —
+    이 함수가 partial delta 경로와 aggregated final 경로의 **공통 관문**이라, 이 한 줄이
+    "사고 발화의 본문 혼입 금지"(원칙 4b)의 방어선 전체다. ADK 내부도 같은 구조 플래그로
+    거른다(contents.py의 `if part.text and not part.thought`).
+    """
+    if not event.content or not event.content.parts:
+        return ""
+    return "".join(part.text or "" for part in event.content.parts if not part.thought)
+
 
 # 최후 방어 문구: 어떤 경로로도 done.text가 비면(모델 빈 응답·홀드 flush 누락 등) 빈 응답을
 # 그대로 내보내지 않고 이 안내로 대체한다("빈 성공 위장 금지"의 사용자 노출 버전).
@@ -69,15 +83,8 @@ _EMPTY_RESPONSE_FALLBACK = (
     "죄송해요, 방금 답변을 제대로 만들지 못했어요. 질문을 한 번 더 보내주시겠어요?"
 )
 
-
 def _is_overloaded_error(exc: BaseException) -> bool:
-    """Gemini API 과부하/일시장애(반응형 폴백 대상)인지 결정론적으로 판정한다.
-
-    google.genai는 HTTP 4xx/5xx를 APIError(ClientError/ServerError)로 감싸 .code에 상태코드를
-    싣고, ADK는 429를 다시 _ResourceExhaustedError(ClientError 하위)로 감싸는데 이 역시
-    APIError·code=429를 보존한다. 재시도로 나아질 수 있는 과부하/일시장애 코드만 True로 보고
-    (그 외 영구 오류·비-API 예외는 False), 그래야 400 같은 영구 오류를 헛되이 폴백하지 않는다.
-    """
+    """Gemini API 과부하/일시장애(반응형 재시도 대상)인지 판정한다."""
     return isinstance(exc, APIError) and getattr(exc, "code", None) in _OVERLOAD_STATUS_CODES
 
 
@@ -110,8 +117,8 @@ def _best_effort_text(
 ) -> str:
     """실패 시점까지 확보한 본문을 정상 경로와 같은 규약으로 조립한다.
 
-    스트림 후처리(재조립·세션 재조회·인용 검증·게이트) 어디서 터져도, 모델이 이미 만들어 낸
-    본문을 버리지 않는다("비파괴"를 게이트 안이 아니라 파이프라인 전체의 계약으로). aggregate
+    스트림 후처리(재조립·인용 검증) 어디서 터져도, 모델이 이미 만들어 낸
+    본문을 버리지 않는다("비파괴"를 특정 구간이 아니라 파이프라인 전체의 계약으로). aggregate
     final response를 우선하고, 없을 때만 partial 조각을 조립한다. 확보된 본문이 없으면 빈 문자열을
     반환해 호출부의 최후 방어가 채우게 둔다.
     """
@@ -134,7 +141,6 @@ async def run_agent_stream(
     제너레이터가 예외로 죽지 않고 error+done을 흘려보낸 뒤 정상 종료한다.
     """
     settings = get_settings()
-
     # 같은 session_id 동시 요청을 순차화한다(입력 id 기준). 신규 세션(None)은 create_session이
     # 고유 id를 부여하므로 충돌하지 않아 락이 불필요하다.
     lock = _get_session_lock(session_id) if session_id else None
@@ -177,10 +183,10 @@ async def run_agent_stream(
         # 스트림에서 관찰한 출처를 누적한다. 병렬 도구 실행 시 세션 state가 유실될 수
         # 있어(_reconcile_sources 참고), done 조립의 유실 방지용 완전한 사본으로 쓴다.
         observed_sources: list[dict] = []
-        # 이번 턴 검색성 도구 호출의 힌트를 누적한다(tool_name·result_count·needs_followup·
-        # status). 지금은 에러/타임아웃 마감 경로의 require_evidence 판정과 로그 카운트에만 쓴다
-        # (충분성 게이트는 W2에서 삭제됨 — 얕은검색 재검색 트리거는 더 이상 없다).
-        observed_tool_calls: list[dict] = []
+        # 이번 턴에 도구가 돌았는지만 센다. 과거엔 tool_name·result_count·needs_followup·status를
+        # 담았으나 충분성 게이트 삭제 후 **어떤 소비자도 필드를 읽지 않고 개수만 본다**
+        # (require_evidence 판정·로그 카운트). 필드를 되살리려면 읽는 쪽을 먼저 만들 것.
+        observed_tool_calls: list[bool] = []
         # done.text 조립용 턴별 누적. 도구 호출 전 텍스트는 턴 경계에서 버리고 최종 모델 턴만
         # 조립한다. current_turn은 진행 중 턴의 조각이다.
         turn_texts: list[str] = []
@@ -188,40 +194,26 @@ async def run_agent_stream(
         final_text = ""
         # 이번 턴에 partial 본문 조각을 실제로 delta로 흘려보냈는지(퍼플렉시티식 토큰 스트리밍).
         # True면 마감에서 최종 본문을 단일 delta로 다시 보내지 않고(중복 방지) done만 방출한다.
-        # 도구 호출로 진행발화가 폐기되거나 오버로드 재시도로 시도가 폐기되면 sse_reset 후 False로
-        # 되돌려, 프론트가 흘린 버블을 비우고 다음 스트림을 깨끗한 화면에서 시작하게 한다.
+        # 도구 호출·오버로드 재시도로 시도가 폐기되면 sse_reset 후 False로 되돌린다.
         streamed_body = False
-        # 모든 턴의 본문은 최종 인용 검증까지 홀드한다. 분류가 외부 근거 필요성을 오판해도
-        # 도구 사용 가능 에이전트가 질문 자체를 보고 검색할 수 있어야 한다.
-        # 반응형 폴백의 안전 조건: 사용자에게 보이는 프레임(delta·source·도구/에러 status)을
-        # 하나라도 흘렸는지. 오버로드가 첫 LLM 호출 전에 나면(아직 아무것도 안 보임) flash로
-        # 조용히 재시도해도 중복 노출·모순이 없다. 반대로 이미 뭔가 흘렸으면 재시도가 본문·
-        # 출처를 중복시키므로 폴백하지 않고 정직 안내로 간다. (열기 thinking status는 제외.)
         emitted_output = False
+        retried_overload = False
 
         run_config = RunConfig(
             streaming_mode=StreamingMode.SSE,
             max_llm_calls=settings.max_llm_calls,
         )
-        # 사전 질의분류기(query_understanding)는 삭제했다 — 라우팅·게이트·typed dispatch가
-        # W1~W3에서 사라지며 분류 출력의 소비처가 없어졌다. 강한 pro 단일 루프가 질문 자체를
-        # 보고 도구를 스스로 당기므로 사용자 원문을 그대로 검색어로 넘긴다(원래도 pass-through).
-        search_query = message
-        # 단일 pro 경로: flash/pro 하이브리드 라우팅을 폐기하고 모든 질의를 pro로 처리한다.
+        # 단일 pro 경로: flash/pro 하이브리드 라우팅도 사전 질의분류기도 폐기했다. 강한 pro
+        # 단일 루프가 질문 자체를 보고 도구를 스스로 당기므로 사용자 원문을 그대로 넘기고,
         # 난도별 추론량 조절은 thinking_budget(Gemini 동적 추론)에 위임한다.
-        main_agent = root_agent
-        active_model = str(main_agent.model)
+        active_model = str(root_agent.model)
 
         runner = Runner(
-            agent=main_agent,
+            agent=root_agent,
             app_name=settings.app_name,
             session_service=service,
         )
-        new_message = types.Content(role="user", parts=[types.Part(text=search_query)])
-
-        # 반응형 재시도 상태: 과부하 재시도를 이미 1회 썼는지. 재시도는 같은 pro로
-        # 딱 1회로 고정한다(무한 재시도 금지).
-        retried_overload = False
+        new_message = types.Content(role="user", parts=[types.Part(text=message)])
 
         # 이벤트 간격에 sse_timeout_s 상한을 건다. ADK 스트림은 하나의 고정 task가 소비해
         # 여러 yield에 걸친 OpenTelemetry context의 소유권을 보존한다.
@@ -232,213 +224,172 @@ async def run_agent_stream(
             run_config=run_config,
         )
         timed_event_stream = iter_adk_events(event_stream, timeout_s=settings.sse_timeout_s)
+
         try:
             while True:
-                try:
-                    event = await timed_event_stream.__anext__()
-                except StopAsyncIteration:
-                    break
-                except APIError as exc:
-                    # 반응형 재시도: pro가 Gemini 과부하/일시장애로, 아직 사용자에게 아무것도
-                    # 안 흘린 상태에서 실패하면 같은 pro로 딱 1회 조용히 재시도한다. 그 외(이미
-                    # 뭔가 흘림·과부하 아님·재시도 소진·기능 off)는 재-raise해 아래 정직
-                    # 안내(error+done) 방어선으로 넘긴다.
-                    if (
-                        settings.error_fallback
-                        and not retried_overload
-                        and not emitted_output
-                        and _is_overloaded_error(exc)
-                    ):
-                        logger.warning(
-                            "Gemini 과부하/일시장애(code=%s) 감지 → pro로 재시도"
-                            "(session_id=%s).",
-                            getattr(exc, "code", "?"),
-                            resolved_session_id,
-                        )
-                        await timed_event_stream.aclose()
-                        await event_stream.aclose()
-                        retried_overload = True
-                        fallback_agent = root_agent
-                        active_model = str(fallback_agent.model)
-                        # 폐기되는 pro 시도가 홀드한 버퍼를 리셋한다.
-                        turn_texts = []
+                while True:
+                    try:
+                        event = await timed_event_stream.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    except APIError as exc:
+                        if (
+                            settings.error_fallback
+                            and not retried_overload
+                            and not emitted_output
+                            and _is_overloaded_error(exc)
+                        ):
+                            logger.warning(
+                                "Gemini 과부하/일시장애(code=%s) 감지 → 같은 메시지로 재시도"
+                                "(session_id=%s).",
+                                getattr(exc, "code", "?"),
+                                resolved_session_id,
+                            )
+                            await timed_event_stream.aclose()
+                            await event_stream.aclose()
+                            retried_overload = True
+                            turn_texts = []
+                            current_turn = []
+                            final_text = ""
+                            # streamed_body 되돌림은 두지 않는다 — 이 분기는 `not
+                            # emitted_output`일 때만 진입하는데 streamed_body는
+                            # emitted_output과 같은 자리에서만 True가 되므로 도달 불가다.
+                            retry_runner = Runner(
+                                agent=root_agent,
+                                app_name=settings.app_name,
+                                session_service=service,
+                            )
+                            event_stream = retry_runner.run_async(
+                                user_id=_POC_USER_ID,
+                                session_id=resolved_session_id,
+                                new_message=new_message,
+                                run_config=run_config,
+                            )
+                            timed_event_stream = iter_adk_events(
+                                event_stream, timeout_s=settings.sse_timeout_s
+                            )
+                            continue
+                        raise
+
+                    if not event.partial and event.get_function_calls():
                         current_turn = []
-                        final_text = ""
-                        # 폐기되는 시도가 이미 본문을 스트림했으면 프론트 버블을 비워, 재시도가
-                        # 깨끗한 화면에서 시작하게 한다(중복 본문 방지).
                         if streamed_body:
                             yield sse_reset()
                             streamed_body = False
-                        # 같은 세션·같은 메시지를 같은 pro로 재실행한다. 이전 시도가 이미 이 user
-                        # 메시지를 세션에 append했으므로 히스토리에 user 턴이 한 번 더 붙지만
-                        # (ADK가 매 run_async 시작에 append), 아무 응답도 못 낸 실패라 중복
-                        # 노출·본문 모순은 없다 ─ 드문 과부하 시의 경미한 히스토리 중복이다.
-                        fallback_runner = Runner(
-                            agent=fallback_agent,
-                            app_name=settings.app_name,
-                            session_service=service,
-                        )
-                        event_stream = fallback_runner.run_async(
-                            user_id=_POC_USER_ID,
-                            session_id=resolved_session_id,
-                            new_message=new_message,
-                            run_config=run_config,
-                        )
-                        timed_event_stream = iter_adk_events(
-                            event_stream, timeout_s=settings.sse_timeout_s
-                        )
-                        continue
-                    raise
-
-                # 1) function call(집계본) → 도구별 진행 status. partial 조각은 args가
-                #    불완전하므로 무시하고 non-partial 집계 이벤트에서만 args를 읽는다.
-                if not event.partial and event.get_function_calls():
-                    # 도구 호출 전 텍스트는 진행 발화이므로 최종 본문 소유권이 없다.
-                    current_turn = []
-                    # 이 진행 발화를 이미 토큰으로 흘렸으면 프론트 버블을 비운다(최종 답변만 남김).
-                    if streamed_body:
-                        yield sse_reset()
-                        streamed_body = False
-                    for call in event.get_function_calls():
-                        stage, detail = _status_for_call(call)
-                        emitted_output = True
-                        yield sse_status(stage, detail)
-                    continue
-
-                # 2) function response → 새 출처 노출(중복 제거), error면 error_type별 status.
-                #    search형(results 리스트)·fetch형(단일 source dict) 응답을 모두 처리.
-                responses = event.get_function_responses()
-                if responses:
-                    for resp in responses:
-                        payload = resp.response or {}
-                        # 충분성 힌트 누적(성공·에러 모두). 에러 응답도 result_count=0·
-                        # needs_followup=True를 실어 오므로 얕음 판정 근거로 함께 관찰한다.
-                        observed_tool_calls.append(
-                            {
-                                "tool_name": getattr(resp, "name", "") or "",
-                                "status": payload.get("status"),
-                                "result_count": payload.get("result_count"),
-                                "needs_followup": payload.get("needs_followup"),
-                            }
-                        )
-                        if payload.get("status") == "error":
-                            stage, detail = _status_for_error(payload)
+                        for call in event.get_function_calls():
+                            status = _status_for_call(call)
+                            if status is None:
+                                continue  # 알릴 진행이 없는 도구는 조용히 지나간다
                             emitted_output = True
-                            yield sse_status(stage, detail)
-                            continue
-                        sources_in_payload = _sources_from_response(payload)
-                        for source in sources_in_payload:
-                            source_id = source.get("source_id")
-                            source_event = build_source_event(source)
-                            for index, observed in enumerate(observed_sources):
-                                if observed.get("id") == source_id:
-                                    observed_sources[index] = merge_turn_source_records(
-                                        observed, source_event
-                                    )
-                                    break
-                            else:
-                                observed_sources.append(source_event)
-                    continue
+                            yield sse_status(*status)
+                        continue
 
-                # 3) partial 토큰 조각을 곧바로 delta로 흘려보낸다(퍼플렉시티/ChatGPT식 스트리밍).
-                #    조각은 current_turn에도 누적해 홀드 경로 fallback을 유지하고, 도구 호출이
-                #    뒤따라 진행발화로 판명되면 sse_reset으로 프론트 버블을 비운다(원칙 4b).
-                if event.partial:
-                    chunk = _event_text(event)
-                    if chunk:
-                        current_turn.append(chunk)
-                        emitted_output = True
-                        streamed_body = True
-                        yield sse_delta(chunk)
-                    continue
+                    responses = event.get_function_responses()
+                    if responses:
+                        for resp in responses:
+                            payload = resp.response or {}
+                            observed_tool_calls.append(True)
+                            if payload.get("status") == "error":
+                                stage, detail = _status_for_error(payload)
+                                emitted_output = True
+                                yield sse_status(stage, detail)
+                                continue
+                            for source in _sources_from_response(payload):
+                                source_id = source.get("source_id")
+                                source_event = build_source_event(source)
+                                for index, observed in enumerate(observed_sources):
+                                    if observed.get("id") == source_id:
+                                        observed_sources[index] = merge_turn_source_records(
+                                            observed, source_event
+                                        )
+                                        break
+                                else:
+                                    observed_sources.append(source_event)
+                        continue
 
-                # 4) 최종 집계 텍스트 → partial이 없던 경로의 본문 확정.
-                if event.is_final_response():
-                    text = _event_text(event)
-                    if text:
-                        final_text = text
+                    if event.partial:
+                        chunk = _event_text(event)
+                        if chunk:
+                            current_turn.append(chunk)
+                            emitted_output = True
+                            streamed_body = True
+                            yield sse_delta(chunk)
+                        continue
 
-            # 스트림 완료: 이번 턴 function_response에서 관측한 출처로 인용을 검증한다. 세션
-            # state 재조회는 병렬 도구 실행 때 레지스트리 유실 수를 계측하는 데만 쓴다.
-            # aggregate final response가 최종 본문의 정본이다. partial은 aggregate가 비는
-            # 비스트리밍/중단 경로에서만 fallback으로 조립한다(보정 턴과 같은 소유권 규약).
-            if current_turn:
-                turn_texts.append("".join(current_turn))
+                    if event.is_final_response():
+                        text = _event_text(event)
+                        if text:
+                            final_text = text
+
+                answer_text = _best_effort_text(turn_texts, current_turn, final_text)
                 current_turn = []
-            streamed_text = "".join(turn_texts)
-            answer_text = final_text or streamed_text
-            refreshed = await service.get_session(
-                app_name=settings.app_name,
-                user_id=_POC_USER_ID,
-                session_id=resolved_session_id,
-            )
-            state = refreshed.state if refreshed is not None else {}
-            state_sources = get_sources(state)
-            current_source_ids = {
-                source["id"] for source in observed_sources if source.get("id") is not None
-            }
-            sources = _reconcile_sources(observed_sources)
+                # 근거 스냅샷은 세션 state가 아니라 **스트림 관찰본**으로 만든다. ADK의
+                # deep_merge_dicts가 병렬 도구의 state_delta를 리스트 키에서 last-wins로
+                # 덮어써 한 도구의 출처가 통째로 유실될 수 있기 때문이다(_reconcile_sources
+                # 주석 참조). 이 유실은 상류 미수정이라 여기서 계속 우회한다.
+                sources = _reconcile_sources(observed_sources)
 
-            # 병렬 도구 state 유실 관측용 메트릭: state가 잃었지만 스트림엔 있던 출처 수.
-            state_source_ids = {
-                source["id"] for source in state_sources if source.get("id") is not None
-            }
-            recovered = len(current_source_ids - state_source_ids)
-            if recovered > 0:
-                logger.warning(
-                    "세션 state에서 유실된 출처 %d개를 스트림 관찰본으로 복구했습니다"
-                    "(병렬 도구 실행 추정, session_id=%s).",
-                    recovered,
+                citation, done_payload = _finalize_answer(
+                    answer_text,
+                    sources,
                     resolved_session_id,
                 )
+                # 유효 인용 0건이어도 **본문을 폐기하지 않는다**. 무접지 백스톱은 2026-07-22
+                # 실측에서 캐치 0 · 오탐 14/14였다 — 40턴 중 14턴에서 접지된 정답을 정형
+                # 거절문으로 덮었고, 14건 전량 육안 판독 결과 창작은 0건이었다(가격·쪽수·정책
+                # 조항 전부 라이브 재확인 일치).
+                #
+                # 오탐이 우연이 아니라 구조적 100%인 경로가 둘 있었다:
+                #   1) 코드블록 전용 출력 → _code_span_ranges가 코드 스팬 내 [n]을 검증에서
+                #      제외 → 유효 인용 0이 확정된다("JSON으로 줘"가 곧 답변 파괴).
+                #   2) 마커 선두 표기("*   [2] …") → _build_support의 세그먼트가 불릿뿐이라
+                #      support_is_meaningful이 false → 마커 전량 제거.
+                # 둘 다 답변 **형식**의 문제이지 접지의 문제가 아니다.
+                #
+                # 2026-07-15에 같은 근거(캐치 0·오탐 9/9)로 게이트 스택을 삭제하고
+                # validate_citations만 코어로 남겼다. 이 백스톱은 그때 살아남은 같은 계열이며
+                # 같은 실패를 반복했다. 무효 마커 제거(validate_citations)는 유지하되,
+                # **정상 본문을 거절문으로 갈아끼우는 파괴 경로만 제거한다.**
+                # 재도입하려면 "창작을 실제로 잡은" 관측을 먼저 가져올 것.
+                if not citation.meaningful_support_count and (
+                    citation.removed_markers or observed_sources
+                ):
+                    logger.warning(
+                        "유효 인용 0건(removed=%s sources=%d) — 본문은 유지하고 기록만 남긴다"
+                        "(session_id=%s).",
+                        bool(citation.removed_markers),
+                        len(observed_sources),
+                        resolved_session_id,
+                    )
 
-            citation, done_payload = _finalize_answer(
-                answer_text,
-                sources,
-                resolved_session_id,
-            )
-            done_payload["model"] = active_model
-            if citation.removed_markers:
-                # 결정론 메트릭: 무효 인용을 몇 개 잘라냈는지 + 그 시점 유효 출처 id를 남긴다.
-                # 유효 id를 함께 찍어, 마커 소실의 원인이 (a)모델이 실제 source_id가 아닌
-                # 번호(카드 순번 등)를 인용 vs (b)출처 등록 유실 중 어느 쪽인지 로그 한 줄로
-                # 규명되게 한다(등록된 id가 있는데 마커만 어긋나면 (a), 등록 자체가 비면 (b)).
-                logger.warning(
-                    "무효 인용 마커 %d개를 본문에서 제거했습니다: %s (유효 출처 id=%s)",
-                    len(citation.removed_markers),
-                    citation.removed_markers,
-                    sorted(s["id"] for s in sources),
-                )
+                done_payload["model"] = active_model
+                if citation.removed_markers:
+                    logger.warning(
+                        "무효 인용 마커 %d개를 본문에서 제거했습니다: %s (유효 출처 id=%s)",
+                        len(citation.removed_markers),
+                        citation.removed_markers,
+                        sorted(s["id"] for s in sources),
+                    )
 
-            # 단일 root_agent(pro) 루프의 답변을 그대로 마감한다. typed-flow(product/policy/
-            # recency)·충분성 게이트·강제 재진입(correction)은 삭제했다 — 모든 질의가 ADK Runner
-            # 네이티브 도구 루프를 타고, 접지 backstop은 별도 모듈인 인용 검증(validate_citations)
-            # 이 맡는다.
-            final_done = done_payload
-
-            # 최후 방어: 마감 후에도 done.text가 비면 빈 응답을 그대로 내보내지 않는다.
-            # 라이브로 아무것도 안 흘렸으면 delta로도 흘려 프론트가 "(응답이 없었어요)" 대신 이
-            # 안내를 렌더하게 한다. 원인 규명용으로 상태를 로그에 남긴다(빈 성공 위장 금지 정신).
-            if not (final_done.get("text") or "").strip():
-                logger.warning(
-                    "done.text가 비어 최후 방어 안내로 대체합니다"
-                    "(session_id=%s tools=%d sources=%d rbti=%s).",
-                    resolved_session_id,
-                    len(observed_tool_calls),
-                    len(sources),
-                    bool(rbti),
-                )
-                final_done["text"] = _EMPTY_RESPONSE_FALLBACK
-            for source in final_done.get("sources", []):
-                yield sse_source(source)
-            # 이미 토큰째 흘린 본문(streamed_body=True)이면 최종 단일 delta를 생략한다 — done.text
-            # (검증본)를 프론트 finalize가 흘린 rawText와 대조해 조용히 교체(인용 마커 정리 반영).
-            # 비스트리밍·aggregate-only·최후방어 경로에서만 최종 delta를 방출한다.
-            if not streamed_body:
-                remaining_delta = _final_body_delta(final_done)
-                if remaining_delta:
-                    yield sse_delta(remaining_delta)
-            yield sse_done(final_done)
+                final_done = done_payload
+                if not (final_done.get("text") or "").strip():
+                    logger.warning(
+                        "done.text가 비어 최후 방어 안내로 대체합니다"
+                        "(session_id=%s tools=%d sources=%d rbti=%s).",
+                        resolved_session_id,
+                        len(observed_tool_calls),
+                        len(sources),
+                        bool(rbti),
+                    )
+                    final_done["text"] = _EMPTY_RESPONSE_FALLBACK
+                for source in final_done.get("sources", []):
+                    yield sse_source(source)
+                if not streamed_body:
+                    remaining_delta = _final_body_delta(final_done)
+                    if remaining_delta:
+                        yield sse_delta(remaining_delta)
+                yield sse_done(final_done)
+                break
 
         except asyncio.TimeoutError:
             logger.error(
@@ -448,7 +399,6 @@ async def run_agent_stream(
             )
             error_text = "응답이 너무 지연되고 있어요. 잠시 후 다시 시도해 주세요."
             yield sse_error(error_text)
-            # 이미 토큰을 흘렸으면 프론트 버블을 비우고 best_effort를 새로 흘린다(중복 방지).
             if streamed_body:
                 yield sse_reset()
                 streamed_body = False
@@ -470,13 +420,12 @@ async def run_agent_stream(
         except Exception as exc:  # noqa: BLE001 — SSE 스트림 최상위 방어선(마지막 수단)
             # 어떤 예외든 제너레이터를 예외로 종료시키지 않고 사용자에게 error를 알린 뒤 done으로
             # 스트림을 정상 마감한다. **빈 done으로 마감하지 않는다**: 모델이 완주한 뒤 재조립·세션
-            # 재조회·검증·게이트 구간에서 예외가 나면 이미 만들어 둔 답이 통째로 사라진다(실측:
-            # 사용자에게 나간 본문 0자). 게이트에만 있던 비파괴 원칙을 파이프라인 전체로 올려,
+            # 재조립·인용 검증 구간에서 예외가 나면 이미 만들어 둔 답이 통째로 사라진다(실측:
+            # 사용자에게 나간 본문 0자). 비파괴 원칙을 파이프라인 전체로 올려,
             # 그 시점까지 확보한 최선의 본문·출처로 마감한다. 스택트레이스는 반드시 로그에 남긴다.
             logger.exception("스트림 처리 중 예외 발생: %s", exc)
             error_text = "일시적인 오류가 발생했어요. 잠시 후 다시 시도해 주세요."
             yield sse_error(error_text)
-            # 이미 토큰을 흘렸으면 프론트 버블을 비우고 best_effort를 새로 흘린다(중복 방지).
             if streamed_body:
                 yield sse_reset()
                 streamed_body = False

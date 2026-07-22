@@ -20,19 +20,34 @@ def _browse_label(section: str) -> str | None:
     return entry.get("label") if entry is not None else None
 
 
-def _status_for_call(call) -> tuple[str, str]:
-    """도구 이름별 진행 status(stage, detail)를 만든다.
+def _angles(queries) -> list[str]:
+    """멀티쿼리 도구의 queries 인자에서 유효한 검색 각도만 추린다(진행 문구용).
+
+    yes24_search·web_search가 같은 리스트 계약을 쓰므로 추출도 한 곳에서 한다.
+    """
+    if not isinstance(queries, list):
+        return []
+    return [q for q in queries if isinstance(q, str) and q.strip()]
+
+
+def _status_for_call(call) -> tuple[str, str] | None:
+    """도구 이름별 진행 status(stage, detail)를 만든다. 알릴 진행이 없으면 None.
 
     yes24_search는 검색, yes24_fetch는 페이지 열람, yes24_browse는 코너 둘러보기,
-    web_search는 웹 검색 라벨을 쓴다. 그 외 미지의 도구는 범용 라벨로 폴백해, 도구가
-    늘어도 runner 수정 없이 자연스러운 상태 문구가 나오게 한다. 사용자 노출 문구에
-    url 원문은 넣지 않는다.
+    web_search는 웹 검색 라벨을 쓴다. 사용자 노출 문구에 url 원문은 넣지 않는다.
+
+    **None을 돌려주는 것이 폴백이다.** 진행 문구는 실제 런타임 전이를 설명할 때만
+    가치가 있고, 아무것도 조회하지 않는 도구(reply_directly)에 "정보를 확인하는 중…"을
+    붙이면 사용자에게 일어나지 않은 일을 알리게 된다. 도구가 늘어도 runner는 그대로다 —
+    라벨이 필요하면 여기에 분기를 더하고, 아니면 조용히 지나간다.
     """
     name = getattr(call, "name", "") or ""
     args = call.args or {}
     if name == "yes24_search":
-        query = args.get("query", "")
-        return "searching", f"Yes24에서 '{query}' 검색 중…"
+        angles = _angles(args.get("queries"))
+        if angles:
+            return "searching", f"Yes24에서 {' · '.join(angles)} 검색 중…"
+        return "searching", "Yes24에서 검색 중…"
     if name == "yes24_fetch":
         title = args.get("title")
         if title:
@@ -50,28 +65,27 @@ def _status_for_call(call) -> tuple[str, str]:
             return "browsing", f"Yes24 {label} 둘러보는 중…"
         return "browsing", "Yes24 코너를 둘러보는 중…"
     if name == "web_search":
-        queries = args.get("queries")
-        angles = (
-            [q for q in queries if isinstance(q, str) and q.strip()]
-            if isinstance(queries, list)
-            else []
-        )
-        if len(angles) > 1:
-            return "searching_web", f"웹에서 {len(angles)}개 각도로 정보를 찾는 중…"
+        angles = _angles(args.get("queries"))
         if angles:
-            return "searching_web", f"웹에서 '{angles[0]}' 관련 정보를 찾는 중…"
+            return "searching_web", f"웹에서 {' · '.join(angles)} 관련 정보를 찾는 중…"
         return "searching_web", "웹에서 정보를 찾는 중…"
     if name == "web_fetch":
         return "reading_web", "웹 페이지를 읽는 중…"
-    return "working", "정보를 확인하는 중…"
+    # 모르는 도구는 **아무 상태도 내지 않는다**(None). 범용 폴백("정보를 확인하는 중…")은
+    # reply_directly처럼 아무것도 조회하지 않는 턴에 붙어 일어나지 않는 일을 알렸다 —
+    # 같은 웨이브에서 지운 거짓 라벨 "retrying"과 동일 클래스다. 도구명을 하드코딩해 예외를
+    # 늘리는 대신, "설명할 진행이 없으면 말하지 않는다"를 기본값으로 둔다.
+    return None
 
 
-# 도구 error_type → status(stage, detail) 매핑. "fetch"만 네트워크성이라 재시도로
-# 복구될 수 있어 재시도 라벨을 쓴다. 나머지는 같은 요청을 반복해도 결과가 같으므로
-# 재시도를 암시하지 않는 각 상황별 중립 문구를 쓴다(사용자에게 헛된 기대를 주지 않기 위함).
+# 도구 error_type → status(stage, detail) 매핑. **어떤 항목도 재시도를 암시하지 않는다** —
+# 런너는 도구 에러에 재시도를 스케줄하지 않으므로(HTTP 재시도는 client의 max_retries에서
+# 이미 소진된 뒤 에러가 올라온다) "재시도 중"류 문구는 사용자에게 헛된 기대를 준다.
 # 미지 error_type은 "페이지 fetch"로 단정하지 않는 범용 문구로 폴백한다.
 _ERROR_STATUS: dict[str, tuple[str, str]] = {
-    "fetch": ("retrying", "일시 오류, 재시도 중…"),
+    # "fetch"는 별도 항목을 두지 않는다 — HTTP 재시도는 client의 max_retries 루프에서 이미
+    # 소진된 뒤에야 error가 올라오고 런너는 아무 재시도도 스케줄하지 않으므로, "재시도 중"은
+    # 거짓 라벨이었다(바로 위 주석의 "재시도를 암시하지 않는다"와도 모순). 폴백이 받는다.
     "parse": ("notice", "페이지 내용을 가져오지 못했어요"),
     "empty": ("notice", "페이지 내용을 가져오지 못했어요"),
     "not_configured": ("notice", "지금은 웹 검색을 사용할 수 없어요"),
@@ -85,11 +99,11 @@ def _status_for_error(payload: dict) -> tuple[str, str]:
     return _ERROR_STATUS.get(payload.get("error_type"), _ERROR_STATUS_FALLBACK)
 
 
-# 출처 카드(sse_source)와 게이트 대조에 함께 쓰이는 출처 이벤트의 **단일 정의**. 예전엔 runner와
+# 출처 카드(sse_source)와 인용 검증에 함께 쓰이는 출처 이벤트의 **단일 정의**. 예전엔 runner와
 # orchestrator가 이 dict를 각자 손으로 조립해, 한쪽에만 필드를 더하면 그 경로의 카드에는 값이
 # 끝까지 안 실렸다(실측 회귀). 조립을 한 곳에 두면 계약 드리프트가 구조적으로 불가능해진다.
 # 상품 결과에만 있는 필드(author·price·rating·publisher·image_url)는 웹 출처에선 None이고,
-# 프론트가 생략한다. rating·publisher는 grounding의 값 대조(지어낸 평점·판본 통칭)에도 쓰인다.
+# 프론트가 생략한다.
 _PUBLIC_SOURCE_FIELDS = (
     *GROUNDING_FIELDS,
     "rank",
@@ -149,8 +163,7 @@ def _reconcile_sources(observed_sources: list[dict]) -> list[dict]:
 
     반면 병렬 function_response는 merge 시 parts가 모두 보존되므로, 런너가 스트림에서
     관찰해 누적한 출처(observed)는 유실되지 않는다. 따라서 근거 스냅샷은 observed만 id 기준으로
-    합친다. 세션 레지스트리를 섞지 않아 과거 상세·가격이 새 검색 관측을 덮거나 이번 턴 상세
-    게이트를 통과시키지 못하게 한다.
+    합친다. 세션 레지스트리를 섞지 않아 과거 상세·가격이 새 검색 관측을 덮지 못하게 한다.
     """
     by_id: dict[int, dict] = {}
     for src in observed_sources:

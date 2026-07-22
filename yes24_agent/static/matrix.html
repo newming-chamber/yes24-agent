@@ -356,6 +356,14 @@
       border: 1px solid var(--border); padding: 2px 6px; text-align: left; white-space: nowrap;
     }
     .md-table th { background: var(--head-bg); font-weight: 700; }
+    /* 코드 — 인라인 `코드`와 ``` 블록(md.js 공용). 안쪽은 리터럴(배지·볼드 미승격). 블록은
+       넘칠 때만 그 안에서 가로 스크롤(셀·모달은 안 넘침). 기본 <pre> 마진이 좁은 셀을 깨지 않게. */
+    .md-code { font-family: var(--mono); font-size: 0.9em; background: var(--panel);
+      border: 1px solid var(--border-soft); border-radius: 3px; padding: 0 3px; }
+    .md-pre { margin: 5px 0; padding: 7px 9px; background: var(--panel);
+      border: 1px solid var(--border-soft); border-radius: 6px; overflow-x: auto; }
+    .md-pre code { font-family: var(--mono); font-size: 10.5px; white-space: pre;
+      background: none; border: none; padding: 0; }
 
     /* ── 모션 ─────────────────────────────────────────────
        (1) 스켈레톤 대각 스태거 등장(페이지/새 질문 시 그리드가 좌상→우하 물결로 나타남)

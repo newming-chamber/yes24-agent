@@ -37,7 +37,6 @@ import httpx
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import Settings, get_settings
-from yes24_agent.evidence_segments import build_evidence_segments, qualify_evidence_segments
 from yes24_agent.sources import now_checked_at, register_source
 from yes24_agent.tools.yes24_fetch import truncate
 
@@ -334,7 +333,7 @@ async def web_search(
         matched = 0
         for item in outcome["raw"]:
             url = item.get("url")
-            if not url or not _url_in_domain_scope(url, domain_filters):
+            if not _url_in_domain_scope(url, domain_filters):
                 continue
             content = next(
                 (
@@ -363,7 +362,6 @@ async def web_search(
             # 통일해 세션 출처와 도구 결과의 snippet이 어긋나지 않게 한다.
             published_at = item.get("date")
             last_updated = item.get("last_updated")
-            evidence_segments = build_evidence_segments(snippet)
             source_id = register_source(
                 tool_context.state,
                 title=title,
@@ -373,7 +371,6 @@ async def web_search(
                 checked_at=checked_at,
                 meta={"published_at": published_at, "last_updated": last_updated},
             )
-            evidence_segments = qualify_evidence_segments(evidence_segments, source_id)
             url_to_index[url] = len(results)
             results.append(
                 {
@@ -385,7 +382,6 @@ async def web_search(
                     "checked_at": checked_at,
                     "published_at": published_at,
                     "last_updated": last_updated,
-                    "evidence_segments": evidence_segments,
                     "queries": [query],
                 }
             )

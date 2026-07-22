@@ -16,7 +16,6 @@ import httpx
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
-from yes24_agent.evidence_segments import build_evidence_segments, qualify_evidence_segments
 from yes24_agent.sources import now_checked_at, register_source
 from yes24_agent.tools.web_search import _get_client
 from yes24_agent.tools.yes24_fetch import window_around_find
@@ -165,12 +164,9 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
         "type": "web",
         "title": title,
         "url": url,
-        "snippet": text,
         "text": text,
-        "evidence_segments": qualify_evidence_segments(
-            build_evidence_segments(text),
-            source_id,
-        ),
+        # text와 동일 내용이나 공개 출처 DTO의 근거 필드는 snippet이다(yes24_fetch 주석 참조).
+        "snippet": text,
         "checked_at": checked_at,
     }
     if total_chars > settings.web_fetch_max_chars:

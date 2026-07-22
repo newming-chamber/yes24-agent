@@ -26,8 +26,10 @@ from dataclasses import dataclass, field, replace
 from google import genai
 
 from yes24_agent.config import Settings, get_genai_client
+from yes24_agent.evidence_segments import build_field_evidence_segments
 from yes24_agent.matrix.planning import PlannedPick, matrix_codes, plan_selection, refine_query
 from yes24_agent.product_selection import (
+    PRODUCT_RATIONALE_FIELDS,
     ProductConstraint,
     product_constraints_satisfied,
     product_evidence_fields,
@@ -126,8 +128,10 @@ _BRACKET_GROUP = re.compile(r"[\[\(【][^\]\)】]*[\]\)】]")
 # 에디션 변형 dedup — 같은 책의 판형/장정 변형("채식주의자"·"채식주의자(개정판)"·"채식주의자
 # (큰글자도서)")이 별개 URL이라 url-dedup을 통과해 풀에 중복 유입되는 것을 접는다.
 #
-# 판형 수식어 목록은 두지 않는다 — **코어 제목**(부제·괄호·시리즈 라벨 앞까지)이 이미 그 부가
-# 텍스트를 잘라내므로, "같은 저자 + 같은 코어 제목"이면 같은 책이다. 목록 없이 부류 전체를 덮는다.
+# 판형 수식어(개정판·큰글자도서 등)는 별도 목록으로 두지 않는다 — **코어 제목**(부제·괄호·시리즈
+# 라벨 앞까지)이 이미 그 부가 텍스트를 잘라내므로, "같은 저자 + 같은 코어 제목"이면 같은 책이다.
+# 단 아래 _AUTHOR_ROLE_STRIP·_DISTINGUISHING_MARKER의 열거(저자 역할어·다른 판본 표지)는 판형이
+# 아니라 오병합 방지용 전수조사 기반 열거이며, 신규 항목 발견 시 추가한다.
 #
 # 코어 제목 경계 — 이 구분자 앞까지가 '책 본제목'이고 뒤는 부제·시리즈 라벨·원제 병기·부록
 # 안내 등 부가 텍스트다.
@@ -310,6 +314,26 @@ async def _build_product_pool(
     )
 
 
+def _known_violation(
+    candidate: dict, constraints: tuple[ProductConstraint, ...]
+) -> bool:
+    """검색 단계에서 이미 관측된 숫자 필드가 조건을 어겼는지 판정한다.
+
+    관측 없는 필드(예: 검색 목록에 없는 page_count)는 위반이 아니다 — 상세 fetch가 확정한다.
+    상세 예산은 유한하므로, 이미 조건을 어긴 게 확실한 후보(가격·평점 초과 등)에 예산을 쓰면
+    eligible 상세 후보가 그만큼 줄어 합리적 제약 질의가 0/16 폴백으로 새기 쉽다.
+    """
+    for constraint in constraints:
+        observed = candidate.get(constraint.field.value)
+        if (
+            isinstance(observed, (int, float))
+            and not isinstance(observed, bool)
+            and not product_constraints_satisfied(candidate, (constraint,))
+        ):
+            return True
+    return False
+
+
 def _detail_source_ids(candidates: list[dict], limit: int) -> tuple[int, ...]:
     """검색 축마다 상위 후보를 번갈아 골라 단일 결과 순서의 상세 편향을 막는다."""
     queues: dict[int, list[int]] = {}
@@ -388,7 +412,9 @@ async def _fetch_selected_details(
             {
                 **source,
                 "_evidence_fields": sorted(product_evidence_fields(result)),
-                "_evidence_segments": result.get("evidence_segments", []),
+                "_evidence_segments": build_field_evidence_segments(
+                    result, PRODUCT_RATIONALE_FIELDS
+                ),
             }
             if source["id"] == source_id
             else source
@@ -434,9 +460,7 @@ async def build_shared_pool(
 
     search_queries = [question]
     expected_constraints: tuple[ProductConstraint, ...] = ()
-    research_model: str | None = None
     refined = await refine_query(question, settings, genai_client)
-    research_model = settings.matrix_generation_model
     if refined is None:
         logger.info("matrix 정제 실패 → 정직한 일시 오류 question=%r", question)
         return SharedPool(question, [], [], checked_at, status="error")
@@ -457,8 +481,7 @@ async def build_shared_pool(
         requested_count=refined.requested_count,
     )
 
-    if research_model:
-        pool = replace(pool, models={**pool.models, "research": research_model})
+    pool = replace(pool, models={**pool.models, "research": settings.model_name})
 
     if pool.status == "ok":
         planner_client = genai_client or get_genai_client()
@@ -468,8 +491,14 @@ async def build_shared_pool(
             len(pool.candidates),
             max(len(matrix_codes()), refined.requested_count),
         )
-        detail_source_ids = _detail_source_ids(
+        # 조건이 있으면 검색 관측만으로 이미 위반이 확실한 후보를 뒤로 미룬다(안정 정렬 —
+        # 같은 그룹 안의 축 배분·등장 순서는 보존). 관측 불가 필드는 미루지 않는다.
+        detail_candidates = sorted(
             pool.candidates,
+            key=lambda candidate: _known_violation(candidate, pool.expected_constraints),
+        )
+        detail_source_ids = _detail_source_ids(
+            detail_candidates,
             detail_budget,
         )
         pool, successful_detail_ids = await _fetch_selected_details(

@@ -16,13 +16,6 @@ from bs4 import BeautifulSoup
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
-from yes24_agent.evidence_segments import (
-    build_entry_evidence_segments,
-    build_evidence_segments,
-    build_field_evidence_segments,
-    qualify_evidence_segments,
-)
-from yes24_agent.product_selection import PRODUCT_RATIONALE_FIELDS
 from yes24_agent.sources import now_checked_at, register_source
 from yes24_agent.tools.yes24_search import _get_client
 from yes24_agent.yes24.client import Yes24FetchError
@@ -154,7 +147,8 @@ async def yes24_fetch(
         함께 온다 — 찾는 내용이 안 보이면 find 키워드로 재호출해 뒷부분을 읽는다.
         함께 오는 links는 이 페이지에서 더 볼 수 있는 다른 Yes24 페이지 후보
         목록이다(아직 열지 않은 페이지 — 인용 대상이 아니며, 필요하면 그 url로 다시
-        yes24_fetch를 호출해 이어서 열람할 수 있다). 실패 시 status="error"와
+        yes24_fetch를 호출해 이어서 열람할 수 있다). 상품 상세에서는 관련 상품 링크만,
+        공지 등 다른 페이지에서는 페이지 내비까지 함께 온다. 실패 시 status="error"와
         error_type("fetch"|"parse"|"empty"), message.
     """
     # title은 runner의 진행 상태 라벨용으로만 쓴다. 반환 dict의 title은 항상 페이지
@@ -266,10 +260,14 @@ def _fetch_product(
     # parse_product는 title이 None이 아님을 보장하지 않으므로 인용 라벨용 방어값을 둔다.
     title = product.get("title") or "제목 미상"
 
-    # 검색·브라우즈와 같은 필드 집합(_product_fields) — 상세만 연 턴에서도 게이트가 대조할
+    # 검색·브라우즈와 같은 필드 집합(product_fields) — 상세만 연 턴에서도 게이트가 대조할
     # 접지 필드(publisher·rating·price·pub_date…)를 빠짐없이 싣는다.
     fields = product_fields(product)
     content = "\n\n".join(block for block in (intro, toc, pub_review, *weekly_reviews) if block)
+    # 상품 상세의 page 링크는 전 페이지 공통 GNB(국내도서·카테고리 트리 …)라 정보가 0이다
+    # (실측 48건 중 35건). 공지·목록 페이지에서는 같은 kind가 정책 내비의 근간이므로
+    # _fetch_generic은 전부 유지한다 — 걸러내는 기준은 페이지 유형이지 링크 문구가 아니다.
+    links = [link for link in links if link.get("kind") == "product"]
     source_id = register_source(
         tool_context.state,
         title=title,
@@ -293,9 +291,14 @@ def _fetch_product(
         "title": title,
         "url": url,
         "type": "book_detail",
-        "snippet": content,
         **fields,
         "is_ebook": product.get("is_ebook"),
+        # snippet은 블록들의 연접이라 모델에겐 중복이지만, **공개 출처 DTO의 근거 본문**이다.
+        # done.sources는 세션 레지스트리가 아니라 이 도구 응답에서 만들어지므로
+        # (_sources_from_response), 여기서 빼면 출처 카드·인용 검증·QA 판정이 근거를 잃는다 —
+        # 2026-07-21 정본 하네스에서 evidence_faithfulness가 4 → 0~2로 급락해 실측됐다.
+        # 페이로드 절감은 evidence_segments·GNB 링크 제거만으로 충분하다.
+        "snippet": content,
         "intro": intro,
         "toc": toc,
         "pub_review": pub_review,
@@ -303,7 +306,6 @@ def _fetch_product(
         "links": links,
         "checked_at": checked_at,
     }
-    detail["evidence_segments"] = build_field_evidence_segments(detail, PRODUCT_RATIONALE_FIELDS)
     if trunc.truncated:
         # 가법 필드: 잘리지 않은 상세의 반환 형태는 기존과 동일하다.
         detail["truncated"] = True
@@ -372,10 +374,8 @@ def _fetch_generic(
                 "error_type": "content_too_large",
                 "message": "완전한 FAQ 질문·답변 항목이 본문 반환 상한을 초과했습니다.",
             }
-        evidence_segments = build_entry_evidence_segments(selected_entries)
     else:
         window, find_found = window_around_find(text, max_chars, find, lead_chars)
-        evidence_segments = build_evidence_segments(window)
 
     source_id = register_source(
         tool_context.state,
@@ -385,7 +385,6 @@ def _fetch_generic(
         snippet=window,
         checked_at=checked_at,
     )
-    evidence_segments = qualify_evidence_segments(evidence_segments, source_id)
 
     logger.info(
         "yes24_fetch url=%r status=ok type=notice chars=%d total=%d find=%r",
@@ -400,9 +399,10 @@ def _fetch_generic(
         "title": title,
         "url": url,
         "type": "notice",
-        "snippet": window,
         "text": window,
-        "evidence_segments": evidence_segments,
+        # text와 같은 내용이지만 공개 출처 DTO가 근거로 읽는 필드는 snippet이다(위 book_detail
+        # 주석과 같은 이유 — done.sources는 이 도구 응답에서 조립된다).
+        "snippet": window,
         "links": links,
         "checked_at": checked_at,
     }
@@ -492,15 +492,13 @@ def _truncate_detail_blocks(
 
 
 def _take_block(
-    text: str | None, remaining: int, find: str | None = None, lead_chars: int = 0
+    text: str, remaining: int, find: str | None = None, lead_chars: int = 0
 ) -> tuple[str | None, int]:
     """남은 예산 안에서 블록을 담는다. 초과 시 절단 표시를 붙이고 예산을 소진한다.
 
     블록이 예산을 넘고 find 키워드가 그 안(예산 밖 위치)에 있으면 앞 절단 대신 키워드
     주변 창으로 잘라, 잘린 블록에서도 찾는 규정이 살아남게 한다.
     """
-    if not text:
-        return text, remaining
     if remaining <= 0:
         return None, 0
     if len(text) <= remaining:

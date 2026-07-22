@@ -86,13 +86,23 @@ AXIS_VALUE_LABELS_KO: dict[str, dict[str, str]] = {
     "motivation": {"I": "정보", "F": "재미"},
 }
 
+# 축 → 한글 축 이름(차원 이름). 값 라벨(AXIS_VALUE_LABELS_KO)과 함께 RBTI 자기지식 설명을
+# 코드에서 파생하는 단일 소스다(describe_axes). 프롬프트에 4축·8라벨을 리터럴로 박지 않는다.
+AXIS_NAMES_KO: dict[str, str] = {
+    "pattern": "패턴",
+    "processing": "처리",
+    "breadth": "폭",
+    "motivation": "동기",
+}
+
 # 16 유형 아키타입 — 스프레드시트 "유형별 코멘트"의 콘텐츠 데이터(AXIS_FRAGMENTS가 합성 톤용
 # 데이터인 것과 동일하게, 이건 표시·정체성용 데이터다. 케이스 로직 분기가 아님). 각 코드:
 #   name          : 아키타입 한 줄 이름([독서 강점] 대표문). 16뷰 카드 제목·정체성 힌트.
 #   traps_title   : [독서 함정] 섹션 대표문(툴팁·상세용).
 #   rx_title      : [독서 처방전] 섹션 대표문(툴팁·상세용).
 #   strengths/traps/prescriptions : 각 3항목("제목: 설명"), 시트 원문 그대로. Phase C 상세/툴팁.
-# 단일 채팅 프롬프트엔 name만 정체성 힌트로 얹고(프롬프트 비대 방지), 3항목 원문은 데이터로만 보유.
+# 프롬프트에는 아래 중 무엇도 얹지 않는다(name 포함 — 이유는 _PERSONA_BODY 위 주석 참조).
+# 여기 데이터는 UI 표시·툴팁용으로만 보유한다.
 TYPE_ARCHETYPES: dict[str, dict[str, object]] = {
     "CADI": {
         "name": "지적 유희를 즐기는 완벽한 탐험가",
@@ -472,6 +482,22 @@ def axis_label(code: object) -> str:
         return ""
     return "-".join(
         AXIS_VALUE_LABELS_KO[axis][ch] for ch, (axis, _allowed) in zip(code, AXIS_ORDER)  # type: ignore[index]
+    )
+
+
+def describe_axes() -> str:
+    """RBTI 4축과 각 축의 두 값을 코드 글자와 함께 한글로 요약한다
+    (예: "패턴(C=완독/S=선택), 처리(A=분석/E=공감), ...").
+
+    각 값의 코드 글자(C/S·A/E·D/B·I/F)를 AXIS_ORDER 정본에서 파생해 라벨과 함께 싣는다.
+    글자를 함께 주지 않으면 모델이 RBTI 자기지식을 설명할 때 축 글자를 지어내 매트릭스 카드
+    코드와 모순되므로, 정본 글자를 이 문장으로 흘려보낸다(리터럴 하드코딩·지어내기 금지).
+    프롬프트의 RBTI 자기지식 문장이 이 결과를 끼워 넣으므로, 축·라벨·글자 데이터가 바뀌면
+    프롬프트도 자동으로 따라간다(단일 소스 — 프롬프트에 축·라벨·글자 리터럴을 박지 않는다)."""
+    return ", ".join(
+        f"{AXIS_NAMES_KO[axis]}"
+        f"({v1}={AXIS_VALUE_LABELS_KO[axis][v1]}/{v2}={AXIS_VALUE_LABELS_KO[axis][v2]})"
+        for axis, (v1, v2) in AXIS_ORDER
     )
 
 

@@ -17,8 +17,6 @@ from typing import Any
 SOURCES_STATE_KEY = "sources"
 PRODUCT_SOURCE_TYPES = frozenset({"search_result", "book_detail", "browse"})
 PRODUCT_DETAIL_SOURCE_TYPES = frozenset({"book_detail"})
-POLICY_SOURCE_TYPES = frozenset({"notice"})
-WEB_SOURCE_TYPES = frozenset({"web"})
 
 # KST(UTC+9). 도구·매트릭스가 "오늘"·검색시각(checked_at)을 계산하는 단일 기준.
 # 값 자체는 외부 사실이지만, 10개 파일에 재정의돼 있던 것을 여기 한 곳으로 모은다.
@@ -29,11 +27,6 @@ def today_kst() -> str:
     """현재 KST 날짜를 에이전트 프롬프트와 최신성 검색이 공유하는 형식으로 반환한다."""
     now = datetime.now(KST)
     return f"{now.year}년 {now.month}월 {now.day}일"
-
-
-def today_kst_iso() -> str:
-    """현재 KST 날짜를 source 시점 필드와 대조할 ISO 날짜로 반환한다."""
-    return datetime.now(KST).date().isoformat()
 
 
 def now_checked_at() -> str:

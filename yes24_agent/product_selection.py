@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from enum import Enum
 from typing import Literal
 
@@ -37,12 +37,6 @@ RationaleEvidenceField = Literal[
     "pub_review",
     "weekly_reviews",
 ]
-ContentRationaleEvidenceField = Literal[
-    "intro",
-    "toc",
-    "pub_review",
-    "weekly_reviews",
-]
 PRODUCT_RATIONALE_FIELDS: tuple[RationaleEvidenceField, ...] = (
     "title",
     "intro",
@@ -65,16 +59,6 @@ class ConstraintOperator(str, Enum):
     GTE = "gte"
     GT = "gt"
 
-
-_MISSING_MESSAGES: dict[str, str] = {
-    "no_results": (
-        "이번 Yes24 검색 범위에서 질문에 맞는 상품을 확인하지 못했어요. "
-        "이 결과만으로 해당 상품이 존재하지 않는다고 단정할 수는 없어요."
-    ),
-    "detail_unavailable": "상품 상세 근거를 확인하지 못해 사실을 단정하지 않았어요.",
-    "insufficient_evidence": "질문의 조건을 뒷받침할 상품 근거가 충분하지 않았어요.",
-    "needs_clarification": "찾는 상품의 분야나 대상, 조건을 조금 더 알려 주세요.",
-}
 
 _EVIDENCE_FIELD_LABELS: dict[EvidenceField, str] = {
     "title": "상품명",
@@ -101,15 +85,6 @@ class ProductRationale(BaseModel):
     constraint_text: str | None = Field(default=None, min_length=1)
 
 
-class ProductContentRationale(BaseModel):
-    """제목 반복이 아닌 상세 본문의 선택 근거 참조."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    evidence_field: ContentRationaleEvidenceField
-    segment_id: str = Field(min_length=1)
-
-
 class ProductSelection(BaseModel):
     """모델이 고른 상품과 같은 상세 응답 안의 근거 필드."""
 
@@ -118,7 +93,6 @@ class ProductSelection(BaseModel):
     source_id: int = Field(gt=0)
     evidence_fields: list[EvidenceField]
     rationales: list[ProductRationale] = Field(default_factory=list)
-    content_rationale: ProductContentRationale | None = None
 
     @field_validator("evidence_fields")
     @classmethod
@@ -170,7 +144,7 @@ class ProductSelectionSubmission(BaseModel):
 
 
 def resolve_product_rationale(
-    rationale: ProductRationale | ProductContentRationale,
+    rationale: ProductRationale,
     source: dict,
 ) -> str | None:
     """구조화된 추천 이유 ID를 같은 상세 출처의 실제 원문으로 역참조한다."""
@@ -195,7 +169,6 @@ def validate_product_submission(
     *,
     expected_constraints: Sequence[ProductConstraint],
     expected_count: int | None = None,
-    user_query: str | None = None,
 ) -> ProductSelectionSubmission | None:
     """선택·근거를 이번 턴 상세와, 상류의 숫자 조건을 canonical 값과 대조한다."""
     if submission is None:
@@ -219,21 +192,6 @@ def validate_product_submission(
         available_fields = product_evidence_fields(evidence_source)
         if any(field not in available_fields for field in selection.evidence_fields):
             return None
-        if user_query is not None:
-            if (
-                selection.content_rationale is None
-                or resolve_product_rationale(
-                    selection.content_rationale,
-                    evidence_source,
-                )
-                is None
-            ):
-                return None
-        elif (
-            selection.content_rationale is not None
-            and resolve_product_rationale(selection.content_rationale, evidence_source) is None
-        ):
-            return None
         seen_rationales: set[tuple[str | None, str, str]] = set()
         for rationale in selection.rationales:
             if resolve_product_rationale(rationale, evidence_source) is None:
@@ -246,12 +204,6 @@ def validate_product_submission(
             if reference in seen_rationales:
                 return None
             seen_rationales.add(reference)
-            if user_query is not None:
-                if (
-                    rationale.constraint_text is None
-                    or rationale.constraint_text not in user_query
-                ):
-                    return None
         if not product_constraints_satisfied(evidence_source, expected_constraints):
             return None
         selected_ids.add(selection.source_id)
@@ -262,12 +214,12 @@ def validate_product_submission(
 def render_product_submission(
     submission: ProductSelectionSubmission,
     current_sources: list[dict],
-    contextual_rationales: Mapping[int, str] | None = None,
 ) -> str:
-    """검증된 canonical 사실과 격리 작성 또는 exact 폴백 이유를 렌더한다."""
-    if not submission.selections:
-        return _MISSING_MESSAGES.get(submission.missing_reason or "", "")
+    """검증된 canonical 상품 사실을 렌더한다.
 
+    유일 호출부(matrix/generate.py)는 항상 검증된 non-empty selections를 넘긴다 —
+    빈 selections면 빈 문자열을 돌려주고 상류가 폴백을 잡는다(silent-success 아님).
+    """
     by_id = {source["id"]: source for source in current_sources}
     blocks: list[str] = []
     for selection in submission.selections:
@@ -278,60 +230,8 @@ def render_product_submission(
         lines = [f"**{title}** [{selection.source_id}]"]
         if facts:
             lines.append(f"- {' · '.join(facts)} [{selection.source_id}]")
-        if selection.content_rationale is not None:
-            rationale_text = (
-                contextual_rationales.get(selection.source_id)
-                if contextual_rationales is not None
-                else resolve_product_rationale(selection.content_rationale, source)
-            )
-            if rationale_text is None:
-                raise ValueError("검증된 추천 이유 원문 구간을 찾을 수 없습니다")
-            lines.append(
-                f"- {escape_citation_markers(rationale_text)} [{selection.source_id}]"
-            )
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
-
-
-def project_product_sources(
-    submission: ProductSelectionSubmission,
-    current_sources: list[dict],
-) -> list[dict]:
-    """selected source의 canonical 필드만 복사하고 원문 snippet은 공개하지 않는다."""
-    by_id = {source.get("id"): source for source in current_sources}
-    projected: list[dict] = []
-    for selection in submission.selections:
-        source = by_id[selection.source_id]
-        projection = {
-            key: value
-            for key, value in source.items()
-            if key
-            not in {
-                "snippet",
-                "_evidence_fields",
-                "_evidence_segments",
-            }
-        }
-        rationale_texts = [
-            *(
-                [resolve_product_rationale(selection.content_rationale, source)]
-                if selection.content_rationale is not None
-                else []
-            ),
-            *[
-            text
-            for rationale in selection.rationales
-            if (text := resolve_product_rationale(rationale, source)) is not None
-            ],
-        ]
-        if any(text is None for text in rationale_texts):
-            raise ValueError("검증된 추천 이유 원문 구간을 찾을 수 없습니다")
-        if rationale_texts:
-            projection["snippet"] = "\n\n".join(
-                dict.fromkeys(text for text in rationale_texts if text is not None)
-            )
-        projected.append(projection)
-    return projected
 
 
 def _product_facts(source: dict) -> list[str]:

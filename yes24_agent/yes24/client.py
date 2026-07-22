@@ -10,7 +10,6 @@ import asyncio
 import codecs
 import re
 import time
-from types import TracebackType
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -338,14 +337,3 @@ class Yes24Client:
     async def aclose(self) -> None:
         """내부 httpx 클라이언트를 정리한다."""
         await self._client.aclose()
-
-    async def __aenter__(self) -> "Yes24Client":
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        await self.aclose()

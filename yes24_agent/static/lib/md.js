@@ -16,6 +16,13 @@ const MD_SEP_RE = /^\s*\|?[\s:|-]+\|?\s*$/;   // 구분선 |---|:--:|
 // 마커 뒤 공백 1칸 이상을 요구해 "*강조*"·"1.5" 같은 비리스트 라인을 배제한다.
 const MD_BULLET_RE = /^\s*[-*•]\s+(.*)$/;
 const MD_ORDERED_RE = /^\s*\d+[.)]\s+(.*)$/;
+// 코드 — 서버 postprocess의 코드/프로즈 분할을 렌더에 미러링한다: 코드 안 [n]은 인용이 아니라
+// 리터럴이라 배지로 승격하지 않는다(예: `print(data[1])`의 [1]은 그대로). 코드가 최우선.
+const MD_FENCE_RE = /^\s*(```|~~~)/;      // 코드펜스 여닫이(``` 또는 ~~~)
+const MD_INLINE_CODE_RE = /`([^`]+)`/g;   // 인라인 `코드`
+// 표 셀 줄바꿈 — 마크다운 표는 셀 안에서 개행을 못 써서 모델이 관례적으로 <br>을 쓴다.
+// 이것만 실제 줄바꿈으로 승격한다(다른 태그는 문자 그대로). 화이트리스트 1종.
+const MD_CELL_BR_RE = /<br\s*\/?>/gi;
 
 // 마커 칩 주변 공백 정리(문자 목록이 아니라 규칙 두 개):
 //  1) 칩은 앞말에 붙는다 — 마커 바로 앞의 공백(줄바꿈 제외)은 접는다.
@@ -60,18 +67,45 @@ function renderMarkersInto(target, text, opts) {
   appendTextSlice(target, text.slice(last), afterMarker, false);
 }
 
-// 인라인: **볼드**를 분리하고 각 구간(볼드 포함) 안에서 마커를 조립한다 — 볼드 안 마커도 정상.
+// 인라인: **볼드**를 top-level로 분리한다(볼드가 `코드`를 감싸는 흔한 경우 — "**A `x` B**" —
+// 를 깨지 않게). 각 구간(볼드 포함) 안에서 `코드`를 떼고, 코드 밖에서만 마커를 조립한다.
 function renderInlineInto(target, text, opts) {
   const re = new RegExp(BOLD_RE.source, "g");
   let last = 0, m;
   while ((m = re.exec(text)) !== null) {
-    if (m.index > last) renderMarkersInto(target, text.slice(last, m.index), opts);
+    if (m.index > last) renderCodeInto(target, text.slice(last, m.index), opts);
     const strong = document.createElement("strong");
-    renderMarkersInto(strong, m[1], opts);
+    renderCodeInto(strong, m[1], opts);
     target.appendChild(strong);
     last = re.lastIndex;
   }
+  if (last < text.length) renderCodeInto(target, text.slice(last), opts);
+}
+
+// `코드` 구간을 리터럴(<code>, 마커 승격 없음)로 떼고, 코드 밖에서만 마커를 조립한다.
+// 코드 안 [n]은 인용이 아니라 문자 그대로다(예: `print(data[1])`의 [1]).
+function renderCodeInto(target, text, opts) {
+  const re = new RegExp(MD_INLINE_CODE_RE.source, "g");
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) renderMarkersInto(target, text.slice(last, m.index), opts);
+    const code = document.createElement("code");
+    code.className = "md-code";
+    code.textContent = m[1]; // 리터럴 — 배지 승격 안 함
+    target.appendChild(code);
+    last = re.lastIndex;
+  }
   if (last < text.length) renderMarkersInto(target, text.slice(last), opts);
+}
+
+// 표 셀 — <br>을 실제 줄바꿈(<br> 요소)으로 바꾸고 각 조각은 평소대로 인라인 렌더한다.
+// 요소를 직접 만들 뿐 innerHTML을 쓰지 않아 임의 HTML 삽입 경로가 없다(<br> 외엔 문자 그대로).
+function renderCellInto(target, text, opts) {
+  const parts = String(text).split(MD_CELL_BR_RE);
+  parts.forEach((part, i) => {
+    if (i) target.appendChild(document.createElement("br"));
+    renderInlineInto(target, part, opts);
+  });
 }
 
 function splitCells(line) {
@@ -100,6 +134,22 @@ export function renderBody(container, text, opts = {}) {
   };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    // 코드펜스(``` / ~~~) 블록 — 안쪽은 리터럴로 <pre><code>에 담는다(마커·볼드·표·리스트 승격
+    // 없음). 닫는 펜스 전에 스트림이 끊긴 상태면 온 만큼만 렌더(다음 델타에서 이어짐).
+    if (MD_FENCE_RE.test(line)) {
+      flush();
+      const fence = line.match(MD_FENCE_RE)[1];
+      const codeLines = [];
+      i++;
+      while (i < lines.length && !lines[i].trimStart().startsWith(fence)) { codeLines.push(lines[i]); i++; }
+      const pre = document.createElement("pre");
+      pre.className = "md-pre";
+      const code = document.createElement("code");
+      code.textContent = codeLines.join("\n");
+      pre.appendChild(code);
+      container.appendChild(pre);
+      continue; // 루프의 i++가 닫는 펜스 줄을 건너뛴다
+    }
     const hm = line.match(MD_H_RE);
     if (hm) {
       flush();
@@ -124,7 +174,7 @@ export function renderBody(container, text, opts = {}) {
         const tr = document.createElement("tr");
         for (const c of splitCells(rows[0])) {
           const th = document.createElement("th");
-          renderInlineInto(th, c, o);
+          renderCellInto(th, c, o);
           tr.appendChild(th);
         }
         table.appendChild(tr);
@@ -135,7 +185,7 @@ export function renderBody(container, text, opts = {}) {
         const tr = document.createElement("tr");
         for (const c of splitCells(rows[r])) {
           const td = document.createElement("td");
-          renderInlineInto(td, c, o);
+          renderCellInto(td, c, o);
           tr.appendChild(td);
         }
         table.appendChild(tr);

@@ -72,8 +72,8 @@ _YES24_ROOT_DOMAIN = "yes24.com"
 
 # 상품형 아이템(검색·베스트셀러·신간·크레마클럽)이 공통으로 싣는 필드 집합.
 # 마크업이 같은 검색/베스트셀러/신간은 _parse_item 하나로 뽑고, 마크업이 다른
-# 크레마클럽도 이 키 집합을 그대로 채운다(없는 필드는 None) — 도구·게이트가 파서마다
-# 다른 키 집합을 상대하지 않게 하기 위함이다(필드 소실 드리프트 원천 차단).
+# 크레마클럽도 이 키 집합을 그대로 채운다(없는 필드는 None) — 도구가 파서마다 다른 키
+# 집합을 상대하지 않게 하기 위함이다(필드 소실 드리프트 원천 차단).
 _ITEM_FIELDS = (
     "goods_no",
     "title",
@@ -99,8 +99,8 @@ class ParseError(Exception):
 def parse_search(html: str, *, base_url: str, limit: int = 10) -> list[dict]:
     """Yes24 검색 결과 HTML을 파싱해 상품 목록을 반환한다.
 
-    각 아이템 dict 키: goods_no, title, url, author, publisher, pub_date, price, rating,
-    image_url(표지, lazy-load `data-original`에서 추출 — 없으면 None).
+    각 아이템 dict 키는 `_ITEM_FIELDS`와 같다(페이지에 없는 필드는 None). 손으로 다시
+    열거하지 않는다 — 목록이 갈라지면 계약이 조용히 어긋난다.
     제목 또는 URL이 없는 아이템은 건너뛴다.
 
     아이템 컨테이너(`ul#yesSchList`) 자체가 없으면 기본적으로 HTML 구조 변경으로 보고
@@ -247,7 +247,7 @@ def _parse_page_count(soup: BeautifulSoup) -> int | None:
         if raw_count is None:
             continue
         normalized = "".join(character for character in raw_count if character.isdecimal())
-        return int(normalized) if normalized.isdigit() else None
+        return int(normalized) if normalized else None
     return None
 
 
