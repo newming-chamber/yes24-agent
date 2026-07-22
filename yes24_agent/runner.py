@@ -32,6 +32,7 @@ from yes24_agent.event_translate import (
     _status_for_error,
     _status_for_result,
     build_source_event,
+    project_source_ref,
 )
 from yes24_agent.postprocess import (
     build_done_payload,
@@ -156,8 +157,10 @@ async def run_agent_stream(
 ) -> AsyncIterator[str]:
     """사용자 메시지 1건을 처리하며 SSE 프레임 문자열을 순서대로 yield한다.
 
-    이벤트 순서 계약: status → source → delta → done. function call/response가
-    텍스트보다 먼저 흐르므로 자연스럽게 이 순서가 유지된다. 어떤 예외가 나도
+    이벤트 순서 계약: status·delta가 도착 순서대로 섞여 흐르고, 마지막에
+    source → (reset →) delta → done으로 마감한다. 도구 응답 시점의 status는
+    `refs`(마커 렌더용 id·url 힌트)를 실어 본문 [n]보다 먼저 도착하고, 검증을 통과한
+    **최종 인용 출처만** source·done.sources로 나간다(원칙 4). 어떤 예외가 나도
     제너레이터가 예외로 죽지 않고 error+done을 흘려보낸 뒤 정상 종료한다.
     """
     settings = get_settings()
@@ -217,10 +220,6 @@ async def run_agent_stream(
         # 직전 도구 경계까지 예고로 소비한 조각 수. 예고는 **경계 이후 새로 온 부분만** 실어야
         # 한다 — 버퍼 전체를 쓰면 두 번째 예고에 첫 예고가 그대로 따라붙는다(실측).
         preface_mark = 0
-        # 각 예고 세그먼트가 시작된 pending 인덱스. 도구 라운드마다 예고가 하나씩 붙어
-        # 본문 머리에 적층되는 것을 마감에서 접기 위해 경계를 전부 기억한다
-        # (실측: 6라운드 턴에서 서문 6개가 답변 앞에 쌓여 심사관 relevance 2점).
-        preface_starts: list[int] = []
         # 이미 delta로 흘려보낸 본문. 예외 핸들러도 참조하므로 try 진입 전에 바인딩한다.
         streamed_text = ""
         final_text = ""
@@ -278,7 +277,6 @@ async def run_agent_stream(
                             retried_overload = True
                             pending = []
                             preface_mark = 0
-                            preface_starts = []
                             final_text = ""
                             retry_runner = Runner(
                                 agent=root_agent,
@@ -298,25 +296,23 @@ async def run_agent_stream(
                         raise
 
                     if not event.partial and event.get_function_calls():
-                        # 도구 호출 앞의 텍스트(예고)를 진행 타임라인에 **복사**한다 —
-                        # 본문에서 빼내지 않는다. 사용자는 본문에서 흐르는 예고를 이미 봤고,
-                        # 타임라인은 나중에 접혀 "무엇을 어떤 순서로 했는지" 요약이 된다.
-                        # 예고(도구 호출 앞 모델 텍스트)는 본문에 그대로 두고 여기서
-                        # status로 복사하지 않는다 — 타임라인이 펼쳐진 동안 같은 문장이
-                        # 두 곳에 나란히 보인다(사용자 지적, 실화면 확인). 타임라인은
-                        # 런타임이 도구 호출에서 만든 사실만 싣는다.
-                        segment_start = preface_mark
+                        # 도구 호출 앞의 텍스트(예고)는 **본문에 그대로 둔다**. status로
+                        # 복사하지도, 마감에서 잘라내지도 않는다 — 프론트가 진행 단계와
+                        # 본문 조각을 도착 순서대로 한 열에 쌓으므로, 예고들은 답변 머리에
+                        # 적층되는 게 아니라 각자 자기 도구 단계 앞에 놓여 서사가 된다.
+                        # (과거의 "마지막 예고만 남기기"는 이 서사를 done에서 지우면서
+                        # 매 다도구 턴마다 reset+전체 재delta를 유발했다.)
                         segment = "".join(pending[preface_mark:])
                         preface_mark = len(pending)
-                        if segment.strip():
-                            preface_starts.append(segment_start)
-                            if not segment.endswith("\n\n"):
-                                # 예고와 답변이 한 문장처럼 붙지 않게 문단을 띄운다.
-                                gap = "\n\n"
-                                pending.append(gap)
-                                preface_mark = len(pending)
-                                emitted_output = True
-                                yield sse_delta(gap)
+                        if segment.strip() and not segment.endswith("\n\n"):
+                            # 예고와 답변이 한 문장처럼 붙지 않게 문단을 띄운다. 이 문단
+                            # 경계가 프론트의 블록 분할 지점이기도 하다(표·코드블록이 블록
+                            # 경계에 걸리지 않음을 구조로 보장).
+                            gap = "\n\n"
+                            pending.append(gap)
+                            preface_mark = len(pending)
+                            emitted_output = True
+                            yield sse_delta(gap)
                         for call in event.get_function_calls():
                             status = _status_for_call(call)
                             if status is None:
@@ -340,6 +336,7 @@ async def run_agent_stream(
                             if result is not None:
                                 emitted_output = True
                                 yield sse_status(*result)
+                            refs: list[dict] = []
                             for source in _sources_from_response(payload):
                                 source_id = source.get("source_id")
                                 source_event = build_source_event(source)
@@ -351,6 +348,13 @@ async def run_agent_stream(
                                         break
                                 else:
                                     observed_sources.append(source_event)
+                                refs.append(project_source_ref(source_event))
+                            # 마커 렌더용 id 힌트를 **본문보다 먼저** 흘린다. 여기서 안 보내면
+                            # 프론트는 [n]이 실재 인용인지 몰라 done 직전까지 생 대괄호로 둔다.
+                            # detail이 비어 있어 진행 단계 행은 만들지 않는다(보이지 않는 프레임).
+                            # emitted_output도 올리지 않는다 — 사용자에게 나간 출력이 아니다.
+                            if refs:
+                                yield sse_status("refs", "", refs=refs)
                         continue
 
                     if event.partial:
@@ -366,17 +370,9 @@ async def run_agent_stream(
                         if text:
                             final_text = text
 
-                # 실제로 화면에 흘려보낸 본문(자르기 **전**). 마감에서 정본과 대조해
-                # 달라졌으면 reset 후 정본을 다시 그린다 — 자른 뒤에 재면 차이를 못 봐서
-                # 화면엔 적층된 예고가 그대로 남는다.
+                # 실제로 화면에 흘려보낸 본문. 마감에서 정본과 대조해 달라졌으면(인용 검증이
+                # 무효 마커를 지운 경우) reset 후 정본을 다시 그린다.
                 streamed_text = "".join(pending)
-                # 예고가 여러 번이면 **마지막 하나만** 본문에 남긴다. 도구 라운드마다 예고가
-                # 붙으면 답변 앞에 서문이 적층돼 읽기 어렵다(실측: 6개). 마지막 예고는 답변
-                # 바로 앞이라 도입부로 읽히고, 앞선 예고들은 진행 타임라인에 이미 전부 있다.
-                # 문구를 보고 자르는 게 아니라 기록해 둔 세그먼트 경계로 자른다.
-                if len(preface_starts) > 1:
-                    pending = pending[preface_starts[-1] :]
-                    preface_mark = max(0, preface_mark - preface_starts[-1])
                 answer_text = _best_effort_text(pending, final_text)
                 # 예고 뒤에 실제 답변이 하나도 오지 않았는가. preface_mark는 예고로 소비한
                 # 조각 수이므로, 그게 곧 전체라면 본문은 예고뿐이다("찾아볼게요.\n\n"만 남아

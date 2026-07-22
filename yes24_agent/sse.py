@@ -31,9 +31,23 @@ def sse_reset() -> str:
     return format_sse("reset", {})
 
 
-def sse_status(stage: str, detail: str = "") -> str:
-    """진행 상태 이벤트 (예: "Yes24 검색 중…")."""
-    return format_sse("status", {"stage": stage, "detail": detail})
+def sse_status(stage: str, detail: str = "", refs: list[dict] | None = None) -> str:
+    """진행 상태 이벤트 (예: "Yes24 검색 중…").
+
+    `refs`는 **마커를 렌더할 최소 정보(id·url)**를 도구 응답 시점에 미리 실어 보내는
+    가법 필드다. 이게 없으면 프론트는 어떤 [n]이 실재 인용인지 몰라 스트리밍 내내
+    생 대괄호로 두다가 done 직전 source 이벤트가 와서야 칩으로 승격한다(실측: 마커
+    노출과 카드 도착 사이 0.42초, 서버가 id를 안 시점부터는 5.14초).
+
+    **카드가 아니다.** 제목·가격 등 검증 대상 상품 사실은 싣지 않고, 프론트도 이걸로
+    출처 카드를 만들지 않는다 — 공개 `source`와 `done.sources`가 최종 인용분만 담는다는
+    원칙 4는 그대로다. refs 미지정(기본)이면 페이로드에 키를 넣지 않아 기존 프레임과
+    바이트 동일하다(_with_col과 같은 규율).
+    """
+    data = {"stage": stage, "detail": detail}
+    if refs:
+        data["refs"] = refs
+    return format_sse("status", data)
 
 
 # 16뷰 매트릭스(/chat/matrix)용 가법 kwarg `col`. col=None(기본)이면 페이로드에 키를 넣지

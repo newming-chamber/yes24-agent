@@ -143,35 +143,25 @@
     @keyframes typing { 0%, 60%, 100% { opacity: 0.3; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-3px); } }
     @keyframes fadein { from { opacity: 0.35; } to { opacity: 1; } }
 
-    /* 진행 과정 블록 — status 단계를 완료 후 한 줄 요약으로 접는다. */
-    .trace { margin-bottom: 6px; }
-    .trace:empty { display: none; }
-    .trace-head {
-      display: flex; align-items: center; gap: 7px; width: 100%; text-align: left;
-      background: transparent; border: none; padding: 4px 6px; cursor: pointer;
-      font-size: 12.5px; color: var(--muted); font-family: inherit; border-radius: 7px;
-    }
-    .trace-head:hover { background: var(--accent-soft); }
-    .trace-caret { flex: 0 0 auto; font-size: 10px; transition: transform 0.15s ease; opacity: 0.7; }
-    .trace.open .trace-caret { transform: rotate(90deg); }
-    /* 진행 중 스피너(펄스 점). 완료(done) 시 감추고 캐럿만 남긴다. */
-    .trace-spin {
-      flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
-      animation: pulse 1.2s ease-in-out infinite;
-    }
-    .trace.done .trace-spin { display: none; }
-    .trace-label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    /* 본문(단계·응대 스트림)은 펼침 상태에서만 보인다. */
-    .trace-body { display: none; flex-direction: column; gap: 3px; padding: 3px 0 3px 18px; }
-    .trace.open .trace-body { display: flex; }
+    /* 진행 흐름 — 진행 단계와 본문 조각을 **도착 순서대로 한 열에** 쌓는다.
+       접히는 별도 타임라인 블록(trace)은 삭제했다: 같은 열에 시간순으로 놓이면 무엇을
+       어떤 순서로 했는지가 그 자체로 읽히고, 완료 후 접으면 이미 읽고 지나간 내용이
+       중간에서 사라지며 아래 본문이 위로 점프한다. */
+    .flow { display: flex; flex-direction: column; gap: 6px; }
     .step {
-      font-size: 12.5px; color: var(--muted); display: flex; align-items: center; gap: 6px;
-      line-height: 1.5; animation: fadein 0.3s ease;
+      font-size: 12.5px; color: var(--muted); display: flex; align-items: flex-start; gap: 6px;
+      line-height: 1.5; animation: fadein 0.3s ease; padding: 0 6px;
     }
     .step .ico { flex: 0 0 auto; width: 15px; text-align: center; }
+    /* 긴 멀티쿼리 검색어(각도 수 상한 없음)는 가로 스크롤이 아니라 줄바꿈으로 흡수한다 —
+       의도된 가로 스크롤러는 .sources·.md-table-wrap 둘뿐이다(스크롤 계약). */
+    .step .step-label { min-width: 0; overflow-wrap: anywhere; }
     .step.done .ico { color: var(--accent); }        /* 완료 단계는 체크 강조색 */
     .step.active .ico { animation: pulse 1.2s ease-in-out infinite; }
     @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+    /* 턴 마감 메타(소요·모델·출처 수) — 접힌 trace 헤더가 담던 정보의 새 자리. */
+    .meta { font-size: 12px; color: var(--muted); padding: 0 6px; }
+    .meta:empty { display: none; }
     .sources { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
     .sources:empty { display: none; }
     .card {
@@ -218,16 +208,18 @@
        개별 칩(옅은 배경·라운드)으로 분리한다(간격만으론 위첨자 숫자가 붙어 읽힘).
        여백은 왼쪽에만 준다: 오른쪽 여백이 있으면 뒤따르는 구두점(., 등)이 칩에서 떨어져
        "…입니다 ¹ ." 처럼 읽힌다. 칩끼리 이어질 때만 아래 인접 규칙으로 간격을 넣는다. */
-    sup.marker {
+    /* url을 아는 마커는 <a>, 모르는 마커는 <sup> 칩이다 — 태그로 셀렉터를 가르지 않고
+       .marker 하나로 둔다(둘의 생김새가 갈라지면 같은 문장에서 크기가 튄다). */
+    .marker {
       display: inline-block; vertical-align: super; line-height: 1;
       color: var(--accent); font-weight: 700; font-size: 0.66em; cursor: pointer;
       background: var(--accent-soft); border-radius: 4px; padding: 1px 3px;
-      margin: 0 0 0 1px;
+      margin: 0 0 0 1px; text-decoration: none;
     }
-    sup.marker:hover { background: var(--accent); color: #fff; text-decoration: none; }
-    sup.marker + sup.marker { margin-left: 3px; }
+    .marker:hover { background: var(--accent); color: #fff; text-decoration: none; }
+    .marker + .marker { margin-left: 3px; }
     /* 키보드 포커스 가시성(a11y) — 클릭 가능한 것은 탭으로도 닿고 링이 보인다(matrix와 동일 계약). */
-    sup.marker:focus-visible, .card:focus-visible, .trace-head:focus-visible {
+    .marker:focus-visible, .card:focus-visible {
       outline: 2px solid var(--accent); outline-offset: 2px;
     }
 
@@ -776,58 +768,51 @@
       const msg = document.createElement("div");
       msg.className = "msg assistant";
 
-      // 진행 과정 블록: 헤더(요약/토글) + 상태 단계. 실행 중엔
-      // 펼쳐서 여정을 보여주고, 완료 시 한 줄 요약으로 접는다(헤더 클릭으로 재확장).
-      const trace = document.createElement("div");
-      trace.className = "trace open";
-      const traceHead = document.createElement("button");
-      traceHead.className = "trace-head";
-      traceHead.type = "button";
-      const traceCaret = document.createElement("span");
-      traceCaret.className = "trace-caret";
-      traceCaret.textContent = "▸";
-      const traceSpin = document.createElement("span");
-      traceSpin.className = "trace-spin";
-      const traceLabel = document.createElement("span");
-      traceLabel.className = "trace-label";
-      traceLabel.textContent = "진행 중…";
-      // 진행 요약은 스크린리더에 조용히 알린다(본문 델타는 낭독 폭주라 제외).
-      traceLabel.setAttribute("aria-live", "polite");
-      traceHead.append(traceCaret, traceSpin, traceLabel);
-      traceHead.setAttribute("aria-expanded", "true"); // 생성 시 펼침 상태
-      const traceBody = document.createElement("div");
-      traceBody.className = "trace-body";
-      trace.append(traceHead, traceBody);
-      // 헤더 클릭 = 펼침/접힘 토글(완료 후 여정 다시 확인).
-      traceHead.addEventListener("click", () => {
-        const open = trace.classList.toggle("open");
-        traceHead.setAttribute("aria-expanded", String(open));
-      });
+      // 진행 흐름: 진행 단계 행과 본문 블록이 **도착 순서대로** 이 한 열에 쌓인다.
+      const flow = document.createElement("div");
+      flow.className = "flow";
+      // 진행 상태는 스크린리더에 조용히 알린다(본문 델타는 낭독 폭주라 제외).
+      flow.setAttribute("aria-live", "polite");
 
       const sources = document.createElement("div");
       sources.className = "sources";
+      const meta = document.createElement("div");
+      meta.className = "meta";
 
+      // 첫 델타 전 대기: 정적 "…" 대신 타이핑 인디케이터. 예전엔 본문 버블 안에 두고
+      // renderBody의 textContent="" 가 **암묵적으로** 걷어냈는데, 본문이 여러 블록이 된
+      // 지금은 그 결합이 성립하지 않는다 — 별도 요소로 두고 명시적으로 제거한다.
       const bubble = document.createElement("div");
       bubble.className = "bubble empty";
-      // 첫 델타 전 대기: 정적 "…" 대신 타이핑 인디케이터(첫 델타 시 renderBody가 걷어낸다).
       const typing = document.createElement("span");
       typing.className = "typing";
       typing.append(document.createElement("i"), document.createElement("i"), document.createElement("i"));
       bubble.appendChild(typing);
+      flow.appendChild(bubble);
+      function clearTyping() {
+        if (bubble.isConnected) bubble.remove();
+      }
 
-      // 본문(답변)은 진행 과정 블록·출처 카드와 시각적으로 분리 — 마커·출처·본문만.
-      msg.append(trace, sources, bubble);
+      // 출처 카드 줄과 메타는 흐름 **끝**에 온다(실제 도착 시점 = 검증 후와 일치).
+      msg.append(flow, sources, meta);
       conversation.appendChild(msg);
       scrollToBottom();
 
       const cardMap = new Map();
+      // 스트리밍 중 마커를 렌더하기 위한 최소 정보(id → url). status.refs로 도구 응답
+      // 시점에 미리 온다. **카드가 아니다** — cardMap·sources DOM엔 절대 손대지 않는다.
+      // 이 분리가 원칙 4(공개 source·done.sources는 최종 인용분만)를 지키는 구조다.
+      const hintMap = new Map();
+      // 본문 텍스트 블록들. 각 블록이 자기 rawText를 소유하고 독립 재렌더한다.
+      // 턴의 rawText = 블록 텍스트의 연결이다(원칙 4b: delta 합계 == done.text).
+      const blocks = [];
+      let pendingSplit = false; // 마지막 델타 이후 진행 단계가 끼어들었는가
       // 이 턴이 본 출처의 원본 페이로드(id → src). 대화 스냅샷 저장·복원의 재료다.
       const srcById = new Map();
       let citedList = [];      // finalize에서 확정된 인용 id(스냅샷용)
       let elapsedSaved = 0;    // 응답 소요(초) — 스냅샷 복원 시 요약에 재사용
       let modelSaved = "";      // 최종 public model — 스냅샷 복원 시 같은 메타를 표시
       let errorText = "";      // 오류로 끝난 턴의 안내 문구(스냅샷용)
-      let rawText = "";
       let firstDelta = false;
       let errored = false;
       let activeStep = null;   // 현재 진행 중(스핀) 단계 요소
@@ -852,14 +837,58 @@
         card.classList.add("flash");
       }
 
-      // 본문 렌더 = 공용 모듈(md.js). 마커 승격 조건은 "이번 턴 출처에 있는 id"이고,
-      // 클릭 시 해당 출처 카드를 하이라이트한다(승격 규칙·공백 규칙은 모듈이 소유).
-      function renderBody(text) {
-        bubble.classList.remove("empty");
-        renderMarkdown(bubble, text, {
-          isCitation: (sid) => cardMap.has(String(sid)),
-          onMarker: highlightSource,
-        });
+      // 마커 승격 조건 = "이번 턴에 실재하는 출처 id". 검증 후 카드(cardMap)뿐 아니라
+      // 도구 응답 시점의 힌트(hintMap)도 인정한다 — 이게 스트리밍 중 [1]이 생 대괄호로
+      // 남아 있다가 done 이후에야 칩이 되던 어색함의 해소다. 검증에서 탈락한 마커는
+      // 백엔드가 done.text에서 지우므로 링크째 사라진다(잘못된 링크가 남지 않는다).
+      const markerOpts = {
+        isCitation: (sid) => cardMap.has(String(sid)) || hintMap.has(String(sid)),
+        onMarker: highlightSource,
+        // 위험 스킴 차단은 공용 모듈(isSafeUrl)이 소유한다 — md.js는 검증된 url만 받는다.
+        // 최종 카드가 있으면 그 url이 정본(힌트 url은 후속 라운드에 갱신될 수 있다).
+        citationUrl: (sid) => {
+          const key = String(sid);
+          const src = srcById.get(key);
+          const url = (src && src.url) || hintMap.get(key) || "";
+          return isSafeUrl(url) ? url : "";
+        },
+      };
+
+      // 이 턴의 본문 = 블록 텍스트의 연결. 스냅샷·중지·finalize 대조가 모두 이 한 값을
+      // 쓴다(판정을 여러 벌 두면 한 벌만 고치는 실수가 반복된다 — 백엔드 _emit_final_body와
+      // 같은 규율). 정상 턴에서 이 값은 delta 합계와 같고, 곧 done.text와 같다(원칙 4b).
+      function bodyText() {
+        return blocks.map((b) => b.text).join("");
+      }
+
+      // 본문 렌더 = 공용 모듈(md.js). 블록 하나를 자기 텍스트로 다시 그린다.
+      function renderBlock(block) {
+        renderMarkdown(block.el, block.text, markerOpts);
+      }
+      function renderAll() {
+        blocks.forEach(renderBlock);
+      }
+
+      // 새 본문 블록을 흐름 끝에 만든다.
+      function pushBlock() {
+        const el = document.createElement("div");
+        el.className = "bubble";
+        flow.appendChild(el);
+        const block = { el, text: "" };
+        blocks.push(block);
+        return block;
+      }
+
+      // 델타를 받을 블록을 고른다. **문단 경계에서만** 새 블록을 연다 — 표(연속 파이프
+      // 라인)·코드펜스(여닫이)가 블록 경계에 걸리면 md.js의 라인 스캐너가 양쪽에서 깨지기
+      // 때문이다(닫히지 않은 펜스는 다음 블록 전체를 <pre>에 가둔다). 문단 중간에 진행
+      // 단계가 끼어들면 분할하지 않고 현재 블록에 계속 이어 붙인다 — 케이스 분기가 아니라
+      // 구조 규칙이고, 백엔드가 도구 호출 앞에 "\n\n"을 넣으므로 예고 경계는 항상 만족한다.
+      function blockForDelta() {
+        const cur = blocks[blocks.length - 1];
+        if (!cur) return pushBlock();
+        if (pendingSplit && (!cur.text || /\n\s*\n\s*$/.test(cur.text))) return pushBlock();
+        return cur;
       }
 
       function makeCard(src) {
@@ -944,23 +973,39 @@
         );
       }
 
-      // 진행 과정 블록을 완료 요약으로 접는다(완료·에러 시). 스피너를 멈추고 캐럿만 남긴다.
-      function collapseTrace(summary) {
-        trace.classList.remove("open");
-        trace.classList.add("done");
-        traceHead.setAttribute("aria-expanded", "false");
-        traceLabel.textContent = summary;
+      // 본문 전체를 done.text 한 덩어리로 다시 그린다. reset(인용 검증이 본문을 바꿈)과
+      // finalize(정본 교체)가 **같은 코드**를 쓴다 — reset은 정본이 빈 특수 케이스일 뿐이다.
+      function replaceBody(text) {
+        blocks.splice(0).forEach((b) => b.el.remove());
+        pendingSplit = false;
+        if (!text) { firstDelta = false; return; }
+        const block = pushBlock();
+        block.text = text;
+        renderBlock(block);
       }
 
       return {
-        setStatus(stage, detail) {
+        setStatus(stage, detail, refs) {
+          // 마커 렌더용 힌트를 먼저 흡수한다. 나중 관측이 정본이다(같은 id의 url이 후속
+          // 라운드에 갱신될 수 있다). **카드는 만들지 않는다** — 검증 전 노출 금지선.
+          if (Array.isArray(refs)) {
+            for (const ref of refs) {
+              if (ref && ref.id != null) hintMap.set(String(ref.id), ref.url || "");
+            }
+            // 이미 흘러간 [n]들을 즉시 칩·링크로 승격시킨다. 힌트 도착 후 델타가 더 오지
+            // 않는 경우가 있어 재렌더를 델타에 미룰 수 없다(1회성이라 비용도 여기서 끝난다).
+            if (blocks.length) renderAll();
+          }
+          // 문구가 없으면 보여 줄 단계가 없다(refs만 실은 프레임). 백엔드가 "설명할 진행이
+          // 없으면 말하지 않는다"를 기본값으로 두는 것과 같은 규칙의 렌더 쪽 절반이다.
+          if (!detail) return;
           // 연속 동일 단계는 중복 추가하지 않는다(같은 도구가 상태만 반복 전송하는 경우).
           // 같은 stage|detail 연속 중복은 접되, found는 제외한다 — 같은 건수를 두 번
           // 찾은 것은 실제로 두 번 일어난 일이라 접으면 단계가 사라진다.
-          const key = stage === "found" ? Symbol() : stage + "|" + (detail || "");
+          const key = stage === "found" ? Symbol() : stage + "|" + detail;
           if (key === lastStepKey) return;
           lastStepKey = key;
-          // 직전 단계를 완료로 마감하고 새 단계를 진행 과정 스트림에 누적한다(덮어쓰지 않음).
+          // 직전 단계를 완료로 마감하고 새 단계를 흐름에 누적한다(덮어쓰지 않음).
           completeActiveStep();
           const step = document.createElement("div");
           step.className = "step active";
@@ -968,46 +1013,52 @@
           ico.className = "ico";
           ico.textContent = STATUS_ICON[stage] || "•";
           const label = document.createElement("span");
-          label.textContent = detail || "";
+          label.className = "step-label";
+          label.textContent = detail;
           step.append(ico, label);
-          traceBody.appendChild(step);
+          flow.appendChild(step);
           activeStep = step;
-          // 헤더는 실행 중 제네릭 "진행 중…"으로 둔다(개별 단계는 본문 스트림에만). 헤더가
-          // 최신 단계를 미러링하면 펼친 상태에서 헤더=본문 첫 줄이 같은 문구로 겹쳐 보인다.
+          // 다음 델타는 (문단 경계라면) 이 단계 **아래**의 새 블록에서 이어진다.
+          pendingSplit = true;
           scrollToBottom();
         },
         addSource(src) {
+          srcById.set(String(src.id), src);
           if (cardMap.has(String(src.id))) return;
           const card = makeCard(src);
           cardMap.set(String(src.id), card);
-          srcById.set(String(src.id), src);
           sources.appendChild(card);
           scrollToBottom();
         },
         appendDelta(chunk) {
           if (!firstDelta) {
             firstDelta = true;
-            // 답변 스트리밍 시작 → 진행 중 단계를 완료 처리한다(접힘은 finalize가 요약과 함께).
+            clearTyping();
+            // 답변 스트리밍 시작 → 진행 중 단계를 완료 처리한다.
             completeActiveStep();
           }
-          rawText += chunk;
-          renderBody(rawText);
+          const block = blockForDelta();
+          pendingSplit = false;
+          block.text += chunk;
+          renderBlock(block);
           scrollToBottom();
         },
         // 백엔드 reset: 흘린 본문을 비우고 정본을 다시 받는다(인용 검증이 본문을 바꾼 경우).
+        // 힌트(hintMap)는 **보존한다** — 비우면 재렌더된 본문의 마커가 다시 생 대괄호가 된다.
         resetBody() {
-          rawText = "";
-          firstDelta = false;
-          renderBody("");
+          replaceBody("");
         },
         finalize(payload, elapsedSec) {
           // error로 끝난 턴이면(백엔드가 error 뒤 done을 함께 보냄) 빨간 안내 말풍선을
           // 그대로 두고 "응답 X초" meta를 붙이지 않는다.
           if (errored) return;
-          if (typeof payload.text === "string" && payload.text.length) {
-            // done.text(검증본)로 스트리밍된 본문을 조용히 교체한다(인용 마커 정리 등 미세 diff).
-            rawText = payload.text;
-            renderBody(rawText);
+          clearTyping();
+          // done.text(검증본)로 본문을 교체한다. 이미 같은 텍스트면 다시 그리지 않는다 —
+          // 무조건 재렌더는 DOM을 통째로 갈아 스크롤·애니메이션이 튀게 만든다(정상 턴은
+          // delta 합계 == done.text라 이 가드가 대부분의 턴에서 재렌더를 없앤다).
+          if (typeof payload.text === "string" && payload.text.length
+              && payload.text !== bodyText()) {
+            replaceBody(payload.text);
           }
           // 출처칩은 최종 답에서 실제로 인용된 출처만 받는다.
           const citedIds = new Set(
@@ -1015,15 +1066,20 @@
           );
           // done.sources로 누락 카드를 보강한다.
           const finalSources = Array.isArray(payload.sources) ? payload.sources : [];
+          let gainedId = false;
           for (const src of finalSources) {
-            if (!cardMap.has(String(src.id))) {
+            const key = String(src.id);
+            if (!cardMap.has(key)) {
               const card = makeCard(src);
-              cardMap.set(String(src.id), card);
+              cardMap.set(key, card);
               sources.appendChild(card);
             }
-            srcById.set(String(src.id), src);
-            citedIds.add(String(src.id));
+            // 힌트로 못 봤던 id라면 그 마커는 아직 평문이다 — 본문을 한 번 더 그린다.
+            if (!hintMap.has(key)) gainedId = true;
+            srcById.set(key, src);
+            citedIds.add(key);
           }
+          if (gainedId) renderAll();
           citedList = [...citedIds];   // 스냅샷 저장용(복원 시 강조 재현)
           elapsedSaved = elapsedSec;
           modelSaved = typeof payload.model === "string" ? payload.model : "";
@@ -1031,23 +1087,23 @@
           for (const [id, card] of cardMap) {
             card.classList.toggle("cited", citedIds.has(id));
           }
-          // 진행 과정 블록을 한 줄 요약으로 접는다(클릭 시 여정 재확인). 단계 수는 status
-          // 상태 단계와 출처·시간·모델을 기존 한 줄 메타 위치에 함께 요약한다.
+          // 흐름 끝에 마감 메타 한 줄(소요·모델·출처 수). 진행 단계는 접지 않고 그대로
+          // 남긴다 — 이미 읽고 지나간 줄이 사라지면 아래 본문이 위로 점프한다.
           completeActiveStep();
-          const stepCount = traceBody.querySelectorAll(".step").length;
+          const stepCount = flow.querySelectorAll(".step").length;
           // 출처 0인 턴(파라메트릭 즉답)은 "N단계 탐색"이 근거 있는 검색처럼 읽히는 착시를
-          // 만든다 — 중립 표기("응답 X초")로만 접는다. 출처가 있을 때만 탐색·출처 요약.
+          // 만든다 — 중립 표기("응답 X초")로만 적는다. 출처가 있을 때만 탐색·출처 요약.
           if (cardMap.size) {
             const parts = [];
             if (stepCount) parts.push(`${stepCount}단계 탐색`);
             parts.push(`출처 ${cardMap.size}개`);
             parts.push(`${elapsedSec.toFixed(1)}초`);
             if (modelSaved) parts.push(`모델 ${modelSaved}`);
-            collapseTrace("🔍 " + parts.join(" · "));
+            meta.textContent = "🔍 " + parts.join(" · ");
           } else {
             const parts = [`응답 ${elapsedSec.toFixed(1)}초`];
             if (modelSaved) parts.push(`모델 ${modelSaved}`);
-            collapseTrace(parts.join(" · "));
+            meta.textContent = parts.join(" · ");
           }
           scrollToBottom();
         },
@@ -1055,42 +1111,48 @@
           errored = true;
           errorText = message || "오류가 발생했어요.";
           completeActiveStep();
-          collapseTrace("⚠️ 오류로 중단됨");
-          bubble.className = "bubble error";
-          bubble.textContent = errorText;
+          clearTyping();
+          meta.textContent = "⚠️ 오류로 중단됨";
+          const box = document.createElement("div");
+          box.className = "bubble error";
+          box.textContent = errorText;
+          flow.appendChild(box);
           scrollToBottom();
         },
         markStopped() {
-          // 중지는 파괴가 아니다 — 이미 스트리밍된 본문은 사용자가 읽고 있던 답이라 지우지 않고,
-          // 진행 블록만 "중지됨"으로 접는다. 한 글자도 못 받았을 때만 안내 말풍선으로 대체한다.
-          if (!rawText) { this.showError("응답을 중지했어요."); return; }
+          // 중지는 파괴가 아니다 — 이미 스트리밍된 본문은 사용자가 읽고 있던 답이라 지우지
+          // 않고 메타만 "중지됨"으로 적는다. 한 글자도 못 받았을 때만 안내로 대체한다.
+          if (!bodyText()) { this.showError("응답을 중지했어요."); return; }
           completeActiveStep();
-          collapseTrace("⏹ 중지됨");
+          clearTyping();
+          meta.textContent = "⏹ 중지됨";
           scrollToBottom();
         },
         markEmptyIfUntouched() {
           // 에러 말풍선은 그대로 둔다(안내 문구를 덮어쓰지 않는다).
-          if (!rawText && !errored) {
-            bubble.classList.remove("empty");
-            bubble.textContent = "(응답이 없었어요)";
+          if (!bodyText() && !errored) {
+            clearTyping();
+            const box = document.createElement("div");
+            box.className = "bubble empty";
+            box.textContent = "(응답이 없었어요)";
+            flow.appendChild(box);
           }
         },
         // 이 턴을 스냅샷 한 조각으로 — 복원은 addSource + finalize를 그대로 다시 태운다
         // (라이브와 복원이 같은 렌더 경로). 본문도 오류도 없으면 저장할 게 없다(null).
         toSnapshot() {
           if (errored) return { role: "assistant", error: errorText };
-          if (!rawText) return null;
+          const text = bodyText();
+          if (!text) return null;
           return {
             role: "assistant",
-            text: rawText,
+            text,
             sources: [...srcById.values()].map(sourceSnapshot),
             cited_ids: citedList,
             elapsed: elapsedSaved,
             model: modelSaved,
           };
         },
-        // 복원된 턴엔 재현할 실시간 진행 과정이 없다 — 빈 진행 블록을 남기지 않고 제거한다.
-        dropTrace() { trace.remove(); },
       };
     }
 
@@ -1136,7 +1198,6 @@
             turn.elapsed || 0
           );
         }
-        asst.dropTrace();
       }
     }
 
@@ -1193,7 +1254,7 @@
         });
         await readEventStream(resp, (event, data) => {
           if (event === "status") {
-            asst.setStatus(data.stage, data.detail);
+            asst.setStatus(data.stage, data.detail, data.refs);
           } else if (event === "source") {
             asst.addSource(data);
           } else if (event === "delta") {

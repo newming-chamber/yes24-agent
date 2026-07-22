@@ -38,14 +38,33 @@ function appendTextSlice(target, slice, afterMarker, beforeMarker) {
   if (s) target.appendChild(document.createTextNode(s));
 }
 
-function makeMarker(sid, onMarker) {
-  const badge = document.createElement("sup");
+// 마커는 url을 알면 **하이퍼링크**, 모르면 기존 칩이다. 두 갈래 모두 class="marker"라
+// CSS·간격 규칙은 하나로 유지된다. url 검증(스킴 화이트리스트)은 호출부가 소유한다 —
+// opts.citationUrl은 이미 안전한 url이거나 빈 문자열을 돌려주기로 한 계약이다
+// (index.html은 lib/sources.js의 isSafeUrl을 쓴다. 여기에 정규식을 복제하지 않는다).
+function makeMarker(sid, opts) {
+  const href = opts.citationUrl ? opts.citationUrl(sid) : "";
+  // 앵커는 포커스·Enter·새 창을 네이티브로 준다 — tabIndex·role·keydown 수동 배선 불필요.
+  // 칩 폴백(url 없음)만 버튼 시맨틱을 갖는다.
+  const badge = document.createElement(href ? "a" : "sup");
   badge.className = "marker";
   badge.textContent = sid;
+  if (href) {
+    badge.href = href;
+    badge.target = "_blank";
+    badge.rel = "noopener noreferrer";
+    badge.setAttribute("aria-label", "출처 " + sid + " 열기 (새 창)");
+    // 이동은 기본 동작에 맡기고, 같은 클릭으로 출처 카드도 강조한다(마커↔카드 연동 보존).
+    badge.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (opts.onMarker) opts.onMarker(sid);
+    });
+    return badge;
+  }
   badge.tabIndex = 0;
   badge.setAttribute("role", "button");
   badge.setAttribute("aria-label", "출처 " + sid + " 보기");
-  const fire = (e) => { e.stopPropagation(); if (onMarker) onMarker(sid); };
+  const fire = (e) => { e.stopPropagation(); if (opts.onMarker) opts.onMarker(sid); };
   badge.addEventListener("click", fire);
   badge.addEventListener("keydown", (e) => {
     if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fire(e); }
@@ -60,7 +79,7 @@ function renderMarkersInto(target, text, opts) {
     const ids = m[1].split(",").map((s) => s.trim()).filter(Boolean);
     if (!ids.length || !ids.every((sid) => opts.isCitation(sid))) continue; // 평문으로 남긴다
     appendTextSlice(target, text.slice(last, m.index), afterMarker, true);
-    ids.forEach((sid) => target.appendChild(makeMarker(sid, opts.onMarker)));
+    ids.forEach((sid) => target.appendChild(makeMarker(sid, opts)));
     last = re.lastIndex;
     afterMarker = true;
   }
@@ -114,13 +133,16 @@ function splitCells(line) {
 
 /**
  * 본문을 container에 렌더한다(기존 내용은 지운다).
- * opts.isCitation(id) → 그 id가 이번 턴 출처인가(배지 승격 조건). 기본: 승격 없음.
- * opts.onMarker(id)   → 배지 클릭·Enter 시 호출.
+ * opts.isCitation(id)  → 그 id가 이번 턴 출처인가(배지 승격 조건). 기본: 승격 없음.
+ * opts.onMarker(id)    → 배지 클릭·Enter 시 호출.
+ * opts.citationUrl(id) → 그 id의 **검증된 안전한** url(없으면 ""). 있으면 마커가 하이퍼링크,
+ *                        없으면 기존 칩. 기본: 링크 없음(매트릭스는 이 옵션을 주지 않는다).
  */
 export function renderBody(container, text, opts = {}) {
   const o = {
     isCitation: opts.isCitation || (() => false),
     onMarker: opts.onMarker || null,
+    citationUrl: opts.citationUrl || null,
   };
   container.textContent = "";
   const lines = (text || "").split("\n");

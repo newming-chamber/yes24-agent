@@ -153,6 +153,16 @@ def project_public_source(source: dict) -> dict:
 build_source_event = project_public_source
 
 
+def project_source_ref(source_event: dict) -> dict:
+    """출처 이벤트에서 **스트리밍 중 마커를 렌더할 최소 정보만** 투영한다(id·url).
+
+    _status_for_result가 건수(int)만 받아 상품 사실 누출을 시그니처로 봉인한 것과 같은
+    규율이다 — 제목·저자·가격·평점은 여기로 나가지 않는다(원칙 4a). url은 마커를
+    하이퍼링크로 만들기 위한 것이고, 없으면 프론트가 링크 대신 칩으로 폴백한다.
+    """
+    return {"id": source_event.get("id"), "url": source_event.get("url") or ""}
+
+
 def _sources_from_response(payload: dict) -> list[dict]:
     """도구 응답에서 노출할 출처 dict 목록을 방어적으로 뽑아낸다.
 
