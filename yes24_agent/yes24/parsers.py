@@ -500,7 +500,16 @@ def extract_links(
 
 
 def extract_faq_entries(soup: BeautifulSoup) -> list[dict[str, str]]:
-    """첫 번째 비어 있지 않은 FAQ 목록을 질문·답변 entry 구조로 추출한다."""
+    """선언된 FAQ 목록을 **전부** 순회해 질문·답변 entry로 추출한다.
+
+    과거엔 첫 비어 있지 않은 목록에서 즉시 반환했다. 그런데 반품 FAQ에서 일반 도서
+    단순변심 조항("출고 완료 후 10일 이내", "반송비는 고객 부담")은 `#faqTop10List`에만
+    있고 `#faqCateList`가 6건으로 먼저 잡혀, 그 조항이 **한 번도 읽히지 않았다**.
+    모델이 본 유일한 "10일" 문구가 CD/LP 항목 안에 있어 그걸 일반 도서로 일반화했다
+    (하네스 yes24-policy의 재현 실패 — 재실행마다 CD/LP·중고도서·창작으로 다르게 발현).
+    `FAQ_ENTRY_LISTS`가 이미 두 목록을 선언해 두었으므로 선언된 의도대로 되돌린다.
+    """
+    collected: list[dict[str, str]] = []
     for list_selector in FAQ_ENTRY_LISTS:
         container = soup.select_one(list_selector)
         if container is None:
@@ -517,9 +526,8 @@ def extract_faq_entries(soup: BeautifulSoup) -> list[dict[str, str]]:
             answer_text = _normalize_whitespace(answer.get_text(" ", strip=True))
             if question_text and answer_text:
                 entries.append({"question": question_text, "answer": answer_text})
-        if entries:
-            return entries
-    return []
+        collected.extend(entries)
+    return collected
 
 
 def _context_first(pages: list[dict], page_url: str | None) -> list[dict]:

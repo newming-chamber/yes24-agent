@@ -771,8 +771,9 @@
       // 진행 흐름: 진행 단계 행과 본문 블록이 **도착 순서대로** 이 한 열에 쌓인다.
       const flow = document.createElement("div");
       flow.className = "flow";
-      // 진행 상태는 스크린리더에 조용히 알린다(본문 델타는 낭독 폭주라 제외).
-      flow.setAttribute("aria-live", "polite");
+      // aria-live는 .flow에 걸지 않는다. 이 컨테이너는 진행 단계와 **본문 블록**을 함께
+      // 담으므로, 여기 걸면 토큰이 붙을 때마다 본문 전체가 반복 낭독된다(낭독 폭주).
+      // 대신 진행 단계 행 각각에 건다 — 짧고 한 번만 바뀌는 텍스트라 안전하다.
 
       const sources = document.createElement("div");
       sources.className = "sources";
@@ -1014,6 +1015,9 @@
           ico.textContent = STATUS_ICON[stage] || "•";
           const label = document.createElement("span");
           label.className = "step-label";
+          // 진행 단계만 조용히 낭독한다. 짧고 한 번 쓰이면 바뀌지 않아 안전하다
+          // (본문 블록에 걸면 토큰마다 전체가 다시 읽힌다).
+          label.setAttribute("aria-live", "polite");
           label.textContent = detail;
           step.append(ico, label);
           flow.appendChild(step);
