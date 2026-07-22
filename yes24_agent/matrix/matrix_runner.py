@@ -36,7 +36,7 @@ import uuid
 from collections.abc import AsyncIterator
 
 from yes24_agent.config import get_settings
-from yes24_agent.event_translate import TURN_START_STATUS, project_public_source
+from yes24_agent.event_translate import project_public_source
 from yes24_agent.matrix.generate import generate_matrix
 from yes24_agent.matrix.retrieval import build_shared_pool
 from yes24_agent.rbti.persona import axis_label, get_archetype_name
@@ -69,7 +69,6 @@ async def run_matrix_stream(question: str, session_id: str | None = None) -> Asy
             }
         )
 
-    yield sse_status(*TURN_START_STATUS)
 
     try:
 

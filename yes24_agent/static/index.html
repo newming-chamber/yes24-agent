@@ -1241,9 +1241,9 @@
       input.style.height = "auto";
 
       const asst = createAssistantMessage();
-      // 진행 라벨 문구는 서버가 정한다(event_translate.TURN_START_STATUS). 여기서 같은
-      // 문자열을 또 만들면 한쪽만 바뀔 때 라벨이 두 번 뜬다 — 제출 직후의 즉시 반응은
-      // 타이핑 인디케이터가 이미 담당한다.
+          // 턴 시작 라벨은 두지 않는다. 아무 일도 일어나기 전의 문구는 설명할 런타임
+          // 전이가 없어 "재시도 중"·"확인하는 중" 류의 거짓 라벨과 같은 계열이다.
+          // 제출 직후의 즉시 반응은 타이핑 인디케이터가 담당한다.
       setSending(true);
 
       controller = new AbortController();

@@ -215,6 +215,7 @@ def create_app() -> FastAPI:
                     max_age=settings.access_cookie_max_age_s,
                     httponly=True,
                     samesite="lax",
+                    secure=settings.cookie_secure,
                 )
                 return resp
             # 실패: 로그인 페이지로 되돌리며 에러 표시(?error=1).

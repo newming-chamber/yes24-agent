@@ -329,6 +329,10 @@ def register_admin(app: FastAPI, settings: Settings) -> None:
             max_age=settings.access_cookie_max_age_s,
             httponly=True,
             samesite="lax",
+            secure=settings.cookie_secure,
+            # admin 쿠키를 읽는 곳은 전부 /admin 하위(admin.html의 fetch 3종 + 이 로그인)라
+            # path를 좁힌다. 기본 "/"면 채팅·SSE·정적 요청마다 운영자 토큰이 함께 실려 나간다.
+            path=router.prefix,
         )
         return resp
 

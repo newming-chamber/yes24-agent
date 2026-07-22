@@ -30,12 +30,6 @@ def _angles(queries) -> list[str]:
     return [q for q in queries if isinstance(q, str) and q.strip()]
 
 
-# 턴 시작 라벨. 도구 호출에서 파생되지 않는 유일한 status라 과거엔 runner와 프론트에
-# 각자 흩어져 있었고(같은 문자열 3벌), 한쪽만 고치면 라벨이 두 번 뜨는 취약 구조였다.
-# 사용자 노출 문구의 단일 출처는 서버다 — 프론트는 서버가 보낸 값만 렌더한다.
-TURN_START_STATUS: tuple[str, str] = ("thinking", "질문을 확인하고 있어요")
-
-
 def _status_for_call(call) -> tuple[str, str] | None:
     """도구 이름별 진행 status(stage, detail)를 만든다. 알릴 진행이 없으면 None.
 

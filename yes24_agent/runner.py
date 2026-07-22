@@ -26,7 +26,6 @@ from yes24_agent.agent import (
 )
 from yes24_agent.config import get_settings
 from yes24_agent.event_translate import (
-    TURN_START_STATUS,
     _reconcile_sources,
     _sources_from_response,
     _status_for_call,
@@ -253,9 +252,6 @@ async def run_agent_stream(
         # 이전 턴들이 남긴 출처 레지스트리(멀티턴 영속). 턴 시작 시점에 고정해 두고 인용
         # **검증 집합**에만 합친다(_citable_sources). 공개 채널은 원칙 4대로 인용분만.
         prior_sources = get_sources(session.state)
-
-        # 첫 프레임을 곧바로 흘려 스트림이 살아 있음을 알린다(문구는 event_translate 단일 출처).
-        yield sse_status(*TURN_START_STATUS)
 
 
         # 스트림에서 관찰한 출처를 누적한다. 병렬 도구 실행 시 세션 state가 유실될 수

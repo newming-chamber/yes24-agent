@@ -132,6 +132,11 @@ class Settings(BaseSettings):
     access_password: str = ""
     # 로그인 쿠키 유효기간(초). 데모 접근 게이트라 재로그인 성가심을 줄이되 무한은 아니게 7일.
     access_cookie_max_age_s: int = 7 * 24 * 60 * 60
+    # 로그인·admin 쿠키에 `Secure`를 붙일지. **기본 False가 의도**다 — 현재 배포(deploy-mq.sh)는
+    # 리버스 프록시·TLS 없이 평문 http로 노출돼, Secure를 켜면 브라우저가 쿠키를 버려 로그인이
+    # 통째로 깨진다. TLS 종단(프록시·ALB)이 생기면 env `COOKIE_SECURE=true`로 코드 수정 없이
+    # 켠다. httponly·samesite는 평문에서도 안전해 플래그 없이 항상 켜져 있다.
+    cookie_secure: bool = False
     # refine·selection 모두 채팅과 같은 pro(model_name)를 쓴다. refine은 추상·분위기형 추천에서
     # 취향을 좁히는 구체 검색씨앗(대표 저자·작품·하위장르)을 내야 하는데, flash는 추론 여지가
     # 있어도 이를 불안정하게 내(넓은 카테고리어 '한국 소설'로 흘러 베스트셀러·참고서 잡탕 풀)
