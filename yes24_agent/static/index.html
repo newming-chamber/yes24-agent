@@ -506,7 +506,7 @@
     ];
     const STATUS_ICON = {
       thinking: "💭", searching: "🔎", searching_web: "🌐", reading: "📖",
-      reading_web: "📄", browsing: "📚", notice: "⚠️",
+      reading_web: "📄", browsing: "📚", notice: "⚠️", found: "✅",
     };
     const TYPE_LABEL = {
       search_result: "검색결과", book_detail: "상세",
@@ -955,7 +955,9 @@
       return {
         setStatus(stage, detail) {
           // 연속 동일 단계는 중복 추가하지 않는다(같은 도구가 상태만 반복 전송하는 경우).
-          const key = stage + "|" + (detail || "");
+          // 같은 stage|detail 연속 중복은 접되, found는 제외한다 — 같은 건수를 두 번
+          // 찾은 것은 실제로 두 번 일어난 일이라 접으면 단계가 사라진다.
+          const key = stage === "found" ? Symbol() : stage + "|" + (detail || "");
           if (key === lastStepKey) return;
           lastStepKey = key;
           // 직전 단계를 완료로 마감하고 새 단계를 진행 과정 스트림에 누적한다(덮어쓰지 않음).
@@ -992,8 +994,7 @@
           renderBody(rawText);
           scrollToBottom();
         },
-        // 스트리밍 중 진행발화가 폐기될 때(백엔드 reset 이벤트) 흘린 본문 버블을 비우고
-        // 다음 스트림을 새로 시작한다. 최종 답변만 남기기 위해(진행 발화는 본문 소유권 없음).
+        // 백엔드 reset: 흘린 본문을 비우고 정본을 다시 받는다(인용 검증이 본문을 바꾼 경우).
         resetBody() {
           rawText = "";
           firstDelta = false;
@@ -1172,7 +1173,9 @@
       input.style.height = "auto";
 
       const asst = createAssistantMessage();
-      asst.setStatus("thinking", "질문을 확인하고 있어요");
+      // 진행 라벨 문구는 서버가 정한다(event_translate.TURN_START_STATUS). 여기서 같은
+      // 문자열을 또 만들면 한쪽만 바뀔 때 라벨이 두 번 뜬다 — 제출 직후의 즉시 반응은
+      // 타이핑 인디케이터가 이미 담당한다.
       setSending(true);
 
       controller = new AbortController();

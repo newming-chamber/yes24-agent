@@ -1305,7 +1305,8 @@
     document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !tourneyBackdrop.hidden) closeTourney(); });
 
     // ── 상태 ──
-    const STATUS_TEXT = { thinking: "Yes24 도서 근거를 확인하고 있어요", generating: "16가지 독서 성향으로 살펴보고 있어요" };
+    // 서버가 detail을 보내지 못한 단계의 폴백만 남긴다(thinking은 서버가 항상 보낸다).
+    const STATUS_TEXT = { generating: "16가지 독서 성향으로 살펴보고 있어요" };
     function setStatus(stage, detail) {
       statusBar.classList.remove("done", "error");
       statusText.textContent = detail || STATUS_TEXT[stage] || "처리 중…";

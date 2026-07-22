@@ -19,6 +19,18 @@ def format_sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {body}\n\n"
 
 
+def sse_reset() -> str:
+    """이미 흘려보낸 본문 버블을 비우게 하는 이벤트.
+
+    본문을 토큰 스트리밍하는 이상, 인용 검증이 무효 마커를 지워 최종 본문이 바뀌면
+    사용자가 본 것과 done.text가 어긋난다("delta 합계 == done.text", 원칙 4b).
+    이미 보낸 것은 무를 수 없으므로 프론트에 비우게 하고 정본을 다시 보낸다.
+    홀드 방식으로 되돌리면 이 이벤트가 필요 없어지지만, 그러면 토큰 스트리밍이 통째로
+    죽는다(실측: 2,385자 답변이 12.4초 무출력 → 스트리밍 복원 후 48조각/6.0초 시작).
+    """
+    return format_sse("reset", {})
+
+
 def sse_status(stage: str, detail: str = "") -> str:
     """진행 상태 이벤트 (예: "Yes24 검색 중…")."""
     return format_sse("status", {"stage": stage, "detail": detail})
@@ -64,12 +76,6 @@ def sse_delta(text: str, col: int | None = None, extra: dict | None = None) -> s
     """
     data = {"text": text, **extra} if extra else {"text": text}
     return format_sse("delta", _with_col(data, col))
-
-
-def sse_reset() -> str:
-    """스트리밍 중 도구 호출로 진행 발화가 폐기될 때, 프론트가 지금까지 흘린 본문 버블을
-    비우게 하는 이벤트. 최종 답변만 남기기 위해(진행 발화는 본문 소유권 없음, 원칙 4b)."""
-    return format_sse("reset", {})
 
 
 def sse_done(payload: dict, col: int | None = None) -> str:

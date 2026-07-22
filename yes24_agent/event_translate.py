@@ -30,6 +30,12 @@ def _angles(queries) -> list[str]:
     return [q for q in queries if isinstance(q, str) and q.strip()]
 
 
+# 턴 시작 라벨. 도구 호출에서 파생되지 않는 유일한 status라 과거엔 runner와 프론트에
+# 각자 흩어져 있었고(같은 문자열 3벌), 한쪽만 고치면 라벨이 두 번 뜨는 취약 구조였다.
+# 사용자 노출 문구의 단일 출처는 서버다 — 프론트는 서버가 보낸 값만 렌더한다.
+TURN_START_STATUS: tuple[str, str] = ("thinking", "질문을 확인하고 있어요")
+
+
 def _status_for_call(call) -> tuple[str, str] | None:
     """도구 이름별 진행 status(stage, detail)를 만든다. 알릴 진행이 없으면 None.
 
@@ -97,6 +103,18 @@ _ERROR_STATUS_FALLBACK: tuple[str, str] = ("notice", "정보를 가져오지 못
 def _status_for_error(payload: dict) -> tuple[str, str]:
     """도구 error 응답의 error_type별 status(stage, detail)를 만든다."""
     return _ERROR_STATUS.get(payload.get("error_type"), _ERROR_STATUS_FALLBACK)
+
+
+def _status_for_result(count: int) -> tuple[str, str] | None:
+    """도구 결과 도착을 **건수만으로** 알린다. 0건이면 알릴 진행이 없다(None).
+
+    인자를 int로 못박아 상품 사실(제목·가격·평점)이 이 경로로 새는 것을 시그니처로 봉인한다.
+    payload를 통째로 받는 순간 4a 우회로가 생기므로 넓히지 말 것. 도구별 분기도 없다 —
+    건수는 모든 검색·열람 도구가 같은 이름(result_count)으로 내는 구조 신호다.
+    """
+    if count <= 0:
+        return None
+    return "found", f"{count}건 찾았어요"
 
 
 # 출처 카드(sse_source)와 인용 검증에 함께 쓰이는 출처 이벤트의 **단일 정의**. 예전엔 runner와
