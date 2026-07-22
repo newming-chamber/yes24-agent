@@ -196,6 +196,9 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8010
     cors_origins: list[str] = ["http://localhost:3000"]  # `*`+credentials 조합 금지 — 명시 목록
+    # 진행 status detail 상한(문자). 예고는 모델이 쓴 자유 텍스트라 길 수 있는데,
+    # 진행 타임라인 한 줄은 짧아야 읽힌다. 문구를 만들지 않고 길이만 자른다.
+    status_detail_max_chars: int = 120
     sse_timeout_s: float = 180.0
     app_name: str = "yes24-agent"
     # 요청 본문 상한(문자). ChatRequest.message·MatrixRequest.question에 pydantic max_length로

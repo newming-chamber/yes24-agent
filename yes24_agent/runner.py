@@ -172,11 +172,47 @@ def _best_effort_text(pending: list[str], final_text: str) -> str:
     final response를 우선하고, 없을 때만 대기 버퍼를 조립한다. 확보된 본문이 없으면 빈 문자열을
     반환해 호출부의 최후 방어가 채우게 둔다.
     """
-    # 흘려보낸 조각의 합이 곧 본문이다. ADK의 aggregate final은 **마지막 모델 턴만** 담아
-    # 도구 호출 앞의 예고를 빠뜨리는데, 예고도 본문으로 내보내기로 했으므로(사용자 방향)
-    # 그걸 정본으로 삼으면 delta 합계와 done.text가 어긋난다(원칙 4b). partial이 하나도
-    # 없었던 경우에만 aggregate로 폴백한다.
+    # `pending`은 도구 경계에서 예고 세그먼트가 제거된 뒤의 본문이다(예고는 status로 갔다).
+    # 그래서 이 값이 곧 화면에 흐른 본문이고 done.text와 같아야 한다(원칙 4b).
+    # partial이 하나도 없었던 경우에만 aggregate final로 폴백한다.
     return "".join(pending) or final_text
+
+
+def _preface_only(pending: list[str], preface_mark: int) -> bool:
+    """확보한 본문이 **도구 예고뿐**인지 판정한다 — 문구가 아니라 세그먼트 경계로.
+
+    `preface_mark`는 마지막 도구 경계까지 소비한 조각 수다. 그 이후에 실질 텍스트가 하나도
+    없다면 사용자가 받은 것은 "…자세히 볼게요."처럼 **이행되지 않은 예고**뿐이다. 상류가
+    도구 결과를 받기 전에 죽으면(Gemini 503 등) 이 상태로 done이 나가, 사용자는 40초를
+    기다려 약속만 남은 답변을 본다(도그푸딩 2/48턴).
+
+    문구·키워드로 예고를 탐지하지 않는다. 경계 인덱스는 런타임이 도구 호출 이벤트에서
+    직접 기록한 구조 신호이므로, 예고 문장이 어떻게 쓰였든 판정이 흔들리지 않는다.
+    """
+    return bool(pending) and preface_mark > 0 and not "".join(pending[preface_mark:]).strip()
+
+
+def _ensure_substantive_text(payload: dict, *, preface_only: bool) -> bool:
+    """실질 내용이 없는 본문을 최후 방어 안내로 대체한다(대체했으면 True).
+
+    정상·타임아웃·예외 **세 경로가 같은 판정을 쓴다**. 정상 경로에만 두면 드문 실패
+    경로에서 같은 결함이 계속 재발한다(require_evidence가 그랬듯이).
+    """
+    if preface_only or not (payload.get("text") or "").strip():
+        payload["text"] = _EMPTY_RESPONSE_FALLBACK
+        return True
+    return False
+
+
+def _guard_orphan_preface(
+    payload: dict, pending: list[str], preface_mark: int, session_id: str
+) -> None:
+    """실패 경로(타임아웃·예외) 공통 마감 가드 — 예고뿐/빈 본문을 안내로 대체한다."""
+    if _ensure_substantive_text(payload, preface_only=_preface_only(pending, preface_mark)):
+        logger.warning(
+            "실패 경로의 본문이 비었거나 예고뿐이라 최후 방어 안내로 대체합니다(session_id=%s).",
+            session_id,
+        )
 
 
 def _final_body_delta(payload: dict) -> str:
@@ -270,8 +306,11 @@ async def run_agent_stream(
         # 직전 도구 경계까지 예고로 소비한 조각 수. 예고는 **경계 이후 새로 온 부분만** 실어야
         # 한다 — 버퍼 전체를 쓰면 두 번째 예고에 첫 예고가 그대로 따라붙는다(실측).
         preface_mark = 0
-        # 이미 delta로 흘려보낸 본문. 예외 핸들러도 참조하므로 try 진입 전에 바인딩한다.
-        streamed_text = ""
+        # 첫 도구 호출 전 모델 텍스트를 잠깐 잡아 두는 버퍼. 도구가 오면 예고로 확정해
+        # status로 보내고, 도구 없이 끝나면 그대로 본문이 된다. None이면 홀드 종료(그 뒤로는
+        # 즉시 스트리밍) — 첫 도구 호출 이후 텍스트는 최종 본문이 확실하기 때문이다.
+        held: list[str] | None = []
+
         final_text = ""
         emitted_output = False
         retried_overload = False
@@ -346,27 +385,26 @@ async def run_agent_stream(
                         raise
 
                     if not event.partial and event.get_function_calls():
-                        # 도구 호출 앞의 텍스트(예고)는 **본문에 그대로 둔다**. status로
-                        # 복사하지도, 마감에서 잘라내지도 않는다 — 프론트가 진행 단계와
-                        # 본문 조각을 도착 순서대로 한 열에 쌓으므로, 예고들은 답변 머리에
-                        # 적층되는 게 아니라 각자 자기 도구 단계 앞에 놓여 서사가 된다.
-                        # (과거의 "마지막 예고만 남기기"는 이 서사를 done에서 지우면서
-                        # 매 다도구 턴마다 reset+전체 재delta를 유발했다.)
-                        segment = "".join(pending[preface_mark:])
+                        if held and not _markdown_block_is_open("".join(pending)):
+                            # 도구 호출이 왔다 = 앞 텍스트는 예고로 확정.
+                            # 단 표·코드펜스가 열려 있으면 그 앞 문단은 본문의 일부이지
+                            # 예고가 아니다(표 중간에 도구 호출이 오는 경우).
+                            # 예고가 아니다(표 중간에 도구 호출이 오는 경우).
+                            # 되돌릴 reset이 필요 없다** — 과거 전량 홀드는 최종 본문까지
+                            # 잡아 토큰 스트리밍을 죽였는데(1,779자 12.4초 무출력), 여기서는
+                            # 첫 도구 호출 전 구간만 잡고 그 뒤로는 즉시 흘린다.
+                            label = " ".join("".join(held).split())
+                            held.clear()
+                            if label:
+                                emitted_output = True
+                                yield sse_status(
+                                    "preface", label[: settings.status_detail_max_chars]
+                                )
                         preface_mark = len(pending)
-                        if (
-                            segment.strip()
-                            and not segment.endswith("\n\n")
-                            and not _markdown_block_is_open("".join(pending))
-                        ):
-                            # 예고와 답변이 한 문장처럼 붙지 않게 문단을 띄운다.
-                            # 단 표·코드펜스가 열려 있으면 넣지 않는다 — 빈 줄이 그 구조를
-                            # 그 자리에서 끝내 뒤 행이 생 파이프로 남는다(프론트 복구 불가).
-                            gap = "\n\n"
-                            pending.append(gap)
-                            preface_mark = len(pending)
-                            emitted_output = True
-                            yield sse_delta(gap)
+                        # 홀드를 다시 연다. 예고는 **매 도구 호출 직전**에 오므로(실측: 모델은
+                        # 첫 라운드엔 텍스트 없이 도구를 부르고, 라운드 2+에서 예고를 쓴다)
+                        # 첫 경계에서 홀드를 닫으면 그 뒤 예고가 전부 본문으로 샌다.
+                        held = []
                         for call in event.get_function_calls():
                             status = _status_for_call(call)
                             if status is None:
@@ -414,9 +452,38 @@ async def run_agent_stream(
                     if event.partial:
                         chunk = _event_text(event)
                         if chunk:
-                            pending.append(chunk)
-                            emitted_output = True
-                            yield sse_delta(chunk)
+                            if held is None:
+                                pending.append(chunk)
+                                emitted_output = True
+                                yield sse_delta(chunk)
+                            else:
+                                # 예고 후보 구간: 아직 흘리지 않는다. 도구 호출이 오면
+                                # 예고로 확정돼 status로 가고 본문에서 빠지며, 도구 없이
+                                # 끝나면 최종 본문이므로 마감에서 한 번에 나간다.
+                                # **화면에 안 나갔으므로 되돌릴 reset도 필요 없다.**
+                                held.append(chunk)
+                                # 예고는 **한 문단**이고, 그 뒤엔 도구 호출이 온다(텍스트가
+                                # 아니라). 그러므로 문단이 닫힌 뒤에도 텍스트가 계속 오면
+                                # 그건 예고가 아니라 본문이다 — 홀드분을 **순서대로 먼저**
+                                # 흘리고 홀드를 푼다. 순서를 뒤집으면 4b가 깨진다(실측).
+                                # 전량을 잡으면 토큰 스트리밍이 죽는다(2,388자 delta 1개).
+                                buffered = "".join(held)
+                                cut = buffered.find("\n\n")
+                                if cut >= 0:
+                                    # 문단이 닫혔다 = 앞은 예고 후보로 계속 잡아 두고,
+                                    # **뒤만** 흘린다. 통째로 흘리면 예고가 화면에 샌다.
+                                    held[:] = [buffered[: cut + 2]]
+                                    rest = buffered[cut + 2 :]
+                                elif len(buffered) > settings.status_detail_max_chars:
+                                    # 문단이 안 닫힌 채 예고 길이를 넘었다 = 본문이다.
+                                    held = None
+                                    rest = buffered
+                                else:
+                                    rest = ""
+                                if rest:
+                                    pending.append(rest)
+                                    emitted_output = True
+                                    yield sse_delta(rest)
                         continue
 
                     if event.is_final_response():
@@ -424,15 +491,16 @@ async def run_agent_stream(
                         if text:
                             final_text = text
 
-                # 실제로 화면에 흘려보낸 본문. 마감에서 정본과 대조해 달라졌으면(인용 검증이
-                # 무효 마커를 지운 경우) reset 후 정본을 다시 그린다.
-                streamed_text = "".join(pending)
+                if held:
+                    # 도구 호출 없이 끝났다 = 홀드분은 예고가 아니라 본문이다.
+                    # 아직 화면에 안 나갔으므로 delta로도 함께 내보낸다(4b).
+                    tail = "".join(held)
+                    held = None
+                    if tail:
+                        pending.append(tail)
+                        emitted_output = True
+                        yield sse_delta(tail)
                 answer_text = _best_effort_text(pending, final_text)
-                # 예고 뒤에 실제 답변이 하나도 오지 않았는가. preface_mark는 예고로 소비한
-                # 조각 수이므로, 그게 곧 전체라면 본문은 예고뿐이다("찾아볼게요.\n\n"만 남아
-                # 최후 방어의 strip() 검사를 통과해 버린다). 문구가 아니라 카운터로 판정한다.
-                answer_is_preface_only = preface_mark >= len(pending) and preface_mark > 0
-                pending = []
                 # 근거 스냅샷은 세션 state가 아니라 **스트림 관찰본**으로 만든다. ADK의
                 # deep_merge_dicts가 병렬 도구의 state_delta를 리스트 키에서 last-wins로
                 # 덮어써 한 도구의 출처가 통째로 유실될 수 있기 때문이다(_reconcile_sources
@@ -482,19 +550,20 @@ async def run_agent_stream(
                     )
 
                 final_done = done_payload
-                if answer_is_preface_only or not (final_done.get("text") or "").strip():
+                if _ensure_substantive_text(
+                    final_done, preface_only=_preface_only(pending, preface_mark)
+                ):
                     logger.warning(
-                        "done.text가 비어 최후 방어 안내로 대체합니다"
+                        "본문이 비었거나 예고뿐이라 최후 방어 안내로 대체합니다"
                         "(session_id=%s tools=%d sources=%d rbti=%s).",
                         resolved_session_id,
                         len(observed_tool_calls),
                         len(sources),
                         bool(rbti),
                     )
-                    final_done["text"] = _EMPTY_RESPONSE_FALLBACK
                 for source in final_done.get("sources", []):
                     yield sse_source(source)
-                for frame in _emit_final_body(streamed_text, final_done):
+                for frame in _emit_final_body("".join(pending), final_done):
                     yield frame
                 yield sse_done(final_done)
                 break
@@ -507,6 +576,13 @@ async def run_agent_stream(
             )
             error_text = "응답이 너무 지연되고 있어요. 잠시 후 다시 시도해 주세요."
             yield sse_error(error_text)
+            if held:
+                tail = "".join(held)
+                held = None
+                if tail:
+                    pending.append(tail)
+                    emitted_output = True
+                    yield sse_delta(tail)
             best_effort = _best_effort_text(pending, final_text)
             _, error_done = _finalize_answer(
                 best_effort,
@@ -514,11 +590,11 @@ async def run_agent_stream(
                 resolved_session_id,
             )
             error_done["model"] = active_model
+            _guard_orphan_preface(error_done, pending, preface_mark, resolved_session_id)
             for source in error_done.get("sources", []):
                 yield sse_source(source)
             # pending은 "흘려보낸 조각"과 동일하다(모든 append 옆에 sse_delta가 있다).
-            # 정상 경로가 이미 비웠다면 그때 저장해 둔 streamed_text를 쓴다.
-            for frame in _emit_final_body("".join(pending) or streamed_text, error_done):
+            for frame in _emit_final_body("".join(pending), error_done):
                 yield frame
             yield sse_done(error_done)
         except Exception as exc:  # noqa: BLE001 — SSE 스트림 최상위 방어선(마지막 수단)
@@ -530,6 +606,13 @@ async def run_agent_stream(
             logger.exception("스트림 처리 중 예외 발생: %s", exc)
             error_text = "일시적인 오류가 발생했어요. 잠시 후 다시 시도해 주세요."
             yield sse_error(error_text)
+            if held:
+                tail = "".join(held)
+                held = None
+                if tail:
+                    pending.append(tail)
+                    emitted_output = True
+                    yield sse_delta(tail)
             best_effort = _best_effort_text(pending, final_text)
             _, error_done = _finalize_answer(
                 best_effort,
@@ -537,11 +620,11 @@ async def run_agent_stream(
                 resolved_session_id,
             )
             error_done["model"] = active_model
+            _guard_orphan_preface(error_done, pending, preface_mark, resolved_session_id)
             for source in error_done.get("sources", []):
                 yield sse_source(source)
             # pending은 "흘려보낸 조각"과 동일하다(모든 append 옆에 sse_delta가 있다).
-            # 정상 경로가 이미 비웠다면 그때 저장해 둔 streamed_text를 쓴다.
-            for frame in _emit_final_body("".join(pending) or streamed_text, error_done):
+            for frame in _emit_final_body("".join(pending), error_done):
                 yield frame
             yield sse_done(error_done)
         finally:
