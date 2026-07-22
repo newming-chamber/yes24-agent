@@ -467,7 +467,7 @@
     // ?v=1은 **일회성** 캐시 탈출구다: no-cache 헤더가 붙기 전 구버전을 heuristic-freshness로
     // 붙든 브라우저가 무쿼리 URL을 재요청하지 않는 문제를, 한 번도 캐시된 적 없는 새 URL로 우회한다.
     // 이후 모듈이 바뀌어도 이 숫자를 올릴 필요 없다 — 서버 no-cache가 매번 재검증하니까(자라지 않음).
-    import { renderBody as renderMarkdown } from "/static/lib/md.js?v=1";
+    import { renderBody as renderMarkdown, canSplitAfter } from "/static/lib/md.js?v=1";
     import { readEventStream } from "/static/lib/sse.js?v=1";
     import {
       AXES as RBTI_AXES, parseCode as parseRbtiCode, deriveCode, deriveAxisLabel,
@@ -880,15 +880,18 @@
         return block;
       }
 
-      // 델타를 받을 블록을 고른다. **문단 경계에서만** 새 블록을 연다 — 표(연속 파이프
-      // 라인)·코드펜스(여닫이)가 블록 경계에 걸리면 md.js의 라인 스캐너가 양쪽에서 깨지기
-      // 때문이다(닫히지 않은 펜스는 다음 블록 전체를 <pre>에 가둔다). 문단 중간에 진행
-      // 단계가 끼어들면 분할하지 않고 현재 블록에 계속 이어 붙인다 — 케이스 분기가 아니라
-      // 구조 규칙이고, 백엔드가 도구 호출 앞에 "\n\n"을 넣으므로 예고 경계는 항상 만족한다.
+      // 델타를 받을 블록을 고른다. **문단 경계이면서 마크다운 구조가 닫혀 있을 때만** 새
+      // 블록을 연다 — 표·코드펜스가 블록 경계에 걸리면 md.js의 라인 스캐너가 양쪽에서
+      // 깨진다(닫히지 않은 펜스는 앞 블록 <pre>가 뒤를 못 삼키고 뒤 코드가 산문이 된다).
+      // 문단 경계 검사만으로는 부족하다: 백엔드가 도구 호출 앞에 "\n\n"을 무조건 넣으므로
+      // 마크다운 상태와 무관하게 항상 통과한다. 그래서 렌더러와 **같은 눈**으로 구조가
+      // 열려 있는지 묻는다(md.js canSplitAfter — 판정을 여기에 복제하지 않는다).
       function blockForDelta() {
         const cur = blocks[blocks.length - 1];
         if (!cur) return pushBlock();
-        if (pendingSplit && (!cur.text || /\n\s*\n\s*$/.test(cur.text))) return pushBlock();
+        const atParagraphEnd = /\n\s*\n\s*$/.test(cur.text);
+        const safe = !cur.text || (atParagraphEnd && canSplitAfter(cur.text));
+        if (pendingSplit && safe) return pushBlock();
         return cur;
       }
 

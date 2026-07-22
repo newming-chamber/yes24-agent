@@ -11,6 +11,7 @@ delta/done/error)의 SSE 프레임으로 번역해 yield한다.
 
 import asyncio
 import logging
+import re
 from collections.abc import AsyncIterator
 
 from google.adk.agents.run_config import RunConfig, StreamingMode
@@ -46,6 +47,7 @@ from yes24_agent.session_service import (
     _resolve_session,
 )
 from yes24_agent.sources import (
+    get_sources,
     merge_turn_source_records,
 )
 from yes24_agent.sse import (
@@ -63,6 +65,30 @@ logger = logging.getLogger(__name__)
 # (레이트리밋·쿼터), 503=UNAVAILABLE(과부하), 500/502/504=일시 서버 오류, 529=Overloaded.
 # 400(bad request)·403·404 등 영구 오류는 제외 ─ 재시도해도 소용없어 정직 안내로 보낸다.
 _OVERLOAD_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 529})
+
+
+_MD_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+_MD_PIPE_RE = re.compile(r"^\s*\|.*\|\s*$")
+
+
+def _markdown_block_is_open(text: str) -> bool:
+    """마크다운 구조(코드펜스·표)가 아직 닫히지 않았는지 판정한다.
+
+    예고 뒤에 문단 구분 "\n\n"을 넣을지 결정하는 데 쓴다. 구조가 열려 있는데 빈 줄을
+    넣으면 **표가 그 자리에서 종료**돼 뒤따르는 행이 생 파이프 평문으로 남는다 —
+    프론트에서는 원리적으로 복구할 수 없다(2026-07-22 실측: 분할을 막아 한 블록으로
+    합쳐도 렌더가 동일하게 깨졌다). 그래서 상류에서 넣지 않는 쪽으로 막는다.
+
+    판정 술어는 `static/lib/md.js`의 `canSplitAfter`와 같다(펜스 개수 홀짝, 마지막 내용
+    줄이 표 행인지). 문구·키워드가 아니라 라인 구조만 본다.
+    """
+    lines = text.split("\n")
+    if sum(1 for line in lines if _MD_FENCE_RE.match(line)) % 2:
+        return True
+    for line in reversed(lines):
+        if line.strip():
+            return bool(_MD_PIPE_RE.match(line))
+    return False
 
 
 def _event_text(event) -> str:
@@ -112,6 +138,31 @@ def _finalize_answer(
     )
     payload["text"] = citation.text
     return citation, payload
+
+
+def _citable_sources(turn_sources: list[dict], prior_sources: list[dict]) -> list[dict]:
+    """인용 검증이 쓸 유효 id 집합 = **이번 턴 관측본 ∪ 세션 레지스트리**.
+
+    모델이 참조하는 id는 `sources.py`의 세션 레지스트리(멀티턴 영속) 것인데, 검증에는
+    이번 턴 스트림 관측본만 넘기고 있었다. 도구를 다시 부르지 않는 연속성 턴은 관측본이
+    비어 유효 집합이 공집합이 되고, **정상 인용이 통째로 폐기됐다**(실측 재현 3/5,
+    `removed=True sources=0`). 그 턴의 수치는 자기 턴1의 접지 수치와 바이트 단위로 같았고
+    라이브 대조에서 전부 사실이었다 — 창작이 아니라 대화 연속성이다.
+
+    이 합집합은 마커를 **더 지우는 게 아니라 덜 지운다**: 삭제 집합이 기존의 진부분집합이라
+    파괴 경로가 구조적으로 없다. 같은 id는 이번 턴 관측이 이긴다(레지스트리의 과거 상세·가격이
+    새 관측을 덮지 못하게 — `_reconcile_sources` 주석의 규율을 그대로 유지).
+
+    원칙 4는 불변이다. 여기서 넓히는 것은 **검증 집합**일 뿐이고, 공개 `source`·
+    `done.sources`는 `build_done_payload`가 `used_source_ids`로 걸러 **이번 턴 최종 본문이
+    실제로 인용한 것만** 싣는다 — 인용되지 않은 레지스트리 출처는 카드로 새지 않는다.
+    """
+    by_id: dict[int, dict] = {}
+    for source in (*prior_sources, *turn_sources):
+        source_id = source.get("id")
+        if source_id is not None:
+            by_id[source_id] = source
+    return [by_id[key] for key in sorted(by_id)]
 
 
 def _best_effort_text(pending: list[str], final_text: str) -> str:
@@ -199,6 +250,9 @@ async def run_agent_stream(
             return
 
         resolved_session_id = session.id
+        # 이전 턴들이 남긴 출처 레지스트리(멀티턴 영속). 턴 시작 시점에 고정해 두고 인용
+        # **검증 집합**에만 합친다(_citable_sources). 공개 채널은 원칙 4대로 인용분만.
+        prior_sources = get_sources(session.state)
 
         # 첫 프레임을 곧바로 흘려 스트림이 살아 있음을 알린다(문구는 event_translate 단일 출처).
         yield sse_status(*TURN_START_STATUS)
@@ -304,10 +358,14 @@ async def run_agent_stream(
                         # 매 다도구 턴마다 reset+전체 재delta를 유발했다.)
                         segment = "".join(pending[preface_mark:])
                         preface_mark = len(pending)
-                        if segment.strip() and not segment.endswith("\n\n"):
-                            # 예고와 답변이 한 문장처럼 붙지 않게 문단을 띄운다. 이 문단
-                            # 경계가 프론트의 블록 분할 지점이기도 하다(표·코드블록이 블록
-                            # 경계에 걸리지 않음을 구조로 보장).
+                        if (
+                            segment.strip()
+                            and not segment.endswith("\n\n")
+                            and not _markdown_block_is_open("".join(pending))
+                        ):
+                            # 예고와 답변이 한 문장처럼 붙지 않게 문단을 띄운다.
+                            # 단 표·코드펜스가 열려 있으면 넣지 않는다 — 빈 줄이 그 구조를
+                            # 그 자리에서 끝내 뒤 행이 생 파이프로 남는다(프론트 복구 불가).
                             gap = "\n\n"
                             pending.append(gap)
                             preface_mark = len(pending)
@@ -383,7 +441,7 @@ async def run_agent_stream(
                 # deep_merge_dicts가 병렬 도구의 state_delta를 리스트 키에서 last-wins로
                 # 덮어써 한 도구의 출처가 통째로 유실될 수 있기 때문이다(_reconcile_sources
                 # 주석 참조). 이 유실은 상류 미수정이라 여기서 계속 우회한다.
-                sources = _reconcile_sources(observed_sources)
+                sources = _citable_sources(_reconcile_sources(observed_sources), prior_sources)
 
                 citation, done_payload = _finalize_answer(
                     answer_text,
@@ -456,7 +514,7 @@ async def run_agent_stream(
             best_effort = _best_effort_text(pending, final_text)
             _, error_done = _finalize_answer(
                 best_effort,
-                observed_sources,
+                _citable_sources(observed_sources, prior_sources),
                 resolved_session_id,
             )
             error_done["model"] = active_model
@@ -479,7 +537,7 @@ async def run_agent_stream(
             best_effort = _best_effort_text(pending, final_text)
             _, error_done = _finalize_answer(
                 best_effort,
-                observed_sources,
+                _citable_sources(observed_sources, prior_sources),
                 resolved_session_id,
             )
             error_done["model"] = active_model

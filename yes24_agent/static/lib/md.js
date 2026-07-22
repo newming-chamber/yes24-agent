@@ -127,6 +127,24 @@ function renderCellInto(target, text, opts) {
   });
 }
 
+/**
+ * 이 텍스트 뒤에서 본문을 **두 블록으로 쪼개도 렌더가 같은가**.
+ * 블록 분할은 렌더 단위를 나누므로, 여닫이가 걸친 구조 안에서 쪼개면 양쪽이 깨진다
+ * (열린 펜스는 앞 블록 <pre>가 뒤를 못 삼키고, 표 중간이면 뒤 행이 생 파이프로 샌다).
+ * 판정은 이 파일이 이미 가진 라인 술어(MD_FENCE_RE·MD_PIPE_RE)를 그대로 쓴다 —
+ * 렌더러와 같은 눈으로 봐야 렌더 결과와 어긋나지 않는다. 사례 분기·키워드 목록 없음.
+ */
+export function canSplitAfter(text) {
+  let fences = 0;
+  let lastContent = "";
+  for (const line of String(text || "").split("\n")) {
+    if (MD_FENCE_RE.test(line)) fences++;
+    if (line.trim()) lastContent = line;
+  }
+  if (fences % 2) return false;              // 펜스가 열린 채다
+  return !MD_PIPE_RE.test(lastContent);      // 마지막 내용 줄이 표 행이면 표 안이다
+}
+
 function splitCells(line) {
   return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((s) => s.trim());
 }
