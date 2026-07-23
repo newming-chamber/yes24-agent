@@ -848,6 +848,9 @@
       // 생각·탐색함"으로 확정되고, 사용자가 펼쳐둔 상태는 존중한다.
       function ensureActivity() {
         if (activity) return activity;
+        // 진행 문구가 타이핑 점("…")의 **그 자리를 이어받는다** — 점과 문구가 두 줄로
+        // 따로 놀지 않게, 첫 진행 도착 시 점 버블을 걷어낸다(2026-07-23 사용자 방향).
+        clearTyping();
         activity = document.createElement("details");
         activity.className = "think-fold";
         const summaryLine = document.createElement("summary");
