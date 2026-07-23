@@ -138,12 +138,13 @@ def _event_thought_text(event) -> str:
 
 
 def _thought_status_labels(buffer: list[str], chunk: str, max_chars: int) -> list[str]:
-    """사고 요약 청크를 buffer에 누적하고, **닫힌 문단**들을 진행 라벨로 뽑아낸다.
+    """사고 요약 청크를 buffer에 누적하고, 닫힌 문단의 **헤드라인만** 진행 라벨로 뽑는다.
 
-    사고 요약은 문단 단위로 주제가 바뀐다(Gemini는 "**주제**\\n내용" 형태로 스트림).
-    닫힌 문단만 라벨로 내보내고 미완 꼬리는 buffer에 남긴다 — 미리보기 채널이라
-    스트림 종료 시 남은 꼬리는 버려도 된다(본문이 곧 도착한다). 라벨은 공백 정규화 +
-    마크다운 강조 토큰(**) 제거 + max_chars 절단(예고 라벨과 같은 규약).
+    Gemini 사고 요약은 "**주제 헤드라인**\\n독백 본문…" 구조로 스트림된다. 독백 본문까지
+    라벨로 내보내면 "답변이 모두 만족스러우며…" 같은 내부 독백이 사용자에게 그대로 노출돼
+    소음이 된다(2026-07-23 사용자 지적) — 퍼플렉시티·Claude Code처럼 짧은 단계 제목만
+    표시한다. 판정은 마크다운 구조(문단 첫 줄이 볼드로 감싸였는가)뿐, 문구 매칭 없음.
+    헤드라인 없는 문단은 버린다(미리보기 채널 — 유실이 아니라 절제).
     """
     buffer.append(chunk)
     joined = "".join(buffer)
@@ -151,7 +152,10 @@ def _thought_status_labels(buffer: list[str], chunk: str, max_chars: int) -> lis
     buffer[:] = [tail]
     labels = []
     for paragraph in closed:
-        label = " ".join(paragraph.replace("**", "").split())
+        first_line = paragraph.strip().split("\n")[0].strip()
+        if not (first_line.startswith("**") and first_line.endswith("**") and len(first_line) > 4):
+            continue  # 헤드라인이 아닌 독백 본문 문단은 표시하지 않는다
+        label = " ".join(first_line.strip("*").split())
         if len(label) > max_chars:
             # 단어 중간 절단("translatio")을 피해 상한 안의 마지막 공백에서 자른다.
             cut = label.rfind(" ", 0, max_chars)
