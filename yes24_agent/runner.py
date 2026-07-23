@@ -58,6 +58,7 @@ from yes24_agent.sse import (
     sse_source,
     sse_status,
 )
+from yes24_agent.thought_translation import translate_thought_label
 
 logger = logging.getLogger(__name__)
 
@@ -385,6 +386,11 @@ async def run_agent_stream(
         # 사고 요약 누적 버퍼(_thought_status_labels). 닫힌 문단만 타임라인으로 나가고
         # 미완 꼬리는 여기 남는다 — 미리보기 채널이라 스트림 종료 시 꼬리는 버려도 된다.
         thought_buf: list[str] = []
+        # 진행 중인 사고 라벨 번역 task들. 본류를 막지 않도록 병행시키고, 완료분은 다음
+        # 이벤트 대기와 **병합**해 즉시 흘린다. 스트림이 끝나면 미완분은 취소한다 —
+        # 본문이 이미 흐른 뒤 도착하는 진행 라벨은 표시 순서를 어지럽힐 뿐이다.
+        thought_tasks: set[asyncio.Task] = set()
+        event_task: asyncio.Task | None = None
 
         final_text = ""
         emitted_output = False
@@ -420,7 +426,28 @@ async def run_agent_stream(
             while True:
                 while True:
                     try:
-                        event = await timed_event_stream.__anext__()
+                        if thought_tasks:
+                            # 번역 완료분을 본류 이벤트와 병합해 흘린다. 번역이 본류를
+                            # 기다리게 하지도(무차단), 본류가 번역을 기다리게 하지도
+                            # 않는다 — 어느 쪽이든 먼저 끝난 것부터 나간다.
+                            event_task = asyncio.ensure_future(
+                                timed_event_stream.__anext__()
+                            )
+                            while thought_tasks and not event_task.done():
+                                completed, _ = await asyncio.wait(
+                                    {event_task, *thought_tasks},
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                for task in list(thought_tasks):
+                                    if task in completed:
+                                        thought_tasks.discard(task)
+                                        # 번역 실패는 translate_thought_label 내부에서
+                                        # 원문 폴백으로 흡수된다(비파괴).
+                                        yield sse_status("thinking", task.result())
+                            event = await event_task
+                            event_task = None
+                        else:
+                            event = await timed_event_stream.__anext__()
                     except StopAsyncIteration:
                         break
                     except APIError as exc:
@@ -445,6 +472,9 @@ async def run_agent_stream(
                             # 보장하듯 화면에 나간 적 없는 텍스트라 유실이 아니다).
                             held = []
                             thought_buf = []
+                            for task in thought_tasks:
+                                task.cancel()
+                            thought_tasks.clear()
                             final_text = ""
                             retry_runner = Runner(
                                 agent=root_agent,
@@ -544,7 +574,10 @@ async def run_agent_stream(
                             for label in _thought_status_labels(
                                 thought_buf, thought_chunk, settings.status_detail_max_chars
                             ):
-                                yield sse_status("thinking", label)
+                                # 번역을 본류와 병행시킨다(위 병합 대기가 완료분을 흘림).
+                                thought_tasks.add(
+                                    asyncio.create_task(translate_thought_label(label))
+                                )
                         chunk = _event_text(event)
                         if chunk:
                             if held is None:
@@ -719,6 +752,11 @@ async def run_agent_stream(
                 yield frame
         finally:
             # 타임아웃·클라이언트 중단 시 미소진 제너레이터의 자원을 정리한다.
+            # 미완 번역·병합 대기 task도 함께 취소한다(부가 채널이라 유실이 아니다).
+            for task in thought_tasks:
+                task.cancel()
+            if event_task is not None and not event_task.done():
+                event_task.cancel()
             await timed_event_stream.aclose()
             await event_stream.aclose()
     finally:

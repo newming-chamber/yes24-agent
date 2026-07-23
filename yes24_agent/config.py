@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     # 타임라인(stage=thinking)으로 흘려 첫 응답 체감 침묵을 줄인다(LLM 실생성 텍스트,
     # 정적 라벨 아님). 본문 오염은 _event_text의 thought 필터가 그대로 막는다(원칙 4b).
     include_thoughts: bool = True
+    # 사고 요약 라벨의 표시용 한국어 번역. 요약기는 벤더측이라 영어 고정(프롬프트·플래너·
+    # 3세대 모델 전부 무효과 실측 — known-limitations.md 2026-07-23). 답변 생성 모델
+    # 정책(pro 단일)과 무관한 **표시 유틸 전용** 경량 모델이며, 빈 문자열이면 번역 없이
+    # 원문(영어)을 그대로 쓴다. 번역은 본류 무차단 병행이고 실패 시 원문 폴백(비파괴).
+    thought_translation_model: str = "gemini-3.1-flash-lite"
+    thought_translation_timeout_s: float = 5.0
+    thought_translation_max_tokens: int = 80
 
     # 에러 구동 반응형 재시도: pro 경로가 Gemini 과부하/일시장애(429/5xx)로 첫 응답조차 내지
     # 못하면 같은 pro로 딱 1회 조용히 재시도한다. off면 곧장 정직 안내(error+done).
