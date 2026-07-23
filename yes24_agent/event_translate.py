@@ -31,50 +31,39 @@ def _angles(queries) -> list[str]:
 
 
 def _status_for_call(call) -> tuple[str, str] | None:
-    """도구 이름별 진행 status(stage, detail)를 만든다. 알릴 진행이 없으면 None.
+    """도구 호출을 **모델이 만든 인자 그대로** 진행 칩으로 번역한다. 없으면 None.
 
-    yes24_search는 검색, yes24_fetch는 페이지 열람, yes24_browse는 코너 둘러보기,
-    web_search는 웹 검색 라벨을 쓴다. 사용자 노출 문구에 url 원문은 넣지 않는다.
+    표시 문장은 짓지 않는다("Yes24에서 X 검색 중…" 류 템플릿 폐기, 2026-07-23 사용자
+    방향) — 화면 텍스트는 모델 산출물(검색 각도·상세 제목·코너명)만 싣고, "무엇을 하는
+    중인지"의 동사 의미는 stage 아이콘(🔎·📖·📚·🌐)이 담당한다. ChatGPT·퍼플렉시티의
+    검색 칩과 같은 구조다. 사용자 노출 문구에 url 원문은 넣지 않는다.
 
-    **None을 돌려주는 것이 폴백이다.** 진행 문구는 실제 런타임 전이를 설명할 때만
-    가치가 있고, 아무것도 조회하지 않는 도구(reply_directly)에 "정보를 확인하는 중…"을
-    붙이면 사용자에게 일어나지 않은 일을 알리게 된다. 도구가 늘어도 runner는 그대로다 —
-    라벨이 필요하면 여기에 분기를 더하고, 아니면 조용히 지나간다.
+    **None을 돌려주는 것이 폴백이다.** 진행 표시는 실제 런타임 전이를 설명할 때만
+    가치가 있고, 실을 모델 인자가 없으면 조용히 지나간다(거짓 라벨 금지). 도구가 늘어도
+    runner는 그대로다 — 칩이 필요하면 여기에 분기를 더한다.
     """
     name = getattr(call, "name", "") or ""
     args = call.args or {}
-    if name == "yes24_search":
+    if name in ("yes24_search", "web_search"):
         angles = _angles(args.get("queries"))
         if angles:
-            return "searching", f"Yes24에서 {' · '.join(angles)} 검색 중…"
-        return "searching", "Yes24에서 검색 중…"
+            stage = "searching" if name == "yes24_search" else "searching_web"
+            return stage, " · ".join(angles)
+        return None
     if name == "yes24_fetch":
         title = args.get("title")
-        if title:
-            return "reading", f"『{title}』 상세 정보를 읽는 중…"
-        return "reading", "페이지를 읽는 중…"
+        return ("reading", str(title)) if title else None
     if name == "fetch_many":
         items = args.get("items")
-        count = len(items) if isinstance(items, list) else 0
-        if count:
-            return "reading", f"{count}개 상세를 함께 읽는 중…"
-        return "reading", "여러 상세를 함께 읽는 중…"
+        titles = [
+            i.get("title") for i in items if isinstance(i, dict) and i.get("title")
+        ] if isinstance(items, list) else []
+        return ("reading", " · ".join(titles)) if titles else None
     if name == "yes24_browse":
         label = _browse_label(args.get("section", ""))
-        if label:
-            return "browsing", f"Yes24 {label} 둘러보는 중…"
-        return "browsing", "Yes24 코너를 둘러보는 중…"
-    if name == "web_search":
-        angles = _angles(args.get("queries"))
-        if angles:
-            return "searching_web", f"웹에서 {' · '.join(angles)} 관련 정보를 찾는 중…"
-        return "searching_web", "웹에서 정보를 찾는 중…"
-    if name == "web_fetch":
-        return "reading_web", "웹 페이지를 읽는 중…"
-    # 모르는 도구는 **아무 상태도 내지 않는다**(None). 범용 폴백("정보를 확인하는 중…")은
-    # reply_directly처럼 아무것도 조회하지 않는 턴에 붙어 일어나지 않는 일을 알렸다 —
-    # 같은 웨이브에서 지운 거짓 라벨 "retrying"과 동일 클래스다. 도구명을 하드코딩해 예외를
-    # 늘리는 대신, "설명할 진행이 없으면 말하지 않는다"를 기본값으로 둔다.
+        return ("browsing", label) if label else None
+    # web_fetch는 실을 모델 인자가 url뿐이라(원문 노출 금지) 칩을 내지 않고, 모르는 도구도
+    # 아무 상태도 내지 않는다(None) — "설명할 진행이 없으면 말하지 않는다"가 기본값이다.
     return None
 
 
@@ -102,9 +91,12 @@ def _status_for_error(payload: dict) -> tuple[str, str]:
 def _status_for_result(count: int) -> tuple[str, str] | None:
     """도구 결과 도착을 **건수만으로** 알린다. 0건이면 알릴 진행이 없다(None).
 
-    인자를 int로 못박아 상품 사실(제목·가격·평점)이 이 경로로 새는 것을 시그니처로 봉인한다.
-    payload를 통째로 받는 순간 4a 우회로가 생기므로 넓히지 말 것. 도구별 분기도 없다 —
-    건수는 모든 검색·열람 도구가 같은 이름(result_count)으로 내는 구조 신호다.
+    건수 표기는 상용 표준이다(2026-07-23 4사 실측: 퍼플렉시티는 소스 카운트를 라이브로
+    올리고, ChatGPT "Searched 12", Claude "N results") — 대기 체감을 상쇄하는 구조 메타라
+    "가짜 활동 서술" 금지 클래스가 아니다. 인자를 int로 못박아 상품 사실(제목·가격·평점)이
+    이 경로로 새는 것을 시그니처로 봉인한다. payload를 통째로 받는 순간 4a 우회로가
+    생기므로 넓히지 말 것. 도구별 분기도 없다 — 건수는 모든 검색·열람 도구가 같은
+    이름(result_count)으로 내는 구조 신호다.
     """
     if count <= 0:
         return None
@@ -147,9 +139,9 @@ def project_public_source(source: dict) -> dict:
 def project_source_ref(source_event: dict) -> dict:
     """출처 이벤트에서 **스트리밍 중 마커를 렌더할 최소 정보만** 투영한다(id·url).
 
-    _status_for_result가 건수(int)만 받아 상품 사실 누출을 시그니처로 봉인한 것과 같은
-    규율이다 — 제목·저자·가격·평점은 여기로 나가지 않는다(원칙 4a). url은 마커를
-    하이퍼링크로 만들기 위한 것이고, 없으면 프론트가 링크 대신 칩으로 폴백한다.
+    제목·저자·가격·평점은 여기로 나가지 않는다(원칙 4a — 검증 전 상품 사실은 어떤 공개
+    채널로도 새지 않는다). url은 마커를 하이퍼링크로 만들기 위한 것이고, 없으면 프론트가
+    링크 대신 칩으로 폴백한다.
     """
     return {"id": source_event.get("id"), "url": source_event.get("url") or ""}
 

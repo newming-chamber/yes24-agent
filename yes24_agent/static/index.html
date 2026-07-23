@@ -156,13 +156,17 @@
     .step .step-label { min-width: 0; overflow-wrap: anywhere; }
     .step.done .ico { color: var(--accent); }        /* 완료 단계는 체크 강조색 */
     .step.active .ico { animation: pulse 1.2s ease-in-out infinite; }
-    /* 답변 확정 시 사고 스텝을 접는 폴드(ChatGPT식 스위칭). summary가 스텝 행 톤을 잇는다. */
+    /* 사고 미리보기(ChatGPT식): 스트리밍 중엔 본문처럼 흐르는 회색 글줄, 구간이 끝나면
+       "N초 동안 생각함" 한 줄로 접힌다. 체크 스텝 행과 구분되는 산문 톤. */
     .think-fold { padding: 0 6px; }
     .think-fold summary {
       font-size: 12.5px; color: var(--muted); cursor: pointer; line-height: 1.5;
       list-style-position: inside;
     }
-    .think-fold .step { padding-left: 18px; }        /* 펼쳤을 때 들여쓰기로 소속 표시 */
+    .think-line {
+      font-size: 12.5px; color: var(--muted); line-height: 1.6; padding-left: 18px;
+      animation: fadein 0.3s ease;
+    }
     @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
     /* 턴 마감 메타(소요·모델·출처 수) — 접힌 trace 헤더가 담던 정보의 새 자리. */
     .meta { font-size: 12px; color: var(--muted); padding: 0 6px; }
@@ -826,14 +830,43 @@
       let errored = false;
       let activeStep = null;   // 현재 진행 중(스핀) 단계 요소
       let lastStepKey = null;  // 직전 단계 키(연속 중복 방지)
+      let activity = null;      // 턴당 하나의 통합 진행 패널(사고+도구, 끝나면 접힘)
+      let activityStart = 0;    // 진행 시작 시각(ChatGPT식 "N초 동안 …")
+
+      // 진행 패널: 사고 글줄과 도구 스텝이 **한 패널 안에** 시간순으로 쌓인다 — 접힘 블록과
+      // 체크 행이 번갈아 나오며 조각나던 것을 통합(2026-07-23 사용자 방향). 답변 확정 시
+      // 패널 전체가 "N초 동안 생각·탐색함" 한 줄로 접힌다.
+      function ensureActivity() {
+        if (activity) return activity;
+        activity = document.createElement("details");
+        activity.className = "think-fold";
+        activity.open = true;
+        const summaryLine = document.createElement("summary");
+        summaryLine.textContent = "💭 생각하는 중…";
+        activity.appendChild(summaryLine);
+        activityStart = performance.now();
+        flow.appendChild(activity);
+        return activity;
+      }
+
+      function closeActivity() {
+        if (!activity) return;
+        const secs = Math.max(1, Math.round((performance.now() - activityStart) / 1000));
+        const hadTools = !!activity.querySelector(".step");
+        activity.querySelector("summary").textContent =
+          `💭 ${secs}초 동안 ${hadTools ? "생각·탐색함" : "생각함"}`;
+        activity.open = false;
+        activity = null;
+      }
 
       // 직전 단계를 완료 처리(스핀 정지 → 체크 아이콘).
       function completeActiveStep() {
         if (!activeStep) return;
+        // 스테이지 아이콘(🔎·📖·💬)은 유지한다 — 라벨이 모델 인자(검색어·제목)뿐이라
+        // "무엇을 했는지"의 동사 의미를 아이콘이 담당한다. ✓로 바꿔치면 "✓ 재테크
+        // 입문서"처럼 의미가 사라진다(2026-07-23 실측). 완료는 스핀 정지(.done)로만 표시.
         activeStep.classList.remove("active");
         activeStep.classList.add("done");
-        const ico = activeStep.querySelector(".ico");
-        if (ico) ico.textContent = "✓";
         activeStep = null;
       }
 
@@ -1011,16 +1044,24 @@
           // 문구가 없으면 보여 줄 단계가 없다(refs만 실은 프레임). 백엔드가 "설명할 진행이
           // 없으면 말하지 않는다"를 기본값으로 두는 것과 같은 규칙의 렌더 쪽 절반이다.
           if (!detail) return;
-          // 연속 동일 단계는 중복 추가하지 않는다(같은 도구가 상태만 반복 전송하는 경우).
-          // 같은 stage|detail 연속 중복은 접되, found는 제외한다 — 같은 건수를 두 번
-          // 찾은 것은 실제로 두 번 일어난 일이라 접으면 단계가 사라진다.
-          const key = stage === "found" ? Symbol() : stage + "|" + detail;
+          // 연속 동일 표시는 중복 추가하지 않는다(같은 도구가 상태만 반복 전송하는 경우).
+          const key = stage + "|" + detail;
           if (key === lastStepKey) return;
           lastStepKey = key;
-          // 직전 단계를 완료로 마감하고 새 단계를 흐름에 누적한다(덮어쓰지 않음).
+          const panel = ensureActivity();
+          if (stage === "thinking") {
+            // 사고는 본문처럼 흐르는 회색 글줄(모델 실생성 텍스트).
+            const line = document.createElement("div");
+            line.className = "think-line";
+            line.textContent = detail;
+            panel.appendChild(line);
+            scrollToBottom();
+            return;
+          }
+          // 도구 진행도 같은 패널 안에 쌓는다 — 접힘 블록과 체크 행이 번갈아 조각나지 않게.
           completeActiveStep();
           const step = document.createElement("div");
-          step.className = stage === "thinking" ? "step active think" : "step active";
+          step.className = "step active";
           const ico = document.createElement("span");
           ico.className = "ico";
           ico.textContent = STATUS_ICON[stage] || "•";
@@ -1031,10 +1072,8 @@
           label.setAttribute("aria-live", "polite");
           label.textContent = detail;
           step.append(ico, label);
-          flow.appendChild(step);
+          panel.appendChild(step);
           activeStep = step;
-          // 다음 델타는 (문단 경계라면) 이 단계 **아래**의 새 블록에서 이어진다.
-          pendingSplit = true;
           scrollToBottom();
         },
         addSource(src) {
@@ -1049,7 +1088,8 @@
           if (!firstDelta) {
             firstDelta = true;
             clearTyping();
-            // 답변 스트리밍 시작 → 진행 중 단계를 완료 처리한다.
+            // 답변 스트리밍 시작 → 진행 중 단계를 완료 처리한다. 패널은 아직 닫지 않는다 —
+            // 다라운드 턴은 본문 스트리밍 뒤에도 진행이 이어질 수 있고, 마감은 finalize가 한다.
             completeActiveStep();
           }
           const block = blockForDelta();
@@ -1103,27 +1143,7 @@
             card.classList.toggle("cited", citedIds.has(id));
           }
           completeActiveStep();
-          // 사고 스텝은 답변 확정 시 **접는다**(ChatGPT식 스위칭 — 스트리밍 중엔 실시간
-          // 노출, 끝나면 "생각 과정 · N단계" 한 줄로). 도구 스텝은 접지 않고 남긴다 —
-          // 검색·열람은 답의 근거 경로라 지나간 뒤에도 읽을 가치가 있다. 사고·도구가
-          // 시간순으로 섞여 있으므로 **연속된 사고 구간별로** 묶어 순서를 보존한다.
-          let thinkRun = [];
-          const foldThinkRun = () => {
-            if (!thinkRun.length) { thinkRun = []; return; }
-            const fold = document.createElement("details");
-            fold.className = "think-fold";
-            const label = document.createElement("summary");
-            label.textContent = `💭 생각 과정 · ${thinkRun.length}단계`;
-            fold.appendChild(label);
-            flow.insertBefore(fold, thinkRun[0]);
-            for (const el of thinkRun) fold.appendChild(el);
-            thinkRun = [];
-          };
-          for (const el of [...flow.children]) {
-            if (el.classList && el.classList.contains("think")) thinkRun.push(el);
-            else foldThinkRun();
-          }
-          foldThinkRun();
+          closeActivity();  // 진행 패널을 "N초 동안 생각·탐색함" 한 줄로 접는다
           const stepCount = flow.querySelectorAll(".step").length;
           // 출처 0인 턴(파라메트릭 즉답)은 "N단계 탐색"이 근거 있는 검색처럼 읽히는 착시를
           // 만든다 — 중립 표기("응답 X초")로만 적는다. 출처가 있을 때만 탐색·출처 요약.
