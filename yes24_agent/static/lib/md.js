@@ -15,7 +15,7 @@ const MD_SEP_RE = /^\s*\|?[\s:|-]+\|?\s*$/;   // 구분선 |---|:--:|
 // 리스트 라인: 불릿(-·*·•) 또는 번호(1. / 1)). 캡처1=마커 종류(순서형은 숫자), 캡처2=내용.
 // 마커 뒤 공백 1칸 이상을 요구해 "*강조*"·"1.5" 같은 비리스트 라인을 배제한다.
 const MD_BULLET_RE = /^\s*[-*•]\s+(.*)$/;
-const MD_ORDERED_RE = /^\s*\d+[.)]\s+(.*)$/;
+const MD_ORDERED_RE = /^\s*(\d+)[.)]\s+(.*)$/;
 // 코드 — 서버 postprocess의 코드/프로즈 분할을 렌더에 미러링한다: 코드 안 [n]은 인용이 아니라
 // 리터럴이라 배지로 승격하지 않는다(예: `print(data[1])`의 [1]은 그대로). 코드가 최우선.
 const MD_FENCE_RE = /^\s*(```|~~~)/;      // 코드펜스 여닫이(``` 또는 ~~~)
@@ -243,11 +243,17 @@ export function renderBody(container, text, opts = {}) {
       const ordered = !!om;
       const list = document.createElement(ordered ? "ol" : "ul");
       list.className = "md-list";
+      if (ordered && om[1] !== "1") {
+        // 모델이 번호 항목 사이에 빈 줄을 쓰거나 스트리밍이 항목 사이에서 블록을 나누면
+        // 목록이 여러 <ol>로 갈라진다. 원문 번호를 start로 보존해야 "1. 1."로 되감기지
+        // 않는다(2026-07-23 실측 — CommonMark도 첫 항목 번호로 시작 번호를 정한다).
+        list.setAttribute("start", om[1]);
+      }
       while (i < lines.length) {
         const im = lines[i].match(ordered ? MD_ORDERED_RE : MD_BULLET_RE);
         if (!im) break;
         const li = document.createElement("li");
-        renderInlineInto(li, im[1], o);
+        renderInlineInto(li, ordered ? im[2] : im[1], o);
         list.appendChild(li);
         i++;
       }
