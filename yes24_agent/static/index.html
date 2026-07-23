@@ -812,7 +812,12 @@
       bubble.appendChild(typing);
       flow.appendChild(bubble);
       function clearTyping() {
-        if (bubble.isConnected) bubble.remove();
+        if (!bubble.isConnected) return;
+        // 진행 패널이 대기 박스 **안**에 살고 있었다면, 본문이 시작되는 지금 박스
+        // 밖(흐름 위쪽)으로 빠져나와 접힌 헤더가 된다 — "박스 안에 있다가 빠진다"
+        // (2026-07-23 사용자 방향). 박스는 본문 블록에게 자리를 내주고 사라진다.
+        if (activity && bubble.contains(activity)) flow.appendChild(activity);
+        bubble.remove();
       }
 
       // 출처 카드 줄과 메타는 흐름 **끝**에 온다(실제 도착 시점 = 검증 후와 일치).
@@ -848,9 +853,6 @@
       // 생각·탐색함"으로 확정되고, 사용자가 펼쳐둔 상태는 존중한다.
       function ensureActivity() {
         if (activity) return activity;
-        // 진행 문구가 타이핑 점("…")의 **그 자리를 이어받는다** — 점과 문구가 두 줄로
-        // 따로 놀지 않게, 첫 진행 도착 시 점 버블을 걷어낸다(2026-07-23 사용자 방향).
-        clearTyping();
         activity = document.createElement("details");
         activity.className = "think-fold";
         const summaryLine = document.createElement("summary");
@@ -860,7 +862,11 @@
         summaryLine.setAttribute("aria-live", "polite");
         activity.appendChild(summaryLine);
         activityStart = performance.now();
-        flow.appendChild(activity);
+        // 진행 라인은 타이핑 점("…")을 밀어내고 **대기 박스 안**에서 산다 — 답이 준비되는
+        // 자리라는 연속성. 본문이 시작되면 clearTyping이 박스 밖으로 빼낸다.
+        const typingEl = bubble.isConnected ? bubble.querySelector(".typing") : null;
+        if (typingEl) typingEl.remove();
+        (bubble.isConnected ? bubble : flow).appendChild(activity);
         return activity;
       }
 
