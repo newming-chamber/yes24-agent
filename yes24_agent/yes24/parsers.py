@@ -171,12 +171,17 @@ def _parse_item(item, base_url: str) -> dict | None:
 
 
 def _item_fields(**values) -> dict:
-    """_ITEM_FIELDS 키 집합을 그대로 채운 dict를 만든다(주지 않은 필드는 None).
+    """_ITEM_FIELDS 순서로 dict를 만들되, **호출자가 넘기지 않은 필드는 키를 뺀다.**
 
-    마크업이 다른 목록(크레마클럽)도 같은 키 집합을 내보내게 강제하는 장치다 — 도구는
-    어떤 목록에서 왔든 동일한 필드를 기대할 수 있다.
+    마크업이 다른 목록(크레마클럽)도 같은 키 집합을 내보내게 강제하는 장치다. 단
+    목록 페이지에 **구조적으로 없는 필드**(예: page_count — 검색·베스트셀러 마크업에
+    쪽수가 없다)는 키 자체를 두지 않는다. 값이 None인 것(관측했으나 그 책엔 없음, 예:
+    리뷰 0인 책의 review_count)과 **관측 자체가 불가능한 것**(키 없음)을 구분하기 위함이다.
+    모델·게이트가 "쪽수: null"을 실제 값으로 오독해 파라메트릭 지식으로 메우는 것을
+    상류에서 막는다(300쪽 이하 제약 창작의 근본 원인). None으로 명시 관측된 필드는
+    호출자가 `field=None`으로 넘기면 그대로 유지된다.
     """
-    return {name: values.get(name) for name in _ITEM_FIELDS}
+    return {name: values[name] for name in _ITEM_FIELDS if name in values}
 
 
 def parse_product(html: str, *, base_url: str) -> dict:
@@ -377,8 +382,8 @@ def _parse_cremaclub_list(
             rank_el = item.select_one(CREMACLUB_RANK)
             rank = _parse_int(rank_el.get_text(strip=True)) if rank_el else None
 
-        # 검색/베스트셀러와 같은 키 집합(_item_fields)을 채운다 — 이 페이지에 필드 자체가
-        # 없는 publisher·pub_date·price·sale_index는 None으로 남는다(구독형 eBook 목록).
+        # 검색/베스트셀러와 같은 필드 순서(_item_fields)를 따르되, 이 페이지에 필드 자체가
+        # 없는 publisher·pub_date·price·sale_index는 키를 내지 않는다(구독형 eBook 목록).
         results.append(
             {
                 "rank": rank,
