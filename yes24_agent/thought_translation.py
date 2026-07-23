@@ -35,6 +35,16 @@ def _client() -> genai.Client:
     return genai.Client()
 
 
+async def warmup_translation() -> None:
+    """서버 기동 시 번역 경로(클라이언트 생성 + TLS/HTTP2 연결)를 미리 데운다.
+
+    첫 라벨의 번역 지연(~0.8초) 중 ~0.3초가 첫 호출의 연결 수립 몫이다 — 기동 시
+    실호출 1회로 흡수해 첫 채팅의 첫 한국어 라벨을 그만큼 앞당긴다. 실패는 조용히
+    무시한다(다음 실호출이 폴백 계약대로 처리).
+    """
+    await translate_thought_label("Warming up")
+
+
 async def translate_thought_label(label: str) -> str:
     """사고 요약 라벨을 한국어로 번역한다. 실패하면 원문을 그대로 돌려준다(비파괴)."""
     settings = get_settings()

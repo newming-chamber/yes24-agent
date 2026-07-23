@@ -5,6 +5,7 @@
 (라우팅·CORS·수명주기 훅)만 얇게 얹는다.
 """
 
+import asyncio
 import hmac
 import logging
 from contextlib import asynccontextmanager
@@ -30,6 +31,7 @@ from yes24_agent.admin import register_admin
 from yes24_agent.config import ensure_google_api_key_env, get_settings
 from yes24_agent.matrix.matrix_runner import run_matrix_stream
 from yes24_agent.runner import run_agent_stream
+from yes24_agent.thought_translation import warmup_translation
 from yes24_agent.tools.web_search import aclose_shared_client as aclose_web_search_client
 from yes24_agent.tools.yes24_search import aclose_shared_client as aclose_yes24_client
 
@@ -160,6 +162,9 @@ async def lifespan(app: FastAPI):
     # ADK는 GOOGLE_API_KEY를 기대한다 — GEMINI_API_KEY를 매핑해 둔다.
     if not ensure_google_api_key_env():
         logger.warning("GEMINI/GOOGLE API 키가 설정되지 않았습니다. LLM 호출이 실패할 수 있어요.")
+    # 사고 라벨 번역 경로를 백그라운드로 데운다(첫 채팅의 첫 한국어 라벨 ~0.3초 단축).
+    # 기동을 막지 않도록 task로만 띄우고, 참조를 잡아 GC 취소를 막는다.
+    app.state.translation_warmup = asyncio.create_task(warmup_translation())
     yield
     # 공유 HTTP 클라이언트(Yes24·웹서치)를 정리해 열린 커넥션을 닫는다.
     await aclose_yes24_client()

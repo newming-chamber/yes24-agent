@@ -156,6 +156,13 @@
     .step .step-label { min-width: 0; overflow-wrap: anywhere; }
     .step.done .ico { color: var(--accent); }        /* 완료 단계는 체크 강조색 */
     .step.active .ico { animation: pulse 1.2s ease-in-out infinite; }
+    /* 답변 확정 시 사고 스텝을 접는 폴드(ChatGPT식 스위칭). summary가 스텝 행 톤을 잇는다. */
+    .think-fold { padding: 0 6px; }
+    .think-fold summary {
+      font-size: 12.5px; color: var(--muted); cursor: pointer; line-height: 1.5;
+      list-style-position: inside;
+    }
+    .think-fold .step { padding-left: 18px; }        /* 펼쳤을 때 들여쓰기로 소속 표시 */
     @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
     /* 턴 마감 메타(소요·모델·출처 수) — 접힌 trace 헤더가 담던 정보의 새 자리. */
     .meta { font-size: 12px; color: var(--muted); padding: 0 6px; }
@@ -1013,7 +1020,7 @@
           // 직전 단계를 완료로 마감하고 새 단계를 흐름에 누적한다(덮어쓰지 않음).
           completeActiveStep();
           const step = document.createElement("div");
-          step.className = "step active";
+          step.className = stage === "thinking" ? "step active think" : "step active";
           const ico = document.createElement("span");
           ico.className = "ico";
           ico.textContent = STATUS_ICON[stage] || "•";
@@ -1095,9 +1102,28 @@
           for (const [id, card] of cardMap) {
             card.classList.toggle("cited", citedIds.has(id));
           }
-          // 흐름 끝에 마감 메타 한 줄(소요·모델·출처 수). 진행 단계는 접지 않고 그대로
-          // 남긴다 — 이미 읽고 지나간 줄이 사라지면 아래 본문이 위로 점프한다.
           completeActiveStep();
+          // 사고 스텝은 답변 확정 시 **접는다**(ChatGPT식 스위칭 — 스트리밍 중엔 실시간
+          // 노출, 끝나면 "생각 과정 · N단계" 한 줄로). 도구 스텝은 접지 않고 남긴다 —
+          // 검색·열람은 답의 근거 경로라 지나간 뒤에도 읽을 가치가 있다. 사고·도구가
+          // 시간순으로 섞여 있으므로 **연속된 사고 구간별로** 묶어 순서를 보존한다.
+          let thinkRun = [];
+          const foldThinkRun = () => {
+            if (!thinkRun.length) { thinkRun = []; return; }
+            const fold = document.createElement("details");
+            fold.className = "think-fold";
+            const label = document.createElement("summary");
+            label.textContent = `💭 생각 과정 · ${thinkRun.length}단계`;
+            fold.appendChild(label);
+            flow.insertBefore(fold, thinkRun[0]);
+            for (const el of thinkRun) fold.appendChild(el);
+            thinkRun = [];
+          };
+          for (const el of [...flow.children]) {
+            if (el.classList && el.classList.contains("think")) thinkRun.push(el);
+            else foldThinkRun();
+          }
+          foldThinkRun();
           const stepCount = flow.querySelectorAll(".step").length;
           // 출처 0인 턴(파라메트릭 즉답)은 "N단계 탐색"이 근거 있는 검색처럼 읽히는 착시를
           // 만든다 — 중립 표기("응답 X초")로만 적는다. 출처가 있을 때만 탐색·출처 요약.
