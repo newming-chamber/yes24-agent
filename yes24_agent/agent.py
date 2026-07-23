@@ -60,9 +60,10 @@ _PROMPT_CORE_TEMPLATE = """당신은 유능하고 친근한 범용 AI 어시스�
 검색했다고 말하지 말고, 도구를 사용했다면 결과를 기다려 완결된 답을 쓰세요.
 
 다만 **도구를 호출하기 직전에는** 무엇을 하려는지 한 문장으로 짧게 예고하세요("~를 찾아볼게요",
-"~를 자세히 볼게요"). **이 문장은 최종 답변의 일부로 사용자에게 그대로 남습니다.** 결과를 받은
-뒤에는 그 문장을 이어받아 자연스럽게 이어 쓰세요 — 같은 말을 다시 하거나, 이미 쓴 내용을
-되풀이하지 마세요. 사용자가 보지 못한 시도를 "다시"라고 지칭하지 마세요.
+"~를 자세히 볼게요"). 이 문장은 진행 과정 표시줄에 실시간으로 보이고 **최종 답변 본문에는 남지
+않습니다.** 그러니 결과를 받은 뒤에는 예고에 기대지 말고 그 자체로 완결된 답을 처음부터 쓰세요 —
+예고를 이어받는 접속("그래서", "확인해 보니")으로 본문을 시작하거나, 사용자가 보지 못한 시도를
+"다시"라고 지칭하지 마세요.
 정체성을 직접 물으면 위 정체성을 본론으로 답하고, 실행 모델명·버전은 추측하지 말고 응답 UI의
 모델 메타가 정본이라고 안내하세요.
 
@@ -240,17 +241,8 @@ def build_system_prompt(persona_directive: str = "") -> str:
     return f"{core}{_NARRATIVE_CONTRACT}{tail}"
 
 
-def _build_root_context_prompt(ctx: ReadonlyContext) -> str:
-    """자유서술 root의 전체 core·서술·독자 페르소나를 조립한다."""
-    code = ctx.state.get("rbti")
-    directive = persona_tool_directive(code) if code else ""
-    base = build_system_prompt(persona_directive=directive)
-    block = build_persona_block(code) if code else ""
-    return f"{base}\n\n{block}" if block else base
-
-
 def _instruction_provider(ctx: ReadonlyContext) -> str:
-    """ADK가 매 인보케이션마다 호출하는 자유서술용 동적 instruction.
+    """ADK가 매 인보케이션마다 호출하는 동적 instruction — core·서술·독자 페르소나 조립.
 
     LlmAgent.instruction은 str뿐 아니라 (ReadonlyContext) -> str 콜러블을 받으며,
     호출 시점에 평가된다. 날짜를 여기서 계산해 날짜 경계를 넘겨도 서버 재시작 없이
@@ -261,7 +253,11 @@ def _instruction_provider(ctx: ReadonlyContext) -> str:
     (build_persona_block, 후보 선택·강조 관점). 코드가 없거나 무효면 둘 다 ""이라 base와 바이트 동일
     (회귀 0). ctx.state는 세션 state의 읽기전용 뷰(MappingProxyType)다.
     """
-    return _build_root_context_prompt(ctx)
+    code = ctx.state.get("rbti")
+    directive = persona_tool_directive(code) if code else ""
+    base = build_system_prompt(persona_directive=directive)
+    block = build_persona_block(code) if code else ""
+    return f"{base}\n\n{block}" if block else base
 
 
 def _force_tool_first_turn(callback_context, llm_request):

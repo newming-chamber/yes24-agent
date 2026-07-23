@@ -40,7 +40,7 @@
       --skeleton: #ececf0;
       --head-bg: #f0f0f3;
       --shadow: rgba(20, 20, 40, 0.10);
-      --grid-line: rgba(20, 20, 40, 0.035);
+      --ok: #16a34a;
       --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
     }
     @media (prefers-color-scheme: dark) {
@@ -59,7 +59,7 @@
         --skeleton: #262630;
         --head-bg: #202027;
         --shadow: rgba(0, 0, 0, 0.45);
-        --grid-line: rgba(255, 255, 255, 0.028);
+        --ok: #4ade80;
       }
     }
     * { box-sizing: border-box; }
@@ -92,8 +92,6 @@
       color: var(--muted); border: 1px solid var(--border); border-radius: 6px; padding: 2px 7px;
       display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
     }
-    header.top .spec .dots { display: inline-flex; gap: 2px; }
-    header.top .spec .dots i { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
     header.top .sub { font-size: 12px; color: var(--muted); }
     header.top .spacer { flex: 1 1 auto; }
     header.top a.backlink {
@@ -137,7 +135,7 @@
       width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
       animation: pulse 1.3s ease-in-out infinite; flex: 0 0 auto;
     }
-    .status-bar.done .dot { animation: none; background: #22c55e; }
+    .status-bar.done .dot { animation: none; background: var(--ok); }
     .status-bar.error { color: var(--error-text); }
     .status-bar.error .dot { background: var(--error-text); animation: none; }
     @keyframes pulse { 0%,100% { opacity: 1; box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); } 50% { opacity: 0.55; box-shadow: 0 0 0 5px transparent; } }
@@ -419,8 +417,7 @@
       color: var(--text); background: var(--head-bg);
       border-left: 2px solid var(--badge-c, var(--accent)); border-radius: 0 5px 5px 0; padding: 2px 9px;
     }
-    .modal .m-axis { font-family: var(--mono); font-size: 11px; letter-spacing: 0.03em; }
-    .modal .m-axis { font-size: 12px; color: var(--muted); }
+    .modal .m-axis { font-family: var(--mono); font-size: 12px; letter-spacing: 0.03em; color: var(--muted); }
     .modal .m-name { font-size: 17px; font-weight: 700; color: var(--text); line-height: 1.35; padding-right: 34px; }
     .modal .m-close {
       position: absolute; top: 12px; right: 14px; font-size: 22px; line-height: 1; color: var(--muted);
@@ -682,7 +679,7 @@
       title.className = "title";
       title.textContent = src.title || "(제목 없음)";
       card.append(num, title);
-      if (src.url && /^https?:\/\//i.test(src.url)) card.addEventListener("click", () => safeOpen(src.url));
+      card.addEventListener("click", () => safeOpen(src.url));
       return card;
     }
     function addSharedSource(src) {
@@ -1305,7 +1302,8 @@
     document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !tourneyBackdrop.hidden) closeTourney(); });
 
     // ── 상태 ──
-    // 서버가 detail을 보내지 못한 단계의 폴백만 남긴다(thinking은 서버가 항상 보낸다).
+    // 서버가 detail을 보내지 못한 단계의 폴백만 남긴다(thinking은 서버가 보내지 않고
+    // 제출 시 프론트가 로컬로 설정한다 — 아래 submit 핸들러).
     const STATUS_TEXT = { generating: "16가지 독서 성향으로 살펴보고 있어요" };
     function setStatus(stage, detail) {
       statusBar.classList.remove("done", "error");

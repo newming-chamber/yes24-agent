@@ -26,12 +26,9 @@ from yes24_agent.yes24.parsers import (
     parse_product,
     product_fields,
 )
+from yes24_agent.yes24.selectors import GOODS_PATH
 
 logger = logging.getLogger(__name__)
-
-
-# 상품 상세 페이지 경로 식별자.
-_GOODS_PATH = "/product/goods/"
 
 # 범용 텍스트 추출 시 제거할 태그(스크립트·스타일 등 비본문).
 _NOISE_TAGS = ("script", "style", "noscript", "template")
@@ -195,7 +192,7 @@ def build_result_from_html(
 
     # 경로 판별은 대소문자 무시 — Yes24가 상품 링크를 /Product/Goods/(대문자)로도
     # 내보내며(크레마클럽 목록 등), 링크 팔로우로 그런 url이 오면 상세로 인식돼야 한다.
-    if _GOODS_PATH in url.lower():
+    if GOODS_PATH in url.lower():
         return _fetch_product(
             html,
             url,

@@ -6,12 +6,13 @@
 
 import re
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
+from datetime import datetime
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from yes24_agent.yes24.client import is_disallowed_path
+from yes24_agent.sources import KST
+from yes24_agent.yes24.client import allowed_domain, is_allowed_host, is_disallowed_path
 from yes24_agent.yes24.selectors import (
     CREMACLUB_AUTHOR,
     CREMACLUB_GOODS_NO_LINK,
@@ -63,12 +64,7 @@ from yes24_agent.yes24.selectors import (
     SEARCH_ITEM,
     SEARCH_LIST_CONTAINER,
 )
-from yes24_agent.yes24.urls import BROWSE_SEED_URLS, absolutize, product_url
-
-# extract_links()의 도메인 허용 판정 기준. www/cremaclub/event/ssl 등 모든
-# *.yes24.com 서브도메인을 "내부"로 취급하고(개별 노이즈 서브도메인은
-# LINK_NOISE_SUBDOMAINS로 별도 배제), 그 외 도메인은 전부 외부로 간주해 배제한다.
-_YES24_ROOT_DOMAIN = "yes24.com"
+from yes24_agent.yes24.urls import BROWSE_SEED_URLS, product_url
 
 # 상품형 아이템(검색·베스트셀러·신간·크레마클럽)이 공통으로 싣는 필드 집합.
 # 마크업이 같은 검색/베스트셀러/신간은 _parse_item 하나로 뽑고, 마크업이 다른
@@ -158,7 +154,7 @@ def _parse_item(item, base_url: str) -> dict | None:
     return _item_fields(
         goods_no=item.get(ITEM_GOODS_NO_ATTR),
         title=title,
-        url=absolutize(base_url, href),
+        url=urljoin(base_url, href),
         author=_author_or_none(item),
         publisher=_text_or_none(item.select_one(ITEM_PUBLISHER)),
         pub_date=_text_or_none(item.select_one(ITEM_PUB_DATE)),
@@ -439,7 +435,8 @@ def extract_links(
 
     kind 판정:
       - "product": href 경로가 `/product/goods/{id}` 패턴(대소문자 무시).
-      - "page": 그 외 yes24.com 계열(서브도메인 포함) 링크 중 노이즈로 걸러지지
+      - "page": 그 외 base_url 도메인 계열(서브도메인 포함, client와 같은 판정) 링크
+        중 노이즈로 걸러지지
         않은 것. 노이즈 판정 기준은 selectors.LINK_NOISE_SUBDOMAINS/
         LINK_NOISE_PATH_MARKERS 참고(캠페인·이벤트 등 콘텐츠와 무관한 페이지).
 
@@ -465,6 +462,9 @@ def extract_links(
     """
     soup = BeautifulSoup(html, "lxml")
 
+    # 도메인 허용 판정은 client와 같은 헬퍼 하나를 공유한다(hostname 기준 suffix 일치).
+    internal_domain = allowed_domain(base_url)
+
     seen_urls: set[str] = set()
     products: list[dict] = []
     pages: list[dict] = []
@@ -478,11 +478,13 @@ def extract_links(
         if not title:
             continue
 
-        url = absolutize(base_url, href)
+        url = urljoin(base_url, href)
         parsed = urlparse(url)
-        netloc = parsed.netloc.lower()
+        host = parsed.hostname
 
-        if not _is_yes24_domain(netloc) or netloc in LINK_NOISE_SUBDOMAINS:
+        if host is None or not is_allowed_host(host, internal_domain):
+            continue
+        if host in LINK_NOISE_SUBDOMAINS:
             continue
 
         # 수집 금지 경로(client와 같은 규칙) → 후보에서 제외. 그 밖의 노이즈는 품질 필터다.
@@ -556,16 +558,6 @@ def _context_first(pages: list[dict], page_url: str | None) -> list[dict]:
         return link_path == context_prefix or link_path.startswith(context_prefix + "/")
 
     return sorted(pages, key=lambda entry: 0 if _in_context(entry) else 1)
-
-
-def _is_yes24_domain(netloc: str) -> bool:
-    """netloc이 yes24.com 자신 또는 그 서브도메인인지 판정한다.
-
-    단순 `"yes24.com" in netloc` 방식은 `hansaeyes24.com`처럼 실제로는 무관한
-    외부 도메인이 우연히 "yes24.com"을 부분 문자열로 포함하는 경우(goods_paper.html
-    실측 확인) 오탐하므로, 반드시 도메인 끝부분(suffix) 일치로 판정해야 한다.
-    """
-    return netloc == _YES24_ROOT_DOMAIN or netloc.endswith("." + _YES24_ROOT_DOMAIN)
 
 
 def _extract_infoset_text(soup: BeautifulSoup, container_selector: str) -> str | None:
@@ -715,9 +707,6 @@ def _parse_grouped_int(el) -> int | None:
 # **투영**이라, 레코드 shape을 정의하는 곳 옆에 있어야 필드가 갈라지지 않는다. 소비자
 # (yes24_search·yes24_fetch·yes24_browse·matrix/retrieval)는 전부 이 레코드의 생산자다.
 
-# KST(UTC+9). pub_status의 "오늘" 판정 기준.
-_KST = timezone(timedelta(hours=9))
-
 # "2022년 03월" / "2022년 03월 28일"의 연·월과 선택적 일자를 추출한다.
 _PUBLICATION_DATE_RE = re.compile(
     r"(?P<year>\d{4})\s*년\s*(?P<month>\d{1,2})\s*월"
@@ -748,8 +737,8 @@ def pub_status(pub_date: str | None, *, now: datetime | None = None) -> str | No
     if not 1 <= month <= 12:
         return None
 
-    now = now or datetime.now(_KST)
-    current_date = now.astimezone(_KST).date() if now.tzinfo else now.date()
+    now = now or datetime.now(KST)
+    current_date = now.astimezone(KST).date() if now.tzinfo else now.date()
     delta_months = (year * 12 + month) - (
         current_date.year * 12 + current_date.month
     )
@@ -793,10 +782,14 @@ GROUNDING_FIELDS = tuple(f for f in _ITEM_FIELDS if f not in _SOURCE_IDENTITY_FI
 def product_fields(item: Mapping) -> dict:
     """파싱된 상품 아이템에서 출처 등록·반환에 실을 공통 필드 dict를 만든다.
 
-    아이템에 없는 필드는 None으로 남는다(빈 성공 위장 금지 — 파서 degrade 규약과 동일).
+    아이템에 **없는 키는 여기서도 뺀다** — _item_fields의 키-생략 신호(관측 자체가 불가능한
+    필드, 예: 목록 페이지의 page_count)를 보존한다. `item.get(name)`으로 되채우면 생략 키가
+    전부 None으로 부활해, 모델이 "쪽수: null"을 실제 값으로 오독하는 오염 표면이 도구 경계
+    밖에서 유지된다(72047b6이 차단하려던 것). 값이 None인 키(관측했으나 그 책엔 없음)는
+    그대로 남는다(빈 성공 위장 금지 — 파서 degrade 규약과 동일).
     pub_status는 pub_date에서 파생하며, 계산 불가(형식 불명·없음)면 키 자체를 넣지 않는다.
     """
-    fields: dict = {name: item.get(name) for name in GROUNDING_FIELDS}
+    fields: dict = {name: item[name] for name in GROUNDING_FIELDS if name in item}
 
     status = pub_status(item.get("pub_date"))
     if status is not None:

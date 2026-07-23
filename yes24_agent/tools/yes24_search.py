@@ -31,6 +31,11 @@ from google.adk.tools import ToolContext
 
 from yes24_agent.config import Settings, get_settings
 from yes24_agent.sources import now_checked_at, register_source
+from yes24_agent.tools._planning import (
+    angle_error_summary,
+    dropped_queries_message,
+    plan_queries,
+)
 from yes24_agent.yes24.client import Yes24Client, Yes24FetchError
 from yes24_agent.yes24.parsers import (
     ParseError,
@@ -146,27 +151,8 @@ async def yes24_search(
     if section not in SEARCH_SECTIONS:
         section = "all"
 
-    # 각도 계획: 문자열이 아니거나 빈 각도는 버리고, 같은 각도는 한 번만(중복 검색은 Yes24
-    # 트래픽·컨텍스트 낭비), 상한까지만 검색한다. 단일 문자열로 잘못 넘어와도 관용 처리한다.
-    if isinstance(queries, str):
-        queries = [queries]
-    requested = (
-        [q.strip() for q in queries if isinstance(q, str) and q.strip()]
-        if isinstance(queries, list)
-        else []
-    )
-
-    planned: list[str] = []
-    seen_queries: set[str] = set()
-    dropped_queries: list[str] = []
-    for q in requested:
-        if q in seen_queries:
-            continue
-        if len(planned) >= settings.yes24_search_max_queries:
-            dropped_queries.append(q)
-            continue
-        seen_queries.add(q)
-        planned.append(q)
+    # 각도 계획(관용 변환·중복 제거·상한 cap)은 web_search와 공용 헬퍼를 쓴다.
+    planned, dropped_queries = plan_queries(queries, settings.yes24_search_max_queries)
 
     if not planned:
         # 유효한 검색 각도가 하나도 없다 — 빈 성공으로 위장하지 않고 명시적 실패.
@@ -194,12 +180,7 @@ async def yes24_search(
     for outcome in searched:
         query = outcome["query"]
         if outcome["status"] == "error":
-            searches.append({
-                "query": query,
-                "status": "error",
-                "error_type": outcome["error_type"],
-                "result_count": 0,
-            })
+            searches.append(angle_error_summary(query, outcome["error_type"]))
             continue
         matched = 0
         for item in outcome["parsed"]:
@@ -274,9 +255,7 @@ async def yes24_search(
         # 가법 필드: 드롭이 없으면 반환 형태는 단일/다중 각도 모두 이 키가 없다.
         response["dropped_count"] = len(dropped_queries)
         response["dropped_queries"] = dropped_queries
-        response["message"] = (
-            f"한 번에 검색할 수 있는 각도 상한({settings.yes24_search_max_queries}개)을 넘어 "
-            f"{len(dropped_queries)}개 각도는 검색하지 않았습니다. "
-            "필요하면 남은 각도로 한 번 더 호출하세요."
+        response["message"] = dropped_queries_message(
+            settings.yes24_search_max_queries, len(dropped_queries)
         )
     return response

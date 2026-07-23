@@ -5,13 +5,14 @@
 파생한다(같은 섹션을 여러 곳에 나열하면 하나만 늘려도 다른 쪽이 조용히 터진다).
 """
 
-from urllib.parse import quote, urljoin
+from urllib.parse import quote
 
 from yes24_agent.yes24.selectors import (
     BESTSELLER_ITEM,
     BESTSELLER_LIST_CONTAINER,
     CREMACLUB_ITEM,
     CREMACLUB_LIST_CONTAINER,
+    GOODS_PATH,
     NEWPRODUCT_ITEM,
     NEWPRODUCT_LIST_CONTAINER,
 )
@@ -48,15 +49,10 @@ def search_url(base_url: str, query: str, section: str = "all") -> str:
     return f"{base}/product/search?domain={domain}&query={encoded_query}"
 
 
-def absolutize(base_url: str, href: str) -> str:
-    """상대 경로 href를 base_url 기준 절대 URL로 변환한다."""
-    return urljoin(base_url, href)
-
-
 def product_url(base_url: str, goods_no: str) -> str:
     """상품 상세 페이지 URL을 조립한다."""
     base = base_url.rstrip("/")
-    return f"{base}/product/goods/{goods_no}"
+    return f"{base}{GOODS_PATH}{goods_no}"
 
 
 # 정책/CS 시드 URL 맵. docs/m2-scout-report.md 라이브 조사 기준으로 확정.

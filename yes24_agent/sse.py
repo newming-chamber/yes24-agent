@@ -97,6 +97,11 @@ def sse_done(payload: dict, col: int | None = None) -> str:
     return format_sse("done", _with_col(payload, col))
 
 
+# 범용 일시 오류 안내 문구 — 채팅(runner)·매트릭스(matrix_runner)가 같은 문구를 쓴다.
+# 각자 리터럴로 두면 한쪽만 고쳐 채팅/매트릭스 안내가 갈라진다(단일 진실).
+STREAM_ERROR_MESSAGE = "일시적인 오류가 발생했어요. 잠시 후 다시 시도해 주세요."
+
+
 def sse_error(message: str) -> str:
     """에러 이벤트."""
     return format_sse("error", {"message": message})

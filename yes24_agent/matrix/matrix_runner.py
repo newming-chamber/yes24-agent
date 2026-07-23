@@ -40,7 +40,14 @@ from yes24_agent.event_translate import project_public_source
 from yes24_agent.matrix.generate import generate_matrix
 from yes24_agent.matrix.retrieval import build_shared_pool
 from yes24_agent.rbti.persona import axis_label, get_archetype_name
-from yes24_agent.sse import sse_delta, sse_done, sse_error, sse_source, sse_status
+from yes24_agent.sse import (
+    STREAM_ERROR_MESSAGE,
+    sse_delta,
+    sse_done,
+    sse_error,
+    sse_source,
+    sse_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,5 +126,5 @@ async def run_matrix_stream(question: str, session_id: str | None = None) -> Asy
 
     except Exception as exc:  # noqa: BLE001 — SSE 스트림 최상위 방어선(글로벌 done 1회 불변식)
         logger.exception("매트릭스 스트림 처리 중 예외: %s", exc)
-        yield sse_error("일시적인 오류가 발생했어요. 잠시 후 다시 시도해 주세요.")
+        yield sse_error(STREAM_ERROR_MESSAGE)
         yield _terminal_done([])

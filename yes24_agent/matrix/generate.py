@@ -37,19 +37,11 @@ class ColumnResult:
 
 
 def _render_product_column(pool: SharedPool, code: str) -> tuple[str, list[dict]]:
-    planned_picks = pool.picks.get(code)
-    if not planned_picks or len(planned_picks) != pool.requested_count:
-        raise ValueError("matrix pick 수가 요청 수량과 다름")
-    by_id = {candidate["source_id"]: candidate for candidate in pool.candidates}
-    if any(pick.source_id not in by_id for pick in planned_picks):
-        raise ValueError("matrix selected source가 상세 후보에 없음")
-    if any(
-        pick.rationale.constraint_text is None
-        or pick.rationale.constraint_text not in pool.question
-        for pick in planned_picks
-    ):
-        raise ValueError("matrix 추천 이유의 질문 원문 span이 무효")
-
+    # 픽 유효성은 풀 빌드 시점의 planning._validated_code_picks가 이미 강제했고,
+    # 아래 validate_product_submission이 상세 출처와 재대조한다 — 여기서 재검증하지 않는다.
+    # 코드 누락(부분 생존) 시 빈 selections가 ProductSelectionSubmission 검증 실패
+    # (ValidationError ⊂ ValueError)로 흘러 generate_column의 기존 catch → fallback "error".
+    planned_picks = pool.picks.get(code) or ()
     submission = ProductSelectionSubmission(
         selections=[
             ProductSelection(
@@ -81,7 +73,7 @@ def _render_product_column(pool: SharedPool, code: str) -> tuple[str, list[dict]
         )
         facts = render_product_submission(facts_submission, public_sources)
         rationale_text = resolve_product_rationale(pick.rationale, sources_by_id[pick.source_id])
-        if rationale_text is None or pick.rationale.constraint_text is None:
+        if rationale_text is None:
             raise ValueError("matrix 추천 이유 원문 구간을 찾을 수 없음")
         connection = " · ".join(
             AXIS_VALUE_LABELS_KO[axis][values_by_axis[axis]] for axis in pick.axis_connections

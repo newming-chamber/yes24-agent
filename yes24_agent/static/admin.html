@@ -11,7 +11,6 @@
     --accent: #2563eb;
     --accent-soft: #dbeafe;
     --web: #ea580c;
-    --web-soft: #ffedd5;
     --error-bg: #fee2e2;
     --error-text: #b91c1c;
     --radius: 10px;
@@ -229,6 +228,8 @@
 </div>
 
 <script type="module">
+  import { isSafeUrl } from "/static/lib/sources.js?v=1";
+
   const $ = (id) => document.getElementById(id);
   const state = { page: 0, total: 0, pageSize: 0, selected: null };
 
@@ -238,17 +239,6 @@
     if (cls) node.className = cls;
     if (text !== undefined) node.textContent = text;
     return node;
-  };
-
-  // 링크 href는 http/https만 허용한다. 출처 URL은 웹 검색 결과에서 오는 비신뢰 데이터라
-  // scheme을 한정하지 않으면 `javascript:` URI가 관리자 클릭 시 admin 오리진에서 실행된다.
-  const safeHref = (u) => {
-    try {
-      const parsed = new URL(u, location.origin);
-      return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.href : '#';
-    } catch {
-      return '#';
-    }
   };
 
   const num = (n) => (n ?? 0).toLocaleString('ko-KR');
@@ -400,7 +390,7 @@
         const link = el('a', null, `[${s.id}] ${s.title || s.url}`);
         // 출처 URL은 웹 검색 결과에서 온 비신뢰 데이터다. scheme을 http/https로 한정하지 않으면
         // `javascript:` URI가 섞였을 때 운영자 클릭이 admin 오리진에서 스크립트를 실행한다.
-        link.href = safeHref(s.url);
+        link.href = isSafeUrl(s.url) ? s.url : '#';
         link.target = '_blank';
         link.rel = 'noopener noreferrer';
         line.append(link);

@@ -50,8 +50,12 @@ def _merge_evidence_segments(existing: object, incoming: object) -> list[dict]:
     return list(merged.values())
 
 
-def _merge_source_observations(existing: dict, incoming: dict) -> dict:
-    """같은 범위의 동일 출처 관측을 합치되 상품 상세 충실도를 보존한다."""
+def merge_source_records(existing: dict, incoming: dict) -> dict:
+    """동일 출처 관측을 합치되 상품 상세 충실도를 보존한다.
+
+    세션 레지스트리(멀티턴 카탈로그: source id·읽은 상세 보존)와 이번 턴 스트림 스냅샷
+    양쪽에서 같은 병합 판정을 쓴다 — 범위 구분은 호출자가 어떤 컬렉션에 쌓느냐로 정해진다.
+    """
     existing_is_detail = existing.get("type") in PRODUCT_DETAIL_SOURCE_TYPES
     incoming_is_product_summary = (
         incoming.get("type") in PRODUCT_SOURCE_TYPES
@@ -102,21 +106,6 @@ def _merge_source_observations(existing: dict, incoming: dict) -> dict:
     return merged
 
 
-def merge_registry_source_records(existing: dict, incoming: dict) -> dict:
-    """세션 레지스트리의 동일 URL 관측을 누적한다.
-
-    레지스트리는 source id와 이미 읽은 상세를 멀티턴에 걸쳐 보존하는 카탈로그다. 이 결과를
-    이번 턴 근거로 직접 사용하지 않고, current-turn 스냅샷은 `merge_turn_source_records`로
-    별도 조립한다.
-    """
-    return _merge_source_observations(existing, incoming)
-
-
-def merge_turn_source_records(existing: dict, incoming: dict) -> dict:
-    """이번 턴 스트림에서 직접 관측한 동일 출처만 합친다."""
-    return _merge_source_observations(existing, incoming)
-
-
 def register_source(
     state: MutableMapping[str, Any],
     *,
@@ -147,7 +136,7 @@ def register_source(
                 "checked_at": checked_at,
                 "meta": meta,
             }
-            updated = merge_registry_source_records(source, incoming)
+            updated = merge_source_records(source, incoming)
             if updated != source:
                 refreshed = list(existing)
                 refreshed[index] = updated

@@ -139,11 +139,15 @@ CREMACLUB_RATING = ".rating_grade em.yes_b"
 # 링크 추출(extract_links) 상수 — M6 링크 팔로우
 # ============================================================
 
+# 상품 상세 경로 조각 — 조립(urls.product_url)·페이지 유형 판정(yes24_fetch)·링크 판별
+# (아래 정규식)의 단일 출처. 무의존 최하층인 이 모듈에 둔다(urls는 이미 selectors를 import).
+GOODS_PATH = "/product/goods/"
+
 # 상품 상세 링크 판별 패턴(경로만 대상, 쿼리스트링 제외하고 매칭).
 # 실측 결과 대소문자가 페이지마다 혼용된다 — 검색/베스트셀러/신간은 소문자
 # "/product/goods/{id}"인데, 크레마클럽 리뷰 건수 링크는
 # "/Product/Goods/{id}?ReviewYn=Y"로 대문자 혼용. 반드시 대소문자 무시로 매칭해야 한다.
-LINK_PRODUCT_PATH_RE = r"(?i)^/product/goods/\d+"
+LINK_PRODUCT_PATH_RE = rf"(?i)^{GOODS_PATH}\d+"
 
 # yes24.com 계열 서브도메인이지만 콘텐츠 탐색에 쓸모없는 노이즈로 실측 확인된 것들
 # (goods_paper.html/bestseller_domestic_sample.html의 모든 <a href> 전수 조사 기준).
@@ -172,8 +176,9 @@ LINK_NOISE_SUBDOMAINS = frozenset({"event.yes24.com", "ssl.yes24.com"})
 #                      프로모션 캠페인 페이지(event.yes24.com과 같은 성격의 노이즈)
 LINK_NOISE_PATH_MARKERS = ("/templates/", "/mypage", "/campaign/")
 
-# 고객센터 FAQ 목록. 현재 카테고리 결과를 우선하고, 서버가 그 목록을 비워 렌더한 페이지는
-# 동일 문서의 FAQ 목록으로 폴백한다. 파서는 첫 번째로 실제 entry가 있는 컨테이너 하나만 쓴다.
+# 고객센터 FAQ 목록. 파서(extract_faq_entries)는 선언된 **모든** 목록을 순회해 entry를
+# 합친다 — 첫 목록만 쓰던 조기 return은 #faqTop10List에만 있던 일반도서 반품 정책을
+# 버렸다(e8247a4에서 삭제, 파서 docstring이 정본).
 FAQ_ENTRY_LISTS = ("#faqCateList", "#faqTop10List")
 FAQ_ENTRY = "dl.yesToggleDl"
 FAQ_QUESTION = "dt a"

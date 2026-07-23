@@ -1,7 +1,7 @@
 // SSE 스트림 읽기 — 채팅·매트릭스 공용 단일 구현(두 페이지에 같은 파서·리더 루프가 복제돼 있었다).
 
 // SSE 이벤트 블록(event:/data:)을 {event, data}로 파싱한다. data가 JSON이 아니면 {}.
-export function parseEvent(block) {
+function parseEvent(block) {
   let event = "message";
   let data = "";
   for (const line of block.split("\n")) {

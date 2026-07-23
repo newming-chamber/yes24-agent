@@ -38,6 +38,11 @@ from google.adk.tools import ToolContext
 
 from yes24_agent.config import Settings, get_settings
 from yes24_agent.sources import now_checked_at, register_source
+from yes24_agent.tools._planning import (
+    angle_error_summary,
+    dropped_queries_message,
+    plan_queries,
+)
 from yes24_agent.tools.yes24_fetch import truncate
 
 logger = logging.getLogger(__name__)
@@ -114,14 +119,6 @@ def _url_in_domain_scope(url: str, domain_filters: list[str]) -> bool:
     return not matched if excluded else matched
 
 
-def _truncate_snippet(snippet: str | None, max_chars: int) -> str | None:
-    """snippet을 max_chars로 절단한다(None이면 그대로) — 절단 로직은 yes24_fetch와 공유.
-
-    절단 자체(상한에서 자르고 끝 공백 정리 후 표식)는 세 도구가 같아야 하므로 yes24_fetch의
-    truncate를 그대로 쓰고, 여기서는 snippet이 None일 수 있다는 관용만 감싼다."""
-    if not isinstance(snippet, str):
-        return snippet
-    return truncate(snippet, max_chars)
 
 # Yes24 클라이언트와 별개인 범용 HTTP 클라이언트(도메인 제약 없음). 모듈 lazy 싱글턴.
 # web_fetch도 이 클라이언트를 재사용한다(둘 다 외부 API 호출 — aclose 일원화). 두 도구가
@@ -275,24 +272,8 @@ async def web_search(
             "result_count": 0,
         }
 
-    # 각도 계획: 문자열이 아니거나 빈 각도는 버리고, 같은 각도는 한 번만(중복 검색은 벤더
-    # 트래픽·컨텍스트 낭비), 상한까지만 검색한다. 단일 문자열로 잘못 넘어와도 관용 처리한다.
-    if isinstance(queries, str):
-        queries = [queries]
-    requested = [q.strip() for q in queries if isinstance(q, str) and q.strip()] \
-        if isinstance(queries, list) else []
-
-    planned: list[str] = []
-    seen_queries: set[str] = set()
-    dropped_queries: list[str] = []
-    for q in requested:
-        if q in seen_queries:
-            continue
-        if len(planned) >= settings.web_search_max_queries:
-            dropped_queries.append(q)
-            continue
-        seen_queries.add(q)
-        planned.append(q)
+    # 각도 계획(관용 변환·중복 제거·상한 cap)은 yes24_search와 공용 헬퍼를 쓴다.
+    planned, dropped_queries = plan_queries(queries, settings.web_search_max_queries)
 
     if not planned:
         # 유효한 검색 각도가 하나도 없다 — 빈 성공으로 위장하지 않고 명시적 실패.
@@ -323,12 +304,7 @@ async def web_search(
     for outcome in searched:
         query = outcome["query"]
         if outcome["status"] == "error":
-            searches.append({
-                "query": query,
-                "status": "error",
-                "error_type": outcome["error_type"],
-                "result_count": 0,
-            })
+            searches.append(angle_error_summary(query, outcome["error_type"]))
             continue
         matched = 0
         for item in outcome["raw"]:
@@ -343,12 +319,11 @@ async def web_search(
                 ),
                 None,
             )
-            snippet = _truncate_snippet(
-                content,
-                settings.web_search_snippet_max_chars,
-            )
-            if not isinstance(snippet, str) or not snippet.strip():
+            if content is None:
                 continue
+            # 절단(상한에서 자르고 끝 공백 정리 후 표식)은 세 도구가 같아야 하므로
+            # yes24_fetch의 truncate를 공유한다.
+            snippet = truncate(content, settings.web_search_snippet_max_chars)
             matched += 1
             existing = url_to_index.get(url)
             if existing is not None:
@@ -422,9 +397,7 @@ async def web_search(
         # 가법 필드: 드롭이 없으면 반환 형태는 단일/다중 각도 모두 이 키가 없다.
         response["dropped_count"] = len(dropped_queries)
         response["dropped_queries"] = dropped_queries
-        response["message"] = (
-            f"한 번에 검색할 수 있는 각도 상한({settings.web_search_max_queries}개)을 넘어 "
-            f"{len(dropped_queries)}개 각도는 검색하지 않았습니다. "
-            "필요하면 남은 각도로 한 번 더 호출하세요."
+        response["message"] = dropped_queries_message(
+            settings.web_search_max_queries, len(dropped_queries)
         )
     return response

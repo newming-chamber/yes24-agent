@@ -6,7 +6,7 @@
 스트림 관찰본으로 보정한다(_reconcile_sources).
 """
 
-from yes24_agent.sources import merge_turn_source_records
+from yes24_agent.sources import merge_source_records
 from yes24_agent.yes24.parsers import GROUNDING_FIELDS
 from yes24_agent.yes24.urls import BROWSE_SEED_URLS
 
@@ -144,9 +144,6 @@ def project_public_source(source: dict) -> dict:
     return event
 
 
-build_source_event = project_public_source
-
-
 def project_source_ref(source_event: dict) -> dict:
     """출처 이벤트에서 **스트리밍 중 마커를 렌더할 최소 정보만** 투영한다(id·url).
 
@@ -191,5 +188,5 @@ def _reconcile_sources(observed_sources: list[dict]) -> list[dict]:
     for src in observed_sources:
         sid = src.get("id")
         if sid is not None:
-            by_id[sid] = merge_turn_source_records(by_id.get(sid, {}), src)
+            by_id[sid] = merge_source_records(by_id.get(sid, {}), src)
     return [by_id[key] for key in sorted(by_id)]

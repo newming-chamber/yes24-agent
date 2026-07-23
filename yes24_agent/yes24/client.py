@@ -57,11 +57,27 @@ def _strip_leading_www(host: str) -> str:
     return host[len(prefix) :] if host.startswith(prefix) else host
 
 
-def _is_allowed_host(host: str, allowed_domain: str | None) -> bool:
-    """host가 allowed_domain(등록 도메인) 본인이거나 그 서브도메인인지 확인한다."""
+def is_allowed_host(host: str, allowed_domain: str | None) -> bool:
+    """host가 allowed_domain(등록 도메인) 본인이거나 그 서브도메인인지 확인한다.
+
+    반드시 도메인 끝부분(suffix) 일치로 판정한다 — 단순 부분 문자열 포함 방식은
+    `hansaeyes24.com`처럼 무관한 외부 도메인이 우연히 "yes24.com"을 포함하는 경우
+    (goods_paper.html 실측 확인) 오탐한다. client의 SSRF 방어와 parsers의 링크 후보
+    선별이 이 판정 하나를 공유한다(중복 구현 금지).
+    """
     if allowed_domain is None:
         return False
     return host == allowed_domain or host.endswith(f".{allowed_domain}")
+
+
+def allowed_domain(base_url: str) -> str | None:
+    """base_url에서 허용 기준 등록 도메인을 파생한다(www. 접두사만 제거).
+
+    base_url이 www.yes24.com이어도 cremaclub.yes24.com 등 다른 서브도메인을
+    허용하기 위함이다. 파싱 불가 시 None(→ `is_allowed_host`가 전부 거부).
+    """
+    host = _hostname(base_url)
+    return _strip_leading_www(host) if host is not None else None
 
 
 def is_disallowed_path(url: str, disallowed_paths: tuple[str, ...]) -> bool:
@@ -147,16 +163,13 @@ class Yes24Client:
         concurrency: int,
         rps: float,
         max_retries: int,
-        backoff_base_s: float = 0.5,
-        max_redirects: int = 5,
-        max_replacement_ratio: float = 0.02,
-        disallowed_paths: tuple[str, ...] = (),
+        backoff_base_s: float,
+        max_redirects: int,
+        max_replacement_ratio: float,
+        disallowed_paths: tuple[str, ...],
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        base_host = _hostname(base_url)
-        # 허용 기준은 등록 도메인(예: yes24.com) — www. 접두사만 벗겨내 base_url이
-        # www.yes24.com이어도 cremaclub.yes24.com 등 다른 서브도메인을 허용한다.
-        self._allowed_domain = _strip_leading_www(base_host) if base_host is not None else None
+        self._allowed_domain = allowed_domain(base_url)
         self._max_retries = max_retries
         self._backoff_base_s = backoff_base_s
         self._max_redirects = max_redirects
@@ -239,7 +252,7 @@ class Yes24Client:
         않는다. 리다이렉트 홉도 이 검증을 거친 뒤에만 요청된다(사전 차단).
         """
         host = _hostname(url)
-        if host is None or not _is_allowed_host(host, self._allowed_domain):
+        if host is None or not is_allowed_host(host, self._allowed_domain):
             reason = (
                 "허용되지 않은 도메인으로 리다이렉트되었습니다"
                 if via_redirect

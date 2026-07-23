@@ -17,7 +17,6 @@
       --accent: #2563eb;
       --accent-soft: #dbeafe;
       --web: #ea580c;
-      --web-soft: #ffedd5;
       --error-bg: #fee2e2;
       --error-text: #b91c1c;
       --chip-bg: #ffffff;
@@ -41,7 +40,6 @@
         --accent: #60a5fa;
         --accent-soft: #1e3a5f;
         --web: #fb923c;
-        --web-soft: #3a2412;
         --error-bg: #3b1a1a;
         --error-text: #fca5a5;
         --chip-bg: #26262b;
@@ -287,9 +285,12 @@
     .btn-send { background: var(--accent); color: #fff; }
     .btn-send:hover:not(:disabled) { filter: brightness(1.08); }
     .btn-send:disabled { opacity: 0.4; cursor: default; }
-    /* 위로 스크롤해 자동추적이 꺼진 동안만 뜨는 "↓ 최신" 버튼(컴포저 위 중앙). 클릭 시 하단 복귀. */
+    /* 위로 스크롤해 자동추적이 꺼진 동안만 뜨는 "↓ 최신" 버튼(컴포저 위 중앙). 클릭 시 하단 복귀.
+       앵커는 높이 0의 위치 기준 — 대화영역과 하단 스택(성향 알림줄·컴포저) 경계에 놓여,
+       컴포저 자동 성장·알림줄 표시에도 버튼이 스택 위 간격을 자동 추종한다(픽셀 결합 없음). */
+    .jump-anchor { position: relative; height: 0; flex: 0 0 auto; z-index: 5; }
     .jump-latest {
-      position: absolute; left: 50%; transform: translateX(-50%); bottom: 78px; z-index: 5;
+      position: absolute; left: 50%; transform: translateX(-50%); bottom: 12px;
       background: var(--accent); color: #fff; border: none; border-radius: 999px;
       padding: 7px 14px; font-size: 12.5px; font-weight: 600; cursor: pointer;
       box-shadow: 0 2px 8px rgba(0,0,0,0.25);
@@ -439,7 +440,7 @@
     <!-- 인사(intro)는 JS가 상수(LANDING_GREETING/LANDING_SUBTITLE)로 그린다 — 문구 단일 출처. -->
     <div id="conversation"></div>
 
-    <button id="jump-latest" class="jump-latest" hidden>↓ 최신</button>
+    <div class="jump-anchor"><button id="jump-latest" class="jump-latest" hidden>↓ 최신</button></div>
 
     <!-- 성향이 적용된 동안에만 뜨는 알림줄(코드 + 한글 축 라벨 + 즉시 해제). -->
     <div class="persona-active" id="persona-active" hidden>
@@ -497,7 +498,7 @@
       "이 문장을 더 따뜻하게 다듬어줘",
     ];
     const STATUS_ICON = {
-      thinking: "💭", searching: "🔎", searching_web: "🌐", reading: "📖",
+      preface: "💬", searching: "🔎", searching_web: "🌐", reading: "📖",
       reading_web: "📄", browsing: "📚", notice: "⚠️", found: "✅",
     };
     const TYPE_LABEL = {
@@ -970,8 +971,8 @@
       function sourceSnapshot(src) {
         const fields = [
           "id", "title", "url", "type", "author", "price", "image_url", "rating",
-          "publisher", "published_at", "last_updated", "checked_at"
-        ];
+          "publisher", "published_at", "last_updated", "checked_at", "snippet"
+        ];  // snippet: 저자 없는 출처의 카드 저자줄 폴백(makeCard) — 복원 시에도 유지
         return Object.fromEntries(
           fields.filter((field) => src[field] !== undefined).map((field) => [field, src[field]])
         );

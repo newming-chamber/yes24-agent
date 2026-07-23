@@ -85,9 +85,7 @@ class RefineResult:
     queries: list[str]
     query_axes: tuple[tuple[str, ...], ...]
     constraints: tuple[ProductConstraint, ...]
-    constraint_texts: tuple[str, ...]
     requested_count: int
-    count_text: str | None
 
 
 @dataclass(frozen=True)
@@ -362,9 +360,7 @@ async def refine_query(
         queries=queries,
         query_axes=query_axes,
         constraints=constraints,
-        constraint_texts=tuple(constraint_texts),
         requested_count=requested_count,
-        count_text=count_text,
     )
 
 

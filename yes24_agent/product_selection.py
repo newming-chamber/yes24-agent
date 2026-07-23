@@ -5,18 +5,12 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from enum import Enum
-from typing import Literal
+from typing import Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from yes24_agent.postprocess import escape_citation_markers
 
-MissingReason = Literal[
-    "no_results",
-    "detail_unavailable",
-    "insufficient_evidence",
-    "needs_clarification",
-]
 EvidenceField = Literal[
     "title",
     "author",
@@ -37,12 +31,9 @@ RationaleEvidenceField = Literal[
     "pub_review",
     "weekly_reviews",
 ]
-PRODUCT_RATIONALE_FIELDS: tuple[RationaleEvidenceField, ...] = (
-    "title",
-    "intro",
-    "toc",
-    "pub_review",
-    "weekly_reviews",
+# Literal 정의에서 파생한다 — 같은 필드 목록을 두 번 나열하지 않는다(단일 진실).
+PRODUCT_RATIONALE_FIELDS: tuple[RationaleEvidenceField, ...] = get_args(
+    RationaleEvidenceField
 )
 
 
@@ -60,19 +51,7 @@ class ConstraintOperator(str, Enum):
     GT = "gt"
 
 
-_EVIDENCE_FIELD_LABELS: dict[EvidenceField, str] = {
-    "title": "상품명",
-    "author": "저자",
-    "publisher": "출판사",
-    "pub_date": "출간일",
-    "price": "판매가",
-    "rating": "평점",
-    "page_count": "쪽수",
-    "intro": "상품 소개",
-    "toc": "목차",
-    "pub_review": "출판사 리뷰",
-    "weekly_reviews": "독자 리뷰",
-}
+_EVIDENCE_FIELD_NAMES: frozenset[str] = frozenset(get_args(EvidenceField))
 
 
 class ProductRationale(BaseModel):
@@ -91,20 +70,8 @@ class ProductSelection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     source_id: int = Field(gt=0)
-    evidence_fields: list[EvidenceField]
+    evidence_fields: list[EvidenceField] = Field(min_length=1)
     rationales: list[ProductRationale] = Field(default_factory=list)
-
-    @field_validator("evidence_fields")
-    @classmethod
-    def _unique_fields(cls, fields: list[EvidenceField]) -> list[EvidenceField]:
-        unique: list[EvidenceField] = []
-        for field in fields:
-            cleaned = field.strip()
-            if cleaned and cleaned not in unique:
-                unique.append(cleaned)
-        if not unique:
-            raise ValueError("evidence_fields가 하나 이상 필요합니다")
-        return unique
 
 
 class ProductConstraint(BaseModel):
@@ -127,20 +94,11 @@ class ProductConstraint(BaseModel):
 
 
 class ProductSelectionSubmission(BaseModel):
-    """선택 성공 또는 근거 부족을 나타내는 typed 제출."""
+    """상품 선택의 typed 제출 (selections는 항상 non-empty)."""
 
     model_config = ConfigDict(extra="forbid")
 
-    selections: list[ProductSelection] = Field(default_factory=list)
-    missing_reason: MissingReason | None = None
-
-    @model_validator(mode="after")
-    def _normalize_selection_state(self) -> ProductSelectionSubmission:
-        if self.selections:
-            self.missing_reason = None
-        elif self.missing_reason is None:
-            raise ValueError("빈 selections에는 missing_reason이 필요합니다")
-        return self
+    selections: list[ProductSelection] = Field(min_length=1)
 
 
 def resolve_product_rationale(
@@ -164,17 +122,13 @@ def resolve_product_rationale(
 
 
 def validate_product_submission(
-    submission: ProductSelectionSubmission | None,
+    submission: ProductSelectionSubmission,
     current_sources: list[dict],
     *,
     expected_constraints: Sequence[ProductConstraint],
     expected_count: int | None = None,
 ) -> ProductSelectionSubmission | None:
     """선택·근거를 이번 턴 상세와, 상류의 숫자 조건을 canonical 값과 대조한다."""
-    if submission is None:
-        return None
-    if not submission.selections:
-        return submission if submission.missing_reason else None
     if expected_count is not None and len(submission.selections) != expected_count:
         return None
 
@@ -261,11 +215,11 @@ def product_evidence_fields(source: dict) -> set[EvidenceField]:
     """상세 DTO에서 실제 nonempty인 허용 근거 필드 이름을 반환한다."""
     observed = source.get("_evidence_fields")
     if isinstance(observed, list):
-        return {field for field in observed if field in _EVIDENCE_FIELD_LABELS}
+        return {field for field in observed if field in _EVIDENCE_FIELD_NAMES}
 
     meta = source.get("meta") if isinstance(source.get("meta"), dict) else {}
     available: set[EvidenceField] = set()
-    for field in _EVIDENCE_FIELD_LABELS:
+    for field in _EVIDENCE_FIELD_NAMES:
         value = source.get(field, meta.get(field))
         if isinstance(value, str) and value.strip():
             available.add(field)
