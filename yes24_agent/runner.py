@@ -124,6 +124,42 @@ def _event_text(event) -> str:
     return "".join(part.text or "" for part in event.content.parts if not part.thought)
 
 
+def _event_thought_text(event) -> str:
+    """ADK 이벤트에서 **사고 요약** 파트만 이어붙인다(_event_text의 여집합).
+
+    include_thoughts=True면 벤더 사고 구간(첫 3~5초, 본문 파트 0)에 사고 요약이 먼저
+    도착한다. 이 텍스트는 본문이 아니라 진행 타임라인(stage=thinking) 몫이다 — 첫 응답
+    체감 침묵을 LLM 실생성 텍스트로 채운다(정적 라벨 금지 원칙과 양립하는 유일한 재료).
+    """
+    if not event.content or not event.content.parts:
+        return ""
+    return "".join(part.text or "" for part in event.content.parts if part.thought)
+
+
+def _thought_status_labels(buffer: list[str], chunk: str, max_chars: int) -> list[str]:
+    """사고 요약 청크를 buffer에 누적하고, **닫힌 문단**들을 진행 라벨로 뽑아낸다.
+
+    사고 요약은 문단 단위로 주제가 바뀐다(Gemini는 "**주제**\\n내용" 형태로 스트림).
+    닫힌 문단만 라벨로 내보내고 미완 꼬리는 buffer에 남긴다 — 미리보기 채널이라
+    스트림 종료 시 남은 꼬리는 버려도 된다(본문이 곧 도착한다). 라벨은 공백 정규화 +
+    마크다운 강조 토큰(**) 제거 + max_chars 절단(예고 라벨과 같은 규약).
+    """
+    buffer.append(chunk)
+    joined = "".join(buffer)
+    *closed, tail = joined.split("\n\n")
+    buffer[:] = [tail]
+    labels = []
+    for paragraph in closed:
+        label = " ".join(paragraph.replace("**", "").split())
+        if len(label) > max_chars:
+            # 단어 중간 절단("translatio")을 피해 상한 안의 마지막 공백에서 자른다.
+            cut = label.rfind(" ", 0, max_chars)
+            label = label[: cut if cut > 0 else max_chars] + "…"
+        if label:
+            labels.append(label)
+    return labels
+
+
 # 최후 방어 문구: 어떤 경로로도 done.text가 비면(모델 빈 응답·홀드 flush 누락 등) 빈 응답을
 # 그대로 내보내지 않고 이 안내로 대체한다("빈 성공 위장 금지"의 사용자 노출 버전).
 _EMPTY_RESPONSE_FALLBACK = (
@@ -346,6 +382,9 @@ async def run_agent_stream(
         # 오거나 예고 길이를 넘으면 본문으로 확정돼 **순서대로** 흘리고 None(홀드 종료)이 된다.
         # 전량 홀드는 금지 — 토큰 스트리밍이 통째로 죽는다(실측: 1,779자가 12.4초 무출력).
         held: list[str] | None = []
+        # 사고 요약 누적 버퍼(_thought_status_labels). 닫힌 문단만 타임라인으로 나가고
+        # 미완 꼬리는 여기 남는다 — 미리보기 채널이라 스트림 종료 시 꼬리는 버려도 된다.
+        thought_buf: list[str] = []
 
         final_text = ""
         emitted_output = False
@@ -405,6 +444,7 @@ async def run_agent_stream(
                             # 이전 시도의 조각이 섞이면 안 된다(emitted_output=False 조건이
                             # 보장하듯 화면에 나간 적 없는 텍스트라 유실이 아니다).
                             held = []
+                            thought_buf = []
                             final_text = ""
                             retry_runner = Runner(
                                 agent=root_agent,
@@ -495,6 +535,16 @@ async def run_agent_stream(
                         continue
 
                     if event.partial:
+                        # 사고 요약은 본문보다 먼저 도착한다(벤더 사고 구간) — 닫힌 문단마다
+                        # 진행 타임라인으로 흘려 첫 응답 침묵을 채운다. emitted_output은
+                        # 올리지 않는다: 미리보기 채널이라 과부하 재시도 가능성을 보존한다
+                        # (재시도하면 새 스트림의 사고가 이어 붙는 것이 자연스럽다).
+                        thought_chunk = _event_thought_text(event)
+                        if thought_chunk:
+                            for label in _thought_status_labels(
+                                thought_buf, thought_chunk, settings.status_detail_max_chars
+                            ):
+                                yield sse_status("thinking", label)
                         chunk = _event_text(event)
                         if chunk:
                             if held is None:

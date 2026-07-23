@@ -299,7 +299,10 @@ def create_agent() -> LlmAgent:
         instruction=_instruction_provider,
         tools=list(AGENT_TOOLS),
         generate_content_config=types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(thinking_budget=settings.thinking_budget)
+            thinking_config=types.ThinkingConfig(
+                thinking_budget=settings.thinking_budget,
+                include_thoughts=settings.include_thoughts,
+            )
         ),
         before_model_callback=_force_tool_first_turn,
     )

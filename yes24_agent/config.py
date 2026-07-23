@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     # -1(동적)은 실측상 첫 토큰 ~10.8s로 512(~4.6s) 대비 2배+ 느려(모든 질의에 최대 추론)
     # "쉬운 건 빠르게" 실익이 없어 검증된 512로 고정(.env 조정 가능).
     thinking_budget: int = 512
+    # 사고 요약 스트리밍(Gemini include_thoughts). 벤더 사고 구간(첫 3~5초)은 본문 파트가
+    # 없어 화면이 비는데, 사고 요약 파트는 그 구간에 먼저 도착한다 — runner가 이를 진행
+    # 타임라인(stage=thinking)으로 흘려 첫 응답 체감 침묵을 줄인다(LLM 실생성 텍스트,
+    # 정적 라벨 아님). 본문 오염은 _event_text의 thought 필터가 그대로 막는다(원칙 4b).
+    include_thoughts: bool = True
 
     # 에러 구동 반응형 재시도: pro 경로가 Gemini 과부하/일시장애(429/5xx)로 첫 응답조차 내지
     # 못하면 같은 pro로 딱 1회 조용히 재시도한다. off면 곧장 정직 안내(error+done).
