@@ -13,6 +13,8 @@ RBTI(Reading BTI) = 독서 성향 16유형. 코드 = ``[C/S][A/E][D/B][I/F]`` 4�
 
 from __future__ import annotations
 
+import itertools
+
 # 코드 자리 순서 → 축 이름·허용값. code[0]=pattern, [1]=processing, [2]=breadth, [3]=motivation.
 # (예: "CADI" → C=pattern, A=processing, D=breadth, I=motivation.)
 AXIS_ORDER: tuple[tuple[str, tuple[str, str]], ...] = (
@@ -428,16 +430,20 @@ TYPE_ARCHETYPES: dict[str, dict[str, object]] = {
 
 # 채팅·typed 제출·매트릭스가 공유하므로 후보 선택과 강조 관점만 담는다.
 _PERSONA_HEADER = (
-    "## 독자 페르소나 (RBTI: {code})\n"
+    "## 독자 페르소나\n"
     "상위 실행 계약을 바꾸지 않고 후보 선택·강조 관점만 조율하세요."
 )
 
-# 유형명(아키타입 이름)은 **주입하지 않는다**. 이름을 프롬프트에 넣으면 모델이 그 단어를 본문에
-# 되뇌고("…파고드는 덕후님을 위해"), 그러면 그 단어를 금지하는 규칙을 프롬프트에 또 얹어야 한다 —
-# 원인을 넣어두고 결과를 막는 구조다. 본 적 없는 단어는 되뇔 수 없다. 카드 제목의 유형명은
-# SSE delta.name으로 UI에 따로 전달되므로 표시에는 손실이 없다.
+# 유형명·유형코드·축 이름은 **주입하지 않는다**(아키타입 이름·{code}·"완독/분석" 등 축 라벨 일체).
+# 이런 라벨을 프롬프트에 넣으면 모델이 그 단어를 본문에 되뇌고("…CADF 성향에 맞추어 엄선했습니다",
+# "서사가 정교하고(분석)"), 그러면 그 단어를 금지하는 규칙을 프롬프트에 또 얹어야 한다 — 원인을
+# 넣어두고 결과를 막는 구조다. 본 적 없는 단어는 되뇔 수 없다. 페르소나는 어떤 책을 고르고 무엇을
+# 강조하며 어떤 어조로 답하는지, 답의 결로만 드러나야지 자기 유형·축을 사용자에게 강의하면 안 된다.
+# 카드 제목의 유형명·코드는 SSE delta.name으로 UI에 따로 전달되므로 표시에는 손실이 없다.
 _PERSONA_BODY = (
-    "이 사용자의 독서 성향은 {code} 유형입니다. 아래 관점으로 후보를 평가하세요.\n"
+    "이 사용자의 독서 성향을 아래 관점으로 후보 선택·평가에만 반영하세요. 성향은 무엇을 고르고 "
+    "무엇을 강조하며 어떤 어조로 답하는지로만 드러내고, 유형 코드·축 이름을 본문에 부르거나 "
+    "성향에 맞췄다고 선언하지 마세요 — 그렇게 고른 답을 그냥 완결로 쓰면 됩니다.\n"
     "- 판단 관점: {tone}\n"
     "- 후보 선택: {structure}\n"
     "- 탐색·선택 범위: {breadth}\n"
@@ -445,6 +451,15 @@ _PERSONA_BODY = (
     "- 자각(함정 회피): {aware}\n"
     "- 성장 후보(선택): 맥락에 맞을 때만 다음 중 하나 — {stretch_pool}"
 )
+
+
+def matrix_codes() -> list[str]:
+    """16개 RBTI 코드 전체를 축 순서대로 생성한다(4축 × 각 2값 = 16조합).
+
+    16뷰 매트릭스가 각 코드로 채팅을 돌릴 때 쓰는 코드 목록. AXIS_ORDER가 단일 진실이라
+    축·값이 바뀌면 자동 반영된다.
+    """
+    return ["".join(values) for values in itertools.product(*(v for _axis, v in AXIS_ORDER))]
 
 
 def is_valid_code(code: object) -> bool:
@@ -518,7 +533,6 @@ def build_persona_block(code: object) -> str:
     aware = " · ".join(picked[axis]["aware"] for axis, _allowed in AXIS_ORDER)
     stretch_pool = "; ".join(picked[axis]["stretch"] for axis, _allowed in AXIS_ORDER)
     body = _PERSONA_BODY.format(
-        code=code,
         tone=picked["processing"]["tone"],
         structure=picked["pattern"]["tone"],
         breadth=picked["breadth"]["tone"],
@@ -526,4 +540,4 @@ def build_persona_block(code: object) -> str:
         aware=aware,
         stretch_pool=stretch_pool,
     )
-    return f"{_PERSONA_HEADER.format(code=code)}\n{body}"
+    return f"{_PERSONA_HEADER}\n{body}"

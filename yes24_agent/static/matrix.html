@@ -976,7 +976,7 @@
       renderChips(card);
 
       // 폴백 판정의 단일 출처 = col done의 fallback 플래그(백엔드가 모든 열에 항상 싣는다:
-      // matrix_runner "fallback": column.gate_reason is not None). 본문 문구 매칭 금지.
+      // matrix_runner fallback = not cell.cited_ids — 인용 0이면 정직 폴백). 본문 문구 매칭 금지.
       // gate_reason만 있는 페이로드(구 스냅샷)는 사유 유무로 파생한다.
       const reason = data.gate_reason != null ? data.gate_reason : null;
       const flag = typeof data.fallback === "boolean" ? data.fallback : reason != null;

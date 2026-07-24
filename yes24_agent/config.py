@@ -128,20 +128,8 @@ class Settings(BaseSettings):
     # 웹 열람(web_fetch)은 여전히 Tavily /extract 사용 — 특정 URL 전문 확보용.
     tavily_extract_url: str = "https://api.tavily.com/extract"
 
-    # 16뷰 매트릭스 (RBTI 시뮬레이터, retrieve-once → fan-out-generate)
-    # 공유 검색이 때릴 Yes24 검색 섹션. 매트릭스 풀은 **도서 섹션(domain=BOOK)**으로 상류에서
-    # 제약한다 — 통합검색(ALL)이 비도서 상품(교구·보드게임)을 섞어 내면 하류에 필터를 겹겹이
-    # 쌓아야 하고, 그 필터의 오탐이 풀을 16셀보다 작게 깎아 수렴을 부른다. 실측(4질의 × ALL/BOOK):
-    # BOOK 응답은 마크업이 동일해 파서가 그대로 동작하고 author·pub_date가 전 항목에 있다
-    # (비도서 0건) — 필터가 아니라 질의로 제약하는 편이 단순하고 견고하다.
-    matrix_search_section: str = "book"
-    # 검색 1건당 파싱할 후보 수. 채팅 도구(search_result_limit=10)는 에이전트가 읽을 목록이라
-    # 짧지만, 매트릭스 풀은 16셀이 갈라질 재료라 한 페이지가 주는 만큼(24건) 다 받는다 —
-    # 풀이 16보다 작으면 차별화가 구조적으로 불가능하다.
-    matrix_pool_parse_limit: int = 24
-    # 질문별 공유 풀 캐시 TTL(초). 같은 질문 재렌더·축필터 조작 시 Yes24 재타격 없이 풀 재사용
-    # (rbti-feature-plan §3.2-4). 짧게 두어 신선도를 지키되 데모 중 반복 렌더는 캐시로 흡수한다.
-    matrix_cache_ttl_s: float = 300.0
+    # 16뷰 매트릭스 (RBTI 시뮬레이터). 채팅 파이프라인(run_agent_stream)을 16 페르소나로
+    # 그대로 병렬 실행한다 — 전용 검색·선택 엔진이 없어 매트릭스만의 설정은 matrix_enabled뿐이다.
     # RBTI 16뷰 매트릭스 배포 게이팅. 로컬 개발은 True(매트릭스 노출), 프로드는 env
     # `MATRIX_ENABLED=false`로 숨긴다("rbti 제외하고 띄우자"). False면 main.py가 /matrix·
     # /chat/matrix 라우트를 등록하지 않아 404가 되고(채팅 경로는 무영향), 프론트 네비 링크는
@@ -158,37 +146,6 @@ class Settings(BaseSettings):
     # 통째로 깨진다. TLS 종단(프록시·ALB)이 생기면 env `COOKIE_SECURE=true`로 코드 수정 없이
     # 켠다. httponly·samesite는 평문에서도 안전해 플래그 없이 항상 켜져 있다.
     cookie_secure: bool = False
-    # refine·selection 모두 채팅과 같은 pro(model_name)를 쓴다. refine은 추상·분위기형 추천에서
-    # 취향을 좁히는 구체 검색씨앗(대표 저자·작품·하위장르)을 내야 하는데, flash는 추론 여지가
-    # 있어도 이를 불안정하게 내(넓은 카테고리어 '한국 소설'로 흘러 베스트셀러·참고서 잡탕 풀)
-    # pro가 필요하다(실측). refine·selection 각 1회뿐이라 16배 비용 가드는 성립하지 않는다.
-    # 추론 예산은 채팅의 thinking_budget(512 — 짧은 답변 지연 튜닝값)과 분리한다: 16코드 차별화
-    # 배정과 다각 검색축 설계는 조합 탐색이 커서, 동일 풀 A/B 실측(2026-07-20)으로 512는 축약
-    # 수렴(selection unique 1~6·미러 빈발, refine 작가씨앗 쏠림 2/4)했고 2048은 selection
-    # unique 4~8(미러 1/8), refine 유형 믹스 4/4로 안정됐다. 매트릭스당 2회뿐이라 비용은
-    # 위와 같은 논리로 무시 가능하다.
-    matrix_planning_thinking_budget: int = 2048
-    # 매트릭스 공유검색 전 경량 쿼리 정제 on/off. 채팅은 에이전트가 "핵심 제목·장르·저자만"으로
-    # 검색어를 성형하지만 매트릭스는 질문을 그대로 검색해, 자연어 문장("~비슷한 소설 추천해줘")이
-    # Yes24 0건 → 16카드 전부 폴백하는 데모 품질 이슈가 있다. on이면 매트릭스당 정제 1회
-    # (16× 아님, 위 주석대로 pro)로 수식어를 걷고 핵심 검색어를 뽑는다. 실패·빈 결과면 원 질문
-    # 폴백(안전).
-    matrix_query_refine: bool = True
-    # 정제 결과의 상한(글자수·공백 토큰 수). 정상 검색어(제목·저자·장르 몇 단어)는 짧아, 둘 중
-    # 하나라도 초과하면 모델이 검색어가 아니라 문장·설명을 냈다는 신호로 보고 원 질문으로 폴백한다.
-    matrix_refine_max_chars: int = 40
-    matrix_refine_max_words: int = 8
-    # 풀 확대: refine이 서로 다른 의미 각도로 낼 수 있는 검색어 개수 상한. 같은 주제를 '교양/입문'
-    # 각도와 '소설/에세이' 각도로 나눠 검색해 union+dedup하면 풀이 넓어져 16 페르소나가 갈라질
-    # 선택지가 생긴다(rbti-feature-plan §3.2, 사용자 피드백: 16셀 수렴). 매트릭스당 이 수만큼 검색.
-    matrix_retrieval_max_queries: int = 3
-    # 공유 풀 목표 크기. 다각 검색·dedup·다양성가드 후 이 수까지 담는다. **16셀보다 충분히 커야
-    # 한다** — 풀이 16보다 작으면 셀들이 같은 책을 고를 수밖에 없어 차별화가 구조적으로 불가능하고
-    # (실측: 최종 풀 12 < 16셀), 회전·축가드 같은 대증요법이 그 부족을 메우려 쌓인다.
-    matrix_pool_target_size: int = 40
-    # 공유 풀 캐시 엔트리 상한(LRU-ish 만료). TTL만 있고 상한이 없으면 장수 프로세스에서 질문
-    # 종류만큼 무한히 자란다.
-    matrix_cache_max_entries: int = 64
 
     # 세션 영속
     session_db_url: str = "sqlite+aiosqlite:///./data/sessions.db"  # async 드라이버 접미사 필수

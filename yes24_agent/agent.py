@@ -30,17 +30,17 @@ AGENT_TOOLS = (
     reply_directly,
 )
 _PERSONA_TOOL_DIRECTIVE = """
-## 독자 맞춤 반영 (RBTI {code} · {label})
+## 독자 맞춤 반영
 독서 성향을 추천 후보의 검색과 선택에 반영하되, 사용자 조건과 증거 계약보다 우선하지 마세요.
-구체적인 성향 정의와 후보 판단 관점은 뒤의 독자 페르소나를 따릅니다.
+성향은 검색·선택에만 쓰고 유형 코드·축 이름은 답에 밝히지 않습니다. 구체적인 성향 정의와
+후보 판단 관점은 뒤의 독자 페르소나를 따릅니다.
 """
 
 
 def persona_tool_directive(code: str) -> str:
-    label = axis_label(code)
-    if not label:  # 무효 코드
+    if not axis_label(code):  # 무효 코드
         return ""
-    return _PERSONA_TOOL_DIRECTIVE.format(code=code, label=label)
+    return _PERSONA_TOOL_DIRECTIVE
 
 
 def _format_policy_seeds() -> str:

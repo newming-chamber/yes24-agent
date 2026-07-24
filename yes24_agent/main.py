@@ -126,6 +126,9 @@ class MatrixRequest(BaseModel):
 
     question: NonBlankText
     session_id: str | None = None
+    # 채팅과 동일한 화이트리스트 계약. selectable_models 값 밖(없음·임의 문자열)은
+    # 기본(pro)으로 폴백한다(임의 모델 주입 차단) — /chat/stream과 동일 로직.
+    model: str | None = None
 
 
 def _configure_logging() -> None:
@@ -287,8 +290,11 @@ def create_app() -> FastAPI:
         @app.post("/chat/matrix")
         async def chat_matrix(request: MatrixRequest) -> StreamingResponse:
             """질문을 받아 16 RBTI 페르소나 답변을 열별 SSE로 스트리밍한다(retrieve-once)."""
+            # 화이트리스트 값만 통과 — /chat/stream과 동일 로직(임의 모델 문자열은 기본 pro로 폴백).
+            allowed = set(get_settings().selectable_models.values())
+            model = request.model if request.model in allowed else None
             return StreamingResponse(
-                run_matrix_stream(request.question, request.session_id),
+                run_matrix_stream(request.question, request.session_id, model=model),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
