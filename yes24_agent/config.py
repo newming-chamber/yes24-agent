@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     # 자율 다단계 탐색용 상위 모델(사용자 승인, 비용·지연 감수). 미명시 시 preview로 떨어짐.
     # 실측: pro는 flash의 빈응답 회귀 없이 자율 보강(정책 질문에 스스로 검색)을 안정 수행.
     model_name: str = "gemini-2.5-pro"
+    # 사용자가 UI에서 선택할 수 있는 Gemini 모델(라벨→모델ID). 요청의 model 필드는 이
+    # 화이트리스트의 **값**만 허용하고(임의 모델 문자열 차단), 없거나 무효면 model_name으로
+    # 폴백한다. 자동 라우팅이 아니라 명시 선택이라 단일 경로 원칙과 상충하지 않는다.
+    # 벤치: pro 9/12·3.5-flash 10/12 동급, 단순질의 flash 2~3배 빠름(2026-07-24).
+    selectable_models: dict[str, str] = {
+        "Gemini 2.5 Pro": "gemini-2.5-pro",
+        "Gemini 3.5 Flash": "gemini-3.5-flash",
+        "Gemini 3.6 Flash": "gemini-3.6-flash",
+    }
     # pro 단일 경로의 고정 추론 예산. flash/pro 하이브리드 라우팅을 폐기하며 이 값으로 통일한다.
     # -1(동적)은 실측상 첫 토큰 ~10.8s로 512(~4.6s) 대비 2배+ 느려(모든 질의에 최대 추론)
     # "쉬운 건 빠르게" 실익이 없어 검증된 512로 고정(.env 조정 가능).

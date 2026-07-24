@@ -116,6 +116,9 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
     # RBTI 독서 페르소나 코드(4글자, 예: "CADI"). 없거나 무효면 페르소나 미적용(기존 동작).
     rbti: str | None = None
+    # 사용자가 UI에서 고른 Gemini 모델ID. selectable_models 화이트리스트 값만 허용하고
+    # 그 밖(없음·임의 문자열)은 기본 pro로 폴백한다(임의 모델 주입 차단).
+    model: str | None = None
 
 
 class MatrixRequest(BaseModel):
@@ -256,11 +259,20 @@ def create_app() -> FastAPI:
         """헬스체크."""
         return {"status": "ok"}
 
+    @app.get("/models")
+    async def models() -> dict:
+        """UI 모델 선택기용 목록(라벨→모델ID)과 기본 모델. 화이트리스트가 단일 진실."""
+        settings = get_settings()
+        return {"models": settings.selectable_models, "default": settings.model_name}
+
     @app.post("/chat/stream")
     async def chat_stream(request: ChatRequest) -> StreamingResponse:
         """사용자 메시지를 받아 SSE로 답변을 스트리밍한다."""
+        # 화이트리스트 값만 통과 — 임의 모델 문자열은 여기서 걸러 기본(pro)으로 폴백한다.
+        allowed = set(get_settings().selectable_models.values())
+        model = request.model if request.model in allowed else None
         return StreamingResponse(
-            run_agent_stream(request.message, request.session_id, rbti=request.rbti),
+            run_agent_stream(request.message, request.session_id, rbti=request.rbti, model=model),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",

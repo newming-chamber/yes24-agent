@@ -97,6 +97,13 @@
       cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 4px;
     }
     header a.navlink:hover { color: var(--text); border-color: var(--accent); }
+    /* 모델 선택기 — navlink와 같은 톤의 얇은 드롭다운. 기본은 pro, localStorage 지속. */
+    .model-select {
+      font-size: 12px; color: var(--muted); background: transparent;
+      border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px;
+      cursor: pointer; max-width: 150px;
+    }
+    .model-select:hover { color: var(--text); border-color: var(--accent); }
 
     #conversation {
       flex: 1 1 auto;
@@ -436,6 +443,7 @@
       <h1>Yes24 AI 어시스턴트</h1>
       <span class="spacer"></span>
       <a id="matrix-navlink" class="navlink" href="/matrix" title="한 질문을 16가지 독서 성향으로 비교해 보기" hidden>🧭 16유형 비교</a>
+      <select id="model-select" class="model-select" title="답변 생성 모델" aria-label="답변 모델 선택"></select>
       <button id="persona-badge" class="persona-badge" aria-haspopup="dialog" aria-expanded="false">
         <span class="pb-ico">📖</span><span id="persona-label">독서 성향</span>
       </button>
@@ -533,6 +541,36 @@
     const stopBtn = document.getElementById("stop");
     const newChatBtn = document.getElementById("new-chat");
     const chipsEl = document.getElementById("chips");
+
+    // ── 모델 선택기: /models 화이트리스트로 채우고 선택을 localStorage에 지속 ──
+    // selectedModel이 빈 문자열이면 payload에서 생략(서버 기본 pro). 목록·기본은 서버가
+    // 단일 진실(config.selectable_models)이라 프론트에 모델ID를 박지 않는다.
+    const modelSelect = document.getElementById("model-select");
+    const MODEL_STORAGE_KEY = "yes24_chat_model";
+    let selectedModel = "";
+    (async () => {
+      try {
+        const r = await fetch("/models");
+        const { models, default: def } = await r.json();
+        const saved = localStorage.getItem(MODEL_STORAGE_KEY);
+        const ids = Object.values(models);
+        selectedModel = ids.includes(saved) && saved !== def ? saved : "";
+        for (const [label, id] of Object.entries(models)) {
+          const opt = document.createElement("option");
+          opt.value = id === def ? "" : id;   // 기본은 빈 값(생략)으로
+          opt.textContent = label;
+          if ((id === def && !selectedModel) || id === selectedModel) opt.selected = true;
+          modelSelect.appendChild(opt);
+        }
+      } catch (e) { modelSelect.hidden = true; }  // /models 실패 시 선택기 숨김(기본 동작 유지)
+    })();
+    modelSelect.addEventListener("change", () => {
+      selectedModel = modelSelect.value;
+      try {
+        if (selectedModel) localStorage.setItem(MODEL_STORAGE_KEY, selectedModel);
+        else localStorage.removeItem(MODEL_STORAGE_KEY);
+      } catch (e) {}
+    });
 
     // 채팅↔매트릭스 왕복(전체 페이지 네비게이션)에도 세션이 이어지도록 sessionId를
     // sessionStorage에 영속한다(페이지별 키 분리 — 매트릭스는 별도 키). 서버가 세션 히스토리를
@@ -1329,6 +1367,8 @@
         // 페르소나 미선택(rbtiCode=null) 시 rbti 필드를 아예 싣지 않아 기존 UX 100% 무변.
         const payload = { message, session_id: sessionId };
         if (rbtiCode) payload.rbti = rbtiCode;
+        // 모델 미선택·기본이면 필드 생략(서버 기본 pro). 화이트리스트 밖은 서버가 폴백.
+        if (selectedModel) payload.model = selectedModel;
         const resp = await fetch("/chat/stream", {
           method: "POST",
           headers: { "Content-Type": "application/json" },

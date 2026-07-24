@@ -22,7 +22,7 @@ from google.genai.errors import APIError
 
 from yes24_agent.adk_stream import iter_adk_events
 from yes24_agent.agent import (
-    root_agent,
+    get_agent,
 )
 from yes24_agent.config import get_settings
 from yes24_agent.event_translate import (
@@ -323,7 +323,7 @@ def _closeout_error_frames(
 
 
 async def run_agent_stream(
-    message: str, session_id: str | None, rbti: str | None = None
+    message: str, session_id: str | None, rbti: str | None = None, model: str | None = None
 ) -> AsyncIterator[str]:
     """사용자 메시지 1건을 처리하며 SSE 프레임 문자열을 순서대로 yield한다.
 
@@ -404,13 +404,14 @@ async def run_agent_stream(
             streaming_mode=StreamingMode.SSE,
             max_llm_calls=settings.max_llm_calls,
         )
-        # 단일 pro 경로: flash/pro 하이브리드 라우팅도 사전 질의분류기도 폐기했다. 강한 pro
-        # 단일 루프가 질문 자체를 보고 도구를 스스로 당기므로 사용자 원문을 그대로 넘기고,
-        # 난도별 추론량 조절은 thinking_budget(Gemini 동적 추론)에 위임한다.
-        active_model = str(root_agent.model)
+        # 사용자가 UI에서 고른 모델의 에이전트(무효·미지정이면 기본 pro). 자동 라우팅이
+        # 아니라 명시 선택이라 단일 루프 원칙은 유지된다 — 프롬프트·도구·thinking 구성은
+        # 모델과 무관하게 동일하고, done.model이 실제 사용 모델을 싣는다.
+        agent = get_agent(model)
+        active_model = str(agent.model)
 
         runner = Runner(
-            agent=root_agent,
+            agent=agent,
             app_name=settings.app_name,
             session_service=service,
         )
@@ -481,7 +482,7 @@ async def run_agent_stream(
                             thought_tasks.clear()
                             final_text = ""
                             retry_runner = Runner(
-                                agent=root_agent,
+                                agent=agent,
                                 app_name=settings.app_name,
                                 session_service=service,
                             )

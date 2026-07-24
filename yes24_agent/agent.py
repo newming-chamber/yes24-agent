@@ -278,15 +278,16 @@ def _force_tool_first_turn(callback_context, llm_request):
     return None
 
 
-def create_agent() -> LlmAgent:
-    """단일 루트(pro) LlmAgent를 생성한다.
+def create_agent(model_name: str | None = None) -> LlmAgent:
+    """루트 LlmAgent를 생성한다(model_name 미지정 시 config 기본 = pro).
 
-    thinking_budget은 config에서 주입한다(-1=Gemini 동적 추론: 복잡도별 자동). 모든
-    질의를 이 단일 pro 경로로 처리한다(flash/pro 하이브리드 라우팅 폐기).
+    thinking_budget=512는 pro·3.5-flash·3.6-flash 모두 호환(2026-07-24 raw API 실측 —
+    3.6-flash는 budget=0만 거부, 512·생략 OK). 사용자가 UI에서 고른 모델만 여기로 오고,
+    프롬프트·도구·thinking 구성은 모델과 무관하게 동일하다(공정 비교 + 단일 계약).
     """
     settings = get_settings()
     return LlmAgent(
-        model=settings.model_name,
+        model=model_name or settings.model_name,
         name="yes24_assistant",
         description="범용 질문에 답하고 Yes24 상품·정책과 웹 사실을 근거로 종합하는 어시스턴트.",
         instruction=_instruction_provider,
@@ -302,3 +303,20 @@ def create_agent() -> LlmAgent:
 
 
 root_agent = create_agent()
+
+# 모델별 에이전트 캐시(프로세스당 모델 수만큼 — 최대 3개). 요청마다 재생성하면
+# LlmAgent 조립 비용이 매 턴 붙으므로 화이트리스트 검증을 통과한 모델만 캐시한다.
+_AGENT_BY_MODEL: dict[str, LlmAgent] = {str(root_agent.model): root_agent}
+
+
+def get_agent(model_name: str | None) -> LlmAgent:
+    """선택된 모델의 에이전트를 돌려준다(무효·미지정이면 기본 pro).
+
+    **화이트리스트 검증은 API 계층(main.py)에서 끝난 상태로 넘어온다** — 여기 도달하는
+    model_name은 selectable_models의 값이거나 None이다. 임의 문자열은 API에서 걸러진다.
+    """
+    if not model_name:
+        return root_agent
+    if model_name not in _AGENT_BY_MODEL:
+        _AGENT_BY_MODEL[model_name] = create_agent(model_name)
+    return _AGENT_BY_MODEL[model_name]
