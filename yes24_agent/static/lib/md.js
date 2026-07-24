@@ -120,7 +120,16 @@ function renderCodeInto(target, text, opts) {
 // 표 셀 — <br>을 실제 줄바꿈(<br> 요소)으로 바꾸고 각 조각은 평소대로 인라인 렌더한다.
 // 요소를 직접 만들 뿐 innerHTML을 쓰지 않아 임의 HTML 삽입 경로가 없다(<br> 외엔 문자 그대로).
 function renderCellInto(target, text, opts) {
-  const parts = String(text).split(MD_CELL_BR_RE);
+  // 모델이 한 셀에 여러 항목을 넣으려 <li>/<ul> HTML을 쓰는 경우가 있다. 렌더러는
+  // innerHTML을 쓰지 않아 그대로 두면 생 태그가 노출되므로(2026-07-24 실측), 리스트
+  // 태그를 줄바꿈 경계로 정규화하고 <li>는 불릿을 앞에 단다. 표 마크업이 아닌 인라인
+  // HTML 일반을 파싱하는 게 아니라, 셀 안 리스트 관용만 평문 불릿으로 환원한다.
+  const normalized = String(text)
+    .replace(/<\/?(?:ul|ol)\s*>/gi, "")
+    .replace(/<li\s*>/gi, "<br>• ")
+    .replace(/<\/li\s*>/gi, "")
+    .replace(/^<br>/i, "");
+  const parts = normalized.split(MD_CELL_BR_RE);
   parts.forEach((part, i) => {
     if (i) target.appendChild(document.createElement("br"));
     renderInlineInto(target, part, opts);
