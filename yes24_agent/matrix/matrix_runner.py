@@ -14,7 +14,8 @@ SSE 계약(프론트 matrix.html 불변):
   등록되고, col done의 sources·picks가 id로 참조한다(중복 id는 한 번만 방출).
 - 열 `delta` {text, col, code, name, axis_label}: 그 페르소나 채팅의 완결 본문(카드 통째 1회).
 - 열 `done` {sources:[{id}], picks:[{id}], fallback, gate_reason, col}: 그 셀이 인용한 출처 id와
-  고른 책 id(picks=비-web 출처, 대표책=picks[0]). 인용 0이면 fallback=true.
+  고른 책 id(picks=비-web 출처, 대표책=picks[0]). fallback=true는 셀이 **답을 못 낸**(빈 본문)
+  경우이며 인용 유무와 무관하다 — 범용 질문은 인용 없이 답하는 게 정상이라 폴백이 아니다.
 - 글로벌 `done`: 스트림 종료 신호(col 없음). sources=전체 방출 출처 합집합.
 """
 
@@ -167,15 +168,19 @@ async def run_matrix_stream(
             }
             yield sse_delta(_remap_marker_text(cell["text"], id_map), col=col, extra=identity)
 
-            # picks = 인용한 **책**(비-web) 출처, 등장 순서 보존(대표책=picks[0]). 인용이 하나도
-            # 없으면 정직 폴백 셀이다(fallback=true). 프론트는 이 명시 필드만 보고 본문을 파싱하지
-            # 않는다(백엔드 인용 검증과의 이중 구현 금지 — 기존 계약 유지).
+            # picks = 인용한 **책**(비-web) 출처, 등장 순서 보존(대표책=picks[0]). 인용 유무는
+            # 대표책 줄 표시에만 쓰이고 폴백 판정과는 분리한다 — 프론트는 이 명시 필드만 보고
+            # 본문을 파싱하지 않는다(백엔드 인용 검증과의 이중 구현 금지 — 기존 계약 유지).
             book_ids = [
                 id_map[source["id"]]
                 for source in sources
                 if source.get("id") is not None and source.get("type") not in _WEB_TYPES
             ]
-            fallback = not cell["cited_ids"]
+            # 폴백 = **셀이 답을 못 낸 것**(빈 본문)이지 인용이 없는 것이 아니다. 매트릭스는 책
+            # 추천 그리드가 아니라 "같은 질문을 16 페르소나가 어떻게 답하나" 비교 뷰이고, 앱은
+            # 범용 어시스턴트라 월드컵·번아웃 등 대다수 질문은 Yes24 인용이 없는 게 정상이다.
+            # 인용 0을 실패로 찍으면 멀쩡한 답이 흐림(opacity 0.62)·비교 제외돼 뷰 목적이 깨진다.
+            fallback = not cell["text"].strip()
             yield sse_done(
                 {
                     "sources": [
