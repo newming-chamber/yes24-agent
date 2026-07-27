@@ -25,6 +25,8 @@
 """
 
 import asyncio
+import contextlib
+import contextvars
 import logging
 
 from google.adk.tools import ToolContext
@@ -51,21 +53,60 @@ logger = logging.getLogger(__name__)
 # 내부에 들고 있으므로 프로세스 전체가 하나의 인스턴스를 공유해야 예의 있는 트래픽이 된다.
 _shared_client: Yes24Client | None = None
 
+# 매트릭스 경로 전용 고처리량 클라이언트(lazy 싱글턴, 채팅 클라이언트와 별도 스로틀 상태).
+# 채팅 단일 경로는 _shared_client(rps=1.5)를 그대로 쓰고, 매트릭스 셀만 아래 contextvar가
+# 켜진 자기 태스크 컨텍스트에서 이 클라이언트(matrix_http_rps/concurrency)를 집어 든다.
+_matrix_client: Yes24Client | None = None
+
+# "고처리량 경로인가" 신호. 매트릭스 셀 태스크가 자기 컨텍스트 사본에서만 True로 켜므로
+# (matrix_runner._run_cell), 동시에 도는 채팅 요청 태스크는 영향받지 않는다. asyncio.gather로
+# 갈라지는 도구 하위 태스크는 켠 시점 이후의 컨텍스트를 복사해 이 값을 물려받는다.
+_high_throughput: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "yes24_high_throughput", default=False
+)
+
+
+@contextlib.contextmanager
+def high_throughput_client():
+    """이 with 블록(및 그 안에서 파생되는 하위 태스크) 동안 Yes24 요청을 고처리량 매트릭스
+    클라이언트로 라우팅한다. 매트릭스 셀 태스크가 감싸 쓰며, 채팅 요청 태스크는 무영향이다.
+    """
+    token = _high_throughput.set(True)
+    try:
+        yield
+    finally:
+        _high_throughput.reset(token)
+
 
 def _get_client(settings: Settings) -> Yes24Client:
-    """공유 Yes24Client 싱글턴을 반환한다(최초 호출 시 생성)."""
-    global _shared_client
+    """이 태스크 컨텍스트에 맞는 Yes24Client 싱글턴을 반환한다(최초 호출 시 생성).
+
+    고처리량 컨텍스트(매트릭스 셀)면 matrix_http_* 예산의 전용 클라이언트를, 아니면 채팅
+    공유 클라이언트를 쓴다. 두 경로는 스로틀·세마포어 상태가 분리돼 서로를 굶기지 않는다.
+    """
+    global _shared_client, _matrix_client
+    if _high_throughput.get():
+        if _matrix_client is None:
+            _matrix_client = Yes24Client.from_settings(
+                settings,
+                concurrency=settings.matrix_http_concurrency,
+                rps=settings.matrix_http_rps,
+            )
+        return _matrix_client
     if _shared_client is None:
         _shared_client = Yes24Client.from_settings(settings)
     return _shared_client
 
 
 async def aclose_shared_client() -> None:
-    """공유 클라이언트를 정리한다(서버 shutdown 훅용). 미생성 상태면 무동작."""
-    global _shared_client
+    """공유·매트릭스 클라이언트를 정리한다(서버 shutdown 훅용). 미생성분은 무동작."""
+    global _shared_client, _matrix_client
     if _shared_client is not None:
         await _shared_client.aclose()
         _shared_client = None
+    if _matrix_client is not None:
+        await _matrix_client.aclose()
+        _matrix_client = None
 
 
 async def _search_one(

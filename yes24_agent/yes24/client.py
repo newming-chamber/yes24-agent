@@ -194,16 +194,26 @@ class Yes24Client:
 
     @classmethod
     def from_settings(
-        cls, settings: Settings, *, transport: httpx.AsyncBaseTransport | None = None
+        cls,
+        settings: Settings,
+        *,
+        concurrency: int | None = None,
+        rps: float | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> "Yes24Client":
-        """`Settings` 값을 생성자 파라미터로 매핑하는 편의 팩토리."""
+        """`Settings` 값을 생성자 파라미터로 매핑하는 편의 팩토리.
+
+        `concurrency`·`rps`는 매트릭스 같은 고처리량 경로가 전역 기본 대신 자기 예산을
+        주입할 수 있게 열어 둔다(미지정이면 settings 기본). 나머지 정책(타임아웃·백오프·
+        도메인/robots 게이트)은 경로와 무관하게 동일하다.
+        """
         return cls(
             base_url=settings.yes24_base_url,
             user_agent=settings.user_agent,
             timeout_s=settings.http_timeout_s,
             connect_timeout_s=settings.http_connect_timeout_s,
-            concurrency=settings.http_concurrency,
-            rps=settings.http_rps,
+            concurrency=settings.http_concurrency if concurrency is None else concurrency,
+            rps=settings.http_rps if rps is None else rps,
             max_retries=settings.http_max_retries,
             backoff_base_s=settings.http_backoff_base_s,
             max_redirects=settings.http_max_redirects,

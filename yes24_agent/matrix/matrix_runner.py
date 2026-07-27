@@ -38,6 +38,7 @@ from yes24_agent.sse import (
     sse_source,
     sse_status,
 )
+from yes24_agent.tools.yes24_search import high_throughput_client
 
 logger = logging.getLogger(__name__)
 
@@ -92,14 +93,19 @@ async def _run_cell(question: str, code: str, model: str | None) -> dict:
     text = ""
     sources: list[dict] = []
     cited_ids: list = []
-    async for frame in run_agent_stream(question, session_id=None, rbti=code, model=model):
-        event, data = _parse_frame(frame)
-        # 채팅의 글로벌 done(col 없음)이 이 셀의 최종 결과다. 공개 source·done 규율은 원칙 4대로
-        # runner가 이미 적용해 두었으므로(인용분만), 여기서는 그대로 옮기기만 한다.
-        if event == "done":
-            text = data.get("text", "") or text
-            sources = data.get("sources", sources)
-            cited_ids = data.get("cited_ids", cited_ids)
+    # 이 셀 태스크(및 그 안에서 파생되는 Yes24 도구 하위 태스크)를 고처리량 경로로 표시한다.
+    # 16셀이 동시에 도는 매트릭스에서 전역 채팅 클라이언트(rps=1.5)의 단일 throttle_lock이 모든
+    # 셀의 Yes24 요청을 0.667초 간격으로 직렬화하던 병목을 없앤다(2026-07-24 실측: 89→~52초).
+    # 채팅 단일 경로는 이 컨텍스트가 꺼져 있어 rps=1.5 그대로 — 매트릭스만 빨라진다.
+    with high_throughput_client():
+        async for frame in run_agent_stream(question, session_id=None, rbti=code, model=model):
+            event, data = _parse_frame(frame)
+            # 채팅의 글로벌 done(col 없음)이 이 셀의 최종 결과다. 공개 source·done 규율은 원칙 4대로
+            # runner가 이미 적용해 두었으므로(인용분만), 여기서는 그대로 옮기기만 한다.
+            if event == "done":
+                text = data.get("text", "") or text
+                sources = data.get("sources", sources)
+                cited_ids = data.get("cited_ids", cited_ids)
     return {"code": code, "text": text, "sources": sources, "cited_ids": cited_ids}
 
 

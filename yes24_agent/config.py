@@ -60,6 +60,19 @@ class Settings(BaseSettings):
     http_connect_timeout_s: float = 5.0
     http_concurrency: int = 5
     http_rps: float = 1.5
+    # 매트릭스 경로 전용 Yes24 처리량. 매트릭스는 채팅 파이프라인을 16 페르소나로 **동시**
+    # 실행하는 개발 확인 화면이라, 전역 rps=1.5의 단일 throttle_lock이 16셀의 Yes24 요청을
+    # 0.667초 간격으로 직렬화해 총 벽시계를 단일 채팅의 3배+로 끌어올렸다(2026-07-24 실측:
+    # rps만 상향해도 89→60초, concurrency는 throttle 뒤에 가려 단독 효과 0). 매트릭스
+    # 셀에서만(contextvar) 이 값으로 클라이언트를 띄워, rps 인공 직렬화 대신 concurrency
+    # 세마포어가 정중함 경계가 되게 한다(≤16 동시 연결 = 대형 상용 사이트 허용 dev 버스트).
+    # 채팅 단일 경로는 http_rps/http_concurrency 그대로 — 채팅 벽시계는 throttle을 사실상
+    # 안 밟아 상향 전후 동일했다(실측 27초 불변). 하드코딩 금지(원칙 6) 준수 config 필드.
+    # 주의: 이 값의 정당성은 "매트릭스=개발 확인 화면, 간헐 버스트" 전제에 걸려 있다.
+    # 매트릭스·채팅이 같은 egress IP를 쓰므로, 매트릭스가 운영 노출·상시 자동 실행으로
+    # 승격되면 버스트가 IP 제재를 부르고 채팅이 연대 피해를 입는다 — 그때 이 값 재심사.
+    matrix_http_concurrency: int = 16
+    matrix_http_rps: float = 16.0
     http_max_retries: int = 2  # 429/5xx 지수 백오프 횟수
     http_backoff_base_s: float = 0.5  # 지수 백오프 기준 간격(backoff_base_s * 2**attempt)
     # 200-위장 서버 오류 리다이렉트 신호(2026-07-27 실측): Yes24는 장애 시 5xx 대신
