@@ -10,7 +10,7 @@ import asyncio
 import codecs
 import re
 import time
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 
@@ -167,9 +167,11 @@ class Yes24Client:
         max_redirects: int,
         max_replacement_ratio: float,
         disallowed_paths: tuple[str, ...],
+        error_redirect_param: str = "",
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._allowed_domain = allowed_domain(base_url)
+        self._error_redirect_param = error_redirect_param
         self._max_retries = max_retries
         self._backoff_base_s = backoff_base_s
         self._max_redirects = max_redirects
@@ -207,6 +209,7 @@ class Yes24Client:
             max_redirects=settings.http_max_redirects,
             max_replacement_ratio=settings.http_max_replacement_char_ratio,
             disallowed_paths=tuple(settings.yes24_disallowed_paths),
+            error_redirect_param=settings.yes24_error_redirect_param,
             transport=transport,
         )
 
@@ -288,6 +291,22 @@ class Yes24Client:
             return None
         return urljoin(str(response.url), location)
 
+    def _server_error_redirect(self, response: httpx.Response) -> str | None:
+        """리다이렉트 대상이 서버 오류 페이지 신호를 담으면 그 URL을, 아니면 None을 반환한다.
+
+        Yes24는 장애 시 5xx 대신 302 → 오류 페이지 → 200으로 응답해(2026-07-27 실측)
+        상태코드 기반 재시도를 우회한다. 대상 URL query의 오류 신호 파라미터
+        (`error_redirect_param`, ASP.NET 표준 aspxerrorpath)를 5xx와 동급으로 판정한다.
+        """
+        if not self._error_redirect_param:
+            return None
+        target = self._redirect_target(response)
+        if target is None:
+            return None
+        if self._error_redirect_param in parse_qs(urlparse(target).query):
+            return target
+        return None
+
     async def _fetch_once(self, url: str, *, original_url: str) -> httpx.Response:
         """단일 홉을 요청한다(재시도·스로틀 포함). 4xx/5xx는 Yes24FetchError.
 
@@ -308,6 +327,18 @@ class Yes24Client:
                 ) from exc
 
             status = response.status_code
+            # 200-위장 서버 오류: 오류 페이지로의 리다이렉트는 상태코드와 무관하게 그 URL의
+            # 서버 오류다 — 5xx와 동급으로 백오프·재시도한다(장애는 간헐이라 재시도로 살아남).
+            error_target = self._server_error_redirect(response)
+            if error_target is not None:
+                if has_more_attempts:
+                    await self._sleep_backoff(attempt)
+                    continue
+                raise Yes24FetchError(
+                    f"Yes24가 서버 오류 페이지로 리다이렉트했습니다(재시도 소진): {url}"
+                    f" -> {error_target}",
+                    url=original_url,
+                )
             if status < 400:
                 return response
 

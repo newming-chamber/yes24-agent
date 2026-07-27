@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     http_rps: float = 1.5
     http_max_retries: int = 2  # 429/5xx 지수 백오프 횟수
     http_backoff_base_s: float = 0.5  # 지수 백오프 기준 간격(backoff_base_s * 2**attempt)
+    # 200-위장 서버 오류 리다이렉트 신호(2026-07-27 실측): Yes24는 장애 시 5xx 대신
+    # 302 → error_500.html?aspxerrorpath=<원경로> → 200을 돌려줘 상태코드 기반 재시도를
+    # 통째로 우회한다. 리다이렉트 대상 query에 이 파라미터가 있으면 5xx와 동급의 재시도
+    # 대상으로 취급한다(ASP.NET 표준 오류 페이지 신호). 빈 문자열이면 판정 비활성.
+    yes24_error_redirect_param: str = "aspxerrorpath"
     # 리다이렉트 홉 상한. 홉마다 도메인 검증을 통과해야 요청되므로(사전 차단) 상한은
     # 무한 루프·체인 폭주 방지용이다.
     http_max_redirects: int = 5
