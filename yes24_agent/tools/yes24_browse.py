@@ -16,28 +16,45 @@ from yes24_agent.config import get_settings
 from yes24_agent.sources import now_checked_at, register_source
 from yes24_agent.tools.yes24_search import _get_client
 from yes24_agent.yes24.client import Yes24FetchError
-from yes24_agent.yes24.parsers import ParseError, parse_browse_list, product_fields
-from yes24_agent.yes24.urls import BROWSE_SEED_URLS
+from yes24_agent.yes24.parsers import (
+    ParseError,
+    parse_browse_list,
+    parse_category_links,
+    product_fields,
+)
+from yes24_agent.yes24.urls import BROWSE_SEED_URLS, browse_url
 
 logger = logging.getLogger(__name__)
 
 
 
-async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
-    """Yes24의 특정 코너(목록)를 직접 열람한다.
+async def yes24_browse(
+    section: str, tool_context: ToolContext, category_number: str = ""
+) -> dict:
+    """Yes24의 특정 코너(목록)를 직접 열람한다. 분야별로 좁힐 수 있다.
 
     검색어가 아니라 코너 전체를 랭킹·목록으로 보고 싶을 때 쓴다. 베스트셀러 순위,
     새로 나온 책, 크레마클럽 구독 인기처럼 "요즘 잘 나가는 책"류 질문에 적합하다.
+
+    "요즘 소설"·"경제 신간"처럼 특정 분야가 목적이면 두 단계로 좁힌다: 먼저 코너를
+    열람하면 결과의 categories에 분야(이름·번호) 목록이 오고, 원하는 분야의 번호를
+    category_number로 다시 호출하면 그 분야만의 목록을 받는다. 분야 번호를 추측으로
+    만들지 말고 categories에서 본 번호만 사용한다.
 
     Args:
         section: 열람할 코너 코드. 셋 중 하나:
             "bestseller"(국내도서 베스트셀러 랭킹), "new"(새로 나온 국내도서),
             "cremaclub"(크레마클럽 eBook 구독 인기).
+        category_number: 분야 번호(선택, 숫자 문자열). 이전 결과의 categories에서 얻은
+            번호로 코너를 그 분야로 좁힌다. 빈 문자열이면 코너 전체(국내도서).
+            cremaclub은 분야 좁히기를 지원하지 않는다.
 
     Returns:
-        성공 시 status="ok"와 section·section_label, results 목록(각 항목에 인용용
-        source_id와 순위 rank 포함), 검색 시각 checked_at, result_count를 담은 dict.
-        잘못된 section은 status="error", error_type="invalid_section". 그 외 실패는
+        성공 시 status="ok"와 section·section_label·적용된 category_number, results
+        목록(각 항목에 인용용 source_id와 순위 rank 포함), 이 페이지가 노출한 분야
+        목록 categories([{name, number}]), 검색 시각 checked_at, result_count를 담은
+        dict. 잘못된 section은 status="error"·error_type="invalid_section", 잘못된
+        분야 번호·미지원 섹션 좁히기는 error_type="invalid_category". 그 외 실패는
         error_type("fetch"|"parse"). 모든 실패 응답은 result_count=0을 함께 담는다.
     """
     settings = get_settings()
@@ -45,7 +62,7 @@ async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
     seed = BROWSE_SEED_URLS.get(section)
     if seed is None:
         valid = ", ".join(BROWSE_SEED_URLS)
-        logger.info("yes24_browse section=%r status=error error_type=invalid_section", section)
+        logger.info(f"yes24_browse section={section!r} status=error error_type=invalid_section")
         return {
             "status": "error",
             "error_type": "invalid_section",
@@ -53,12 +70,39 @@ async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
             "result_count": 0,
         }
 
+    # 분야 번호 검증·적용. 번호는 숫자만(입구에서 fail-loud — URL 주입·추측 번호 차단),
+    # 시드에 카테고리 슬롯이 없는 섹션은 browse_url이 ValueError로 알린다(조용한 무시 금지).
+    if category_number and not category_number.isdigit():
+        logger.info(
+            f"yes24_browse section={section!r} category={category_number!r} "
+            "status=error error_type=invalid_category"
+        )
+        return {
+            "status": "error",
+            "error_type": "invalid_category",
+            "message": "category_number는 categories에서 본 숫자 번호여야 합니다.",
+            "result_count": 0,
+        }
+    try:
+        url = browse_url(section, category_number)
+    except ValueError as exc:
+        logger.info(
+            f"yes24_browse section={section!r} category={category_number!r} "
+            "status=error error_type=invalid_category"
+        )
+        return {
+            "status": "error",
+            "error_type": "invalid_category",
+            "message": str(exc),
+            "result_count": 0,
+        }
+
     client = _get_client(settings)
 
     try:
-        html = await client.get_text(seed["url"])
+        html = await client.get_text(url)
     except Yes24FetchError as exc:
-        logger.info("yes24_browse section=%r status=error error_type=fetch", section)
+        logger.info(f"yes24_browse section={section!r} status=error error_type=fetch")
         return {
             "status": "error",
             "error_type": "fetch",
@@ -74,7 +118,7 @@ async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
             limit=settings.browse_result_limit,
         )
     except ParseError as exc:
-        logger.info("yes24_browse section=%r status=error error_type=parse", section)
+        logger.info(f"yes24_browse section={section!r} status=error error_type=parse")
         return {
             "status": "error",
             "error_type": "parse",
@@ -109,11 +153,19 @@ async def yes24_browse(section: str, tool_context: ToolContext) -> dict:
             }
         )
 
-    logger.info("yes24_browse section=%r status=ok results=%d", section, len(results))
+    # 이 페이지가 노출한 분야 내비 — 모델이 분야 번호를 발견하는 유일한 표면(추측 금지).
+    categories = parse_category_links(html, limit=settings.browse_categories_limit)
+
+    logger.info(
+        f"yes24_browse section={section!r} category={category_number!r} status=ok "
+        f"results={len(results)} categories={len(categories)}"
+    )
     return {
         "status": "ok",
         "section": section,
         "section_label": seed["label"],
+        "category_number": category_number,
+        "categories": categories,
         "results": results,
         "checked_at": checked_at,
         "result_count": len(results),

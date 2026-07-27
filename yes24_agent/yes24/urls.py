@@ -5,7 +5,7 @@
 파생한다(같은 섹션을 여러 곳에 나열하면 하나만 늘려도 다른 쪽이 조용히 터진다).
 """
 
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from yes24_agent.yes24.selectors import (
     BESTSELLER_ITEM,
@@ -129,3 +129,33 @@ BROWSE_SEED_URLS: dict[str, dict] = {
         "has_rank": True,
     },
 }
+
+
+def browse_url(section: str, category_number: str = "") -> str:
+    """섹션 시드 URL에 카테고리 번호를 적용한 열람 URL을 만든다.
+
+    category_number가 빈 문자열이면 시드 그대로다. 번호가 주어지면 시드 URL의
+    카테고리 파라미터 값만 치환한다 — 파라미터 표기는 시드마다 다르므로
+    (bestseller=CategoryNumber, new=categoryNumber) 키를 대소문자 무시로 찾고
+    원 표기를 보존한다. 시드에 카테고리 파라미터가 없는 섹션(cremaclub)은
+    조용히 무시하지 않고 ValueError로 fail-loud한다.
+
+    카테고리 번호 자체는 여기서 열거하지 않는다 — 목록 페이지 내비의
+    /Category/Display/{번호} 링크(parse_category_links)가 단일 소스다.
+    """
+    seed = BROWSE_SEED_URLS[section]["url"]
+    if not category_number:
+        return seed
+
+    scheme, netloc, path, query, fragment = urlsplit(seed)
+    replaced = False
+    pairs = []
+    for key, value in parse_qsl(query, keep_blank_values=True):
+        if key.lower() == "categorynumber":
+            pairs.append((key, category_number))
+            replaced = True
+        else:
+            pairs.append((key, value))
+    if not replaced:
+        raise ValueError(f"'{section}' 섹션은 카테고리 좁히기를 지원하지 않습니다")
+    return urlunsplit((scheme, netloc, path, urlencode(pairs), fragment))

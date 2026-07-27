@@ -14,6 +14,7 @@ from bs4 import BeautifulSoup
 from yes24_agent.sources import KST
 from yes24_agent.yes24.client import allowed_domain, is_allowed_host, is_disallowed_path
 from yes24_agent.yes24.selectors import (
+    CATEGORY_DISPLAY_HREF_RE,
     CREMACLUB_AUTHOR,
     CREMACLUB_GOODS_NO_LINK,
     CREMACLUB_RANK,
@@ -795,3 +796,30 @@ def product_fields(item: Mapping) -> dict:
     if status is not None:
         fields["pub_status"] = status
     return fields
+
+
+_CATEGORY_DISPLAY_HREF_RE = re.compile(CATEGORY_DISPLAY_HREF_RE)
+
+
+def parse_category_links(html: str, *, limit: int) -> list[dict]:
+    """목록 페이지 내비의 카테고리 링크(이름·번호)를 추출한다.
+
+    카테고리 번호를 코드에 열거하는 대신 **페이지 자신의 내비를 단일 소스**로 쓴다 —
+    yes24_browse가 이 결과를 categories 필드로 통과시키면, 모델이 분야 번호를 스스로
+    발견해 category_number로 코너를 좁힌다(POLICY_SEEDS "입구만 시드" 설계와 동일 원리:
+    정적 맵은 사이트 개편 시 조용히 썩는다). 이름 없는 링크는 건너뛰고, 같은 번호는
+    첫 등장만 남기며(문서 순서 보존), limit에서 멈춘다.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    seen: dict[str, str] = {}
+    for anchor in soup.find_all("a", href=_CATEGORY_DISPLAY_HREF_RE):
+        match = _CATEGORY_DISPLAY_HREF_RE.search(anchor["href"])
+        name = anchor.get_text(strip=True)
+        if match is None or not name:
+            continue
+        number = match.group(1)
+        if number not in seen:
+            seen[number] = name
+            if len(seen) >= limit:
+                break
+    return [{"number": number, "name": name} for number, name in seen.items()]

@@ -184,3 +184,8 @@ FAQ_ENTRY = "dl.yesToggleDl"
 FAQ_QUESTION = "dt a"
 FAQ_QUESTION_DECORATION = "em.bgYUI"
 FAQ_ANSWER = "dd .csCView_cont"
+
+# 목록 페이지 내비의 카테고리 링크 href 패턴. Yes24는 카테고리 트리를
+# `/Product/Category/Display/{번호}`(대소문자 혼재) 링크로 페이지에 싣는다 —
+# parse_category_links가 이 패턴으로 분야 이름·번호를 추출한다(번호 정적 맵 금지).
+CATEGORY_DISPLAY_HREF_RE = r"(?i)/category/display/(\d+)"

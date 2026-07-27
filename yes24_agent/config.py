@@ -89,6 +89,10 @@ class Settings(BaseSettings):
     # 초과분은 조용히 버리지 않고 dropped_queries로 명시한다(fail-loud).
     yes24_search_max_queries: int = 4
     browse_result_limit: int = 10
+    # yes24_browse 결과에 싣는 카테고리 내비(이름·번호) 상한. 페이지의 카테고리 트리는
+    # 144개+라 전부 실으면 도구 결과가 비대해진다 — 상위·중분류가 앞서 렌더되므로 문서
+    # 순서 상위만 담아도 분야 좁히기(소설/경제 등)는 충분하다.
+    browse_categories_limit: int = 60
     fetch_max_chars: int = 6000
     # yes24_fetch 결과에 싣는 페이지 내 이동 링크 후보 상한. FAQ 입구 같은 내비 허브는
     # 카테고리 메뉴가 40여 개라, 동적 정책 내비게이션(입구 fetch → links에서 카테고리 선택)이
