@@ -8,6 +8,7 @@ URL·UA·타임아웃·모델명·상한값 등 하드코딩 금지 원칙에 �
 import logging
 import os
 from functools import lru_cache
+from typing import Literal
 
 from google import genai
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -124,6 +125,18 @@ class Settings(BaseSettings):
     # 공유 Yes24Client의 동시성 Semaphore(http_concurrency=5)와 정렬해 초과 요청이 쌓이지
     # 않게 한다. 초과 items는 이 상한까지만 처리한다(하드코딩 금지 — 원칙 6).
     fetch_many_max_items: int = 5
+
+    # 웹 검색 백엔드 스위치(2026-07-28, 사용자 결정): "grounding" = Gemini google_search
+    # 그라운딩을 도구 내부의 **별도 요청**으로 실행(빌트인 도구는 함수 선언과 같은 요청에
+    # 혼용 금지 — 400 실측). 전환 근거: 시변 수치에서 검색 스니펫=크롤 캐시 한계 실측
+    # (삼전 폭락일: 그라운딩은 분 단위 정확 224,000, 스니펫·Tavily는 7~20% 낡음).
+    # "perplexity" = 기존 원시 검색 경로(임시 비활 — 코드 유지, 이 값으로 즉시 복귀).
+    # 도메인 필터(domains)가 지정된 호출은 그라운딩에 구조적 필터가 없어 항상 퍼플렉시티
+    # 경로로 처리한다(능력 기반 라우팅 — 콘텐츠 분기 아님).
+    web_search_backend: Literal["grounding", "perplexity"] = "grounding"
+    # 그라운딩 서브콜 모델·타임아웃. flash 실측: 분 단위 신선 + 저렴 + 컨텍스트(시장 상황)까지.
+    web_grounding_model: str = "gemini-3.5-flash"
+    web_grounding_timeout_s: float = 40.0
 
     # 웹 검색 (외부 원시 검색 — Perplexity /search). 상품 정보는 여전히 Yes24 출처만 인용 가능.
     # 퍼플렉시티 /search는 결과의 snippet 필드에 페이지 콘텐츠(추출 본문)를 직접 담아준다

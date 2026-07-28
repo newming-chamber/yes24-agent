@@ -31,10 +31,14 @@ source_id가 유일·단조로 부여된다(fetch_many와 동일 규약, 병렬 
 
 import asyncio
 import logging
+from functools import lru_cache
 from urllib.parse import urlsplit
 
 import httpx
+from google import genai
 from google.adk.tools import ToolContext
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 
 from yes24_agent.config import Settings, get_settings
 from yes24_agent.sources import now_checked_at, register_source
@@ -127,6 +131,156 @@ def _url_in_domain_scope(url: str, domain_filters: list[str]) -> bool:
 _shared_client: httpx.AsyncClient | None = None
 
 
+@lru_cache(maxsize=1)
+def _grounding_client(timeout_ms: int) -> genai.Client:
+    """그라운딩 서브콜 전용 genai 클라이언트(프로세스당 1개, thought_translation._client 관례).
+
+    빌트인 google_search는 함수 선언과 같은 요청에 혼용이 금지되므로(400 실측), 이 도구
+    내부의 **별도 요청**으로 실행한다 — 에이전트 루프의 커스텀 도구 7종과 충돌하지 않는다.
+    """
+    return genai.Client(http_options=genai_types.HttpOptions(timeout=timeout_ms))
+
+
+def _grounding_response_to_results(response) -> list[dict]:
+    """그라운딩 응답을 출처별 원시 재료 목록으로 분해한다.
+
+    grounding_supports(문장 구간 ↔ 출처 청크 매핑)를 이용해 종합문을 **출처별 근거 발췌**로
+    되돌린다 — 벤더 종합을 그대로 삼키지 않고 출처 단위 재료로 낮춰, 에이전트가 직접
+    종합·인용하는 기존 계약(원시 결과 철학)을 보존하기 위함이다. 근거 구간이 하나도 연결되지
+    않은 청크는 인용 불가이므로 버리고, 종합문 자체도 반환하지 않는다 — supports가 연결되지
+    않은 문장은 정확히 "인용 불가한 벤더 주장"이라 도구 결과에 실으면 마커 세탁 경로가 된다.
+    """
+    candidates = getattr(response, "candidates", None) or []
+    metadata = getattr(candidates[0], "grounding_metadata", None) if candidates else None
+    chunks = getattr(metadata, "grounding_chunks", None) or []
+    supports = getattr(metadata, "grounding_supports", None) or []
+
+    segments_by_chunk: dict[int, list[str]] = {}
+    for support in supports:
+        segment_text = getattr(getattr(support, "segment", None), "text", None)
+        if not segment_text:
+            continue
+        for chunk_index in getattr(support, "grounding_chunk_indices", None) or []:
+            segments_by_chunk.setdefault(chunk_index, []).append(segment_text)
+
+    raw_results: list[dict] = []
+    for index, chunk in enumerate(chunks):
+        web = getattr(chunk, "web", None)
+        uri = getattr(web, "uri", None)
+        segments = segments_by_chunk.get(index)
+        if not uri or not segments:
+            continue
+        raw_results.append(
+            {
+                "url": uri,
+                "title": getattr(web, "title", None) or uri,
+                "snippet": "\n".join(dict.fromkeys(segments)),  # 순서 보존 중복 제거
+            }
+        )
+    return raw_results
+
+
+async def _grounded_search(
+    planned: list[str], tool_context: ToolContext, settings: Settings
+) -> dict:
+    """google_search 그라운딩 서브콜 1회로 모든 각도를 검색·종합해 도구 결과를 조립한다.
+
+    그라운딩은 질문에서 스스로 다중 검색 쿼리를 만들어 실행하므로(실측: 질문 1개 → 구글
+    쿼리 3개) 각도별 병렬 호출이 필요 없다 — 서브콜 한 번이 각도 전체를 흡수한다.
+    """
+    prompt = (
+        "다음 질문(들)의 사실을 웹 검색으로 확인해, 확인된 사실만 간결하게 정리하세요. "
+        "시간에 따라 변하는 값은 기준 시각을 함께 적으세요.\n"
+        + "\n".join(f"- {q}" for q in planned)
+    )
+    # 벤더 **일시** 오류(5xx·타임아웃 = ServerError)만 1회 재시도로 흡수한다(Yes24Client의
+    # 전송 오류 재시도와 동일 철학 — 라이브 실측: 504가 재시도에서 정상). 4xx(ClientError:
+    # 인증·잘못된 요청)는 반복해도 같으므로 즉시 실패 — 과금 낭비·오독 방지.
+    last_error: Exception | None = None
+    raw_results: list[dict] = []
+    for _ in range(2):
+        try:
+            response = await asyncio.to_thread(
+                _grounding_client(int(settings.web_grounding_timeout_s * 1000))
+                .models.generate_content,
+                model=settings.web_grounding_model,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())]
+                ),
+            )
+            raw_results = _grounding_response_to_results(response)
+            last_error = None
+            break
+        except genai_errors.ServerError as exc:
+            last_error = exc
+        except Exception as exc:  # noqa: BLE001 — 비일시 오류: 재시도 없이 도구 계약대로 삼킨다
+            last_error = exc
+            break
+    if last_error is not None:
+        logger.info(
+            f"web_search backend=grounding status=error error_type=fetch ({last_error!r:.120})"
+        )
+        return {
+            "status": "error",
+            "error_type": "fetch",
+            "message": "웹 검색(그라운딩)이 실패했습니다",
+            "result_count": 0,
+        }
+
+    if not raw_results:
+        # 근거 출처가 하나도 연결되지 않은 답은 인용 불가 — 빈 성공으로 위장하지 않는다.
+        # 일시 오류(fetch)와 구분되는 별도 라벨: 재시도해도 같을 가능성이 큰 상태다.
+        logger.info("web_search backend=grounding status=error error_type=empty_grounding")
+        return {
+            "status": "error",
+            "error_type": "empty_grounding",
+            "message": "웹 검색 결과에 인용 가능한 출처가 없습니다",
+            "result_count": 0,
+        }
+
+    checked_at = now_checked_at()
+    results: list[dict] = []
+    # 출처 등록은 순차 루프(단일 state, source_id 유일·단조 — 기존 규약).
+    for item in raw_results:
+        snippet = truncate(item["snippet"], settings.web_search_snippet_max_chars)
+        source_id = register_source(
+            tool_context.state,
+            title=item["title"],
+            url=item["url"],
+            source_type="web",
+            snippet=snippet,
+            checked_at=checked_at,
+            meta={"published_at": None, "last_updated": None},
+        )
+        results.append(
+            {
+                "source_id": source_id,
+                "type": "web",
+                "title": item["title"],
+                "url": item["url"],
+                "snippet": snippet,
+                "checked_at": checked_at,
+            }
+        )
+
+    logger.info(
+        f"web_search backend=grounding queries={len(planned)} status=ok "
+        f"results={len(results)}"
+    )
+    # searches는 **실제 관측 단위**로만 보고한다: 그라운딩은 서브콜 1회가 전 각도를
+    # 흡수하므로 그 호출 1건이 유일한 관측이다. 각도별 성공을 제조하거나(빈 성공 위장)
+    # 결과를 각도에 거짓 귀속(queries)하지 않는다 — 어느 각도가 어느 출처를 낳았는지는
+    # 이 백엔드에서 관측 불가한 값이다.
+    return {
+        "status": "ok",
+        "results": results,
+        "searches": [{"query": " | ".join(planned), "status": "ok"}],
+        "checked_at": checked_at,
+        "result_count": len(results),
+    }
+
+
 def _get_client(settings: Settings) -> httpx.AsyncClient:
     """외부 API 호출용 공유 httpx 클라이언트 싱글턴을 반환한다(최초 호출 시 생성)."""
     global _shared_client
@@ -216,23 +370,19 @@ async def web_search(
     tool_context: ToolContext,
     domains: list[str] | None = None,
 ) -> dict:
-    """웹에서 원시 검색 결과(제목·URL·스니펫) 목록을 가져온다(여러 각도를 한 번에 병렬 검색).
+    """웹을 검색해 최신 사실을 출처별 근거와 함께 가져온다(실시간 값 포함).
 
-    Yes24로 답할 수 없는 외부·최신 정보(뉴스·스포츠·주가·날씨·시사·인물·상식 등)가
-    필요할 때 쓴다. 각 결과의 snippet에는 해당 페이지에서 추출한 본문이 담기므로, 여러
-    결과의 snippet을 종합해 그대로 답한다. snippet만으로 부족해 특정 페이지의 더 긴 전문이
-    필요하면 그 url을 web_fetch에 넣어 읽는다. 각 결과의 published_at(문서 발행 시점)과
-    last_updated(출처 갱신 시점)를 구분해 시의성을 판단한다. **주의: snippet은 검색엔진이
-    그 페이지를 과거에 긁어간 캐시다** — 시시각각 변하는 수치(시세·환율·순위 등)의 현재 값은
-    snippet에 낡은 채 담겨 있으므로, 그 값이 답의 핵심이면 snippet을 인용하지 말고 결과의
-    url을 web_fetch로 열람해 지금 관측되는 값으로 답한다(web_fetch는 캐시가 아니라 라이브
-    열람이다). 가격·재고·구매 링크 같은 상품
-    정보를 얻는 용도가 아니다(그것은 Yes24 검색으로). 잡담이나 Yes24로 충분한 질문엔 쓰지 않는다.
+    Yes24로 답할 수 없는 외부·최신 정보(뉴스·스포츠·주가·환율·날씨·시사·인물·상식 등)가
+    필요할 때 쓴다. 시시각각 변하는 수치의 현재 값도 이 도구가 신선하게 가져온다. 각 결과의
+    snippet은 그 출처가 뒷받침하는 근거 발췌이며, 여러 결과를 직접 종합해 각 사실에 해당
+    출처의 source_id를 [n]으로 인용해 답한다. 특정 출처의 더 긴 전문이 필요하면 그 url을
+    web_fetch로 읽는다(리다이렉트 url도 원문으로 열린다 — 실측). 가격·재고·구매 링크 같은 상품 정보를 얻는 용도가 아니다
+    (그것은 Yes24 검색으로). 잡담이나 Yes24로 충분한 질문엔 쓰지 않는다.
 
-    복합·시의성·비교 질문은 서로 독립적인 검색 각도를 queries에 함께 담을 수 있다. 각도들은
-    동시에 검색되며, 단순 질문은 하나의 원소만 전달한다. 같은 목적의 표현만 바꾼 중복 검색은
-    만들지 않고 서로 다른 요구나 충돌 확인에 필요한 각도만 사용한다. 사용자가 여러 사이트를
-    함께 근거로 요구했다면 각 사이트를 실제로 찾는 독립 검색 각도를 두고, 결과가 반환된 사이트만
+    복합·시의성·비교 질문은 서로 독립적인 검색 각도를 queries에 함께 담을 수 있다. 단순
+    질문은 하나의 원소만 전달한다. 같은 목적의 표현만 바꾼 중복 검색은 만들지 않고 서로
+    다른 요구나 충돌 확인에 필요한 각도만 사용한다. 사용자가 여러 사이트를 함께 근거로
+    요구했다면 각 사이트를 실제로 찾는 독립 검색 각도를 두고, 결과가 반환된 사이트만
     사용했다고 말한다.
 
     Args:
@@ -242,28 +392,17 @@ async def web_search(
         domains: 사용자가 구체적으로 지정한 사이트 hostname의 선택적 목록. 포함 범위는
             `["news.example", "wire.example"]`, 특정 사이트 제외는 `["-example.com"]`처럼
             전달하며 포함과 제외를 섞지 않는다. 출처 범주를 임의 hostname 목록으로 바꾸지 않는다.
+            도메인을 지정한 검색은 원시 검색 경로로 처리되며, 그 경로의 snippet은 검색엔진
+            캐시라 시변 수치의 현재 값 근거로 쓰지 않는다.
 
     Returns:
-        성공 시 status="ok"와 results 목록(모든 각도의 결과를 url 기준으로 병합·중복제거,
-        각 결과에 인용용 source_id·title·url·snippet·published_at·last_updated와 어느 각도에서
-        나왔는지(queries), 각 각도의 성공/실패를 담은 searches 요약, 검색 시각 checked_at을 담은
-        dict.
-        snippet은 스니펫이 아니라 페이지 콘텐츠(추출 본문)라 그 자체로 종합 재료가 된다.
-        상한을 넘겨 검색하지 않은 각도가 있으면 dropped_count·dropped_queries로 명시한다.
-        성공·실패 모두 result_count를 함께 담는다. 모든 각도가 실패했을 때만 status="error"와
-        error_type("not_configured"|"empty_query"|"fetch"), message에 더해
-        result_count=0을 담은 dict.
+        성공 시 status="ok"와 results 목록(각 결과에 인용용 source_id·title·url·snippet),
+        searches(실제 수행된 검색 호출 단위의 성공/실패 — 그라운딩 경로는 서브콜 1건),
+        검색 시각 checked_at을 담은 dict. 성공·실패 모두 result_count를 함께 담는다.
+        실패 시 status="error"와 error_type("not_configured"|"empty_query"|"fetch"|
+        "empty_grounding"), message, result_count=0을 담은 dict.
     """
     settings = get_settings()
-
-    if not settings.perplexity_api_key:
-        logger.info("web_search status=error error_type=not_configured")
-        return {
-            "status": "error",
-            "error_type": "not_configured",
-            "message": "웹 검색이 설정되지 않았습니다",
-            "result_count": 0,
-        }
 
     try:
         domain_filters = _normalize_domain_filters(domains)
@@ -286,6 +425,28 @@ async def web_search(
             "status": "error",
             "error_type": "empty_query",
             "message": "검색할 유효한 검색어가 없습니다",
+            "result_count": 0,
+        }
+
+    # 백엔드 라우팅(config web_search_backend): 그라운딩이 기본. 도메인 필터는 그라운딩에
+    # 구조적 필터가 없어 원시(퍼플렉시티) 경로로 처리한다 — 능력 기반 라우팅(콘텐츠 분기 아님).
+    if settings.web_search_backend == "grounding" and not domain_filters:
+        outcome = await _grounded_search(planned, tool_context, settings)
+        if dropped_queries and outcome.get("status") == "ok":
+            # 상한 초과 각도를 조용히 버리지 않는다(fail-loud) — 퍼플렉시티 경로와 동일 규약.
+            outcome["dropped_count"] = len(dropped_queries)
+            outcome["dropped_queries"] = dropped_queries
+            outcome["message"] = dropped_queries_message(
+                settings.web_search_max_queries, len(dropped_queries)
+            )
+        return outcome
+
+    if not settings.perplexity_api_key:
+        logger.info("web_search status=error error_type=not_configured")
+        return {
+            "status": "error",
+            "error_type": "not_configured",
+            "message": "웹 검색이 설정되지 않았습니다",
             "result_count": 0,
         }
 
