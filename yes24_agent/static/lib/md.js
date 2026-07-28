@@ -245,10 +245,14 @@ export function renderBody(container, text, opts = {}) {
     }
     // 리스트 = 연속된 불릿/번호 라인. 한 블록 안에서 첫 라인의 종류(불릿/번호)가 태그를 정한다.
     // 줄머리 마커는 <li>가 대신하므로 리터럴 `*`/`-`가 본문에 새지 않는다(웹셀 날씨 등).
+    // 부모 항목보다 깊게 들여쓴 연속 리스트 라인은 그 <li> 안의 **한 단계 중첩 목록**으로
+    // 담는다 — 모델의 상품 관용("1. 제목" 밑에 들여쓴 "* 가격/평점")이 이전엔 종류가 갈리는
+    // 지점에서 블록이 끊겨 납작한 형제 목록들로 조각났다(2026-07-28 실측: 경제 베스트 답).
     const bm = line.match(MD_BULLET_RE);
     const om = bm ? null : line.match(MD_ORDERED_RE);
     if (bm || om) {
       flush();
+      const indentOf = (l) => l.match(/^\s*/)[0].length;
       const ordered = !!om;
       const list = document.createElement(ordered ? "ol" : "ul");
       list.className = "md-list";
@@ -261,8 +265,30 @@ export function renderBody(container, text, opts = {}) {
       while (i < lines.length) {
         const im = lines[i].match(ordered ? MD_ORDERED_RE : MD_BULLET_RE);
         if (!im) break;
+        const parentIndent = indentOf(lines[i]);
         const li = document.createElement("li");
         renderInlineInto(li, ordered ? im[2] : im[1], o);
+        // 한 단계 중첩: 다음 라인들이 (종류 무관) 리스트이고 부모보다 깊게 들여쓴 동안
+        // li 안의 하위 목록으로 흡수한다. 종류가 바뀌면 하위 목록만 새로 연다.
+        let sub = null;
+        let subOrdered = null;
+        while (i + 1 < lines.length) {
+          const next = lines[i + 1];
+          const nb = next.match(MD_BULLET_RE);
+          const no = nb ? null : next.match(MD_ORDERED_RE);
+          if (!(nb || no) || indentOf(next) <= parentIndent) break;
+          const childOrdered = !!no;
+          if (!sub || subOrdered !== childOrdered) {
+            sub = document.createElement(childOrdered ? "ol" : "ul");
+            sub.className = "md-list";
+            li.appendChild(sub);
+            subOrdered = childOrdered;
+          }
+          const childLi = document.createElement("li");
+          renderInlineInto(childLi, childOrdered ? no[2] : nb[1], o);
+          sub.appendChild(childLi);
+          i++;
+        }
         list.appendChild(li);
         i++;
       }
