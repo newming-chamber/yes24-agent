@@ -131,13 +131,25 @@ BROWSE_SEED_URLS: dict[str, dict] = {
 }
 
 
+def _seed_category_param(section: str) -> tuple[str, str] | None:
+    """시드 쿼리의 카테고리 파라미터를 (원 표기 키, 값)으로 찾는다. 없으면 None.
+
+    표기는 시드마다 다르므로(bestseller=CategoryNumber, new=categoryNumber) 대소문자
+    무시로 찾되 원 표기를 보존한다. browse_url(치환)·browse_category_prefix(트리)·
+    "좁히기 미지원" 판정이 전부 이 한 스캔을 공유한다(같은 판정의 중복 구현 금지).
+    """
+    query = urlsplit(BROWSE_SEED_URLS[section]["url"]).query
+    for key, value in parse_qsl(query, keep_blank_values=True):
+        if key.lower() == "categorynumber":
+            return key, value
+    return None
+
+
 def browse_url(section: str, category_number: str = "") -> str:
     """섹션 시드 URL에 카테고리 번호를 적용한 열람 URL을 만든다.
 
     category_number가 빈 문자열이면 시드 그대로다. 번호가 주어지면 시드 URL의
-    카테고리 파라미터 값만 치환한다 — 파라미터 표기는 시드마다 다르므로
-    (bestseller=CategoryNumber, new=categoryNumber) 키를 대소문자 무시로 찾고
-    원 표기를 보존한다. 시드에 카테고리 파라미터가 없는 섹션(cremaclub)은
+    카테고리 파라미터 값만 치환한다. 시드에 카테고리 파라미터가 없는 섹션(cremaclub)은
     조용히 무시하지 않고 ValueError로 fail-loud한다.
 
     카테고리 번호 자체는 여기서 열거하지 않는다 — 목록 페이지 내비의
@@ -147,15 +159,26 @@ def browse_url(section: str, category_number: str = "") -> str:
     if not category_number:
         return seed
 
-    scheme, netloc, path, query, fragment = urlsplit(seed)
-    replaced = False
-    pairs = []
-    for key, value in parse_qsl(query, keep_blank_values=True):
-        if key.lower() == "categorynumber":
-            pairs.append((key, category_number))
-            replaced = True
-        else:
-            pairs.append((key, value))
-    if not replaced:
+    param = _seed_category_param(section)
+    if param is None:
         raise ValueError(f"'{section}' 섹션은 카테고리 좁히기를 지원하지 않습니다")
+    category_key = param[0]
+
+    scheme, netloc, path, query, fragment = urlsplit(seed)
+    pairs = [
+        (key, category_number if key == category_key else value)
+        for key, value in parse_qsl(query, keep_blank_values=True)
+    ]
     return urlunsplit((scheme, netloc, path, urlencode(pairs), fragment))
+
+
+def browse_category_prefix(section: str) -> str:
+    """섹션 시드가 속한 카테고리 트리 접두(예: 국내도서 "001")를 반환한다.
+
+    페이지 내비에는 국내도서(001)·외국도서(002)·eBook(017) 등 여러 트리의 동명 분야가
+    섞여 있어(실측: '소설'이 eBook 트리에도 존재), 이름 해석은 시드와 같은 트리로
+    한정해야 다른 매장으로 새지 않는다. 시드에 카테고리 파라미터가 없으면 빈 문자열
+    — 이는 정의상 "분야 좁히기 미지원"과 동치다(도구가 이 신호로 조기 거절).
+    """
+    param = _seed_category_param(section)
+    return param[1] if param else ""
