@@ -286,8 +286,8 @@ def _force_tool_first_turn(callback_context, llm_request):
 def create_agent(model_name: str | None = None) -> LlmAgent:
     """루트 LlmAgent를 생성한다(model_name 미지정 시 config 기본 = pro).
 
-    thinking_budget=512는 pro·3.5-flash·3.6-flash 모두 호환(2026-07-24 raw API 실측 —
-    3.6-flash는 budget=0만 거부, 512·생략 OK). 사용자가 UI에서 고른 모델만 여기로 오고,
+    thinking_budget=-1(동적)은 pro·3.5-flash·3.6-flash 모두 호환(2026-07-28 라이브 실측 —
+    3.6-flash는 budget=0만 거부, -1·512·생략 OK). 사용자가 UI에서 고른 모델만 여기로 오고,
     프롬프트·도구·thinking 구성은 모델과 무관하게 동일하다(공정 비교 + 단일 계약).
     """
     settings = get_settings()
