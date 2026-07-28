@@ -48,11 +48,11 @@ ssh "$SSH_HOST" bash -lc "'
 # .env는 빌드 후에 올린다 (COPY 대상 아님 + .dockerignore 제외라 이미지 유출 없음)
 scp -q "$LOCAL_DIR/.env" "$SSH_HOST:$REMOTE_BUILD/.env"
 
-# RBTI 16뷰 매트릭스는 프로드에서 숨긴다("rbti 제외하고 띄우자"). **원격 .env 복사본에만**
-# MATRIX_ENABLED를 주입한다 — 로컬 .env는 건드리지 않아 로컬 개발은 계속 매트릭스가 보인다.
-# 원격 .env는 매 배포 로컬본으로 새로 덮이므로(위 scp) append가 누적되지 않는다. 노출 배포가
-# 필요하면 MATRIX_ENABLED=true ./deploy-mq.sh (기본 false).
-MATRIX_ENABLED="${MATRIX_ENABLED:-false}"
+# RBTI 16뷰 매트릭스 노출 스위치. 2026-07-28 사용자 결정으로 기본 **노출(true)** —
+# 과거 "rbti 제외하고 띄우자"(기본 false) 방침을 뒤집었다. **원격 .env 복사본에만**
+# 주입한다 — 로컬 .env는 건드리지 않으며, 원격 .env는 매 배포 로컬본으로 새로 덮이므로
+# append가 누적되지 않는다. 숨김 배포가 필요하면 MATRIX_ENABLED=false ./deploy-mq.sh.
+MATRIX_ENABLED="${MATRIX_ENABLED:-true}"
 ssh "$SSH_HOST" bash -lc "'printf \"\nMATRIX_ENABLED=%s\n\" \"$MATRIX_ENABLED\" >> $REMOTE_BUILD/.env'"
 echo "  → 원격 .env에 MATRIX_ENABLED=$MATRIX_ENABLED 주입(로컬 .env 불변)"
 
