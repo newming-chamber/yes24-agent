@@ -27,11 +27,12 @@ logger = logging.getLogger(__name__)
 
 
 async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None) -> dict:
-    """외부 웹 페이지의 전문을 읽어온다.
+    """외부 웹 페이지의 전문을 **지금 라이브로** 읽어온다(검색 캐시 아님).
 
     web_search 결과의 스니펫만으로 부족할 때, 특정 페이지 url을 넣어 본문 전체를 확보한다.
-    보통 web_search가 반환한 결과의 url을 그대로 전달한다. Yes24 상품·정책 페이지는 이 도구가
-    아니라 yes24_fetch로 읽는다.
+    보통 web_search가 반환한 결과의 url을 그대로 전달한다. 시시각각 변하는 수치(시세·환율·
+    순위 등)의 현재 값이 필요할 때는 이 도구가 유일한 관측 수단이다 — 검색 snippet은 낡은
+    캐시라 그 값을 담지 못한다. Yes24 상품·정책 페이지는 이 도구가 아니라 yes24_fetch로 읽는다.
 
     Args:
         url: 읽을 외부 페이지의 절대 URL(http/https). web_search 결과의 url을 그대로 넣는다.
