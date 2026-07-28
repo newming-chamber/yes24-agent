@@ -32,8 +32,10 @@ def _match_category(categories: list[dict], name: str, tree_prefix: str) -> list
 
     내비에는 국내도서(001)·eBook(017) 등 여러 트리의 동명 분야가 섞여 있으므로 시드
     트리(tree_prefix)로 먼저 한정하고, 정확 일치 → 접두 일치("소설"→"소설/시/희곡") →
-    포함 일치 순으로 좁힌다. 같은 단계에서 2개+면 그대로 돌려 호출자가 fail-loud하게
-    한다(임의 선택 금지).
+    순방향 포함("과학"→"자연과학") 순으로 좁힌다. 역방향 포함(분야명⊂입력)은 두지
+    않는다 — "시사경제"를 "경제 경영"으로 넓혀 잇는 순간 도구가 의미 선택을 하게 되어
+    하네스의 선을 넘는다(그런 입력은 미매칭으로 categories와 함께 모델에 반납). 같은
+    단계에서 2개+면 그대로 돌려 호출자가 fail-loud하게 한다(임의 선택 금지).
     """
     wanted = " ".join(name.split())
     pool = [
@@ -42,7 +44,7 @@ def _match_category(categories: list[dict], name: str, tree_prefix: str) -> list
     for tier in (
         [c for c in pool if c["name"] == wanted],
         [c for c in pool if c["name"].startswith(wanted)],
-        [c for c in pool if wanted in c["name"] or c["name"] in wanted],
+        [c for c in pool if wanted in c["name"]],
     ):
         if tier:
             return tier
