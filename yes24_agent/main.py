@@ -117,7 +117,7 @@ class ChatRequest(BaseModel):
     # RBTI 독서 페르소나 코드(4글자, 예: "CADI"). 없거나 무효면 페르소나 미적용(기존 동작).
     rbti: str | None = None
     # 사용자가 UI에서 고른 Gemini 모델ID. selectable_models 화이트리스트 값만 허용하고
-    # 그 밖(없음·임의 문자열)은 기본 pro로 폴백한다(임의 모델 주입 차단).
+    # 그 밖(없음·임의 문자열)은 config 기본 모델로 폴백한다(임의 모델 주입 차단).
     model: str | None = None
 
 
@@ -290,7 +290,7 @@ def create_app() -> FastAPI:
         @app.post("/chat/matrix")
         async def chat_matrix(request: MatrixRequest) -> StreamingResponse:
             """질문을 받아 16 RBTI 페르소나 답변을 열별 SSE로 스트리밍한다(retrieve-once)."""
-            # 화이트리스트 값만 통과 — /chat/stream과 동일 로직(임의 모델 문자열은 기본 pro로 폴백).
+            # 화이트리스트 값만 통과 — /chat/stream과 동일 로직(임의 문자열은 config 기본 모델로 폴백).
             allowed = set(get_settings().selectable_models.values())
             model = request.model if request.model in allowed else None
             return StreamingResponse(
@@ -310,4 +310,11 @@ app = create_app()
 
 if __name__ == "__main__":
     settings = get_settings()
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    if settings.dev_reload:
+        # 자동 리로드(개발 편의, 2026-07-29 사용자 요청): 소스 변경 시 uvicorn이 스스로
+        # 재기동한다. reload 모드는 앱 객체가 아니라 임포트 문자열이 필요하다(워커 재생성).
+        uvicorn.run(
+            "yes24_agent.main:app", host=settings.host, port=settings.port, reload=True
+        )
+    else:
+        uvicorn.run(app, host=settings.host, port=settings.port)

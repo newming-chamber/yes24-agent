@@ -22,7 +22,10 @@ class Settings(BaseSettings):
     # LLM
     # 자율 다단계 탐색용 상위 모델(사용자 승인, 비용·지연 감수). 미명시 시 preview로 떨어짐.
     # 실측: pro는 flash의 빈응답 회귀 없이 자율 보강(정책 질문에 스스로 검색)을 안정 수행.
-    model_name: str = "gemini-2.5-pro"
+    # 2026-07-28 기본값 flash 전환(사용자 결정 — 속도 우선): 완료 기준 시변 11.2s·환율 6.3s
+    # (pro 18~30s·10s), 채팅 품질 7승1패 동급 실측. pro는 드롭다운에 유지. 매트릭스는 채팅
+    # 선택 모델을 따르므로 다양성 검증 시엔 드롭다운에서 pro 선택 권장(flash 다양성 붕괴 실측).
+    model_name: str = "gemini-3.6-flash"
     # 사용자가 UI에서 선택할 수 있는 Gemini 모델(라벨→모델ID). 요청의 model 필드는 이
     # 화이트리스트의 **값**만 허용하고(임의 모델 문자열 차단), 없거나 무효면 model_name으로
     # 폴백한다. 자동 라우팅이 아니라 명시 선택이라 단일 경로 원칙과 상충하지 않는다.
@@ -32,6 +35,14 @@ class Settings(BaseSettings):
         "Gemini 3.5 Flash": "gemini-3.5-flash",
         "Gemini 3.6 Flash": "gemini-3.6-flash",
     }
+    # 첫 모델 턴 도구 호출 강제(ANY). **커플링**: True로 켜면 reply_directly 도구가 탈출구로
+    # 반드시 함께 있어야 한다 — 스위치·_force_tool_first_turn·reply_directly는 한 세트다.
+    # 기본 False = Claude Code식 자율(AUTO 상시) —
+    # 2026-07-29 채점 채택: 첫 delta 6~30s → 2.5~4.0s, 내레이션 확률적(30~50%) → 도구턴
+    # 8/8 결정적, 4a 유혹 배터리(유명책 가격·평점·판매지수) 전수 무인용 0건 + 라이브 대조
+    # 일치. ANY의 보호는 입구(도구 강제)에서 출구(validate_citations 인용 검증)로 이동해도
+    # 유지됨이 실증됐다. True로 되돌리면 예전 ANY 가드(느리지만 사전 차단)로 복귀.
+    force_first_turn_tool: bool = False
     # 추론 예산. -1 = 동적(모델이 질의별로 사고량을 스스로 결정). 과거 512 고정의 근거였던
     # "-1은 첫 토큰 ~10.8s" 실측은 사고 요약 스트리밍 도입 후 재현되지 않는다(2026-07-28
     # A/B: 첫 반응 -1·512 모두 3.2~3.8s 동일). 총시간은 쉬운 질문에서 -1이 우세(평균 5.9s
@@ -134,9 +145,26 @@ class Settings(BaseSettings):
     # 도메인 필터(domains)가 지정된 호출은 그라운딩에 구조적 필터가 없어 항상 퍼플렉시티
     # 경로로 처리한다(능력 기반 라우팅 — 콘텐츠 분기 아님).
     web_search_backend: Literal["grounding", "perplexity"] = "grounding"
-    # 그라운딩 서브콜 모델·타임아웃. flash 실측: 분 단위 신선 + 저렴 + 컨텍스트(시장 상황)까지.
-    web_grounding_model: str = "gemini-3.5-flash"
+    # 그라운딩 서브콜 모델·타임아웃. 서브콜은 "검색해 출처별 근거를 모아오는" 유틸이라 깊은
+    # 추론이 불필요하다(종합은 메인 에이전트 몫) — flash-lite A/B 실측(2026-07-28): 3.1s vs
+    # 3.5-flash 12~55s, 출처 수·당일 시황 정확도 동급. thought_translation과 같은 경량 유틸
+    # 모델 관례.
+    web_grounding_model: str = "gemini-3.1-flash-lite"
     web_grounding_timeout_s: float = 40.0
+    # 웹 출처 카드용 페이지 <title> 경량 fetch 상한(표시 보강 — 실패 시 도메인 폴백).
+    web_title_fetch_timeout_s: float = 3.0
+    # 웹 선제 실행(prefetch) — TTFT 실측(2026-07-28: 첫 본문 11.8s = 사고1 3.8 + 도구 2.8 +
+    # 사고2 5.2 직렬)에서 도구 구간을 사고1과 병렬화하는 순수 지연 최적화. 턴 시작 시 경량
+    # 모델이 "웹 최신 정보가 필요한가"만 판단(모델 판단 — 키워드 분류 아님)해 그라운딩
+    # 서브콜을 미리 시작하고, 이번 턴 첫 web_search가 그 결과를 서빙받는다. 힌트 오판·
+    # 실패·미소비 전부 정상 경로 폴백이라 답 내용·도구 선택에는 영향이 없다(web_search.py).
+    web_prefetch_enabled: bool = True
+    # 프리페치 결과 공유 캐시 TTL. 매트릭스 16셀이 같은 질문을 동시에 돌려도 힌트·서브콜이
+    # 1회가 되는 공유 창구다. 시변 수치의 신선도 하한이기도 하므로 분 단위 이상 늘리지 말 것.
+    web_prefetch_ttl_s: float = 90.0
+    # 힌트 판정(불리언 1개) 상한. 이 시간 안에 판정이 안 오면 프리페치를 포기한다 — 힌트가
+    # 그라운딩 타임아웃(40s)을 물려받으면 최악 경로에서 도구가 힌트 완료까지 기다리게 된다.
+    web_prefetch_hint_timeout_s: float = 5.0
 
     # 웹 검색 (외부 원시 검색 — Perplexity /search). 상품 정보는 여전히 Yes24 출처만 인용 가능.
     # 퍼플렉시티 /search는 결과의 snippet 필드에 페이지 콘텐츠(추출 본문)를 직접 담아준다
@@ -211,9 +239,12 @@ class Settings(BaseSettings):
     # 서버
     host: str = "0.0.0.0"
     port: int = 8010
+    # 소스 변경 시 uvicorn 자동 재기동(로컬 개발 편의). 배포 컨테이너에선 켜지 않는다 —
+    # 리로드 워커는 신호 처리·성능 특성이 달라 운영 경로가 아니다.
+    dev_reload: bool = False
     cors_origins: list[str] = ["http://localhost:3000"]  # `*`+credentials 조합 금지 — 명시 목록
-    # 진행 status detail 상한(문자). 예고는 모델이 쓴 자유 텍스트라 길 수 있는데,
-    # 진행 타임라인 한 줄은 짧아야 읽힌다. 문구를 만들지 않고 길이만 자른다.
+    # 진행 status detail 상한(문자). 사고 요약 라벨·검색 각도는 모델이 쓴 자유 텍스트라
+    # 길 수 있는데, 진행 타임라인 한 줄은 짧아야 읽힌다. 문구를 만들지 않고 길이만 자른다.
     status_detail_max_chars: int = 120
     sse_timeout_s: float = 180.0
     app_name: str = "yes24-agent"

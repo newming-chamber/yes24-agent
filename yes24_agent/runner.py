@@ -11,7 +11,7 @@ delta/done/error)의 SSE 프레임으로 번역해 yield한다.
 
 import asyncio
 import logging
-import re
+from collections import deque
 from collections.abc import AsyncIterator
 
 from google.adk.agents.run_config import RunConfig, StreamingMode
@@ -59,6 +59,7 @@ from yes24_agent.sse import (
     sse_status,
 )
 from yes24_agent.thought_translation import translate_thought_label
+from yes24_agent.tools.web_search import start_web_prefetch
 
 logger = logging.getLogger(__name__)
 
@@ -68,46 +69,10 @@ logger = logging.getLogger(__name__)
 _OVERLOAD_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 529})
 
 
-_MD_FENCE_RE = re.compile(r"^\s*(```|~~~)")
-_MD_PIPE_RE = re.compile(r"^\s*\|.*\|\s*$")
-
-
-def _markdown_block_is_open(text: str) -> bool:
-    """마크다운 구조(코드펜스·표)가 아직 닫히지 않았을 **수 있는지** 판정한다.
-
-    이 지점에서 텍스트를 임의 분할하면 열린 구조가 깨질 수 있다는 보수적 신호다.
-    판정 술어는 `yes24_agent/static/lib/md.js`의 `canSplitAfter`와 같고(펜스 개수 홀짝, 마지막 내용
-    줄이 표 행인지 — 동치는 tests/test_md_split_equivalence.py가 고정), 문구·키워드가
-    아니라 라인 구조만 본다. 단 파이프 표는 GFM 문법상 빈 줄에서만 끝나므로 "마지막 줄이
-    표 행"은 열림/닫힘을 확정하지 못한다 — 도구 경계의 예고 확정 가부는 held 내용까지 보는
-    `_held_continues_open_block`이 판정한다.
-    """
-    if _fence_is_open(text):
-        return True
-    for line in reversed(text.split("\n")):
-        if line.strip():
-            return bool(_MD_PIPE_RE.match(line))
-    return False
-
-
-def _fence_is_open(text: str) -> bool:
-    """코드펜스가 홀수 개라 아직 닫히지 않았는지 판정한다(라인 구조만 본다)."""
-    return bool(sum(1 for line in text.split("\n") if _MD_FENCE_RE.match(line)) % 2)
-
-
-def _held_continues_open_block(body: str, held_text: str) -> bool:
-    """도구 경계의 held 텍스트가 **열린 마크다운 구조의 내용물**인지 판정한다.
-
-    펜스가 열려 있으면 held는 코드 내용이다 — 예고로 빼면 코드가 훼손되므로 본문이다.
-    파이프 표는 "마지막 줄이 표 행"만으로 열림/닫힘을 구분할 수 없으므로(GFM 표는 빈
-    줄에서만 끝난다) held **자신이 표 행("|"로 시작)인지**로 가른다: 행이면 표의 연속이라
-    본문으로 흘려야 하고, 산문이면 표는 그 앞에서 사실상 끝난 것이라 예고 확정(status행)이
-    안전하다. 산문을 본문으로 흘리면 완결된 표의 마지막 행에 무개행 접합돼 답변 전체가
-    표 행으로 빨려 들어간다(적대 검증 2026-07-23 실측 — 시퀀스 E).
-    """
-    if _fence_is_open(body):
-        return True
-    return _markdown_block_is_open(body) and held_text.lstrip().startswith("|")
+# 예고 홀드 기계(_markdown_block_is_open·_fence_is_open·_held_continues_open_block·held 버퍼)는
+# 2026-07-29 Claude Code식 내레이션 전환으로 통째로 삭제했다 — 도구 직전 예고를 본문에서 빼
+# status로 승격하던 구조 자체가 사라졌고, 이제 조사 경과 서술은 응답 본문의 일부로 흐른다
+# (원칙 4b 개정 — 사용자 승인). delta 합계 == done.text 불변식은 그대로다.
 
 
 def _event_text(event) -> str:
@@ -232,9 +197,9 @@ def _best_effort_text(pending: list[str], final_text: str) -> str:
     final response를 우선하고, 없을 때만 대기 버퍼를 조립한다. 확보된 본문이 없으면 빈 문자열을
     반환해 호출부의 최후 방어가 채우게 둔다.
     """
-    # `pending`은 도구 경계에서 예고 세그먼트가 제거된 뒤의 본문이다(예고는 status로 갔다).
-    # 그래서 이 값이 곧 화면에 흐른 본문이고 done.text와 같아야 한다(원칙 4b).
-    # partial이 하나도 없었던 경우에만 aggregate final로 폴백한다.
+    # `pending`은 화면에 흐른 본문 전체다(내레이션 포함 — 홀드 없음). 이 값이 곧
+    # done.text와 같아야 한다(원칙 4b). partial이 하나도 없었던 경우에만 aggregate final로
+    # 폴백한다.
     return "".join(pending) or final_text
 
 
@@ -244,15 +209,9 @@ def _ensure_substantive_text(payload: dict) -> bool:
     정상·타임아웃·예외 **세 경로가 같은 판정을 쓴다**. 정상 경로에만 두면 드문 실패
     경로에서 같은 결함이 계속 재발한다(require_evidence가 그랬듯이).
 
-    옛 _preface_only 가드(마지막 도구 경계 이후 텍스트 없음 → 예고뿐 판정)는 삭제했다 —
-    held 설계 이후 예고는 확정 시 pending에 들어가지 않아, 발동 가능한 유일한 케이스가
-    경계 **앞**에 흘린 실본문을 폴백으로 갈아끼우는 파괴 경로뿐이었다(전수 리뷰 2026-07-23).
-
-    남는 구멍 하나는 정직하게 적는다: 예고 partial과 도구 호출 이벤트 **사이**에서 스트림이
-    죽으면(call 이벤트 미도착) closeout이 held를 본문으로 방류해 "…볼게요."만 담긴 done이
-    나갈 수 있다. call 이벤트가 없어 그 텍스트가 예고인지 짧은 실본문인지 **구조적으로 판별
-    불가능**하므로, 비파괴 원칙상 보존이 폐기보다 낫다(옛 가드도 preface_mark>0 조건 탓에
-    이 케이스를 못 잡았다 — 적대 검증 2026-07-23 결함 3).
+    내레이션 전환(2026-07-29) 이후 "…볼게요"류 경과 서술은 응답의 정상 구성 요소다 —
+    실패 시에도 화면에 흐른 서술은 비파괴 원칙대로 보존되고, 실패 안내는 error 프레임이
+    담당한다. 이 가드는 문자 그대로 **빈 본문**만 잡는다(문구 판정 없음).
     """
     if not (payload.get("text") or "").strip():
         payload["text"] = _EMPTY_RESPONSE_FALLBACK
@@ -282,7 +241,6 @@ def _closeout_error_frames(
     error_text: str,
     *,
     pending: list[str],
-    held: list[str] | None,
     final_text: str,
     observed_sources: list[dict],
     prior_sources: list[dict],
@@ -291,19 +249,14 @@ def _closeout_error_frames(
 ) -> list[str]:
     """타임아웃·예외 두 실패 경로가 공유하는 마감 시퀀스를 프레임 목록으로 조립한다.
 
-    순서는 기존 두 경로와 동일: sse_error → held flush(delta) → source* → 본문 → done.
-    held 조각은 pending에 append(뮤테이션 — 모든 append 옆에 delta 프레임이 있어
-    "pending == 흘려보낸 조각" 불변식 유지)하고, held=None 재바인딩은 호출부가 수행한다.
+    순서: sse_error → source* → 본문 → done. 내레이션 전환으로 본문은 이미 전량 흘렀으므로
+    (홀드 없음) 여기서 붙일 잔여 조각은 없다 — 화면에 흐른 경과 서술("~찾아볼게요")은
+    비파괴 원칙대로 done.text에 남고, 사용자는 error 프레임으로 실패를 안내받는다.
     출처는 정상 경로와 동일하게 _reconcile_sources를 거친다 — 과거 두 실패 경로만 raw
     observed_sources를 넘겨 병렬 도구 유실 보정이 빠지는 드리프트가 있었다(판정을 세 벌
     두면 한 벌만 고치는 실수가 반복된다는 _emit_final_body docstring의 실례).
     """
     frames = [sse_error(error_text)]
-    if held:
-        tail = "".join(held)
-        if tail:
-            pending.append(tail)
-            frames.append(sse_delta(tail))
     best_effort = _best_effort_text(pending, final_text)
     _, error_done = _finalize_answer(
         best_effort,
@@ -334,6 +287,10 @@ async def run_agent_stream(
     제너레이터가 예외로 죽지 않고 error+done을 흘려보낸 뒤 정상 종료한다.
     """
     settings = get_settings()
+    # 웹 선제 실행: 모델 1라운드 사고와 그라운딩 서브콜을 병렬화하는 순수 지연 최적화.
+    # 힌트 오판·실패·미소비 전부 정상 경로 폴백이라 답 내용·도구 선택에 영향이 없다
+    # (계약·격리·매트릭스 공유는 web_search.py의 프리페치 절 참조).
+    start_web_prefetch(message)
     # 같은 session_id 동시 요청을 순차화한다(입력 id 기준). 신규 세션(None)은 create_session이
     # 고유 id를 부여하므로 충돌하지 않아 락이 불필요하다.
     lock = _get_session_lock(session_id) if session_id else None
@@ -382,18 +339,14 @@ async def run_agent_stream(
         # 화면에 흘린 본문 조각. **모든 append 옆에 sse_delta가 있다** — 이 불변식이
         # "pending == 흘려보낸 조각"을 만들고, 마감의 4b 대조(_emit_final_body)가 그 위에 선다.
         pending: list[str] = []
-        # 예고 후보 버퍼. 각 도구 경계에서 열리고(모델은 매 도구 호출 직전에 예고 한 문단을
-        # 쓴다), 도구 호출이 오면 예고로 확정돼 status로 간다. 문단이 닫힌 뒤에도 텍스트가
-        # 오거나 예고 길이를 넘으면 본문으로 확정돼 **순서대로** 흘리고 None(홀드 종료)이 된다.
-        # 전량 홀드는 금지 — 토큰 스트리밍이 통째로 죽는다(실측: 1,779자가 12.4초 무출력).
-        held: list[str] | None = []
         # 사고 요약 누적 버퍼(_thought_status_labels). 닫힌 문단만 타임라인으로 나가고
         # 미완 꼬리는 여기 남는다 — 미리보기 채널이라 스트림 종료 시 꼬리는 버려도 된다.
         thought_buf: list[str] = []
-        # 진행 중인 사고 라벨 번역 task들. 본류를 막지 않도록 병행시키고, 완료분은 다음
-        # 이벤트 대기와 **병합**해 즉시 흘린다. 스트림이 끝나면 미완분은 취소한다 —
-        # 본문이 이미 흐른 뒤 도착하는 진행 라벨은 표시 순서를 어지럽힐 뿐이다.
-        thought_tasks: set[asyncio.Task] = set()
+        # 진행 중인 사고 라벨 번역 task들 — **발생 순서 deque**. 번역은 본류와 병행하되,
+        # 방류는 머리(head)가 끝났을 때만 순서대로 한다: 완료순 방류는 번역 지연 편차만큼
+        # 사고 순서를 뒤섞어 타임라인이 실제 진행과 어긋난다(2026-07-29 사용자 실측:
+        # "시장 데이터 수집 중"이 말미에). 스트림이 끝나면 미완분은 취소한다.
+        thought_tasks: deque[asyncio.Task] = deque()
         event_task: asyncio.Task | None = None
 
         final_text = ""
@@ -404,7 +357,7 @@ async def run_agent_stream(
             streaming_mode=StreamingMode.SSE,
             max_llm_calls=settings.max_llm_calls,
         )
-        # 사용자가 UI에서 고른 모델의 에이전트(무효·미지정이면 기본 pro). 자동 라우팅이
+        # 사용자가 UI에서 고른 모델의 에이전트(무효·미지정이면 config 기본 모델). 자동 라우팅이
         # 아니라 명시 선택이라 단일 루프 원칙은 유지된다 — 프롬프트·도구·thinking 구성은
         # 모델과 무관하게 동일하고, done.model이 실제 사용 모델을 싣는다.
         agent = get_agent(model)
@@ -432,23 +385,22 @@ async def run_agent_stream(
                 while True:
                     try:
                         if thought_tasks:
-                            # 번역 완료분을 본류 이벤트와 병합해 흘린다. 번역이 본류를
-                            # 기다리게 하지도(무차단), 본류가 번역을 기다리게 하지도
-                            # 않는다 — 어느 쪽이든 먼저 끝난 것부터 나간다.
+                            # 번역 완료분을 본류 이벤트와 병합해 흘리되, **발생 순서(FIFO)**
+                            # 로만 방류한다 — 머리가 아직이면 뒤의 완료분도 기다린다(순서가
+                            # 체감보다 우선, 번역은 ~1초라 지연 미미). 번역 실패는
+                            # translate_thought_label 내부의 원문 폴백으로 흡수된다.
                             event_task = asyncio.ensure_future(
                                 timed_event_stream.__anext__()
                             )
                             while thought_tasks and not event_task.done():
-                                completed, _ = await asyncio.wait(
-                                    {event_task, *thought_tasks},
+                                await asyncio.wait(
+                                    {event_task, thought_tasks[0]},
                                     return_when=asyncio.FIRST_COMPLETED,
                                 )
-                                for task in list(thought_tasks):
-                                    if task in completed:
-                                        thought_tasks.discard(task)
-                                        # 번역 실패는 translate_thought_label 내부에서
-                                        # 원문 폴백으로 흡수된다(비파괴).
-                                        yield sse_status("thinking", task.result())
+                                while thought_tasks and thought_tasks[0].done():
+                                    yield sse_status(
+                                        "thinking", thought_tasks.popleft().result()
+                                    )
                             event = await event_task
                             event_task = None
                         else:
@@ -471,11 +423,10 @@ async def run_agent_stream(
                             await timed_event_stream.aclose()
                             await event_stream.aclose()
                             retried_overload = True
+                            # 재시도 스트림에도 프리페치를 다시 연다 — 첫 시도가 이미
+                            # 소비했어도 캐시가 완료 task를 돌려주므로 추가 비용이 없다.
+                            start_web_prefetch(message)
                             pending = []
-                            # 죽은 스트림이 남긴 예고 후보도 버린다 — 새 스트림의 홀드에
-                            # 이전 시도의 조각이 섞이면 안 된다(emitted_output=False 조건이
-                            # 보장하듯 화면에 나간 적 없는 텍스트라 유실이 아니다).
-                            held = []
                             thought_buf = []
                             for task in thought_tasks:
                                 task.cancel()
@@ -499,32 +450,8 @@ async def run_agent_stream(
                         raise
 
                     if not event.partial and event.get_function_calls():
-                        if held:
-                            if _held_continues_open_block("".join(pending), "".join(held)):
-                                # held가 열린 블록의 내용물(코드·표 행)이다. status로 빼면
-                                # 블록이 깨지고, 버리면 유실이다(전수 리뷰 2026-07-23) —
-                                # 문서 순서대로 본문에 흘리는 것만이 비파괴다.
-                                tail = "".join(held)
-                                if tail:
-                                    pending.append(tail)
-                                    emitted_output = True
-                                    yield sse_delta(tail)
-                            else:
-                                # 도구 호출이 왔다 = 앞 텍스트는 예고로 확정.
-                                # 화면에 안 나갔으므로 **되돌릴 reset이 필요 없다** —
-                                # 과거 전량 홀드는 최종 본문까지 잡아 토큰 스트리밍을
-                                # 죽였는데(1,779자 12.4초 무출력), 여기서는 도구 호출 직전
-                                # 한 문단만 잡고 그 뒤로는 즉시 흘린다.
-                                label = " ".join("".join(held).split())
-                                if label:
-                                    emitted_output = True
-                                    yield sse_status(
-                                        "preface", label[: settings.status_detail_max_chars]
-                                    )
-                        # 홀드를 다시 연다. 예고는 **매 도구 호출 직전**에 오므로(실측: 모델은
-                        # 첫 라운드엔 텍스트 없이 도구를 부르고, 라운드 2+에서 예고를 쓴다)
-                        # 첫 경계에서 홀드를 닫으면 그 뒤 예고가 전부 본문으로 샌다.
-                        held = []
+                        # 도구 직전 예고·경과 서술은 이미 본문 delta로 흘렀다(내레이션 전환).
+                        # 여기서는 도구 호출 자체의 진행 칩만 낸다.
                         for call in event.get_function_calls():
                             status = _status_for_call(call)
                             if status is None:
@@ -580,60 +507,17 @@ async def run_agent_stream(
                                 thought_buf, thought_chunk, settings.status_detail_max_chars
                             ):
                                 # 번역을 본류와 병행시킨다(위 병합 대기가 완료분을 흘림).
-                                thought_tasks.add(
+                                thought_tasks.append(
                                     asyncio.create_task(translate_thought_label(label))
                                 )
                         chunk = _event_text(event)
                         if chunk:
-                            if held is None:
-                                pending.append(chunk)
-                                emitted_output = True
-                                yield sse_delta(chunk)
-                            else:
-                                # 예고 후보 구간: 아직 흘리지 않는다. 도구 호출이 오면
-                                # 예고로 확정돼 status로 가고 본문에서 빠지며, 도구 없이
-                                # 끝나면 최종 본문이므로 마감에서 한 번에 나간다.
-                                # **화면에 안 나갔으므로 되돌릴 reset도 필요 없다.**
-                                held.append(chunk)
-                                # 예고는 **한 문단**이고, 그 뒤엔 도구 호출이 온다(텍스트가
-                                # 아니라). 그러므로 문단이 닫힌 뒤에도 텍스트가 계속 오면
-                                # 그건 예고가 아니라 본문이다 — 홀드분을 **순서대로 먼저**
-                                # 흘리고 홀드를 푼다. 순서를 뒤집으면 4b가 깨진다(실측).
-                                # 전량을 잡으면 토큰 스트리밍이 죽는다(2,388자 delta 1개).
-                                buffered = "".join(held)
-                                # 선행 개행은 문단 "닫힘"이 아니라 라운드 시작의 여백이다 —
-                                # 이를 닫힘으로 읽으면 cut=0·후속 텍스트 존재로 즉시 본문
-                                # 확정돼 예고 분리가 통째로 무력화된다(적대 검증 C').
-                                content_at = len(buffered) - len(buffered.lstrip("\n"))
-                                cut = buffered.find("\n\n", content_at)
-                                # 문단 뒤 "텍스트"는 실질 내용만 친다 — 공백·개행만 담긴
-                                # 후행 청크로 예고가 본문으로 새지 않도록(diff 리뷰 지적).
-                                if (cut >= 0 and buffered[cut + 2 :].strip()) or (
-                                    len(buffered) > settings.status_detail_max_chars
-                                ):
-                                    # 문단이 닫힌 **뒤에도** 텍스트가 왔거나, 예고 길이
-                                    # 상한을 넘었다 = 이 라운드는 예고가 아니라 본문이다.
-                                    # 순서대로 전량 흘리고 홀드를 푼다.
-                                    # ① 첫 문단만 계속 잡으면 종료 시 tail flush가 그
-                                    #    문단을 말미에 붙여 문서 순서가 파괴되고(전수 리뷰
-                                    #    2026-07-23 — "## 결론" 서두가 답변 맨 뒤로 감),
-                                    # ② 닫힌 문단을 길이 무제한으로 잡으면 장문 실질
-                                    #    문단이 예고로 확정돼 120자 절단·본문 소실된다
-                                    #    (적대 검증 결함 2 — 상한은 닫힘 여부와 무관하게
-                                    #    대칭이어야 청크 경계 비결정 파괴가 없다).
-                                    held = None
-                                    rest = buffered
-                                elif cut >= 0:
-                                    # 상한 이내의 한 문단이 닫힌 상태 = 예고 후보로 계속
-                                    # 잡아 둔다. 다음 이벤트가 도구 호출이면 예고로 확정된다.
-                                    held[:] = [buffered]
-                                    rest = ""
-                                else:
-                                    rest = ""
-                                if rest:
-                                    pending.append(rest)
-                                    emitted_output = True
-                                    yield sse_delta(rest)
+                            # 내레이션 전환: 본문은 항상 즉시 흐른다(홀드 없음). 도구 직전
+                            # 예고·경과 서술도 응답의 일부다 — 4b의 "delta 합계 == done.text"
+                            # 불변식은 이 무조건 방류로 오히려 단순하게 성립한다.
+                            pending.append(chunk)
+                            emitted_output = True
+                            yield sse_delta(chunk)
                         continue
 
                     if event.is_final_response():
@@ -641,15 +525,6 @@ async def run_agent_stream(
                         if text:
                             final_text = text
 
-                if held:
-                    # 도구 호출 없이 끝났다 = 홀드분은 예고가 아니라 본문이다.
-                    # 아직 화면에 안 나갔으므로 delta로도 함께 내보낸다(4b).
-                    tail = "".join(held)
-                    held = None
-                    if tail:
-                        pending.append(tail)
-                        emitted_output = True
-                        yield sse_delta(tail)
                 answer_text = _best_effort_text(pending, final_text)
                 # 근거 스냅샷은 세션 state가 아니라 **스트림 관찰본**으로 만든다. ADK의
                 # deep_merge_dicts가 병렬 도구의 state_delta를 리스트 키에서 last-wins로
@@ -725,14 +600,12 @@ async def run_agent_stream(
             frames = _closeout_error_frames(
                 "응답이 너무 지연되고 있어요. 잠시 후 다시 시도해 주세요.",
                 pending=pending,
-                held=held,
                 final_text=final_text,
                 observed_sources=observed_sources,
                 prior_sources=prior_sources,
                 active_model=active_model,
                 session_id=resolved_session_id,
             )
-            held = None
             for frame in frames:
                 yield frame
         except Exception as exc:  # noqa: BLE001 — SSE 스트림 최상위 방어선(마지막 수단)
@@ -745,14 +618,12 @@ async def run_agent_stream(
             frames = _closeout_error_frames(
                 STREAM_ERROR_MESSAGE,
                 pending=pending,
-                held=held,
                 final_text=final_text,
                 observed_sources=observed_sources,
                 prior_sources=prior_sources,
                 active_model=active_model,
                 session_id=resolved_session_id,
             )
-            held = None
             for frame in frames:
                 yield frame
         finally:

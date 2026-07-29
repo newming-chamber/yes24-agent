@@ -30,7 +30,12 @@ source_id가 유일·단조로 부여된다(fetch_many와 동일 규약, 병렬 
 """
 
 import asyncio
+import contextvars
+import html
+import json
 import logging
+import re
+import time
 from functools import lru_cache
 from urllib.parse import urlsplit
 
@@ -141,6 +146,120 @@ def _grounding_client(timeout_ms: int) -> genai.Client:
     return genai.Client(http_options=genai_types.HttpOptions(timeout=timeout_ms))
 
 
+# ── 웹 선제 실행(prefetch) ─────────────────────────────────────────────────────
+# TTFT 실측(2026-07-28): 시변 질의의 첫 본문 토큰 11.8s = 사고1(도구 결정) 3.8 → 도구 2.8 →
+# 사고2 5.2의 직렬 합. 도구 실행에는 모델 판단이 필요 없으므로, 턴 시작 시 경량 모델이
+# "웹 최신 정보가 필요한 질문인가"만 판단해 그라운딩 서브콜을 사고1과 **병렬로** 미리
+# 시작한다. 계약(순수 지연 최적화):
+#   - 판단 대체 금지: 프리페치는 힌트일 뿐 에이전트의 도구 선택·재검색 판단을 바꾸지 않는다.
+#     서빙 결과의 searches에 실제 검색 질의(사용자 메시지)를 정직하게 실어, 모델이 자기
+#     각도와 다르면 스스로 재검색한다(턴당 1회 서빙 — 두 번째 호출부터 항상 정상 경로).
+#   - 실패는 무해: 힌트 오판·서브콜 실패·미소비 전부 정상 경로 폴백. 기능 저하 경로 없음.
+#   - 캐시는 메시지 키·TTL 공유: 매트릭스 16셀이 같은 질문을 동시에 돌려도 힌트·서브콜은
+#     1회다(셀은 채팅 runner를 그대로 쓰고, 공유는 여기서 일어난다 — 매트릭스 전용 로직 없음).
+
+_HINT_INSTRUCTION = (
+    "사용자 메시지에 정확히 답하려면 웹 실시간 검색(뉴스·시세·날씨·경기·순위·일정 등 "
+    "시간에 따라 변하는 사실이나 웹에서 확인해야 하는 외부 사실)이 필요한지만 판단한다. "
+    "잡담·창작·번역·개념 설명이나 도서·상품 검색으로 충분한 질문이면 필요 없음으로 판단한다."
+)
+
+# 턴 스코프 프리페치 핸들: (사용자 메시지, task) **1원소 list 홀더**. 러너가 턴 시작에
+# set하고 이번 턴 첫 그라운딩 호출이 pop으로 소비한다. contextvar 값이 홀더(가변 list)인
+# 이유: ADK 2.3.0은 도구를 단건이어도 create_task(컨텍스트 **사본**)로 실행하므로, 사본에서
+# `set(None)`을 해도 부모·형제 task에는 안 보여 "턴당 1회"가 붕괴한다(적대 검증 실증
+# 2026-07-28). 사본들이 **같은 list 객체**를 공유하므로 pop은 전 task에 즉시 보이고,
+# check-pop 사이에 await가 없어 단일 스레드 이벤트 루프에서 원자적이다. 요청·매트릭스 셀
+# 간 격리는 contextvar 그대로다(각 턴이 자기 홀더를 새로 만든다 — 교차 서빙 불가).
+_turn_prefetch: contextvars.ContextVar[list[tuple[str, asyncio.Task]] | None] = (
+    contextvars.ContextVar("web_prefetch", default=None)
+)
+# 메시지 키 공유 캐시: message → (시작 monotonic, task). TTL 내 같은 질문은 task를 공유한다.
+_prefetch_cache: dict[str, tuple[float, asyncio.Task]] = {}
+
+
+async def _prefetch_hint_needs_web(message: str, settings: Settings) -> bool:
+    """경량 모델이 이 메시지에 웹 검색이 필요한지 판단한다(불리언 1개, 짧은 타임아웃)."""
+    response = await asyncio.wait_for(
+        _grounding_client(int(settings.web_grounding_timeout_s * 1000))
+        .aio.models.generate_content(
+            model=settings.web_grounding_model,
+            contents=message,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=_HINT_INSTRUCTION,
+                temperature=0,
+                response_mime_type="application/json",
+                response_schema={
+                    "type": "OBJECT",
+                    "properties": {"needs_web": {"type": "BOOLEAN"}},
+                    "required": ["needs_web"],
+                },
+            ),
+        ),
+        timeout=settings.web_prefetch_hint_timeout_s,
+    )
+    return json.loads(response.text or "{}").get("needs_web") is True
+
+
+async def _prefetch_pipeline(message: str, settings: Settings) -> list[dict] | None:
+    """힌트 판정 → (필요 시) 그라운딩 서브콜. 서빙 불가 상태는 None(정상 경로 폴백)."""
+    if not await _prefetch_hint_needs_web(message, settings):
+        logger.info("web_search prefetch hint=no_web")
+        return None
+    raw_results = await _grounding_raw_results(_grounding_prompt([message]), settings)
+    logger.info(f"web_search prefetch ready results={len(raw_results)}")
+    # 빈 근거는 서빙하지 않는다 — 정상 경로가 자기 재시도 규약대로 다시 시도하게 둔다.
+    return raw_results or None
+
+
+def _log_prefetch_outcome(task: asyncio.Task) -> None:
+    """미소비 프리페치의 예외를 회수한다(경고 소음 방지) — 실패는 무해하므로 기록만 한다."""
+    if not task.cancelled() and task.exception() is not None:
+        logger.info(f"web_search prefetch 실패(정상 경로 폴백): {task.exception()!r:.120}")
+
+
+def start_web_prefetch(message: str) -> None:
+    """이번 턴의 웹 프리페치를 시작한다(러너가 턴 시작에 호출, 실패·미소비 무해)."""
+    settings = get_settings()
+    if not (settings.web_prefetch_enabled and settings.web_search_backend == "grounding"):
+        return
+    message = message.strip()
+    if not message:
+        return
+    now = time.monotonic()
+    for key in [
+        k
+        for k, (started, _) in _prefetch_cache.items()
+        if now - started > settings.web_prefetch_ttl_s
+    ]:
+        del _prefetch_cache[key]
+    entry = _prefetch_cache.get(message)
+    # 실패로 끝난 task가 TTL까지 캐시에 고정되면 같은 메시지의 후속 턴(매트릭스 셀 포함)이
+    # 전부 폴백만 탄다 — 죽은 항목은 재생성한다(성공·실행 중 task만 공유 가치가 있다).
+    if entry is not None and entry[1].done() and (
+        entry[1].cancelled() or entry[1].exception() is not None
+    ):
+        entry = None
+    if entry is None:
+        task = asyncio.create_task(_prefetch_pipeline(message, settings))
+        task.add_done_callback(_log_prefetch_outcome)
+        _prefetch_cache[message] = (now, task)
+    else:
+        task = entry[1]
+    _turn_prefetch.set([(message, task)])
+
+
+def _take_turn_prefetch() -> tuple[str, asyncio.Task] | None:
+    """이번 턴의 프리페치 핸들을 소비한다(턴당 1회 — 두 번째 호출부터 None).
+
+    pop 소비인 이유는 _turn_prefetch 주석 참조(ADK 도구 task 컨텍스트 사본 간 공유).
+    """
+    holder = _turn_prefetch.get()
+    if not holder:
+        return None
+    return holder.pop()
+
+
 def _grounding_response_to_results(response) -> list[dict]:
     """그라운딩 응답을 출처별 원시 재료 목록으로 분해한다.
 
@@ -180,22 +299,62 @@ def _grounding_response_to_results(response) -> list[dict]:
     return raw_results
 
 
-async def _grounded_search(
-    planned: list[str], tool_context: ToolContext, settings: Settings
-) -> dict:
-    """google_search 그라운딩 서브콜 1회로 모든 각도를 검색·종합해 도구 결과를 조립한다.
-
-    그라운딩은 질문에서 스스로 다중 검색 쿼리를 만들어 실행하므로(실측: 질문 1개 → 구글
-    쿼리 3개) 각도별 병렬 호출이 필요 없다 — 서브콜 한 번이 각도 전체를 흡수한다.
-    """
-    prompt = (
+def _grounding_prompt(questions: list[str]) -> str:
+    """그라운딩 서브콜 프롬프트를 조립한다(도구 경로·선제 실행 경로가 문자 단위로 같아야 한다)."""
+    return (
         "다음 질문(들)의 사실을 웹 검색으로 확인해, 확인된 사실만 간결하게 정리하세요. "
         "시간에 따라 변하는 값은 기준 시각을 함께 적으세요.\n"
-        + "\n".join(f"- {q}" for q in planned)
+        + "\n".join(f"- {q}" for q in questions)
     )
-    # 벤더 **일시** 오류(5xx·타임아웃 = ServerError)만 1회 재시도로 흡수한다(Yes24Client의
-    # 전송 오류 재시도와 동일 철학 — 라이브 실측: 504가 재시도에서 정상). 4xx(ClientError:
-    # 인증·잘못된 요청)는 반복해도 같으므로 즉시 실패 — 과금 낭비·오독 방지.
+
+
+async def _fetch_page_title(url: str, settings: Settings) -> str | None:
+    """리다이렉트를 따라가 페이지 <title>만 가볍게 긁어온다(표시 보강용, 실패 무해).
+
+    그라운딩 API는 페이지 제목을 주지 않아(title=도메인, 2026-07-29 실측) 카드가 도메인
+    문자열뿐이었다 — 사용자 방향: "그 주소의 title만 따오면 안 되나". 본문 스트림을 제목
+    태그가 나올 만큼만 읽고 끊으며(대형 뉴스 페이지 전체 다운로드 방지), 어떤 실패도
+    None(도메인 유지)으로 삼킨다. 인용 근거가 아니라 순수 표시 메타다.
+    """
+    try:
+        client = _get_client(settings)
+        buf = b""
+        async with client.stream(
+            "GET", url, follow_redirects=True,
+            timeout=settings.web_title_fetch_timeout_s,
+        ) as response:
+            if response.status_code != 200:
+                return None
+            async for chunk in response.aiter_bytes():
+                buf += chunk
+                if b"</title>" in buf.lower() or len(buf) > 65536:
+                    break
+        match = re.search(rb"<title[^>]*>(.*?)</title>", buf, re.S | re.I)
+        if not match:
+            return None
+        raw = match.group(1)
+        for encoding in ("utf-8", "cp949"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            return None
+        title = html.unescape(" ".join(text.split()))
+        return title[:120] or None
+    except Exception:  # noqa: BLE001 — 표시 보강 전용: 어떤 실패도 도메인 폴백
+        return None
+
+
+async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
+    """그라운딩 서브콜을 실행해 출처별 원시 재료를 돌려준다(빈 목록 가능, 종단 실패는 raise).
+
+    일시 실패 2종을 1회 재시도로 흡수한다(Yes24Client의 전송 오류 재시도와 동일 철학):
+    ① 벤더 5xx·타임아웃(ServerError — 504가 재시도에서 정상, 라이브 실측) ② **빈 근거**
+    — 그라운딩 종합은 확률적이라 같은 질의가 다음 시도에서 출처를 붙인다(영화 질의 실측:
+    E2E 1회 empty → 직호출 3/3 성공). 4xx(ClientError)는 반복해도 같으므로 즉시 실패.
+    """
     last_error: Exception | None = None
     raw_results: list[dict] = []
     for _ in range(2):
@@ -211,22 +370,68 @@ async def _grounded_search(
             )
             raw_results = _grounding_response_to_results(response)
             last_error = None
-            break
+            if raw_results:
+                break
         except genai_errors.ServerError as exc:
             last_error = exc
-        except Exception as exc:  # noqa: BLE001 — 비일시 오류: 재시도 없이 도구 계약대로 삼킨다
+        except Exception as exc:  # noqa: BLE001 — 비일시 오류: 재시도 없이 종단 실패로 올린다
             last_error = exc
             break
     if last_error is not None:
-        logger.info(
-            f"web_search backend=grounding status=error error_type=fetch ({last_error!r:.120})"
+        raise last_error
+    if raw_results:
+        # 제목 보강(병렬·실패 무해). 프리페치 파이프라인 안에서도 실행되므로 대부분의
+        # 지연이 모델 사고 시간에 숨는다.
+        titles = await asyncio.gather(
+            *(_fetch_page_title(item["url"], settings) for item in raw_results),
+            return_exceptions=True,
         )
-        return {
-            "status": "error",
-            "error_type": "fetch",
-            "message": "웹 검색(그라운딩)이 실패했습니다",
-            "result_count": 0,
-        }
+        for item, title in zip(raw_results, titles):
+            if isinstance(title, str) and title:
+                item["title"] = title
+    return raw_results
+
+
+async def _grounded_search(
+    planned: list[str], tool_context: ToolContext, settings: Settings
+) -> dict:
+    """google_search 그라운딩 서브콜 1회로 모든 각도를 검색·종합해 도구 결과를 조립한다.
+
+    그라운딩은 질문에서 스스로 다중 검색 쿼리를 만들어 실행하므로(실측: 질문 1개 → 구글
+    쿼리 3개) 각도별 병렬 호출이 필요 없다 — 서브콜 한 번이 각도 전체를 흡수한다.
+
+    이번 턴의 선제 실행(prefetch) 결과가 있으면 서브콜 없이 그것을 서빙한다(턴당 1회).
+    서빙 시 searches에는 **실제 검색된 질의(사용자 메시지)**를 정직하게 실어, 모델이 자기
+    각도와 다르다고 판단하면 스스로 재검색하게 한다 — 두 번째 호출부터는 항상 정상 경로다.
+    """
+    raw_results: list[dict] | None = None
+    searched_query = " | ".join(planned)
+    prefetch_served = False
+    prefetch = _take_turn_prefetch()
+    if prefetch is not None:
+        prefetch_message, prefetch_task = prefetch
+        try:
+            prefetched = await prefetch_task
+        except Exception:  # noqa: BLE001 — 프리페치 실패는 무해: 정상 경로 폴백(로그는 콜백)
+            prefetched = None
+        if prefetched:
+            raw_results = prefetched
+            searched_query = prefetch_message
+            prefetch_served = True
+
+    if raw_results is None:
+        try:
+            raw_results = await _grounding_raw_results(_grounding_prompt(planned), settings)
+        except Exception as exc:  # noqa: BLE001 — 도구 계약: 예외를 밖으로 던지지 않는다
+            logger.info(
+                f"web_search backend=grounding status=error error_type=fetch ({exc!r:.120})"
+            )
+            return {
+                "status": "error",
+                "error_type": "fetch",
+                "message": "웹 검색(그라운딩)이 실패했습니다",
+                "result_count": 0,
+            }
 
     if not raw_results:
         # 근거 출처가 하나도 연결되지 않은 답은 인용 불가 — 빈 성공으로 위장하지 않는다.
@@ -266,16 +471,17 @@ async def _grounded_search(
 
     logger.info(
         f"web_search backend=grounding queries={len(planned)} status=ok "
-        f"results={len(results)}"
+        f"results={len(results)} prefetch={'served' if prefetch_served else 'none'}"
     )
     # searches는 **실제 관측 단위**로만 보고한다: 그라운딩은 서브콜 1회가 전 각도를
     # 흡수하므로 그 호출 1건이 유일한 관측이다. 각도별 성공을 제조하거나(빈 성공 위장)
     # 결과를 각도에 거짓 귀속(queries)하지 않는다 — 어느 각도가 어느 출처를 낳았는지는
-    # 이 백엔드에서 관측 불가한 값이다.
+    # 이 백엔드에서 관측 불가한 값이다. 프리페치가 서빙됐다면 query에는 실제 검색된
+    # 질의(사용자 메시지)가 실린다(제조 금지 — 모델의 재검색 판단 재료).
     return {
         "status": "ok",
         "results": results,
-        "searches": [{"query": " | ".join(planned), "status": "ok"}],
+        "searches": [{"query": searched_query, "status": "ok"}],
         "checked_at": checked_at,
         "result_count": len(results),
     }

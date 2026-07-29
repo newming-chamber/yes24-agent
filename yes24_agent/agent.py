@@ -9,7 +9,7 @@ from google.adk.agents.readonly_context import ReadonlyContext
 from google.genai import types
 
 from yes24_agent.config import get_settings
-from yes24_agent.rbti.persona import axis_label, build_persona_block, describe_axes
+from yes24_agent.rbti.persona import axis_label, build_persona_block
 from yes24_agent.sources import today_kst
 from yes24_agent.tools.fetch_many import fetch_many
 from yes24_agent.tools.reply_directly import reply_directly
@@ -58,23 +58,20 @@ def _format_policy_seeds() -> str:
 
 _PROMPT_CORE_TEMPLATE = """당신은 유능하고 친근한 범용 AI 어시스턴트이며 Yes24 책·상품에 특히
 밝습니다. 도서 특화는 강점이지 답변 범위의 한계가 아닙니다. 사용자의 언어로 질문에 직접 답하고,
-최종 답변을 변명·자기소개·진행 상황·사고 과정으로 시작하지 마세요. 도구를 사용하지 않았다면
-검색했다고 말하지 말고, 도구를 사용했다면 결과를 기다려 완결된 답을 쓰세요.
+답을 변명·자기소개로 시작하지 마세요. 하지 않은 검색을 했다고 말하지 말고, 도구 결과를 받기
+전에 그 내용을 아는 것처럼 쓰지 마세요.
 
-다만 **도구를 호출하기 직전에는** 무엇을 하려는지 한 문장으로 짧게 예고하세요("~를 찾아볼게요",
-"~를 자세히 볼게요"). 이 문장은 진행 과정 표시줄에 실시간으로 보이고 **최종 답변 본문에는 남지
-않습니다.** 그러니 결과를 받은 뒤에는 예고에 기대지 말고 그 자체로 완결된 답을 처음부터 쓰세요.
-답을 마칠 때는 사용자가 자연스럽게 이어갈 다음 걸음(더 볼 정보·좁힐 조건·대안)이 있으면 한
-문장으로 제안하세요 — 마땅한 것이 없으면 억지로 붙이지 않습니다. 답을 완성하지 못한 경우일수록
-다음 걸음(다른 검색어·확인 가능한 경로)을 제시해 대화가 막다른 골목이 되지 않게 하세요.
+여러 단계로 조사하는 답변에서는 조사하면서 말하세요: 도구 호출 직전에 한 문장씩, 새 문단으로 —
+첫 문장은 요청을 알아들었음을 자연스럽게 담아 시작하고("SF 소설을 찾으시는군요. 베스트셀러부터
+훑어볼게요"), 그 뒤로는 방금 나온 결과를 과거형으로 짧게 딛고 아직 안 한 다음 단계만
+예고합니다("후보가 11권 나왔네요. 이 중 평점 높은 네 권의 상세를 열어볼게요"). 이 문장들은
+응답의 일부로 사용자에게 그대로 보입니다 — 제목·라벨 없이 대화 문장으로만 쓰고, 마친 조사를
+미래형으로 되풀이하지 마세요. 도구 이름·인자·호출 준비 같은 내부 절차는 절대 본문에 쓰지
+않습니다. 한 번의 도구 호출로 끝나는 단순한 답과 도구 없는 대화에는 경과 서술을 붙이지 않고,
+조사가 끝나면 경과 서술에 기대지 말고 완결된 답으로 마무리하세요.
 정체성을 직접 물으면 위 정체성을 본론으로 답하고, 실행 모델명·버전은 추측하지 말고 응답 UI의
 모델 메타가 정본이라고 안내하세요.
 
-당신의 대표 기능으로 이 앱이 제공하는 **RBTI(Reading BTI, 독서 성향 유형)**가 있습니다. 독서
-성향을 4개 축({rbti_axes})의 조합으로 나눈 16개 독서유형이며, `/matrix` 화면에서 한 질문을 16개
-독서유형 관점으로 나눠 각 유형에 맞는 책을 추천합니다. "RBTI가 뭐냐"류 질문에는 이 앱의 독서유형을
-제1 의미로 설명하고, 외부의 동음이의 약어는 사용자가 그 맥락을 지정했을 때만 보조로 덧붙이세요.
-대화 중 사용자의 독서 취향을 물어 이 4축 기준으로 독서유형을 함께 가늠해 줄 수 있습니다.
 {persona_directive}
 ## 일하는 방식
 - 사용자의 대상, 의도, 제약을 내부 체크리스트로 파악하고, 답변 전 각 조건을 실제 근거로
@@ -155,10 +152,8 @@ Yes24 상품·정책과 오늘자·상대 시점 사실은 당신이 알 수 없
   읽습니다. 결과가 잘렸거나 답이 다른 링크에 있으면 해당 페이지의 검색·링크 정보를 사용합니다.
 - `fetch_many`: 여러 Yes24 페이지의 상세 내용이 모두 필요할 때 동시에 읽습니다(한 페이지면
   `yes24_fetch`).
-- `web_search`: Yes24 밖의 외부 사실과 지식을 검색합니다. `domains` 사용법은 도구 설명을
-  따르되, 결과가 일부 사이트에서만 나왔다면 반환된 사이트만 사용했다고 밝히고, 결과가 없는
-  사이트까지 확인·인용했다고 말하지 마세요. 답변을 출처별로 구획하면 구획 라벨은 인용한 URL의
-  실제 발행 hostname과 일치시키고, 여러 출처의 종합은 별도 구획에 둡니다.
+- `web_search`: Yes24 밖의 외부 사실과 지식을 검색합니다. 답변을 출처별로 구획하면 구획
+  라벨은 인용한 URL의 실제 발행 hostname과 일치시키고, 여러 출처의 종합은 별도 구획에 둡니다.
 - `web_fetch`: 검색 결과의 스니펫만으로 핵심 주장을 뒷받침할 수 없거나 출처가 충돌할 때 원문을
   읽습니다. Yes24 URL은 Yes24 도구로 읽습니다.
 
@@ -182,6 +177,9 @@ _NARRATIVE_CONTRACT = """
   이번 턴의 인용으로 재사용하지 마세요.
 - 출처가 충돌하면 날짜·원문·출처의 직접성을 비교해 가장 잘 뒷받침되는 사실을 사용하고, 해소할 수
   없는 차이는 숨기지 마세요.
+- 실제 사건·기록·수치의 근거는 그 사실을 공식적으로 기록하거나 보도하는 성격의 출처여야
+  합니다. 개인 영상·게임 시뮬레이션·팬 창작·커뮤니티 추측은 실제 사실의 근거가 아닙니다 —
+  그런 출처만 확보됐다면 사실을 단정하지 말고, 그 성격을 밝히며 확인 불가로 답하세요.
 - 도구를 실행한 턴의 최종 답변에서 검증 가능한 사실이 있는 단락에 유효한 `[n]`이 하나도 없으면
   불완전한 답변입니다. 그 단락을 직접 지지하는 인용을 넣거나 단락을 삭제하세요. 앞 단락의 인용은
   다음 단락의 근거가 되지 않습니다.
@@ -198,8 +196,10 @@ _NARRATIVE_CONTRACT = """
 - 추천은 확인된 상품 사실과 사용자의 조건, 이번 세션에서 파악된 사용자의 상황·취향을 연결한
   판단이어야 합니다. 출처가 다루지 않은 속성(효능·인기·재고·배송 가능 여부 등)은 출처에 없다는
   것을 근거로 긍정도 부정도 하지 말고, 확인된 범위만 말하거나 확인되지 않았다고 밝히세요.
-- 두 개 이상의 대상을 비교할 때는 결론과 함께 핵심 축을 마크다운 표로 정리하세요. 추천·탐색형
-  답변의 말미에는 자연스러운 다음 단계(읽는 순서나 선택을 좁힐 질문)를 짧게 제안합니다.
+- 답을 마칠 때 사용자가 자연스럽게 이어갈 다음 걸음(더 볼 정보·좁힐 조건·대안)이 있으면 한
+  문장으로 제안하세요 — 마땅한 것이 없으면 억지로 붙이지 않습니다. 답을 완성하지 못한
+  경우일수록 다음 걸음(다른 검색어·확인 가능한 경로)을 제시해 대화가 막다른 골목이 되지
+  않게 하세요.
 - 검색으로 확보한 사실과 모델의 해석을 구분하세요. 일부 조건만 확인됐으면 확인된 답을 버리지
   말고 제공하되, 미확인 조건은 충족한 것처럼 쓰지 말고 무엇이 미확인인지 함께 명시합니다.
   근거를 끝내 확보하지 못했다면 그 사실을 짧게 알리고 답을 꾸며내지 마세요.
@@ -230,10 +230,12 @@ def build_system_prompt(persona_directive: str = "") -> str:
     persona_directive가 ""(기본)이면 해당 자리에 빈 문자열이 들어가 rbti 없는 경로와 바이트 동일.
     그 경로에서는 날짜 말미를 뺀 앞부분 전체가 매 인보케이션 바이트 동일한 캐시 프리픽스다.
     """
+    # RBTI 소개 단락은 2026-07-29 삭제 — RBTI/매트릭스는 개발자용 검증 뷰이지 사용자에게
+    # 소개·영업할 앱 기능이 아니다(사용자 확인: "내가 보기 위한 뷰"). 페르소나 선택 시의
+    # 어조 반영(persona_directive)은 유지하되, 모델이 먼저 RBTI를 입에 올리지 않는다.
     core = _PROMPT_CORE_TEMPLATE.format(
         policy_seeds=_format_policy_seeds(),
         persona_directive=persona_directive,
-        rbti_axes=describe_axes(),
     )
     tail = _DYNAMIC_TAIL_TEMPLATE.format(today=today_kst())
     return f"{core}{_NARRATIVE_CONTRACT}{tail}"
@@ -259,13 +261,14 @@ def _instruction_provider(ctx: ReadonlyContext) -> str:
 
 
 def _force_tool_first_turn(callback_context, llm_request):
-    """레퍼런스 표준(tool_choice=required)을 ADK로 구현 — 첫 모델 턴에 도구 호출을 강제한다.
+    """[롤백 레버] 첫 모델 턴 도구 강제(ANY) — 기본 비활성(config force_first_turn_tool 참조).
 
-    tool_choice=auto(모델 자율)는 모델이 "안다"고 확신하면 검색을 스킵하고 자체 지식으로
-    답하는 실패(예: 유명 책 가격 환각)가 잦다(업계 공통). 그래서 이번 턴에 아직 도구 응답이
-    없으면(=첫 턴) `FunctionCallingConfigMode.ANY`로 도구 호출을 강제해 모델이 직답하지
-    못하게 하고, Yes24·웹 사실은 검색·인용, 순수 대화는 `reply_directly`로 명시 선택하게 한다.
-    도구가 이미 실행됐으면(응답 존재) `AUTO`로 풀어 결과를 종합해 답하게 한다(출처 최대화)."""
+    2026-07-29 이전의 기본 구조였다: 자체지식 직답(파라메트릭 가격 환각)을 입구에서 차단하되
+    순수 대화는 `reply_directly`로 탈출시켰다. AUTO 상시 전환 채점(4a 유혹 배터리 무인용
+    0건)으로 보호가 출구(validate_citations)만으로 충분함이 실증돼 기본에서 내려왔지만,
+    회귀 관측 시 즉시 되돌릴 수 있게 유지한다. **커플링**: 이 콜백을 켜면 reply_directly가
+    탈출구로 반드시 함께 있어야 한다(없으면 잡담도 강제 검색). 셋(스위치·콜백·reply_directly)은
+    한 세트로 유지·삭제한다."""
     contents = getattr(llm_request, "contents", None) or []
     parts = (getattr(contents[-1], "parts", None) or []) if contents else []
     has_response = any(getattr(p, "function_response", None) is not None for p in parts)
@@ -284,7 +287,7 @@ def _force_tool_first_turn(callback_context, llm_request):
 
 
 def create_agent(model_name: str | None = None) -> LlmAgent:
-    """루트 LlmAgent를 생성한다(model_name 미지정 시 config 기본 = pro).
+    """루트 LlmAgent를 생성한다(model_name 미지정 시 config 기본 = model_name 필드).
 
     thinking_budget=-1(동적)은 pro·3.5-flash·3.6-flash 모두 호환(2026-07-28 라이브 실측 —
     3.6-flash는 budget=0만 거부, -1·512·생략 OK). 사용자가 UI에서 고른 모델만 여기로 오고,
@@ -303,7 +306,11 @@ def create_agent(model_name: str | None = None) -> LlmAgent:
                 include_thoughts=settings.include_thoughts,
             )
         ),
-        before_model_callback=_force_tool_first_turn,
+        # 첫 턴 ANY 강제는 config 스위치로 뗄 수 있다(Claude Code식 자율 실험 —
+        # force_first_turn_tool 주석 참조). 끄면 AUTO 상시: 첫 토큰부터 내레이션 가능.
+        before_model_callback=(
+            _force_tool_first_turn if settings.force_first_turn_tool else None
+        ),
     )
 
 
@@ -315,7 +322,7 @@ _AGENT_BY_MODEL: dict[str, LlmAgent] = {str(root_agent.model): root_agent}
 
 
 def get_agent(model_name: str | None) -> LlmAgent:
-    """선택된 모델의 에이전트를 돌려준다(무효·미지정이면 기본 pro).
+    """선택된 모델의 에이전트를 돌려준다(무효·미지정이면 config 기본 모델).
 
     **화이트리스트 검증은 API 계층(main.py)에서 끝난 상태로 넘어온다** — 여기 도달하는
     model_name은 selectable_models의 값이거나 None이다. 임의 문자열은 API에서 걸러진다.
