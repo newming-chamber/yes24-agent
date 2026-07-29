@@ -9,9 +9,15 @@
 
 const MARKER_RE = /\[(\d+(?:\s*,\s*\d+)*)\]/g;
 const BOLD_RE = /\*\*([\s\S]+?)\*\*/g;
+// 이탤릭 *...* — 볼드 추출 뒤 남은 구간에서만 적용한다. 내용의 양끝이 공백이 아닐 것을
+// 요구해 곱셈·별표 나열 오탐을 줄인다(모델 관용: *(참고로 …)* 가 생 별표로 노출되던 실측).
+const EM_RE = /\*(\S(?:[^*\n]*\S)?)\*/g;
 const MD_H_RE = /^(#{1,6})\s+(.*)$/;
 const MD_PIPE_RE = /^\s*\|.*\|\s*$/;          // |로 시작·끝나는 라인만 표 후보
 const MD_SEP_RE = /^\s*\|?[\s:|-]+\|?\s*$/;   // 구분선 |---|:--:|
+// 수평선: ---·***·___ 단독 라인. 모델이 구획 구분에 관용적으로 쓰는데 평문으로 노출되면
+// 완성도를 크게 깎는다(UI/UX 실측). 표 구분선은 파이프 행 블록 안에서만 소비되므로 충돌 없음.
+const MD_HR_RE = /^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/;
 // 리스트 라인: 불릿(-·*·•) 또는 번호(1. / 1)). 캡처1=마커 종류(순서형은 숫자), 캡처2=내용.
 // 마커 뒤 공백 1칸 이상을 요구해 "*강조*"·"1.5" 같은 비리스트 라인을 배제한다.
 const MD_BULLET_RE = /^\s*[-*•]\s+(.*)$/;
@@ -48,7 +54,10 @@ function makeMarker(sid, opts) {
   // 칩 폴백(url 없음)만 버튼 시맨틱을 갖는다.
   const badge = document.createElement(href ? "a" : "sup");
   badge.className = "marker";
-  badge.textContent = sid;
+  // 칩 텍스트에 괄호를 포함한다 — 화면 스타일은 CSS 몫이지만 **복사(clipboard)는 DOM
+  // 텍스트를 그대로 가져가므로**, 숫자만 두면 "스페인3371"처럼 본문에 들러붙는다
+  // (2026-07-29 사용자 실측 붙여넣기). [33][71]이면 복사본도 원문 마커 표기와 일치한다.
+  badge.textContent = "[" + sid + "]";
   if (href) {
     badge.href = href;
     badge.target = "_blank";
@@ -86,8 +95,9 @@ function renderMarkersInto(target, text, opts) {
   appendTextSlice(target, text.slice(last), afterMarker, false);
 }
 
-// 인라인: **볼드**를 top-level로 분리한다(볼드가 `코드`를 감싸는 흔한 경우 — "**A `x` B**" —
-// 를 깨지 않게). 각 구간(볼드 포함) 안에서 `코드`를 떼고, 코드 밖에서만 마커를 조립한다.
+// 인라인 체인: **볼드** → `코드` → *이탤릭* → [n] 마커. 코드 추출이 이탤릭보다 먼저여야
+// `code*x*` 안의 별표가 이탤릭으로 먹히지 않는다(모듈 테스트 실측). 볼드가 최상위인 것은
+// "**A `x` B**" 관용을 깨지 않기 위함(기존 규율 유지).
 function renderInlineInto(target, text, opts) {
   const re = new RegExp(BOLD_RE.source, "g");
   let last = 0, m;
@@ -101,17 +111,31 @@ function renderInlineInto(target, text, opts) {
   if (last < text.length) renderCodeInto(target, text.slice(last), opts);
 }
 
-// `코드` 구간을 리터럴(<code>, 마커 승격 없음)로 떼고, 코드 밖에서만 마커를 조립한다.
-// 코드 안 [n]은 인용이 아니라 문자 그대로다(예: `print(data[1])`의 [1]).
+// `코드` 구간을 리터럴(<code>, 마커·이탤릭 승격 없음)로 떼고, 코드 밖은 이탤릭 층으로 넘긴다.
+// 코드 안 [n]·*는 인용·강조가 아니라 문자 그대로다(예: `print(data[1])`).
 function renderCodeInto(target, text, opts) {
   const re = new RegExp(MD_INLINE_CODE_RE.source, "g");
   let last = 0, m;
   while ((m = re.exec(text)) !== null) {
-    if (m.index > last) renderMarkersInto(target, text.slice(last, m.index), opts);
+    if (m.index > last) renderEmInto(target, text.slice(last, m.index), opts);
     const code = document.createElement("code");
     code.className = "md-code";
-    code.textContent = m[1]; // 리터럴 — 배지 승격 안 함
+    code.textContent = m[1]; // 리터럴 — 배지·강조 승격 안 함
     target.appendChild(code);
+    last = re.lastIndex;
+  }
+  if (last < text.length) renderEmInto(target, text.slice(last), opts);
+}
+
+// *이탤릭* 구간을 <em>으로 승격하고, 남은 평문에서 마커를 조립한다.
+function renderEmInto(target, text, opts) {
+  const re = new RegExp(EM_RE.source, "g");
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) renderMarkersInto(target, text.slice(last, m.index), opts);
+    const em = document.createElement("em");
+    renderMarkersInto(em, m[1], opts);
+    target.appendChild(em);
     last = re.lastIndex;
   }
   if (last < text.length) renderMarkersInto(target, text.slice(last), opts);
@@ -199,6 +223,13 @@ export function renderBody(container, text, opts = {}) {
       container.appendChild(pre);
       continue; // 루프의 i++가 닫는 펜스 줄을 건너뛴다
     }
+    if (MD_HR_RE.test(line)) {
+      flush();
+      const hr = document.createElement("hr");
+      hr.className = "md-hr";
+      container.appendChild(hr);
+      continue;
+    }
     const hm = line.match(MD_H_RE);
     if (hm) {
       flush();
@@ -276,6 +307,16 @@ export function renderBody(container, text, opts = {}) {
           const next = lines[i + 1];
           const nb = next.match(MD_BULLET_RE);
           const no = nb ? null : next.match(MD_ORDERED_RE);
+          // 리스트 마커 없이 부모보다 깊게 들여쓴 내용 라인은 이 항목의 연속 문단이다
+          // (CommonMark의 li 연속 규칙). 밖으로 흘리면 리스트가 끊기고 생 들여쓰기가
+          // 본문에 노출돼 계층이 어긋나 보인다(도그푸딩 2026-07-28 실측: 제목 불릿 밑
+          // 설명 문단). li 안에 줄바꿈으로 이어 담는다.
+          if (!(nb || no) && next.trim() && indentOf(next) > parentIndent) {
+            li.appendChild(document.createTextNode("\n"));
+            renderInlineInto(li, next.trim(), o);
+            i++;
+            continue;
+          }
           if (!(nb || no) || indentOf(next) <= parentIndent) break;
           const childOrdered = !!no;
           if (!sub || subOrdered !== childOrdered) {

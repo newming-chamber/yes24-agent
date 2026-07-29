@@ -148,11 +148,20 @@
     @keyframes typing { 0%, 60%, 100% { opacity: 0.3; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-3px); } }
     @keyframes fadein { from { opacity: 0.35; } to { opacity: 1; } }
 
-    /* 진행 흐름 — 진행 단계와 본문 조각을 **도착 순서대로 한 열에** 쌓는다.
-       접히는 별도 타임라인 블록(trace)은 삭제했다: 같은 열에 시간순으로 놓이면 무엇을
-       어떤 순서로 했는지가 그 자체로 읽히고, 완료 후 접으면 이미 읽고 지나간 내용이
-       중간에서 사라지며 아래 본문이 위로 점프한다. */
+    /* 진행 흐름 = 턴당 하나의 카드(Claude Code식 인라인 타임라인, 2026-07-29 재설계).
+       내레이션·도구 스텝·최종 답이 도착 순서 그대로 이 카드 안에 영구히 쌓인다 — 이동·
+       접힘·강등 없음. 어시스턴트 말풍선 배경은 개별 블록이 아니라 카드가 담당한다. */
     .flow { display: flex; flex-direction: column; gap: 6px; }
+    .msg.assistant .flow:not(:empty) {
+      background: var(--assistant-bg); border-radius: 14px;
+      border-bottom-left-radius: 4px; padding: 12px 16px;
+    }
+    /* 카드 안의 본문 블록은 투명 섹션 — 이중 박스 금지. 오류·빈 응답 안내만 자기 배경 유지. */
+    .msg.assistant .flow .bubble { background: transparent; padding: 2px 0; max-width: 100%; }
+    .msg.assistant .flow .bubble.error { background: var(--error-bg); padding: 8px 12px; }
+    .msg.assistant .flow .bubble.empty { padding: 8px 12px; }
+    /* 살아있는 사고 한 줄 — 최신 사고로 갱신되다 실텍스트가 오면 사라진다. */
+    .think-live { font-size: 12.5px; color: var(--muted); padding: 2px 0; animation: pulse 1.6s ease-in-out infinite; }
     .step {
       font-size: 12.5px; color: var(--muted); display: flex; align-items: flex-start; gap: 6px;
       line-height: 1.5; animation: fadein 0.3s ease; padding: 0 6px;
@@ -163,31 +172,23 @@
     .step .step-label { min-width: 0; overflow-wrap: anywhere; }
     .step.done .ico { color: var(--accent); }        /* 완료 단계는 체크 강조색 */
     .step.active .ico { animation: pulse 1.2s ease-in-out infinite; }
-    /* 사고 미리보기(ChatGPT식): 스트리밍 중엔 본문처럼 흐르는 회색 글줄, 구간이 끝나면
-       "N초 동안 생각함" 한 줄로 접힌다. 체크 스텝 행과 구분되는 산문 톤. */
-    .think-fold { padding: 0 6px; }
-    .think-fold summary {
-      font-size: 12.5px; color: var(--muted); cursor: pointer; line-height: 1.5;
-      list-style-position: inside;
+    .md-hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+    /* 완료 시 과정(내레이션+스텝) 접힘 — 스트리밍 중엔 인라인 그대로, 최종 답이 확정되는
+       순간 한 줄로 접힌다(2026-07-29 사용자: "마지막 문구 나올 때 접으면 딱 맞잖아").
+       펼치면 인라인 타임라인이 원래 순서 그대로 보인다(이동 없음 — 감싸기만). */
+    .process-fold summary {
+      cursor: pointer; list-style: none; font-size: 12.5px; color: var(--muted); padding: 2px 0;
     }
-    /* 진행 중 한 줄 갱신 셔머(ChatGPT식) — 텍스트 위를 밝은 띠가 훑고 지나간다 */
-    .think-fold summary.live {
-      background: linear-gradient(90deg, var(--muted) 40%, var(--text) 50%, var(--muted) 60%);
-      background-size: 200% 100%;
-      -webkit-background-clip: text; background-clip: text;
-      -webkit-text-fill-color: transparent; color: transparent;
-      animation: shimmer 1.8s linear infinite;
-    }
-    @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
-    .think-line {
-      font-size: 12.5px; color: var(--muted); line-height: 1.6; padding-left: 18px;
-      animation: fadein 0.3s ease;
-    }
+    .process-fold summary::-webkit-details-marker { display: none; }
+    .process-fold summary:hover { color: var(--text); }
+    .process-fold[open] { border-left: 2px solid var(--border); padding-left: 10px; margin: 2px 0 6px; }
     @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
     /* 턴 마감 메타(소요·모델·출처 수) — 접힌 trace 헤더가 담던 정보의 새 자리. */
     .meta { font-size: 12px; color: var(--muted); padding: 0 6px; }
     .meta:empty { display: none; }
-    .sources { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
+    /* 줄바꿈 배치 — 가로 스크롤이면 칩 5개+에서 뒤 카드가 화면 밖으로 잘려 존재 자체가
+       안 보인다(도그푸딩 2026-07-28 실측: 7·6개 턴에서 마지막 칩 유실 체감). */
+    .sources { display: flex; flex-wrap: wrap; gap: 8px; padding-bottom: 4px; }
     .sources:empty { display: none; }
     .card {
       flex: 0 0 auto; max-width: 210px; background: var(--card-bg); border: 1px solid var(--border);
@@ -526,8 +527,8 @@
       "이 문장을 더 따뜻하게 다듬어줘",
     ];
     const STATUS_ICON = {
-      thinking: "💭", preface: "💬", searching: "🔎", searching_web: "🌐", reading: "📖",
-      reading_web: "📄", browsing: "📚", notice: "⚠️", found: "✅",
+      thinking: "💭", searching: "🔎", searching_web: "🌐", reading: "📖",
+      browsing: "📚", notice: "⚠️", found: "✅",
     };
     const TYPE_LABEL = {
       search_result: "검색결과", book_detail: "상세",
@@ -851,10 +852,6 @@
       flow.appendChild(bubble);
       function clearTyping() {
         if (!bubble.isConnected) return;
-        // 진행 패널이 대기 박스 **안**에 살고 있었다면, 본문이 시작되는 지금 박스
-        // 밖(흐름 위쪽)으로 빠져나와 접힌 헤더가 된다 — "박스 안에 있다가 빠진다"
-        // (2026-07-23 사용자 방향). 박스는 본문 블록에게 자리를 내주고 사라진다.
-        if (activity && bubble.contains(activity)) flow.appendChild(activity);
         bubble.remove();
       }
 
@@ -872,6 +869,7 @@
       // 턴의 rawText = 블록 텍스트의 연결이다(원칙 4b: delta 합계 == done.text).
       const blocks = [];
       let pendingSplit = false; // 마지막 델타 이후 진행 단계가 끼어들었는가
+      let finalized = false;   // finalize 이후엔 정본을 그대로 그린다(꼬리 홀드 해제)
       // 이 턴이 본 출처의 원본 페이로드(id → src). 대화 스냅샷 저장·복원의 재료다.
       const srcById = new Map();
       let citedList = [];      // finalize에서 확정된 인용 id(스냅샷용)
@@ -882,46 +880,79 @@
       let errored = false;
       let activeStep = null;   // 현재 진행 중(스핀) 단계 요소
       let lastStepKey = null;  // 직전 단계 키(연속 중복 방지)
-      let activity = null;      // 턴당 하나의 통합 진행 패널(사고+도구, 끝나면 접힘)
-      let activityStart = 0;    // 진행 시작 시각(ChatGPT식 "N초 동안 …")
 
-      // 진행 패널(ChatGPT식): 기본은 **접힌 한 줄이 현재 활동으로 실시간 갱신**되는
-      // 셔머 라벨이고, 사고 글줄·도구 스텝의 전체 추적은 클릭해 펼치면 보인다(점진적
-      // 공개 — 상용 4사 실측 공통 패턴, 2026-07-23). 답변 확정 시 "N초 동안
-      // 생각·탐색함"으로 확정되고, 사용자가 펼쳐둔 상태는 존중한다.
-      function ensureActivity() {
-        if (activity) return activity;
-        activity = document.createElement("details");
-        activity.className = "think-fold";
-        const summaryLine = document.createElement("summary");
-        summaryLine.className = "live";
-        summaryLine.textContent = "생각하는 중…";
-        // 진행 중 한 줄 갱신을 조용히 낭독한다(전체 추적은 펼쳤을 때만 DOM에 노출).
-        summaryLine.setAttribute("aria-live", "polite");
-        activity.appendChild(summaryLine);
-        activityStart = performance.now();
-        // 진행 라인은 타이핑 점("…")을 밀어내고 **대기 박스 안**에서 산다 — 답이 준비되는
-        // 자리라는 연속성. 본문이 시작되면 clearTyping이 박스 밖으로 빼낸다.
-        const typingEl = bubble.isConnected ? bubble.querySelector(".typing") : null;
-        if (typingEl) typingEl.remove();
-        (bubble.isConnected ? bubble : flow).appendChild(activity);
-        return activity;
+      // Claude Code식 인라인 타임라인(2026-07-29 사용자 방향, 재설계):
+      // **아무것도 움직이지 않는다.** 내레이션(본문)·도구 스텝이 도착 순서 그대로 flow에
+      // 한 열로 영구히 쌓이고, 사고 요약만 "살아있는 한 줄"(think-live)로 흐름 끝에서
+      // 갱신되다 실텍스트가 오면 사라진다. 이전의 접힘 패널·강등·자리표시자 설계는 이동
+      // 리플로우(위아래 점프)·순서 뒤섞임·중복 표시를 계속 낳아 통째로 삭제했다.
+      let thinkLive = null;   // 진행 중 사고 한 줄(완료·본문 도착 시 제거)
+      const turnStart = performance.now();
+      let processSecs = 0;    // 조사 구간(최종 답 스트리밍 시작 전까지) — 접힘 요약용
+
+      function setThinkLive(text) {
+        if (!thinkLive) {
+          thinkLive = document.createElement("div");
+          thinkLive.className = "think-live";
+          thinkLive.setAttribute("aria-live", "polite");
+        }
+        thinkLive.textContent = "\ud83d\udcad " + text;
+        flow.appendChild(thinkLive);  // 항상 흐름 끝 = 지금 일어나는 일
+        scrollToBottom();
       }
 
-      // 접힌 한 줄을 최신 활동으로 갱신한다(아이콘이 동사 의미를 담당).
-      function updateActivitySummary(icon, text) {
-        if (!activity) return;
-        activity.querySelector("summary").textContent = `${icon} ${text}`;
+      function clearThinkLive() {
+        if (thinkLive) { thinkLive.remove(); thinkLive = null; }
       }
 
-      function closeActivity() {
-        if (!activity) return;
-        const secs = Math.max(1, Math.round((performance.now() - activityStart) / 1000));
-        const hadTools = !!activity.querySelector(".step");
-        const summaryLine = activity.querySelector("summary");
-        summaryLine.textContent = `💭 ${secs}초 동안 ${hadTools ? "생각·탐색함" : "생각함"}`;
-        summaryLine.classList.remove("live");
-        activity = null;
+      // 과정 접힘 — 확정 계약(2026-07-29 사용자: "think들 나열되다가 final_text
+      // 스트리밍이 시작될 때 병합, 최종 답은 처음부터 쭉"):
+      //   조사 중 = 내레이션·스텝 나열(인라인, 접지 않음) → 최종 답 텍스트 시작 감지 =
+      //   그 앞 전부를 상단 접힘으로 병합, 최종 답 블록은 첫 글자부터 통째로 흐른다.
+      // "최종 답" 판정은 구조 신호 — 내레이션은 계약상 한 문단이라, 현재 블록이 닫힌
+      // 문단 뒤에도 이어지거나 내레이션 규모를 넘으면 최종 답이다(문구·키워드 없음).
+      // 오판(장문 내레이션)은 finalize의 collapseProcess가 잔여를 이어 접어 보정한다.
+      let processFold = null;
+      const NARRATION_MAX_CHARS = 200;  // 내레이션 한 문단의 시각 상한(표시 판정 전용)
+      function collapseInto(beforeEl) {
+        const children = [...flow.children];
+        const idx = children.indexOf(beforeEl);
+        const toAbsorb = children.slice(0, idx).filter(
+          (c) => c !== processFold && c !== thinkLive
+        );
+        if (!toAbsorb.length) return;
+        if (!processFold) {
+          processFold = document.createElement("details");
+          processFold.className = "process-fold";
+          const sum = document.createElement("summary");
+          sum.textContent = "\ud83d\udcad \uc0dd\uac01\u00b7\ud0d0\uc0c9 \uacfc\uc815";
+          processFold.appendChild(sum);
+          flow.prepend(processFold);
+        }
+        toAbsorb.forEach((c) => processFold.appendChild(c));
+      }
+      // 최종 답 시작 감지(appendDelta에서 호출): 닫힌 문단 뒤 내용 or 내레이션 규모 초과.
+      function maybeCollapseAtFinalText(block) {
+        if (processFold) return;
+        const t = block.text;
+        const contentAt = t.length - t.replace(/^\n+/, "").length;
+        const cut = t.indexOf("\n\n", contentAt);
+        const closedParaThenMore = cut >= 0 && t.slice(cut + 2).trim().length > 0;
+        if (closedParaThenMore || t.length > NARRATION_MAX_CHARS) {
+          // 조사 시간은 여기까지 — 최종 답 작성 시간은 포함하지 않는다(사용자 방향:
+          // 전체 소요를 접힘에 찍으면 "생각만 29초"처럼 길어 보인다).
+          if (!processSecs) processSecs = (performance.now() - turnStart) / 1000;
+          collapseInto(block.el);
+        }
+      }
+      function collapseProcess(elapsedSec) {
+        const last = blocks[blocks.length - 1];
+        if (last && last.el.isConnected) collapseInto(last.el);
+        if (!processFold) return;
+        const secs = Math.max(1, Math.round(processSecs || elapsedSec || 0));
+        const hadTools = !!processFold.querySelector(".step");
+        processFold.querySelector("summary").textContent =
+          `\ud83d\udcad ${secs}\ucd08 \ub3d9\uc548 ${hadTools ? "\uc0dd\uac01\u00b7\ud0d0\uc0c9\ud568" : "\uc0dd\uac01\ud568"}`;
       }
 
       // 직전 단계를 완료 처리(스핀 정지 → 체크 아이콘).
@@ -968,9 +999,19 @@
         return blocks.map((b) => b.text).join("");
       }
 
+      // 스트리밍 중 마지막 줄이 내용 없는 리스트 마커("    *"·"3.")뿐이면 다음 델타가
+      // 완성할 때까지 **화면에서만** 잡아둔다 — 청크 경계에서 생 마커가 순간 노출되던
+      // 문제(도그푸딩 2026-07-28 실측). block.text는 그대로라 4b 대조(bodyText)에 영향이
+      // 없고, finalize가 정본 전체를 다시 그리므로 유실 경로도 없다.
+      const BARE_LIST_TAIL_RE = /(^|\n)[^\S\n]*(?:[-*•]|\d+[.)])[ \t]*$/;
+      function withHeldTail(text) {
+        const m = text.match(BARE_LIST_TAIL_RE);
+        return m ? text.slice(0, m.index + m[1].length) : text;
+      }
+
       // 본문 렌더 = 공용 모듈(md.js). 블록 하나를 자기 텍스트로 다시 그린다.
       function renderBlock(block) {
-        renderMarkdown(block.el, block.text, markerOpts);
+        renderMarkdown(block.el, finalized ? block.text : withHeldTail(block.text), markerOpts);
       }
       function renderAll() {
         blocks.forEach(renderBlock);
@@ -995,9 +1036,16 @@
       function blockForDelta() {
         const cur = blocks[blocks.length - 1];
         if (!cur) return pushBlock();
-        const atParagraphEnd = /\n\s*\n\s*$/.test(cur.text);
-        const safe = !cur.text || (atParagraphEnd && canSplitAfter(cur.text));
-        if (pendingSplit && safe) return pushBlock();
+        // 도구 경계(pendingSplit)의 직전 텍스트는 그 라운드가 완결한 본문이라 문단 경계
+        // 요구 없이 나눠도 안전하다 — 단 열린 표·코드펜스 안이면 나누지 않는다(canSplitAfter,
+        // 열린 구조를 블록 경계로 끊으면 양쪽 렌더가 깨진다). 확정된 라운드는 꼬리 홀드
+        // 없이 정본으로 한 번 다시 그린다(빈 라운드는 요소만 정리 — blocks엔 남아 4b 유지).
+        const safe = !cur.text || canSplitAfter(cur.text);
+        if (pendingSplit && safe) {
+          if (!cur.text.trim()) cur.el.remove();
+          else renderMarkdown(cur.el, cur.text, markerOpts);
+          return pushBlock();
+        }
         return cur;
       }
 
@@ -1086,6 +1134,8 @@
       // 본문 전체를 done.text 한 덩어리로 다시 그린다. reset(인용 검증이 본문을 바꿈)과
       // finalize(정본 교체)가 **같은 코드**를 쓴다 — reset은 정본이 빈 특수 케이스일 뿐이다.
       function replaceBody(text) {
+        // 본문 블록만 지운다 — 도구 스텝 줄은 blocks 밖(flow 직속)이라 조사 기록이
+        // reset 턴에서도 살아남는다(인라인 타임라인의 부수 이득).
         blocks.splice(0).forEach((b) => b.el.remove());
         pendingSplit = false;
         if (!text) { firstDelta = false; return; }
@@ -1113,18 +1163,15 @@
           const key = stage + "|" + detail;
           if (key === lastStepKey) return;
           lastStepKey = key;
-          const panel = ensureActivity();
           if (stage === "thinking") {
-            // 사고는 본문처럼 흐르는 회색 글줄(모델 실생성 텍스트).
-            const line = document.createElement("div");
-            line.className = "think-line";
-            line.textContent = detail;
-            panel.appendChild(line);
-            updateActivitySummary("💭", detail);
-            scrollToBottom();
+            // 사고는 흐름 끝의 살아있는 한 줄로만 — 최신 사고로 제자리 갱신되고,
+            // 실텍스트(본문·스텝)가 오면 물러난다(Claude Code의 사고 표시와 같은 결).
+            setThinkLive(detail);
             return;
           }
-          // 도구 진행도 같은 패널 안에 쌓는다 — 접힘 블록과 체크 행이 번갈아 조각나지 않게.
+          // 도구 스텝은 흐름에 **인라인으로 영구히** 남는다 — 내레이션과 시간순으로
+          // 교차하며 아무것도 이동·접힘하지 않는다(Claude Code식, 2026-07-29 재설계).
+          clearTyping();
           completeActiveStep();
           const step = document.createElement("div");
           step.className = "step active";
@@ -1138,9 +1185,12 @@
           label.setAttribute("aria-live", "polite");
           label.textContent = detail;
           step.append(ico, label);
-          panel.appendChild(step);
+          flow.appendChild(step);
+          if (thinkLive) flow.appendChild(thinkLive);  // 사고 줄은 항상 맨 끝
           activeStep = step;
-          updateActivitySummary(ico.textContent, detail);
+          // 도구 단계가 끼어들었다 = 직전 라운드의 본문은 완결됐다. 다음 delta는 새
+          // 블록으로 연다(문단 분리 — done.text는 블록 연결과 무관해 4b 무영향).
+          pendingSplit = true;
           scrollToBottom();
         },
         addSource(src) {
@@ -1159,9 +1209,11 @@
             // 다라운드 턴은 본문 스트리밍 뒤에도 진행이 이어질 수 있고, 마감은 finalize가 한다.
             completeActiveStep();
           }
+          clearThinkLive();  // 실텍스트가 흐르면 사고 줄은 물러난다
           const block = blockForDelta();
           pendingSplit = false;
           block.text += chunk;
+          maybeCollapseAtFinalText(block);  // 최종 답이 시작되면 그 앞 과정을 접는다
           renderBlock(block);
           scrollToBottom();
         },
@@ -1174,6 +1226,7 @@
           // error로 끝난 턴이면(백엔드가 error 뒤 done을 함께 보냄) 빨간 안내 말풍선을
           // 그대로 두고 "응답 X초" meta를 붙이지 않는다.
           if (errored) return;
+          finalized = true; // 이후 렌더는 정본 그대로(스트리밍 꼬리 홀드 해제)
           clearTyping();
           // done.text(검증본)로 본문을 교체한다. 이미 같은 텍스트면 다시 그리지 않는다 —
           // 무조건 재렌더는 DOM을 통째로 갈아 스크롤·애니메이션이 튀게 만든다(정상 턴은
@@ -1181,6 +1234,11 @@
           if (typeof payload.text === "string" && payload.text.length
               && payload.text !== bodyText()) {
             replaceBody(payload.text);
+          } else if (blocks.length) {
+            // 텍스트가 같아 교체를 생략해도, 마지막 스트리밍 렌더가 꼬리를 홀드한 채라면
+            // 그 블록만 정본 그대로 다시 그린다(홀드가 화면에 영구 잔류하는 구멍 봉합).
+            const last = blocks[blocks.length - 1];
+            if (withHeldTail(last.text) !== last.text) renderBlock(last);
           }
           // 출처칩은 최종 답에서 실제로 인용된 출처만 받는다.
           const citedIds = new Set(
@@ -1210,7 +1268,8 @@
             card.classList.toggle("cited", citedIds.has(id));
           }
           completeActiveStep();
-          closeActivity();  // 진행 패널을 "N초 동안 생각·탐색함" 한 줄로 접는다
+          clearThinkLive();
+          collapseProcess(elapsedSec);  // 최종 답만 남기고 과정을 한 줄로 접는다
           const stepCount = flow.querySelectorAll(".step").length;
           // 출처 0인 턴(파라메트릭 즉답)은 "N단계 탐색"이 근거 있는 검색처럼 읽히는 착시를
           // 만든다 — 중립 표기("응답 X초")로만 적는다. 출처가 있을 때만 탐색·출처 요약.
@@ -1218,7 +1277,9 @@
             const parts = [];
             if (stepCount) parts.push(`${stepCount}단계 탐색`);
             parts.push(`출처 ${cardMap.size}개`);
-            parts.push(`${elapsedSec.toFixed(1)}초`);
+            // 시간은 한 곳에만 — 과정 접힘이 조사 시간을 담당하면 메타에선 뺀다(중복 표기
+            // 지적, 2026-07-29). 접힘 없는 도구 턴(단일 라운드)만 여기서 전체 소요를 적는다.
+            if (!processFold) parts.push(`${elapsedSec.toFixed(1)}초`);
             if (modelSaved) parts.push(`모델 ${modelSaved}`);
             meta.textContent = "🔍 " + parts.join(" · ");
           } else {
@@ -1232,6 +1293,7 @@
           errored = true;
           errorText = message || "오류가 발생했어요.";
           completeActiveStep();
+          clearThinkLive();  // 실패 턴이 계속 일하는 것처럼 보이지 않게
           clearTyping();
           meta.textContent = "⚠️ 오류로 중단됨";
           const box = document.createElement("div");
@@ -1245,6 +1307,7 @@
           // 않고 메타만 "중지됨"으로 적는다. 한 글자도 못 받았을 때만 안내로 대체한다.
           if (!bodyText()) { this.showError("응답을 중지했어요."); return; }
           completeActiveStep();
+          clearThinkLive();  // 중지 턴도 사고 줄을 정지한다
           clearTyping();
           meta.textContent = "⏹ 중지됨";
           scrollToBottom();
@@ -1252,6 +1315,7 @@
         markEmptyIfUntouched() {
           // 에러 말풍선은 그대로 둔다(안내 문구를 덮어쓰지 않는다).
           if (!bodyText() && !errored) {
+            clearThinkLive();  // 무응답 마감도 사고 줄을 정지한다
             clearTyping();
             const box = document.createElement("div");
             box.className = "bubble empty";
