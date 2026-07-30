@@ -12,7 +12,9 @@
 SSE 계약(프론트 matrix.html 불변):
 - 글로벌 `source` {id,title,url,type,...}: 어느 셀이든 인용한 출처. id로 프론트 레지스트리에
   등록되고, col done의 sources·picks가 id로 참조한다(중복 id는 한 번만 방출).
-- 열 `delta` {text, col, code, name, axis_label}: 그 페르소나 채팅의 완결 본문(카드 통째 1회).
+- 열 `delta` {text, col, code, name, axis_label, process_chars}: 그 페르소나 채팅의 완결 본문
+  (카드 통째 1회). `process_chars`는 **본문을 자르지 않는 표시용 오프셋**이다 — text[:n]이
+  조사 과정(내레이션), text[n:]이 최종 답이다(0이면 접을 과정이 없다). 본문 자체는 불변.
 - 열 `done` {sources:[{id}], picks:[{id}], fallback, gate_reason, col}: 그 셀이 인용한 출처 id와
   고른 책 id(picks=비-web 출처, 대표책=picks[0]). fallback=true는 셀이 **답을 못 낸**(빈 본문)
   경우이며 인용 유무와 무관하다 — 범용 질문은 인용 없이 답하는 게 정상이라 폴백이 아니다.
@@ -88,11 +90,20 @@ async def _run_cell(question: str, code: str, model: str | None) -> dict:
     **채팅 runner를 그대로 소비한다 — 모듈·로직 동일, 유일한 차이는 rbti(페르소나) 주입뿐.**
     모델도 채팅에서 고른 것을 그대로 따른다(매트릭스 전용 모델 없음). 각 셀은 독립
     세션(session_id=None → runner가 고유 id 부여)이라 서로의 맥락을 오염시키지 않는다.
-    최종 done 프레임의 text·sources·cited_ids만 취해 열 프레임으로 재조립한다.
+    최종 done 프레임의 text·sources·cited_ids만 취해 열 프레임으로 재조립한다. 여기에
+    **라운드 경계 오프셋(process_chars)**을 더한다: 채팅 화면이 조사 과정을 접는 근거는
+    텍스트가 아니라 **도구 스텝 프레임이 본문을 끊는다는 이벤트 순서**인데, 셀은 본문 통째
+    1회로 방출돼 그 순서 정보가 프론트에 남지 않는다. 본문에 라운드 구분자가 들어가긴
+    하지만(runner _ROUND_SEPARATOR) 모델이 스스로 쓴 문단 경계와 구별되지 않아 텍스트만으로는
+    어느 문단 경계가 라운드 경계인지 특정할 수 없다. 그래서 여기서 한 번 세어 넘긴다 —
+    본문은 한 글자도 바꾸지 않는다(표시용 부가 필드).
     """
     text = ""
     sources: list[dict] = []
     cited_ids: list = []
+    streamed: list[str] = []  # 흐른 본문 조각(라운드 경계를 세기 위한 것 — 방출하지 않는다)
+    process_prefix = ""       # 마지막 도구 스텝까지 흐른 본문 = 경계의 정본
+    settled = False           # reset 이후 = 정본 재전송, 라운드 경계를 더 셀 수 없다
     # 이 셀 태스크(및 그 안에서 파생되는 Yes24 도구 하위 태스크)를 고처리량 경로로 표시한다.
     # 16셀이 동시에 도는 매트릭스에서 전역 채팅 클라이언트(rps=1.5)의 단일 throttle_lock이 모든
     # 셀의 Yes24 요청을 0.667초 간격으로 직렬화하던 병목을 없앤다(2026-07-24 실측: 89→~52초).
@@ -100,13 +111,40 @@ async def _run_cell(question: str, code: str, model: str | None) -> dict:
     with high_throughput_client():
         async for frame in run_agent_stream(question, session_id=None, rbti=code, model=model):
             event, data = _parse_frame(frame)
+            if event == "delta" and not settled:
+                streamed.append(data.get("text", ""))
+            elif event == "reset":
+                # 인용 검증이 본문을 바꿔 정본이 통째로 다시 온다. 그 덩어리엔 경계가 없지만
+                # **이미 센 경계는 버리지 않는다** — 지워진 마커가 답 구간에 있었다면 과정
+                # 접두는 정본에서도 그대로다(아래 대조가 판정한다).
+                settled = True
+            elif (
+                not settled
+                and event == "status"
+                and data.get("stage") != "thinking"
+                and data.get("detail")
+            ):
+                # 채팅 프론트가 블록을 나누는 조건과 같은 프레임이다(thinking은 본문을 끊지
+                # 않고, 문구 없는 프레임은 표시할 단계가 없다 — index.html setStatus 참조).
+                process_prefix = "".join(streamed)
             # 채팅의 글로벌 done(col 없음)이 이 셀의 최종 결과다. 공개 source·done 규율은 원칙 4대로
             # runner가 이미 적용해 두었으므로(인용분만), 여기서는 그대로 옮기기만 한다.
-            if event == "done":
+            elif event == "done":
                 text = data.get("text", "") or text
                 sources = data.get("sources", sources)
                 cited_ids = data.get("cited_ids", cited_ids)
-    return {"code": code, "text": text, "sources": sources, "cited_ids": cited_ids}
+    # 오프셋은 **정본 위에서 유효해야** 쓴다: 과정 접두가 정본의 접두와 다르거나(인용 검증이
+    # 그 구간을 고친 경우) 경계 뒤에 남는 답이 없으면(도구 호출 후 본문 없이 끝난 셀) 접지
+    # 않는다 — 과정만 남고 답이 사라지는 표시는 어떤 경우에도 만들지 않는다.
+    if not text.startswith(process_prefix) or not text[len(process_prefix) :].strip():
+        process_prefix = ""
+    return {
+        "code": code,
+        "text": text,
+        "sources": sources,
+        "cited_ids": cited_ids,
+        "process_chars": len(process_prefix),
+    }
 
 
 async def run_matrix_stream(
@@ -171,6 +209,12 @@ async def run_matrix_stream(
                 "code": cell["code"],
                 "name": get_archetype_name(cell["code"]),
                 "axis_label": axis_label(cell["code"]),
+                # 마커 전역화가 [2]→[2002]로 길이를 바꾸므로 오프셋도 **치환 후 기준**으로 센다.
+                # 경계가 마커 안에 걸리면 그 마커만 치환에서 빠져 몇 글자 짧게 잡히는데, 과정
+                # 꼬리가 조금 더 보이는 방향이라 무해하다(경계는 신호가 정본 — 문구 보정 없음).
+                "process_chars": len(
+                    _remap_marker_text(cell["text"][: cell["process_chars"]], id_map)
+                ),
             }
             yield sse_delta(_remap_marker_text(cell["text"], id_map), col=col, extra=identity)
 

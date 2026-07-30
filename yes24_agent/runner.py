@@ -74,6 +74,12 @@ _OVERLOAD_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 529})
 # status로 승격하던 구조 자체가 사라졌고, 이제 조사 경과 서술은 응답 본문의 일부로 흐른다
 # (원칙 4b 개정 — 사용자 승인). delta 합계 == done.text 불변식은 그대로다.
 
+# 조사 라운드 경계에 넣는 문단 구분자. 라이브 화면은 도구 스텝 프레임이 블록을 갈라 멀쩡해
+# 보이지만, 그 순서 정보가 없는 소비자(새로고침 복원·복사·매트릭스 셀·API)에게는 라운드의
+# 문장들이 그대로 붙어 나갔다("…찾아볼게요.베스트셀러 목록을…" 실측). 라운드 경계는 실제
+# 흐름의 구조이므로 이 표기는 4b("본문은 흐른 그대로")의 위반이 아니라 충실한 표기다.
+_ROUND_SEPARATOR = "\n\n"
+
 
 def _event_text(event) -> str:
     """ADK 이벤트 content에서 **본문** 텍스트 파트만 손실 없이 이어붙인다(사고 파트 제외).
@@ -88,6 +94,21 @@ def _event_text(event) -> str:
     if not event.content or not event.content.parts:
         return ""
     return "".join(part.text or "" for part in event.content.parts if not part.thought)
+
+
+def _round_boundary_prefix(pending: list[str], chunk: str) -> str:
+    """도구를 건너뛴 두 텍스트 사이에 넣을 문단 구분자(넣지 않으면 빈 문자열).
+
+    **경계에 공백이 전혀 없을 때만** 넣는다. 이미 어느 쪽이든 개행·공백으로 끝나거나
+    시작하면 접착이 아니므로 손대지 않는다 — 이 한 줄이 중복 삽입 방지와 열린
+    마크다운 블록 보호를 동시에 해낸다: 표는 행마다 개행으로 끊기므로 표 도중의 경계는
+    항상 개행 위에 놓이고, 그 자리에 빈 줄을 넣으면 표가 그 지점에서 종료돼 뒤따르는
+    행이 생 파이프 평문으로 남는다(2026-07-22 실측, 프론트에서 복구 불가). 펜스 홀짝을
+    세는 블록 파서를 되살리지 않고 구조만으로 같은 선을 지킨다.
+    """
+    if not pending or pending[-1][-1:].isspace() or chunk[:1].isspace():
+        return ""
+    return _ROUND_SEPARATOR
 
 
 def _event_thought_text(event) -> str:
@@ -339,6 +360,9 @@ async def run_agent_stream(
         # 화면에 흘린 본문 조각. **모든 append 옆에 sse_delta가 있다** — 이 불변식이
         # "pending == 흘려보낸 조각"을 만들고, 마감의 4b 대조(_emit_final_body)가 그 위에 선다.
         pending: list[str] = []
+        # 마지막 본문 청크 이후 도구가 돌았는가 = 다음 텍스트가 **새 조사 라운드**의 시작인가.
+        # 이 신호로만 라운드 경계 구분자를 넣는다(_round_boundary_prefix).
+        tool_ran_since_text = False
         # 사고 요약 누적 버퍼(_thought_status_labels). 닫힌 문단만 타임라인으로 나가고
         # 미완 꼬리는 여기 남는다 — 미리보기 채널이라 스트림 종료 시 꼬리는 버려도 된다.
         thought_buf: list[str] = []
@@ -427,6 +451,7 @@ async def run_agent_stream(
                             # 소비했어도 캐시가 완료 task를 돌려주므로 추가 비용이 없다.
                             start_web_prefetch(message)
                             pending = []
+                            tool_ran_since_text = False
                             thought_buf = []
                             for task in thought_tasks:
                                 task.cancel()
@@ -452,6 +477,7 @@ async def run_agent_stream(
                     if not event.partial and event.get_function_calls():
                         # 도구 직전 예고·경과 서술은 이미 본문 delta로 흘렀다(내레이션 전환).
                         # 여기서는 도구 호출 자체의 진행 칩만 낸다.
+                        tool_ran_since_text = True
                         for call in event.get_function_calls():
                             status = _status_for_call(call)
                             if status is None:
@@ -462,6 +488,7 @@ async def run_agent_stream(
 
                     responses = event.get_function_responses()
                     if responses:
+                        tool_ran_since_text = True
                         for resp in responses:
                             payload = resp.response or {}
                             tool_call_count += 1
@@ -515,6 +542,11 @@ async def run_agent_stream(
                             # 내레이션 전환: 본문은 항상 즉시 흐른다(홀드 없음). 도구 직전
                             # 예고·경과 서술도 응답의 일부다 — 4b의 "delta 합계 == done.text"
                             # 불변식은 이 무조건 방류로 오히려 단순하게 성립한다.
+                            # 라운드 경계 구분자도 **여기 한 지점에서** 청크에 붙여, 스트림과
+                            # 정본 누적이 갈릴 수 없게 한다(불변식이 자동 충족되는 구조).
+                            if tool_ran_since_text:
+                                chunk = _round_boundary_prefix(pending, chunk) + chunk
+                                tool_ran_since_text = False
                             pending.append(chunk)
                             emitted_output = True
                             yield sse_delta(chunk)
