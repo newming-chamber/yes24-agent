@@ -301,6 +301,12 @@
       flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
       padding-top: 6px; border-top: 1px dashed var(--border-soft);
     }
+    /* 접힌 조사 과정 = 한 줄 표시만. 셀 본문은 overflow:hidden + 하단 페이드라 여기서
+       펼치면 잘려서 못 읽는다 — 펼침은 공간이 있는 모달(.m-process)이 담당한다. */
+    .cell .c-process {
+      flex: 0 0 auto; font-size: 10.5px; color: var(--muted);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
     /* 정직 폴백 셀(책 못 찾음/추천 미완성)은 살짝 muted로 구분. */
     .cell.fallback { opacity: 0.62; }
     .cell.fallback .c-flow { color: var(--muted); -webkit-mask-image: none; mask-image: none; }
@@ -437,6 +443,14 @@
     .modal .m-book-title { font-size: 10px; color: var(--muted); margin-top: 5px; line-height: 1.3;
       display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
     .modal .m-body { padding: 12px 18px 16px; overflow-y: auto; font-size: 14px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
+    /* 조사 과정 접힘 — 채팅(index.html .process-fold)과 같은 문법·기본 닫힘. */
+    .modal .m-process summary {
+      cursor: pointer; list-style: none; font-size: 12.5px; color: var(--muted); padding: 2px 0;
+    }
+    .modal .m-process summary::-webkit-details-marker { display: none; }
+    .modal .m-process summary:hover { color: var(--text); }
+    .modal .m-process[open] { border-left: 2px solid var(--border); padding-left: 10px; margin-bottom: 10px; }
+    .modal .m-process .m-process-body { font-size: 13px; color: var(--muted); }
     .modal .m-foot { padding: 12px 18px 16px; border-top: 1px solid var(--border-soft); display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
     .modal .m-chips { display: flex; gap: 8px; overflow-x: auto; flex: 1 1 auto; }
     .modal .m-adopt {
@@ -854,7 +868,8 @@
 
       const handle = {
         el, code, nameEl, body, foot,
-        name: "", axisLabel: deriveAxisLabel(code), text: "", sources: [], picks: [], filled: false,
+        name: "", axisLabel: deriveAxisLabel(code), text: "", processChars: 0,
+        sources: [], picks: [], filled: false,
       };
       el.addEventListener("click", () => { if (handle.filled) openModal(handle); });
       el.addEventListener("keydown", (e) => {
@@ -863,6 +878,11 @@
       cardByCode.set(code, handle);
       return handle;
     }
+
+    // 과정(조사 서술) / 최종 답 — 표시 계층의 단일 분할점. card.text는 자르지 않는다
+    // (스냅샷·모달·토너먼트가 같은 본문을 공유하고, 정본은 백엔드 done.text 그대로다).
+    function processText(card) { return card.text.slice(0, card.processChars); }
+    function answerText(card) { return card.text.slice(card.processChars); }
 
     // ── W1: 구조화 본문 — 흐르는 전문 + 선택한 책(백엔드 picks) ──
     // 책·가격·표지는 **백엔드가 col done에 실어 주는 구조화된 picks**를 그대로 그린다.
@@ -874,10 +894,19 @@
       body.className = "c-body structured";
       body.textContent = "";
 
+      // 조사 과정은 셀 상단 한 줄로 접는다(채팅과 같은 "💭" 문법). 전문은 모달에서 펼친다.
+      if (processText(card).trim()) {
+        const fold = document.createElement("div");
+        fold.className = "c-process";
+        fold.textContent = "💭 생각·탐색 과정";
+        fold.title = "카드를 열면 과정을 볼 수 있어요";
+        body.appendChild(fold);
+      }
+
       // 흐르는 전문 + 인용 마커([n]). 셀 높이만큼 채우고 넘치면 하단 페이드(CSS). 상세는 모달.
       const flow = document.createElement("div");
       flow.className = "c-flow";
-      renderBody(flow, card.text, { isCitation: isPooled, onMarker: (sid) => highlightChip(card, sid) });
+      renderBody(flow, answerText(card), { isCitation: isPooled, onMarker: (sid) => highlightChip(card, sid) });
       body.appendChild(flow);
 
       // 선택 책 슬롯(『』·표지·세로바)은 **책만** 채운다 — 웹 출처(뉴스·유튜브)가 섞인 비도서
@@ -938,6 +967,11 @@
       if (!card) return;
 
       card.text = data.text || "";
+      // 과정/답 경계 = 백엔드가 센 라운드 경계 오프셋(matrix_runner process_chars). 본문을
+      // 뜯어 읽지 않고 이 숫자만 믿는다 — 문구·문단 판정을 프론트에 두면 백엔드의 이벤트
+      // 순서와 어긋난다. 옛 스냅샷엔 필드가 없어 0(접힘 없음)으로 떨어진다.
+      const cut = Number(data.process_chars);
+      card.processChars = Number.isFinite(cut) ? Math.max(0, Math.min(cut, card.text.length)) : 0;
       card.filled = true;
       card.el.classList.remove("pending");
       card.el.classList.add("filled");
@@ -1041,10 +1075,24 @@
       mCode.textContent = card.code;
       mAxis.textContent = card.axisLabel;
       mName.textContent = card.name || card.axisLabel;
-      renderBody(mBody, card.text, { isCitation: isPooled, onMarker: (sid) => {
+      const markerOpts = { isCitation: isPooled, onMarker: (sid) => {
         const chip = mChips.querySelector('.c-chip[data-sid="' + CSS.escape(String(sid)) + '"]');
         if (chip) { chip.scrollIntoView({ block: "nearest", inline: "center" }); chip.classList.add("hl"); setTimeout(() => chip.classList.remove("hl"), CHIP_HIGHLIGHT_MS); }
-      } });
+      } };
+      renderBody(mBody, answerText(card), markerOpts);
+      // 조사 과정은 답 위의 접힘(기본 닫힘)으로 — 셀에선 한 줄이던 것이 여기서 펼쳐진다.
+      const process = processText(card);
+      if (process.trim()) {
+        const fold = document.createElement("details");
+        fold.className = "m-process";
+        const sum = document.createElement("summary");
+        sum.textContent = "💭 생각·탐색 과정";
+        const inner = document.createElement("div");
+        inner.className = "m-process-body";
+        renderBody(inner, process, markerOpts);
+        fold.append(sum, inner);
+        mBody.prepend(fold);
+      }
       // W2: 이 유형이 고른 책 표지 스트립(표지 있는 출처만). 없으면 컨테이너 비어 숨김.
       mBooks.textContent = "";
       for (const src of card.sources) {
@@ -1172,8 +1220,9 @@
       // 취약(작은 n) → 앞, 견고(큰 n) → 뒤. 동률은 Array.sort 안정성으로 AXES 원순서 유지.
       return AXES.slice().sort((x, y) => robustness[x.key] - robustness[y.key]);
     }
-    // 토너먼트 카드 미리보기 = 전문(.tc-gist가 3줄 클램프).
-    function tGist(card) { return card && card.text ? card.text.trim() : ""; }
+    // 토너먼트 카드 미리보기 = 최종 답 전문(.tc-gist가 3줄 클램프). 조사 과정은 뺀다 —
+    // 3줄 클램프에 "찾아볼게요"가 들어차면 성향 비교가 아니라 조사 로그를 고르게 된다.
+    function tGist(card) { return card && card.text ? answerText(card).trim() : ""; }
     // 대표책 = 첫 번째 **책** 픽(백엔드 인용 등장 순서). 웹 출처(type=web)는 대표책이 아니다
     // — 비도서 질문에서 뉴스 제목이 토너먼트·핸드오프에 책처럼 새지 않게(렌더와 같은 규칙).
     function repTitle(card) {
@@ -1467,7 +1516,8 @@
         for (const [code, card] of cardByCode) {
           if (!card.filled) continue;
           cells.push({
-            code, text: card.text, name: card.name, axis_label: card.axisLabel,
+            code, text: card.text, process_chars: card.processChars,
+            name: card.name, axis_label: card.axisLabel,
             sources: card.sources, picks: card.picks, fallback: !!card.isFallback,
           });
         }
