@@ -24,61 +24,33 @@ AXIS_ORDER: tuple[tuple[str, tuple[str, str]], ...] = (
     ("motivation", ("I", "F")),
 )
 
-# 8개 축-값 조각. 각 값은 {tone(강점 체화), aware(함정 자각), stretch(성장 처방)}.
-# 미러형 기본: tone은 그 성향을 따르는 추천 결, aware는 스스로 경계할 함정, stretch는
-# 가끔·강요 없이 곁들이는 취향 밖 한 권. 기획서 1.2 조각표가 데이터의 단일 소스다.
+# 8개 축-값 조각. 값 → tone(그 성향을 따르는 추천 결). 기획서 1.2 조각표가 데이터의 단일 소스다.
 #
 # tone을 주제 중립 렌즈로 일반화하는 실험(2026-07-27)은 **킬**됐다: 감정 상담류 수렴이
 # 그대로였고(2.5/10 동점, 복제 클러스터 확산) 프롬프트 문구 계열 3연속 실패로 가설 반증.
 # 감정류 차별화는 프롬프트 문구가 아니라 구조 개입으로 접근할 것 — 문구 재실험 금지.
-AXIS_FRAGMENTS: dict[str, dict[str, dict[str, str]]] = {
+#
+# aware(함정 자각)·stretch(성장 처방) 조각은 삭제됐다(2026-07-30): 16뷰 냉정 평가에서
+# aware가 메인 추천 논거로 **역류**해 축을 뒤집는 것이 실측됐다(완독형 셀이 "완독 압박
+# 없이 발췌 읽기"를 세일즈 포인트로 판매 — 출처는 C축 aware "완독 압박으로 무겁게 몰지
+# 않기"). 함정·처방 데이터는 TYPE_ARCHETYPES(UI 표시 전용)가 이미 보유하므로 프롬프트
+# 주입에서만 뺀다. 재도입하려면 역류를 막는 구조 근거와 함께 재계측할 것.
+AXIS_FRAGMENTS: dict[str, dict[str, str]] = {
     "pattern": {
-        "C": {
-            "tone": "끝까지 읽을 가치 중심으로 엄선하고 깊게 집중",
-            "aware": "완독 압박으로 무겁게 몰지 않기",
-            "stretch": "가끔 '흥미 식으면 편히 하차해도 좋다' 여지",
-        },
-        "S": {
-            "tone": "가볍게 탐색할 메뉴로 구성하고 발췌·핵심 챕터 짚기",
-            "aware": "파편화·휘발 경계(각 권 맥락 한 줄)",
-            "stretch": "가끔 '이건 진득하게 완독 추천' 한 권",
-        },
+        "C": "끝까지 읽을 가치 중심으로 엄선하고 깊게 집중",
+        "S": "가볍게 탐색할 메뉴로 구성하고 발췌·핵심 챕터 짚기",
     },
     "processing": {
-        "A": {
-            "tone": "논증·구조·근거로 왜 좋은지 차분·객관적으로 설명",
-            "aware": "개연성 강박·건조함·비판 과잉 경계",
-            "stretch": "가끔 감성·서사 강한 한 권으로 균형추",
-        },
-        "E": {
-            "tone": "감정·위로·인물의 결로 따뜻하게, 마음에 닿는 언어로",
-            "aware": "과몰입·객관성 상실·무거운 주제 집착 경계",
-            "stretch": "가끔 논리·비문학 한 권으로 팩트 균형",
-        },
+        "A": "논증·구조·근거로 왜 좋은지 차분·객관적으로 설명",
+        "E": "감정·위로·인물의 결로 따뜻하게, 마음에 닿는 언어로",
     },
     "breadth": {
-        "D": {
-            "tone": "좋아하는 분야·작가를 깊이, 다음 단계까지 파고들기",
-            "aware": "좁은 편식·확증편향·우물 안 경계",
-            "stretch": "가끔 낯선 인접 장르 한 권 열어주기",
-        },
-        "B": {
-            "tone": "분야를 넘나들며 트렌드·연결·큐레이션으로 폭넓게",
-            "aware": "얕음·겉핥기·선택장애 경계",
-            "stretch": "가끔 '한 우물' 심화서 한 권",
-        },
+        "D": "좋아하는 분야·작가를 깊이, 다음 단계까지 파고들기",
+        "B": "분야를 넘나들며 트렌드·연결·큐레이션으로 폭넓게",
     },
     "motivation": {
-        "I": {
-            "tone": "배움·실용·삶에 적용될 값 우선('무엇을 얻나')",
-            "aware": "수집 집착·앎↔실천 괴리 경계",
-            "stretch": "가끔 순수 재미·힐링 한 권",
-        },
-        "F": {
-            "tone": "몰입·재미·힐링·장르적 즐거움 우선('얼마나 재밌나')",
-            "aware": "현실도피·스낵컬처·깊이 부재 경계",
-            "stretch": "가끔 묵직한 서사·교양 한 권 도전",
-        },
+        "I": "배움·실용·삶에 적용될 값 우선('무엇을 얻나')",
+        "F": "몰입·재미·힐링·장르적 즐거움 우선('얼마나 재밌나')",
     },
 }
 
@@ -453,9 +425,7 @@ _PERSONA_BODY = (
     "- 판단 관점: {tone}\n"
     "- 후보 선택: {structure}\n"
     "- 탐색·선택 범위: {breadth}\n"
-    "- 우선 가치: {value}\n"
-    "- 자각(함정 회피): {aware}\n"
-    "- 성장 후보(선택): 맥락에 맞을 때만 다음 중 하나 — {stretch_pool}"
+    "- 우선 가치: {value}"
 )
 
 
@@ -534,16 +504,11 @@ def build_persona_block(code: object) -> str:
     # 자리별 조각을 축 이름으로 뽑는다(하드코딩 없이 코드 파싱).
     picked = {axis: AXIS_FRAGMENTS[axis][ch] for ch, (axis, _allowed) in zip(code, AXIS_ORDER)}
 
-    # 본문의 각 레버를 담당 축의 tone으로 채운다(1.1 축=레버 매핑). aware·stretch는
-    # 4조각을 모아 자각 목록·성장 제안 풀로 조인한다.
-    aware = " · ".join(picked[axis]["aware"] for axis, _allowed in AXIS_ORDER)
-    stretch_pool = "; ".join(picked[axis]["stretch"] for axis, _allowed in AXIS_ORDER)
+    # 본문의 각 레버를 담당 축의 tone으로 채운다(1.1 축=레버 매핑).
     body = _PERSONA_BODY.format(
-        tone=picked["processing"]["tone"],
-        structure=picked["pattern"]["tone"],
-        breadth=picked["breadth"]["tone"],
-        value=picked["motivation"]["tone"],
-        aware=aware,
-        stretch_pool=stretch_pool,
+        tone=picked["processing"],
+        structure=picked["pattern"],
+        breadth=picked["breadth"],
+        value=picked["motivation"],
     )
     return f"{_PERSONA_HEADER}\n{body}"
