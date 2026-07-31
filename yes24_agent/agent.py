@@ -250,7 +250,7 @@ def _instruction_provider(ctx: ReadonlyContext) -> str:
 
     세션 state에 RBTI 코드가 있으면(플러밍이 저장) **두 지점**에 페르소나를 얹는다: 상단
     도구-반영 지시(persona_tool_directive, 검색·선택에 실제 적용)와 끝의 상세 블록
-    (build_persona_block, 후보 선택·강조 관점). 코드가 없거나 무효면 둘 다 ""이라 base와 바이트 동일
+    (build_persona_block, 후보 구성·읽기 권유·강조 관점). 코드가 없거나 무효면 둘 다 ""이라 base와 바이트 동일
     (회귀 0). ctx.state는 세션 state의 읽기전용 뷰(MappingProxyType)다.
     """
     code = ctx.state.get("rbti")
