@@ -1084,12 +1084,14 @@
         title.className = "title";
         title.textContent = src.title || "(제목 없음)";
         main.append(top, title);
-        // 상품 카드(비웹)엔 저자·가격을 노출한다. 데이터가 오는 형태가 둘이라 관대하게 읽는다:
-        // 신규 공개 DTO는 author/price 평면 필드이고, 아래 fallback은 기존 스냅샷 호환 경로다.
+        // 상품 카드(비웹)엔 저자·판매가를 노출한다. 데이터가 오는 형태가 여럿이라 관대하게
+        // 읽는다: 현행 공개 DTO는 author/sale_price 평면 필드이고, 아래 fallback은 가격 키가
+        // sale_price로 바뀌기 전 저장된 스냅샷(평면 price·meta.price) 호환 경로다.
         // 값이 없으면 placeholder 없이 그 줄을 생략한다.
         if (!isWeb) {
           const author = src.author || src.snippet;
-          const priceRaw = (src.price != null) ? src.price : (src.meta && src.meta.price);
+          const priceRaw = [src.sale_price, src.price, src.meta && src.meta.sale_price, src.meta && src.meta.price]
+            .find((v) => v != null);
           if (author) {
             const au = document.createElement("div");
             au.className = "info author";
@@ -1124,9 +1126,10 @@
 
       function sourceSnapshot(src) {
         const fields = [
-          "id", "title", "url", "type", "author", "price", "image_url", "rating",
+          "id", "title", "url", "type", "author", "sale_price", "price", "image_url", "rating",
           "publisher", "published_at", "last_updated", "checked_at", "snippet"
         ];  // snippet: 저자 없는 출처의 카드 저자줄 폴백(makeCard) — 복원 시에도 유지
+            // price: sale_price 개명 전 스냅샷 복원 경로(makeCard 폴백과 한 세트)
         return Object.fromEntries(
           fields.filter((field) => src[field] !== undefined).map((field) => [field, src[field]])
         );

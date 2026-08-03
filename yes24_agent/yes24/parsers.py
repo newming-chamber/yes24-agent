@@ -30,13 +30,13 @@ from yes24_agent.yes24.selectors import (
     ITEM_GOODS_NO_ATTR,
     ITEM_IMAGE,
     ITEM_IMAGE_ATTR,
-    ITEM_PRICE,
     ITEM_PUB_DATE,
     ITEM_PUBLISHER,
     ITEM_RANK,
     ITEM_RATING,
     ITEM_REVIEW_COUNT,
     ITEM_SALE_INDEX,
+    ITEM_SALE_PRICE,
     ITEM_TITLE_LINK,
     LINK_NOISE_PATH_MARKERS,
     LINK_NOISE_SUBDOMAINS,
@@ -78,7 +78,7 @@ _ITEM_FIELDS = (
     "author",
     "publisher",
     "pub_date",
-    "price",
+    "sale_price",
     "rating",
     "page_count",
     "sale_index",
@@ -159,7 +159,7 @@ def _parse_item(item, base_url: str) -> dict | None:
         author=_author_or_none(item),
         publisher=_text_or_none(item.select_one(ITEM_PUBLISHER)),
         pub_date=_text_or_none(item.select_one(ITEM_PUB_DATE)),
-        price=_parse_price(item.select_one(ITEM_PRICE)),
+        sale_price=_parse_price(item.select_one(ITEM_SALE_PRICE)),
         rating=_parse_rating(item.select_one(ITEM_RATING)),
         sale_index=_parse_grouped_int(item.select_one(ITEM_SALE_INDEX)),
         review_count=_parse_grouped_int(item.select_one(ITEM_REVIEW_COUNT)),
@@ -184,13 +184,16 @@ def _item_fields(**values) -> dict:
 def parse_product(html: str, *, base_url: str) -> dict:
     """Yes24 상품 상세 페이지 HTML을 파싱해 상세 정보를 반환한다.
 
-    반환 dict 키: goods_no, title, url, author, publisher, pub_date, price(int|None),
+    반환 dict 키: goods_no, title, url, author, publisher, pub_date, sale_price(int|None),
     rating(float|None), is_ebook(bool), intro, toc, pub_review, weekly_reviews(list[str]).
     텍스트 블록(intro/toc/pub_review)은 없으면 None, weekly_reviews는 없으면 빈 리스트.
 
     가격·goods_no·eBook 여부는 CSS가 아니라 페이지 인라인 <script>의 전역변수를
     정규식으로 추출한다 — 상세페이지 CSS 가격(em.yes_b)은 번들가·중고가까지 섞여
-    나와 오염 위험이 크다(docs/m2-scout-report.md 참조).
+    나와 오염 위험이 크다(docs/m2-scout-report.md 참조). 뽑는 값은 `g_GoodsSalePrice`,
+    즉 **할인 적용 판매가**이므로 키도 sale_price다 — 중립적인 `price`로 내보내면
+    소비자(모델·카드)가 정가인지 판매가인지 추측하게 되고, 실제로 "정가 16,200원"처럼
+    틀린 라벨을 붙였다(정가는 별도 변수 g_GoodsShopPrice이며 여기서 뽑지 않는다).
 
     제목(CSS)도 없고 goods_no(JS 변수)도 없으면 상품 상세 페이지가 아니거나 구조가
     변경된 것으로 보고 ParseError를 발생시킨다.
@@ -214,8 +217,8 @@ def parse_product(html: str, *, base_url: str) -> dict:
     is_ebook_match = re.search(PRODUCT_IS_EBOOK_JS_RE, html)
     is_ebook = is_ebook_match.group(1) == "Y" if is_ebook_match else False
 
-    price_match = re.search(PRODUCT_SALE_PRICE_JS_RE, html)
-    price = _parse_js_price(price_match.group(1)) if price_match else None
+    sale_price_match = re.search(PRODUCT_SALE_PRICE_JS_RE, html)
+    sale_price = _parse_js_price(sale_price_match.group(1)) if sale_price_match else None
 
     return {
         "goods_no": goods_no,
@@ -224,7 +227,7 @@ def parse_product(html: str, *, base_url: str) -> dict:
         "author": _author_text_or_none(soup.select_one(PRODUCT_AUTHOR)),
         "publisher": _text_or_none(soup.select_one(PRODUCT_PUBLISHER)),
         "pub_date": _text_or_none(soup.select_one(PRODUCT_PUB_DATE)),
-        "price": price,
+        "sale_price": sale_price,
         "rating": _parse_rating(soup.select_one(PRODUCT_RATING)),
         "page_count": _parse_page_count(soup),
         "is_ebook": is_ebook,
@@ -257,7 +260,7 @@ def parse_browse_list(html: str, *, base_url: str, section: str, limit: int = 24
     """Yes24 섹션 목록(베스트셀러/신간/크레마클럽 인기) HTML을 파싱한다.
 
     반환 dict 키: rank(int|None) + parse_search와 **동일한 상품 필드 집합**(_ITEM_FIELDS:
-    goods_no, title, url(절대), author, publisher, pub_date, price, rating, sale_index,
+    goods_no, title, url(절대), author, publisher, pub_date, sale_price, rating, sale_index,
     review_count, image_url). 페이지에 필드가 없으면 None이다. 아이템 단위로 제목 또는
     링크(크레마클럽은 goods_no)가 없으면 건너뛴다.
 
@@ -266,7 +269,7 @@ def parse_browse_list(html: str, *, base_url: str, section: str, limit: int = 24
       - markup="search"   : 검색 결과와 동일한 마크업(베스트셀러·신간).
       - markup="cremaclub": 별도 마크업(cremaclub.yes24.com). URL은 `/BookClub/Detail/{id}`가
         아니라 항상 product_url(base_url, goods_no)로 조립한 www.yes24.com 상품 페이지를
-        반환한다. publisher·pub_date·price·sale_index는 이 섹션에 필드 자체가 없어 항상 None.
+        반환한다. publisher·pub_date·sale_price·sale_index는 이 섹션에 필드 자체가 없어 항상 None.
 
     표에 없는 section은 ValueError(도구는 같은 표로 사전 검증하므로 실제로는 프로그래머
     오류만 잡는다). 목록 컨테이너 자체가 없으면(무결과 신호도 없으면) HTML 구조 변경으로
@@ -380,7 +383,7 @@ def _parse_cremaclub_list(
             rank = _parse_int(rank_el.get_text(strip=True)) if rank_el else None
 
         # 검색/베스트셀러와 같은 필드 순서(_item_fields)를 따르되, 이 페이지에 필드 자체가
-        # 없는 publisher·pub_date·price·sale_index는 키를 내지 않는다(구독형 eBook 목록).
+        # 없는 publisher·pub_date·sale_price·sale_index는 키를 내지 않는다(구독형 eBook 목록).
         results.append(
             {
                 "rank": rank,

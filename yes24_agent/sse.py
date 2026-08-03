@@ -61,7 +61,10 @@ def _with_col(data: dict, col: int | None) -> dict:
 def sse_source(source: dict, col: int | None = None) -> str:
     """최종 인용 검증을 통과한 출처 이벤트를 공개 DTO로 직렬화한다.
 
-    image_url·author·price는 있는 상품 출처에만 싣고, 웹·정책 출처에서는 생략한다.
+    image_url·author·sale_price는 있는 상품 출처에만 싣고, 웹·정책 출처에서는 생략한다.
+    가격 키가 sale_price인 것은 파서가 뽑는 값이 정가가 아니라 할인 적용 판매가이기
+    때문이다(parsers.parse_product 참조) — 중립적인 이름으로 내보내면 소비자가 어느
+    가격인지 추측하게 된다.
     """
     data = {
         "id": source["id"],
@@ -75,9 +78,9 @@ def sse_source(source: dict, col: int | None = None) -> str:
     author = source.get("author")
     if author:
         data["author"] = author
-    price = source.get("price")
-    if price is not None:
-        data["price"] = price
+    sale_price = source.get("sale_price")
+    if sale_price is not None:
+        data["sale_price"] = sale_price
     return format_sse("source", _with_col(data, col))
 
 

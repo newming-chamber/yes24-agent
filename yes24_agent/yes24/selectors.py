@@ -36,7 +36,9 @@ ITEM_PUB_DATE = "span.authPub.info_date"
 # 가격과 평점이 둘 다 `em.yes_b`를 재사용하므로 컨테이너로 구분해야 한다.
 # `.info_price` 안에는 쿠폰 적용가(`.yCoupon` 안의 `strong.txt_num`)가 추가로 나올 수
 # 있어, '>' 자식 결합자로 최상위 판매가(strong.txt_num)만 선택해 쿠폰가 오염을 막는다.
-ITEM_PRICE = ".info_price > strong.txt_num em.yes_b"
+# 뽑히는 값은 **할인 적용 판매가**다(같은 블록의 취소선 `span.txt_num.dash em.yes_m`가
+# 정가이며 뽑지 않는다) — 상세페이지 g_GoodsSalePrice와 같은 의미라 필드명도 sale_price다.
+ITEM_SALE_PRICE = ".info_price > strong.txt_num em.yes_b"
 ITEM_RATING = ".rating_grade em.yes_b"
 
 # 대중성/매력 신호(매트릭스 풀 재순위화용). 둘 다 검색 결과 HTML에 SSR로 박혀 있다.

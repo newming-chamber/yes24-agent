@@ -192,7 +192,7 @@ async def run_matrix_stream(
             }
 
             # 이 셀이 인용한 출처를 전역 id로 등록한다(같은 전역 id는 한 번만). 프론트가 id로
-            # 조회하므로 title·price·image_url 등 전체 정보를 이때 싣는다.
+            # 조회하므로 title·sale_price·image_url 등 전체 정보를 이때 싣는다.
             for source in sources:
                 sid = source.get("id")
                 if sid is None:

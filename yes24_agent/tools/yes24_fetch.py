@@ -258,7 +258,7 @@ def _fetch_product(
     title = product.get("title") or "제목 미상"
 
     # 검색·브라우즈와 같은 필드 집합(product_fields) — 상세만 연 턴에서도 게이트가 대조할
-    # 접지 필드(publisher·rating·price·pub_date…)를 빠짐없이 싣는다.
+    # 접지 필드(publisher·rating·sale_price·pub_date…)를 빠짐없이 싣는다.
     fields = product_fields(product)
     content = "\n\n".join(block for block in (intro, toc, pub_review, *weekly_reviews) if block)
     # 상품 상세의 page 링크는 전 페이지 공통 GNB(국내도서·카테고리 트리 …)라 정보가 0이다

@@ -942,11 +942,13 @@
         title.textContent = "『" + selected.title + "』";
         title.title = selected.title;
         pick.appendChild(title);
-        if (selected.price != null && selected.price !== "") {
+        // 가격 키는 sale_price(할인 적용 판매가)다 — 평면 price는 개명 전 스냅샷 호환 폴백.
+        const priceRaw = (selected.sale_price != null) ? selected.sale_price : selected.price;
+        if (priceRaw != null && priceRaw !== "") {
           const price = document.createElement("span");
           price.className = "c-pick-price";
-          const n = Number(selected.price);
-          price.textContent = (Number.isFinite(n) && n > 0 ? n.toLocaleString("ko-KR") : String(selected.price)) + "원";
+          const n = Number(priceRaw);
+          price.textContent = (Number.isFinite(n) && n > 0 ? n.toLocaleString("ko-KR") : String(priceRaw)) + "원";
           pick.appendChild(price);
         }
         body.appendChild(pick);
