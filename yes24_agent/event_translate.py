@@ -71,7 +71,7 @@ def _status_for_call(call) -> tuple[str, str] | None:
 # 런너는 도구 에러에 재시도를 스케줄하지 않으므로(HTTP 재시도는 client의 max_retries에서
 # 이미 소진된 뒤 에러가 올라온다) "재시도 중"류 문구는 사용자에게 헛된 기대를 준다.
 # 미지 error_type은 "페이지 fetch"로 단정하지 않는 범용 문구로 폴백한다.
-_ERROR_STATUS: dict[str, tuple[str, str]] = {
+_ERROR_STATUS: dict[str, tuple[str, str] | None] = {
     # "fetch"는 별도 항목을 두지 않는다 — HTTP 재시도는 client의 max_retries 루프에서 이미
     # 소진된 뒤에야 error가 올라오고 런너는 아무 재시도도 스케줄하지 않으므로, "재시도 중"은
     # 거짓 라벨이었다(바로 위 주석의 "재시도를 암시하지 않는다"와도 모순). 폴백이 받는다.
@@ -80,17 +80,18 @@ _ERROR_STATUS: dict[str, tuple[str, str]] = {
     "not_configured": ("notice", "지금은 웹 검색을 사용할 수 없어요"),
     "invalid_section": ("notice", "요청한 코너를 찾지 못했어요"),
     # 분야명 미해석은 실패가 아니라 정상 반려다(도구가 실제 분야 목록을 동봉해 돌려주고,
-    # 모델이 그중 번호로 재호출한다 — 실측상 상시 회복). 폴백 문구("정보를 가져오지
-    # 못했어요")로 새면 네트워크 장애처럼 읽혀 "베스트셀러를 계속 못 가져온다"는 오해를
-    # 만든다(2026-07-29 사용자 관측). 재시도를 암시하지 않는 사실 서술만 싣는다(맵 규율).
-    "category_not_found": ("notice", "그 이름의 분야가 따로 없어요"),
-    "category_ambiguous": ("notice", "해당하는 분야가 여러 개예요"),
+    # 모델이 그중 번호로 재호출한다 — 실측상 상시 회복). 그래서 **아무 상태도 내지 않는다**:
+    # 어떤 문구를 써도 사용자에겐 무엇이 없다는 건지 알 수 없는 경고로만 읽히고(⚠️ "그 이름의
+    # 분야가 따로 없어요" — 2026-08-03 UX 평가), 곧바로 회복되는 내부 재호출을 실패로 오해하게
+    # 만든다. 설명할 진행이 없으면 말하지 않는다 — _status_for_call과 같은 규율이다.
+    "category_not_found": None,
+    "category_ambiguous": None,
 }
 _ERROR_STATUS_FALLBACK: tuple[str, str] = ("notice", "정보를 가져오지 못했어요")
 
 
-def _status_for_error(payload: dict) -> tuple[str, str]:
-    """도구 error 응답의 error_type별 status(stage, detail)를 만든다."""
+def _status_for_error(payload: dict) -> tuple[str, str] | None:
+    """도구 error 응답의 error_type별 status(stage, detail)를 만든다(알릴 게 없으면 None)."""
     return _ERROR_STATUS.get(payload.get("error_type"), _ERROR_STATUS_FALLBACK)
 
 

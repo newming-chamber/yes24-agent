@@ -27,24 +27,36 @@ from yes24_agent.yes24.urls import BROWSE_SEED_URLS, browse_category_prefix, bro
 logger = logging.getLogger(__name__)
 
 
+def _squash(name: str) -> str:
+    """분야명 대조용 정규화 — 공백을 전부 없앤다.
+
+    Yes24 내비는 복합어 분야를 띄어 적지만("경제 경영"·"사회 정치"·"IT 모바일") 사용자와
+    모델은 붙여 쓴다("경제경영"). 띄어쓰기는 같은 이름의 표기 변이일 뿐이므로 양쪽을 같은
+    형태로 눕혀 비교한다 — 별칭 사전이 아니라 표기 정규화라, 분야가 늘어도 갱신할 목록이
+    없다(2026-08-03: "경제경영" 미해석으로 베스트셀러 폴백, 재현 2/2).
+    """
+    return "".join(name.split())
+
+
 def _match_category(categories: list[dict], name: str, tree_prefix: str) -> list[dict]:
     """분야 이름을 페이지 내비 항목과 대조해 후보를 고른다(동적 해석 — 이름 목록 미보유).
 
     내비에는 국내도서(001)·eBook(017) 등 여러 트리의 동명 분야가 섞여 있으므로 시드
     트리(tree_prefix)로 먼저 한정하고, 정확 일치 → 접두 일치("소설"→"소설/시/희곡") →
-    순방향 포함("과학"→"자연과학") 순으로 좁힌다. 역방향 포함(분야명⊂입력)은 두지
-    않는다 — "시사경제"를 "경제 경영"으로 넓혀 잇는 순간 도구가 의미 선택을 하게 되어
-    하네스의 선을 넘는다(그런 입력은 미매칭으로 categories와 함께 모델에 반납). 같은
-    단계에서 2개+면 그대로 돌려 호출자가 fail-loud하게 한다(임의 선택 금지).
+    순방향 포함("과학"→"자연과학") 순으로 좁힌다. 대조는 공백을 눕힌 형태로 한다(_squash).
+    역방향 포함(분야명⊂입력)은 두지 않는다 — "시사경제"를 "경제 경영"으로 넓혀 잇는 순간
+    도구가 의미 선택을 하게 되어 하네스의 선을 넘는다(그런 입력은 미매칭으로 categories와
+    함께 모델에 반납). 같은 단계에서 2개+면 그대로 돌려 호출자가 fail-loud하게 한다
+    (임의 선택 금지).
     """
-    wanted = " ".join(name.split())
+    wanted = _squash(name)
     pool = [
         c for c in categories if not tree_prefix or c["number"].startswith(tree_prefix)
     ]
     for tier in (
-        [c for c in pool if c["name"] == wanted],
-        [c for c in pool if c["name"].startswith(wanted)],
-        [c for c in pool if wanted in c["name"]],
+        [c for c in pool if _squash(c["name"]) == wanted],
+        [c for c in pool if _squash(c["name"]).startswith(wanted)],
+        [c for c in pool if wanted in _squash(c["name"])],
     ):
         if tier:
             return tier

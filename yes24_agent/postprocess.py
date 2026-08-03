@@ -231,6 +231,57 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
     )
 
 
+def _renumber_markers(text: str, mapping: dict[int, int]) -> str:
+    """프로즈 마커 안의 id만 표시 번호로 갈아끼운다(구분자·공백 표기 그대로).
+
+    코드 스팬 안의 `[n]`은 배열 인덱스·수식이므로 검증과 **같은 눈**으로 건너뛴다
+    (`_code_span_ranges`) — 판정을 두 벌 두면 한 벌만 고치는 실수가 반복된다.
+    """
+    code_ranges = _code_span_ranges(text)
+
+    def _replace(match: re.Match) -> str:
+        if _within_code_span(match.start(), code_ranges):
+            return match.group(0)
+        inner = re.sub(
+            r"\d+",
+            lambda digits: str(mapping.get(int(digits.group()), int(digits.group()))),
+            match.group(1),
+        )
+        return f"[{inner}]"
+
+    return MARKER_PATTERN.sub(_replace, text)
+
+
+def renumber_for_display(
+    citation: CitationResult, sources: list[dict]
+) -> tuple[CitationResult, list[dict]]:
+    """세션 누적 id를 **이번 답변의 등장 순서 1..n**으로 갈아끼운다(공개 표시층).
+
+    내부 `source_id`는 세션 레지스트리에서 단조 증가하므로, 검색이 많이 쌓이는 턴이면 첫
+    답변인데도 본문이 `[30]`으로 시작하고 카드가 30·40·50·60으로 나간다. 사용자는 "출처를
+    30개 봤다는 건가" 하고 카드를 세게 된다(실제 4개, 2026-08-03 UX 평가 실측). 번호는
+    **표시 규약**이지 식별자가 아니므로 공개 직전에 1..n으로 다시 매긴다(퍼플렉시티 방식).
+
+    순서가 중요하다: 검증(`validate_citations`)은 모델이 실제로 쓴 내부 id로 해야 하고,
+    재번호는 그 **이후**에만 성립한다(먼저 바꾸면 대조할 id 집합이 사라진다). 재번호한
+    본문을 다시 검증에 통과시켜 support 인덱스를 새 본문 길이에 맞춘다 — `[30]`→`[1]`은
+    길이가 줄어 인덱스가 밀리므로, 인덱스 보정을 손으로 하지 않고 같은 함수에 맡긴다.
+
+    반환하는 출처 목록은 **공개용 사본**이다(내부 레지스트리·세션 state는 손대지 않는다).
+    """
+    mapping = {old: new for new, old in enumerate(citation.used_source_ids, start=1)}
+    if all(old == new for old, new in mapping.items()):
+        return citation, sources
+
+    by_id = {source["id"]: source for source in sources}
+    public_sources = [
+        {**by_id[old], "id": new} for old, new in mapping.items() if old in by_id
+    ]
+    renumbered = validate_citations(_renumber_markers(citation.text, mapping), public_sources)
+    renumbered.removed_markers = [*citation.removed_markers, *renumbered.removed_markers]
+    return renumbered, public_sources
+
+
 def _build_support(final_text: str, marker_start: int, source_ids: list[int]) -> dict:
     """마커 직전 문장을 근사한 세그먼트를 만든다.
 

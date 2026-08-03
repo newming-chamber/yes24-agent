@@ -36,6 +36,7 @@ from yes24_agent.event_translate import (
 )
 from yes24_agent.postprocess import (
     build_done_payload,
+    renumber_for_display,
     validate_citations,
 )
 from yes24_agent.rbti.persona import is_valid_code
@@ -175,6 +176,8 @@ def _finalize_answer(
     에러·타임아웃 경로에만 남겨두면 같은 결함이 드문 경로에서 계속 재발한다.
     """
     citation = validate_citations(text or "", sources)
+    # 검증이 끝난 **뒤에만** 공개 번호를 1..n으로 다시 매긴다(renumber_for_display docstring).
+    citation, sources = renumber_for_display(citation, sources)
     payload = build_done_payload(
         sources=sources,
         used_source_ids=citation.used_source_ids,
@@ -493,9 +496,10 @@ async def run_agent_stream(
                             payload = resp.response or {}
                             tool_call_count += 1
                             if payload.get("status") == "error":
-                                stage, detail = _status_for_error(payload)
-                                emitted_output = True
-                                yield sse_status(stage, detail)
+                                status = _status_for_error(payload)
+                                if status is not None:
+                                    emitted_output = True
+                                    yield sse_status(*status)
                                 continue
                             count = payload.get("result_count")
                             result = _status_for_result(count) if isinstance(count, int) else None
