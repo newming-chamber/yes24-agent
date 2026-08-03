@@ -38,7 +38,7 @@ from yes24_agent.tools._planning import (
     dropped_queries_message,
     plan_queries,
 )
-from yes24_agent.yes24.client import Yes24Client, Yes24FetchError
+from yes24_agent.yes24.client import Yes24Client, Yes24FetchError, Yes24TextCache
 from yes24_agent.yes24.parsers import (
     ParseError,
     parse_search,
@@ -57,6 +57,22 @@ _shared_client: Yes24Client | None = None
 # 채팅 단일 경로는 _shared_client(rps=1.5)를 그대로 쓰고, 매트릭스 셀만 아래 contextvar가
 # 켜진 자기 태스크 컨텍스트에서 이 클라이언트(matrix_http_rps/concurrency)를 집어 든다.
 _matrix_client: Yes24Client | None = None
+
+# 두 클라이언트가 **공유**하는 Yes24 HTTP 텍스트 캐시(lazy 싱글턴). 매트릭스 16셀 버스트의
+# 동일 URL 중복 fetch가 표적이며, 채팅↔매트릭스 사이에서도 TTL 내 관측을 재사용한다.
+# TTL·용량·한계(checked_at 표류)는 config yes24_cache_* 주석 참조.
+_shared_cache: Yes24TextCache | None = None
+
+
+def _get_cache(settings: Settings) -> Yes24TextCache:
+    """공유 텍스트 캐시 싱글턴을 반환한다(최초 호출 시 생성)."""
+    global _shared_cache
+    if _shared_cache is None:
+        _shared_cache = Yes24TextCache(
+            ttl_s=settings.yes24_cache_ttl_s,
+            max_entries=settings.yes24_cache_max_entries,
+        )
+    return _shared_cache
 
 # "고처리량 경로인가" 신호. 매트릭스 셀 태스크가 자기 컨텍스트 사본에서만 True로 켜므로
 # (matrix_runner._run_cell), 동시에 도는 채팅 요청 태스크는 영향받지 않는다. asyncio.gather로
@@ -91,22 +107,24 @@ def _get_client(settings: Settings) -> Yes24Client:
                 settings,
                 concurrency=settings.matrix_http_concurrency,
                 rps=settings.matrix_http_rps,
+                cache=_get_cache(settings),
             )
         return _matrix_client
     if _shared_client is None:
-        _shared_client = Yes24Client.from_settings(settings)
+        _shared_client = Yes24Client.from_settings(settings, cache=_get_cache(settings))
     return _shared_client
 
 
 async def aclose_shared_client() -> None:
     """공유·매트릭스 클라이언트를 정리한다(서버 shutdown 훅용). 미생성분은 무동작."""
-    global _shared_client, _matrix_client
+    global _shared_client, _matrix_client, _shared_cache
     if _shared_client is not None:
         await _shared_client.aclose()
         _shared_client = None
     if _matrix_client is not None:
         await _matrix_client.aclose()
         _matrix_client = None
+    _shared_cache = None
 
 
 async def _search_one(

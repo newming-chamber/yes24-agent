@@ -10,6 +10,8 @@ import asyncio
 import codecs
 import re
 import time
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
@@ -151,6 +153,74 @@ def _decode_response(response: httpx.Response, *, url: str, max_replacement_rati
     return text
 
 
+class Yes24TextCache:
+    """`get_text` 성공 결과(디코딩 str)의 짧은 TTL 캐시 + single-flight.
+
+    매트릭스 16셀이 같은 질문으로 거의 같은 Yes24 URL(베스트셀러 목록·상품 상세)을
+    동시에 중복 요청하는 버스트가 표적이다. 키는 **원 요청 URL**(리다이렉트 전) —
+    에이전트·도구는 항상 같은 원 URL로 다시 요청하므로 fetch 없이 키가 정해져
+    동시 dedup이 성립한다. 도메인·robots 검증(_validate_target)은 캐시 히트에도
+    호출자(get_text)가 항상 먼저 통과시킨다 — 검증은 동기·저비용이라 아낄 이유가 없고,
+    SSRF·robots 게이트가 캐시 유무와 무관하게 불변으로 유지된다.
+
+    - **성공(디코딩 완료) 결과만 저장**한다. 예외·차단·인코딩 실패는 저장하지 않는다 —
+      진행 중 fetch를 기다리던 동시 대기자는 그 예외를 공유하지만(같은 시점의 같은 실패),
+      이후 새 요청은 새로 fetch한다(실패 비캐시).
+    - **만료 정리는 요청 경로에서 게으르게**: 만료 엔트리는 다음 조회 때 삭제되고, 용량
+      초과분은 저장 시 LRU 퇴출된다(백그라운드 태스크 없음). 메모리는 max_entries로 유계.
+    - **TTL은 고정 만료**다(접근해도 연장 없음) — 관측 시각과 서빙 시각의 표류가 TTL을
+      절대 넘지 않게 하는 경계(config의 checked_at 정직성 주석 참조).
+    """
+
+    def __init__(self, ttl_s: float, max_entries: int) -> None:
+        self._ttl_s = ttl_s
+        self._max_entries = max_entries
+        # key -> (만료 시각 monotonic, 본문). OrderedDict 순서 = LRU(최근 사용이 뒤).
+        self._entries: OrderedDict[str, tuple[float, str]] = OrderedDict()
+        # 진행 중 fetch 공유 태스크(single-flight). 완료 즉시 제거된다.
+        self._inflight: dict[str, asyncio.Task[str]] = {}
+
+    @property
+    def enabled(self) -> bool:
+        """TTL·용량이 모두 양수일 때만 활성 — ttl 0은 완전 비활성(롤백 레버)."""
+        return self._ttl_s > 0 and self._max_entries > 0
+
+    async def get_or_fetch(self, key: str, fetch: Callable[[], Awaitable[str]]) -> str:
+        """캐시 히트면 즉시 반환, 아니면 fetch를 **키당 1회만** 실행해 결과를 공유한다."""
+        entry = self._entries.get(key)
+        if entry is not None:
+            expires_at, text = entry
+            if time.monotonic() < expires_at:
+                self._entries.move_to_end(key)
+                return text
+            del self._entries[key]  # 만료 — 게으른 정리
+
+        task = self._inflight.get(key)
+        if task is None:
+            task = asyncio.create_task(self._fetch_and_store(key, fetch))
+            # 대기자 전원이 취소돼 예외가 미회수돼도 GC 경고를 내지 않게 소비 표시.
+            task.add_done_callback(
+                lambda t: None if t.cancelled() else t.exception()
+            )
+            self._inflight[key] = task
+        # shield: 대기자 하나가 취소돼도 공유 fetch와 다른 대기자는 살아남는다.
+        return await asyncio.shield(task)
+
+    async def _fetch_and_store(self, key: str, fetch: Callable[[], Awaitable[str]]) -> str:
+        try:
+            text = await fetch()
+            self._store(key, text)  # await 없이 inflight 제거와 원자적(asyncio 단일 스레드)
+            return text
+        finally:
+            self._inflight.pop(key, None)
+
+    def _store(self, key: str, text: str) -> None:
+        self._entries[key] = (time.monotonic() + self._ttl_s, text)
+        self._entries.move_to_end(key)
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)  # LRU 퇴출 — 용량 유계
+
+
 class Yes24Client:
     """동시성·속도 상한, 지수 백오프, 도메인 화이트리스트를 적용하는 Yes24 클라이언트."""
 
@@ -168,6 +238,7 @@ class Yes24Client:
         max_replacement_ratio: float,
         disallowed_paths: tuple[str, ...],
         error_redirect_param: str = "",
+        cache: Yes24TextCache | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._allowed_domain = allowed_domain(base_url)
@@ -178,6 +249,8 @@ class Yes24Client:
         self._max_replacement_ratio = max_replacement_ratio
         self._disallowed_paths = tuple(p.lower() for p in disallowed_paths)
         self._min_interval_s = 1.0 / rps if rps > 0 else 0.0
+        # 여러 클라이언트(채팅·매트릭스)가 같은 인스턴스를 주입받아 캐시를 공유할 수 있다.
+        self._cache = cache
 
         self._semaphore = asyncio.Semaphore(concurrency)
         self._throttle_lock = asyncio.Lock()
@@ -199,13 +272,16 @@ class Yes24Client:
         *,
         concurrency: int | None = None,
         rps: float | None = None,
+        cache: Yes24TextCache | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> "Yes24Client":
         """`Settings` 값을 생성자 파라미터로 매핑하는 편의 팩토리.
 
         `concurrency`·`rps`는 매트릭스 같은 고처리량 경로가 전역 기본 대신 자기 예산을
         주입할 수 있게 열어 둔다(미지정이면 settings 기본). 나머지 정책(타임아웃·백오프·
-        도메인/robots 게이트)은 경로와 무관하게 동일하다.
+        도메인/robots 게이트)은 경로와 무관하게 동일하다. `cache`는 호출자가 만들어
+        주입한다 — 채팅·매트릭스 클라이언트가 **같은 캐시 인스턴스**를 공유해야 하므로
+        여기서 새로 만들지 않는다(미주입이면 캐시 없음 = 기존 동작).
         """
         return cls(
             base_url=settings.yes24_base_url,
@@ -220,6 +296,7 @@ class Yes24Client:
             max_replacement_ratio=settings.http_max_replacement_char_ratio,
             disallowed_paths=tuple(settings.yes24_disallowed_paths),
             error_redirect_param=settings.yes24_error_redirect_param,
+            cache=cache,
             transport=transport,
         )
 
@@ -233,9 +310,18 @@ class Yes24Client:
         백오프 후 최대 `max_retries`회 재시도하며, 그 외 4xx는 재시도 없이 즉시 실패한다.
         본문 인코딩은 `_decode_response`가 선언이 아니라 strict 디코드 성공 여부로
         판별하고, 판별 실패 시 깨진 텍스트를 반환하지 않고 실패시킨다.
+
+        캐시가 주입·활성이면 짧은 TTL 안의 같은 URL 재요청은 fetch 없이 즉답하고,
+        같은 URL 동시 요청은 single-flight로 1회만 fetch한다(Yes24TextCache docstring).
+        검증은 캐시 히트에도 항상 먼저 돈다.
         """
         self._validate_target(url, original_url=url)
+        if self._cache is not None and self._cache.enabled:
+            return await self._cache.get_or_fetch(url, lambda: self._fetch_text(url))
+        return await self._fetch_text(url)
 
+    async def _fetch_text(self, url: str) -> str:
+        """검증을 마친 URL을 실제로 fetch한다(리다이렉트 추종·재시도·디코딩)."""
         async with self._semaphore:
             current = url
             for _ in range(self._max_redirects + 1):
