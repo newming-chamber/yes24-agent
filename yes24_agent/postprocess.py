@@ -14,14 +14,10 @@ from yes24_agent.event_translate import project_public_source
 
 logger = logging.getLogger(__name__)
 
-# 서버가 붙인 ASCII 대괄호+숫자만 마커로 간주한다. 원문 안의 예약 문법은
-# `escape_citation_markers`가 전각 괄호로 바꿔 모델/도구 데이터와 서버 마커를 구분한다.
+# 서버가 붙인 ASCII 대괄호+숫자만 마커로 간주한다. 도구 데이터 안의 리터럴 `[1]`은
+# 이 패턴과 구분되지 않는다 — 프로즈/코드 스팬 분할(`_code_span_ranges`) 외에 이스케이프
+# 계층은 없다(docs/known-limitations.md).
 MARKER_PATTERN = re.compile(r"(?<!\\)\[(\d+(?:\s*,\s*\d+)*)\]")
-
-
-def escape_citation_markers(text: str) -> str:
-    """신뢰하지 않는 원문 안의 인용 예약 문법을 일반 표시 텍스트로 이스케이프한다."""
-    return MARKER_PATTERN.sub(lambda match: f"［{match.group(1)}］", text)
 
 
 # 코드 스팬(펜스 블록 ```…``` · 인라인 코드 `…`)은 프로즈가 아니라 그대로 표시되는 리터럴
