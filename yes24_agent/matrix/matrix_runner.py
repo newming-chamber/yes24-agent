@@ -101,10 +101,12 @@ def _normalize_for_align(text: str) -> tuple[str, list[int]]:
 def _aligned_offset(text: str, streamed: str) -> int:
     """정본 text에서 이미 흐른 조각(streamed)이 끝나는 위치. 못 맞추면 -1.
 
-    인용 검증은 무효 마커를 지우고 남은 것을 1..n으로 다시 매기므로(postprocess), 정본은
-    스트리밍 본문과 **마커 표기만** 다르다. 그 차이에 눈감고 대조해 재번호에도 경계를 잃지
-    않는다 — 프론트의 같은 판정(md.js redistributeCanonical)과 한 쌍이다(런타임이 달라
-    사본이 둘일 뿐, 규칙은 하나다).
+    표시 번호를 스트리밍 시점에 배정하고 빈 근거 제거를 삭제한 뒤로(2026-08-04) 정본과
+    스트리밍 본문은 **재생 47턴 전부에서 바이트 동일**하다. 이 정렬이 실제로 일할 일은
+    존재하지 않는 출처를 가리킨 **유령 마커**가 지워진 셀뿐이고, 그 경로는 살아 있으므로
+    (4a의 실제 방어선) 이 대조도 남긴다 — 마커 차이에 눈감지 않으면 그 셀은 접힘을 포기해
+    답이 조사 로그로 시작한다. 프론트의 같은 판정(md.js redistributeCanonical)과 한 쌍이라
+    한쪽만 지우면 채팅과 매트릭스가 갈린다(런타임이 달라 사본이 둘일 뿐, 규칙은 하나다).
     """
     norm_text, index_map = _normalize_for_align(text)
     norm_streamed, _ = _normalize_for_align(streamed)

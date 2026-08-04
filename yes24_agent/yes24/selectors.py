@@ -18,6 +18,16 @@ ITEM_GOODS_NO_ATTR = "data-goods-no"
 # 제목 + 상세 링크(href는 "/product/goods/{id}" 상대경로)
 ITEM_TITLE_LINK = "a.gd_name"
 
+# 상품 분류·판형 라벨. 제목 링크 **바로 앞**에 사이트가 직접 렌더한다(실측 어휘: "[도서]"
+# "[eBook]" "[외서]" "[중고]" "[LP]" "[CD]" "[만화]" "[문구/GIFT]" "[오디오북]"
+# "[직수입일서]"). 제목 문자열에는 판형이 들어 있지 않으므로(a.gd_name·상세 h2.gd_name·
+# g_GoodsName 모두 순수 상품명 — 2026-08-04 실측), 목록에서 전자책 여부를 관측할 수 있는
+# 유일한 신호가 이 라벨이다(상세는 JS 변수 g_isEbook). 목록 아이템 전체에 렌더되므로
+# 라벨이 있는데 값이 eBook이 아니면 "전자책 아님"을 관측한 것이고, 라벨 자체가 없는
+# 마크업(크레마클럽)에서는 관측 불가다 — 그 구분은 _item_fields의 키 생략이 표현한다.
+ITEM_FORMAT_LABEL = "span.gd_res"
+ITEM_EBOOK_LABEL = "[eBook]"
+
 # 표지 이미지. lazy-load라 실제 커버 URL은 `src`(Noimg 플레이스홀더)가 아니라 `data-original`
 # 속성에 든다(실측: 24개 상품 전부 data-original에 image 서브도메인의 goods 커버 경로, src는
 # placeholder). URL은 HTML 속성값을 그대로 추출하며 파생 패턴을 하드코딩하지 않는다.

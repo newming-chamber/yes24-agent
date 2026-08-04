@@ -27,6 +27,8 @@ from yes24_agent.yes24.selectors import (
     FAQ_QUESTION_DECORATION,
     ITEM_AUTHOR,
     ITEM_AUTHOR_TOGGLE,
+    ITEM_EBOOK_LABEL,
+    ITEM_FORMAT_LABEL,
     ITEM_GOODS_NO_ATTR,
     ITEM_IMAGE,
     ITEM_IMAGE_ATTR,
@@ -74,10 +76,11 @@ from yes24_agent.yes24.urls import BROWSE_SEED_URLS, product_url
 # 마크업이 같은 검색/베스트셀러/신간은 _parse_item 하나로 뽑고, 마크업이 다른
 # 크레마클럽도 이 키 집합을 그대로 채운다(없는 필드는 None) — 도구가 파서마다 다른 키
 # 집합을 상대하지 않게 하기 위함이다(필드 소실 드리프트 원천 차단).
-# 목록에 구조적으로 없는 필드(page_count·is_ebook·other_formats — 상세에서만 관측된다)도
-# 여기 담는다. 그런 필드는 _item_fields의 키 생략으로 "관측 불가"가 표시되므로, 합집합에
+# 목록에 구조적으로 없는 필드(page_count·other_formats — 상세에서만 관측된다)도 여기
+# 담는다. 그런 필드는 _item_fields의 키 생략으로 "관측 불가"가 표시되므로, 합집합에
 # 두는 편이 안전하다: 상세 전용 필드를 뺐다가 도구가 손으로 되붙이면(과거 is_ebook이 그랬다)
-# product_fields를 우회해 **출처 레코드(meta)에서만 소실**된다.
+# product_fields를 우회해 **출처 레코드(meta)에서만 소실**된다. is_ebook은 목록에도
+# 구조가 있다(ITEM_FORMAT_LABEL — 2026-08-04 실측으로 정정).
 _ITEM_FIELDS = (
     "goods_no",
     "title",
@@ -164,7 +167,13 @@ def _parse_item(item, base_url: str) -> dict | None:
     if not title or not href:
         return None
 
+    # 판형은 제목이 아니라 옆 라벨이 말한다(ITEM_FORMAT_LABEL 주석). 라벨이 없는 마크업에선
+    # 키를 생략해 "관측 불가"로 남긴다 — False로 되채우면 전자책을 종이책으로 단정하게 된다.
+    format_label = _text_or_none(item.select_one(ITEM_FORMAT_LABEL))
+    observed_format = {"is_ebook": format_label == ITEM_EBOOK_LABEL} if format_label else {}
+
     return _item_fields(
+        **observed_format,
         goods_no=item.get(ITEM_GOODS_NO_ATTR),
         title=title,
         url=urljoin(base_url, href),

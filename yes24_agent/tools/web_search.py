@@ -263,11 +263,20 @@ def _take_turn_prefetch() -> tuple[str, asyncio.Task] | None:
 def _grounding_response_to_results(response) -> list[dict]:
     """그라운딩 응답을 출처별 원시 재료 목록으로 분해한다.
 
-    grounding_supports(문장 구간 ↔ 출처 청크 매핑)를 이용해 종합문을 **출처별 근거 발췌**로
-    되돌린다 — 벤더 종합을 그대로 삼키지 않고 출처 단위 재료로 낮춰, 에이전트가 직접
-    종합·인용하는 기존 계약(원시 결과 철학)을 보존하기 위함이다. 근거 구간이 하나도 연결되지
-    않은 청크는 인용 불가이므로 버리고, 종합문 자체도 반환하지 않는다 — supports가 연결되지
-    않은 문장은 정확히 "인용 불가한 벤더 주장"이라 도구 결과에 실으면 마커 세탁 경로가 된다.
+    grounding_supports(문장 구간 ↔ 출처 청크 매핑)를 이용해 종합문을 **출처가 뒷받침한
+    서술(claims)**로 되돌린다 — 벤더 종합을 그대로 삼키지 않고 출처 단위 재료로 낮춰,
+    에이전트가 직접 종합·인용하는 기존 계약(원시 결과 철학)을 보존하기 위함이다. 근거 구간이
+    하나도 연결되지 않은 청크는 인용 불가이므로 버리고, 종합문 자체도 반환하지 않는다 —
+    supports가 연결되지 않은 문장은 정확히 "인용 불가한 벤더 주장"이라 도구 결과에 실으면
+    마커 세탁 경로가 된다.
+
+    **한 서술을 여러 청크가 함께 뒷받침하는 것이 API의 정상 형태다**(2026-08-04 실측:
+    "오늘 코스피"는 supports 1건 → 청크 3개, "미움받을 용기 중고 가격"은 supports 3건이
+    각각 청크 2·3·3개에 걸렸다 — 1:1 매핑이 오히려 드물다). 그래서 서술을 출처별 문자열로
+    접어 넣으면 같은 문장이 출처마다 복제되고, 읽는 쪽은 그것을 서로 다른 출처의 독립 확증으로
+    오독한다(실측: 중고가 답변에서 알라딘 2건 + 예스24 1건의 근거가 바이트 동일). 여기서는
+    서술을 **원자 단위 목록**으로만 담고, "어느 서술을 어느 출처들이 함께 뒷받침하는가"는
+    호출부가 도구 결과의 evidence에 한 번씩만 표현한다.
     """
     candidates = getattr(response, "candidates", None) or []
     metadata = getattr(candidates[0], "grounding_metadata", None) if candidates else None
@@ -293,7 +302,7 @@ def _grounding_response_to_results(response) -> list[dict]:
             {
                 "url": uri,
                 "title": getattr(web, "title", None) or uri,
-                "snippet": "\n".join(dict.fromkeys(segments)),  # 순서 보존 중복 제거
+                "claims": list(dict.fromkeys(segments)),  # 순서 보존 중복 제거
             }
         )
     return raw_results
@@ -401,14 +410,13 @@ async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
                 item["url"] = final_url
             if title:
                 item["title"] = title
-        # 서로 다른 리다이렉트 URI가 같은 원문으로 풀리면 출처는 하나다 — 등록 전에 근거
-        # 발췌를 합친다(같은 url 재등록은 state에서 나중 관측이 이겨 앞 발췌가 사라진다).
+        # 서로 다른 리다이렉트 URI가 같은 원문으로 풀리면 출처는 하나다 — 등록 전에 서술을
+        # 합친다(같은 url 재등록은 state에서 나중 관측이 이겨 앞 근거가 사라진다).
         merged: dict[str, dict] = {}
         for item in raw_results:
             kept = merged.setdefault(item["url"], item)
             if kept is not item:
-                lines = f"{kept['snippet']}\n{item['snippet']}".split("\n")
-                kept["snippet"] = "\n".join(dict.fromkeys(lines))
+                kept["claims"] = list(dict.fromkeys(kept["claims"] + item["claims"]))
         raw_results = list(merged.values())
     return raw_results
 
@@ -467,9 +475,26 @@ async def _grounded_search(
 
     checked_at = now_checked_at()
     results: list[dict] = []
+    # 서술 → 그 서술을 함께 뒷받침한 출처 id들(등장 순서 보존). 같은 서술이 여러 출처에
+    # 걸리는 것이 API의 정상 형태이므로(_grounding_response_to_results 주석), 서술을 읽는
+    # 쪽에는 **한 번만** 싣고 뒷받침한 출처를 묶어 보여준다. results의 출처별 snippet만
+    # 있으면 같은 문장이 출처 수만큼 복제돼 서로 독립인 확증처럼 읽힌다 — 두 표현은
+    # 소비자가 다르다(results.snippet=공개 DTO의 출처별 근거, evidence=종합·인용 재료).
+    evidence: dict[str, list[int]] = {}
     # 출처 등록은 순차 루프(단일 state, source_id 유일·단조 — 기존 규약).
     for item in raw_results:
-        snippet = truncate(item["snippet"], settings.web_search_snippet_max_chars)
+        claims = [
+            truncate(claim, settings.web_search_snippet_max_chars) for claim in item["claims"]
+        ]
+        # snippet은 **그 출처가 뒷받침한 서술들의 사영**이다. 다대다 관계를 출처별로 사영하면
+        # 공동 근거는 반드시 겹치지만, 이 필드는 공개 출처 DTO의 근거 본문이라 출처마다 자기
+        # 몫을 들고 있어야 한다(공개 DTO는 세션 레지스트리가 아니라 **이 도구 결과**에서
+        # 조립되고, QA 심사관은 source id별 snippet을 읽어 인용을 판정한다 — 여기서 빼면
+        # 웹 인용이 통째로 검증 불가가 된다. 2026-08-04 라이브 실측으로 확인).
+        # 총량도 같은 상한으로 자른다 — 클레임별 truncate만 있으면 클레임 수에 비례해
+        # snippet이 자라 공개 DTO의 bounded-snippet 계약(상한 = 이 설정값)을 넘는다
+        # (실측 최대 4,472자/28클레임 — 아직 안 터졌지만 결정론 지뢰라 커밋 전 봉합).
+        snippet = truncate("\n".join(claims), settings.web_search_snippet_max_chars)
         source_id = register_source(
             tool_context.state,
             title=item["title"],
@@ -489,6 +514,8 @@ async def _grounded_search(
                 "checked_at": checked_at,
             }
         )
+        for claim in claims:
+            evidence.setdefault(claim, []).append(source_id)
 
     logger.info(
         f"web_search backend=grounding queries={len(planned)} status=ok "
@@ -502,6 +529,7 @@ async def _grounded_search(
     return {
         "status": "ok",
         "results": results,
+        "evidence": [{"text": text, "source_ids": ids} for text, ids in evidence.items()],
         "searches": [{"query": searched_query, "status": "ok"}],
         "checked_at": checked_at,
         "result_count": len(results),
@@ -600,10 +628,14 @@ async def web_search(
     """웹을 검색해 최신 사실을 출처별 근거와 함께 가져온다(실시간 값 포함).
 
     Yes24로 답할 수 없는 외부·최신 정보(뉴스·스포츠·주가·환율·날씨·시사·인물·상식 등)가
-    필요할 때 쓴다. 시시각각 변하는 수치의 현재 값도 이 도구가 신선하게 가져온다. 각 결과의
-    snippet은 그 출처가 뒷받침하는 근거 발췌이며, 여러 결과를 직접 종합해 각 사실에 해당
-    출처의 source_id를 [n]으로 인용해 답한다. 특정 출처의 더 긴 전문이 필요하면 그 url을
-    web_fetch로 읽는다(리다이렉트 url도 원문으로 열린다 — 실측). 가격·재고·구매 링크 같은 상품 정보를 얻는 용도가 아니다
+    필요할 때 쓴다. 시시각각 변하는 수치의 현재 값도 이 도구가 신선하게 가져온다. 확인된
+    사실은 evidence에 서술 단위로 담기고 각 서술에는 그것을 뒷받침한 출처 source_ids가
+    붙는다 — 여러 출처가 한 서술을 함께 뒷받침하면 그 서술은 evidence에 한 번만 실리고
+    (결과마다 실리는 snippet에는 겹쳐 보인다) 함께 인용한다([1][2]). 그 재료를 직접 종합해
+    각 사실에 출처의 source_id를 [n]으로 인용해 답한다(도메인 지정 검색은 원시 경로라
+    evidence 없이 결과마다 페이지 발췌 snippet만 실린다).
+    특정 출처의 더 긴 전문이 필요하면 그 url을 web_fetch로 읽는다(리다이렉트 url도 원문으로
+    열린다 — 실측). 가격·재고·구매 링크 같은 상품 정보를 얻는 용도가 아니다
     (그것은 Yes24 검색으로). 잡담이나 Yes24로 충분한 질문엔 쓰지 않는다.
 
     복합·시의성·비교 질문은 서로 독립적인 검색 각도를 queries에 함께 담을 수 있다. 단순
@@ -624,6 +656,7 @@ async def web_search(
 
     Returns:
         성공 시 status="ok"와 results 목록(각 결과에 인용용 source_id·title·url·snippet),
+        evidence(확인된 서술 1건과 그것을 뒷받침한 source_ids — 그라운딩 경로만),
         searches(실제 수행된 검색 호출 단위의 성공/실패 — 그라운딩 경로는 서브콜 1건),
         검색 시각 checked_at을 담은 dict. 성공·실패 모두 result_count를 함께 담는다.
         실패 시 status="error"와 error_type("not_configured"|"empty_query"|"fetch"|

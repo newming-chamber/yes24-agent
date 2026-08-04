@@ -35,6 +35,7 @@ from yes24_agent.event_translate import (
     project_source_ref,
 )
 from yes24_agent.postprocess import (
+    StreamRenumberer,
     build_done_payload,
     renumber_for_display,
     validate_citations,
@@ -97,7 +98,7 @@ def _event_text(event) -> str:
     return "".join(part.text or "" for part in event.content.parts if not part.thought)
 
 
-def _round_boundary_prefix(pending: list[str], chunk: str) -> str:
+def _round_boundary_prefix(raw_body: list[str], chunk: str) -> str:
     """도구를 건너뛴 두 텍스트 사이에 넣을 문단 구분자(넣지 않으면 빈 문자열).
 
     **경계에 공백이 전혀 없을 때만** 넣는다. 이미 어느 쪽이든 개행·공백으로 끝나거나
@@ -107,9 +108,51 @@ def _round_boundary_prefix(pending: list[str], chunk: str) -> str:
     행이 생 파이프 평문으로 남는다(2026-07-22 실측, 프론트에서 복구 불가). 펜스 홀짝을
     세는 블록 파서를 되살리지 않고 구조만으로 같은 선을 지킨다.
     """
-    if not pending or pending[-1][-1:].isspace() or chunk[:1].isspace():
+    if not raw_body or raw_body[-1][-1:].isspace() or chunk[:1].isspace():
         return ""
     return _ROUND_SEPARATOR
+
+
+def _display_frames(
+    renumberer: StreamRenumberer,
+    raw_body: list[str],
+    known_sources: dict[int, dict],
+    streamed: list[str],
+    *,
+    final: bool = False,
+) -> list[str]:
+    """원시 본문(세션 누적 id)을 **표시 번호 본문**으로 바꿔 흘릴 프레임을 만든다.
+
+    표시 번호를 스트리밍 시점에 배정하므로, 사용자는 첫 글자부터 출처 카드와 같은
+    `[1][2]`를 본다(예전엔 `[49, 59, 78]`이 흐르다 마감 reset에서 통째로 다시 그려졌다).
+
+    새로 배정된 번호의 `refs`를 **그 번호가 처음 실린 delta보다 먼저** 낸다 — 프론트가
+    마커를 링크로 승격할 힌트(id→url)가 마커보다 늦게 오면 그 사이 생 대괄호가 보인다.
+    refs를 표시 번호로 내보내는 덕에 프론트의 힌트 맵·출처 카드·본문 마커가 **한 번호
+    공간**을 쓴다(예전엔 refs만 내부 id라, 같은 턴에서 `[2]`가 refs와 카드에서 서로 다른
+    상품을 가리켰다 — 실측 40턴 중 32턴).
+
+    `streamed`에는 실제로 흘린 조각만 쌓는다(원칙 4b의 "delta 합계 == done.text" 대조본).
+    """
+    chunk, assigned = renumberer.feed(
+        "".join(raw_body), known_sources.keys(), final=final
+    )
+    frames: list[str] = []
+    if assigned:
+        frames.append(
+            sse_status(
+                "refs",
+                "",
+                refs=[
+                    project_source_ref({**known_sources[old], "id": new})
+                    for old, new in assigned.items()
+                ],
+            )
+        )
+    if chunk:
+        streamed.append(chunk)
+        frames.append(sse_delta(chunk))
+    return frames
 
 
 def _event_thought_text(event) -> str:
@@ -213,7 +256,7 @@ def _citable_sources(turn_sources: list[dict], prior_sources: list[dict]) -> lis
     return [by_id[key] for key in sorted(by_id)]
 
 
-def _best_effort_text(pending: list[str], final_text: str) -> str:
+def _best_effort_text(raw_body: list[str], final_text: str) -> str:
     """실패 시점까지 확보한 본문을 정상 경로와 같은 규약으로 조립한다.
 
     스트림 후처리(재조립·인용 검증) 어디서 터져도, 모델이 이미 만들어 낸
@@ -221,10 +264,10 @@ def _best_effort_text(pending: list[str], final_text: str) -> str:
     final response를 우선하고, 없을 때만 대기 버퍼를 조립한다. 확보된 본문이 없으면 빈 문자열을
     반환해 호출부의 최후 방어가 채우게 둔다.
     """
-    # `pending`은 화면에 흐른 본문 전체다(내레이션 포함 — 홀드 없음). 이 값이 곧
-    # done.text와 같아야 한다(원칙 4b). partial이 하나도 없었던 경우에만 aggregate final로
-    # 폴백한다.
-    return "".join(pending) or final_text
+    # `raw_body`는 모델이 쓴 본문 전체다(내레이션 포함 — 홀드 없음). 표시 번호로 바꾸기
+    # **전**의 원시 id를 그대로 담아 인용 검증의 입력이 된다. partial이 하나도 없었던
+    # 경우에만 aggregate final로 폴백한다.
+    return "".join(raw_body) or final_text
 
 
 def _ensure_substantive_text(payload: dict) -> bool:
@@ -264,7 +307,10 @@ def _emit_final_body(streamed_text: str, payload: dict) -> list[str]:
 def _closeout_error_frames(
     error_text: str,
     *,
-    pending: list[str],
+    renumberer: StreamRenumberer,
+    raw_body: list[str],
+    streamed: list[str],
+    known_sources: dict[int, dict],
     final_text: str,
     observed_sources: list[dict],
     prior_sources: list[dict],
@@ -281,7 +327,10 @@ def _closeout_error_frames(
     두면 한 벌만 고치는 실수가 반복된다는 _emit_final_body docstring의 실례).
     """
     frames = [sse_error(error_text)]
-    best_effort = _best_effort_text(pending, final_text)
+    # 이월해 둔 표시 번호 꼬리를 먼저 방류한다 — 실패 경로에서도 화면에 흐른 본문과
+    # done.text의 대조(원칙 4b)가 같은 규약 위에서 이뤄져야 한다.
+    frames.extend(_display_frames(renumberer, raw_body, known_sources, streamed, final=True))
+    best_effort = _best_effort_text(raw_body, final_text)
     _, error_done = _finalize_answer(
         best_effort,
         _citable_sources(_reconcile_sources(observed_sources), prior_sources),
@@ -294,7 +343,7 @@ def _closeout_error_frames(
         )
     for source in error_done.get("sources", []):
         frames.append(sse_source(source))
-    frames.extend(_emit_final_body("".join(pending), error_done))
+    frames.extend(_emit_final_body("".join(streamed), error_done))
     frames.append(sse_done(error_done))
     return frames
 
@@ -360,9 +409,20 @@ async def run_agent_stream(
         observed_sources: list[dict] = []
         # 이번 턴에 도구가 돈 횟수. 최후 방어 실패 로그(tools=%d)의 진단값으로만 쓴다.
         tool_call_count = 0
-        # 화면에 흘린 본문 조각. **모든 append 옆에 sse_delta가 있다** — 이 불변식이
-        # "pending == 흘려보낸 조각"을 만들고, 마감의 4b 대조(_emit_final_body)가 그 위에 선다.
-        pending: list[str] = []
+        # 모델이 쓴 **원시** 본문 조각(세션 누적 id 그대로). 인용 검증의 입력이다.
+        raw_body: list[str] = []
+        # 화면에 흘린 **표시 번호** 본문 조각. 마감의 4b 대조(_emit_final_body)가 이 값 위에
+        # 선다 — 모든 append 옆에 sse_delta가 있다(_display_frames가 그 불변식을 소유).
+        streamed: list[str] = []
+        # 원시 id → 표시 번호 증분 치환기. 배정 규칙은 출구(renumber_for_display)와 공유한다.
+        renumberer = StreamRenumberer()
+        # 이번 턴에 인용 가능한 출처(원시 id → 공개 DTO). 이전 턴 레지스트리에서 출발해
+        # 도구 응답마다 자란다 — 표시 번호 배정의 유효 id 집합이자 refs url의 출처다.
+        known_sources: dict[int, dict] = {
+            source["id"]: project_public_source(source)
+            for source in prior_sources
+            if source.get("id") is not None
+        }
         # 마지막 본문 청크 이후 도구가 돌았는가 = 다음 텍스트가 **새 조사 라운드**의 시작인가.
         # 이 신호로만 라운드 경계 구분자를 넣는다(_round_boundary_prefix).
         tool_ran_since_text = False
@@ -453,7 +513,9 @@ async def run_agent_stream(
                             # 재시도 스트림에도 프리페치를 다시 연다 — 첫 시도가 이미
                             # 소비했어도 캐시가 완료 task를 돌려주므로 추가 비용이 없다.
                             start_web_prefetch(message)
-                            pending = []
+                            raw_body = []
+                            streamed = []
+                            renumberer = StreamRenumberer()
                             tool_ran_since_text = False
                             thought_buf = []
                             for task in thought_tasks:
@@ -506,7 +568,6 @@ async def run_agent_stream(
                             if result is not None:
                                 emitted_output = True
                                 yield sse_status(*result)
-                            refs: list[dict] = []
                             for source in _sources_from_response(payload):
                                 source_id = source.get("source_id")
                                 source_event = project_public_source(source)
@@ -518,13 +579,12 @@ async def run_agent_stream(
                                         break
                                 else:
                                     observed_sources.append(source_event)
-                                refs.append(project_source_ref(source_event))
-                            # 마커 렌더용 id 힌트를 **본문보다 먼저** 흘린다. 여기서 안 보내면
-                            # 프론트는 [n]이 실재 인용인지 몰라 done 직전까지 생 대괄호로 둔다.
-                            # detail이 비어 있어 진행 단계 행은 만들지 않는다(보이지 않는 프레임).
-                            # emitted_output도 올리지 않는다 — 사용자에게 나간 출력이 아니다.
-                            if refs:
-                                yield sse_status("refs", "", refs=refs)
+                                # 인용 후보 풀만 넓힌다. 마커 렌더용 refs는 여기서 내지 않는다 —
+                                # 표시 번호가 배정되는 시점(_display_frames)에 나가야 프론트의
+                                # 힌트 맵이 본문 마커와 같은 번호 공간에 놓인다.
+                                known_sources[source_id] = merge_source_records(
+                                    known_sources.get(source_id, {}), source_event
+                                )
                         continue
 
                     if event.partial:
@@ -549,11 +609,14 @@ async def run_agent_stream(
                             # 라운드 경계 구분자도 **여기 한 지점에서** 청크에 붙여, 스트림과
                             # 정본 누적이 갈릴 수 없게 한다(불변식이 자동 충족되는 구조).
                             if tool_ran_since_text:
-                                chunk = _round_boundary_prefix(pending, chunk) + chunk
+                                chunk = _round_boundary_prefix(raw_body, chunk) + chunk
                                 tool_ran_since_text = False
-                            pending.append(chunk)
-                            emitted_output = True
-                            yield sse_delta(chunk)
+                            raw_body.append(chunk)
+                            for frame in _display_frames(
+                                renumberer, raw_body, known_sources, streamed
+                            ):
+                                emitted_output = True
+                                yield frame
                         continue
 
                     if event.is_final_response():
@@ -561,7 +624,13 @@ async def run_agent_stream(
                         if text:
                             final_text = text
 
-                answer_text = _best_effort_text(pending, final_text)
+                # 이월해 둔 표시 번호 꼬리(미완성 마커·열린 인라인 코드)를 방류한다.
+                for frame in _display_frames(
+                    renumberer, raw_body, known_sources, streamed, final=True
+                ):
+                    yield frame
+
+                answer_text = _best_effort_text(raw_body, final_text)
                 # 근거 스냅샷은 세션 state가 아니라 **스트림 관찰본**으로 만든다. ADK의
                 # deep_merge_dicts가 병렬 도구의 state_delta를 리스트 키에서 last-wins로
                 # 덮어써 한 도구의 출처가 통째로 유실될 수 있기 때문이다(_reconcile_sources
@@ -584,6 +653,9 @@ async def run_agent_stream(
                 #   2) 마커 선두 표기("*   [2] …") → _build_support의 세그먼트가 불릿뿐이라
                 #      support_is_meaningful이 false → 마커 전량 제거.
                 # 둘 다 답변 **형식**의 문제이지 접지의 문제가 아니다.
+                # (2)의 마커 제거는 2026-08-04에 삭제됐다 — 같은 오탐이 책 제목 끝의 `!`·`?`
+                # 에서도 100% 재현돼(재생 47턴, 캐치 0) 본문 삭제 부분만 걷어냈다. 이제 이
+                # 카운트가 0이어도 마커는 본문에 남고, 로그만 남는다.
                 #
                 # 2026-07-15에 같은 근거(캐치 0·오탐 9/9)로 게이트 스택을 삭제하고
                 # validate_citations만 코어로 남겼다. 이 백스톱은 그때 살아남은 같은 계열이며
@@ -622,7 +694,7 @@ async def run_agent_stream(
                     )
                 for source in final_done.get("sources", []):
                     yield sse_source(source)
-                for frame in _emit_final_body("".join(pending), final_done):
+                for frame in _emit_final_body("".join(streamed), final_done):
                     yield frame
                 yield sse_done(final_done)
                 break
@@ -635,7 +707,10 @@ async def run_agent_stream(
             )
             frames = _closeout_error_frames(
                 "응답이 너무 지연되고 있어요. 잠시 후 다시 시도해 주세요.",
-                pending=pending,
+                renumberer=renumberer,
+                raw_body=raw_body,
+                streamed=streamed,
+                known_sources=known_sources,
                 final_text=final_text,
                 observed_sources=observed_sources,
                 prior_sources=prior_sources,
@@ -653,7 +728,10 @@ async def run_agent_stream(
             logger.exception("스트림 처리 중 예외 발생: %s", exc)
             frames = _closeout_error_frames(
                 STREAM_ERROR_MESSAGE,
-                pending=pending,
+                renumberer=renumberer,
+                raw_body=raw_body,
+                streamed=streamed,
+                known_sources=known_sources,
                 final_text=final_text,
                 observed_sources=observed_sources,
                 prior_sources=prior_sources,
