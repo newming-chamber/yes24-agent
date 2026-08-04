@@ -142,7 +142,8 @@
     .status-bar .count { font-family: var(--mono); font-size: 11px; color: var(--text); font-weight: 600; letter-spacing: 0.02em; }
     .status-bar .models { font-family: var(--mono); font-size: 10px; color: var(--muted); }
 
-    .filters { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    /* 필터는 줄 오른쪽 끝에 붙는다(margin-left:auto — 빈 스페이서 span 삭제). */
+    .filters { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-left: auto; }
     .filter-axis { display: flex; align-items: center; gap: 4px; }
     .filter-axis .fa-label { font-size: 10.5px; color: var(--muted); font-weight: 600; margin-right: 1px; }
     .fchip {
@@ -168,8 +169,7 @@
     }
     .filter-reset:hover { color: var(--text); }
 
-    /* 공유 출처 — 접이식(기본 접힘, 스크롤 원인 제거) */
-    .shared { display: flex; align-items: center; gap: 8px; min-height: 24px; }
+    /* 공유 출처 — 접이식(기본 접힘, 스크롤 원인 제거). 컨트롤 줄에 얹혀 산다. */
     .shared-toggle {
       font-size: 11.5px; color: var(--muted); background: transparent; border: 1px solid var(--border);
       border-radius: 999px; padding: 3px 11px; cursor: pointer; font-family: inherit;
@@ -179,7 +179,7 @@
     .shared-toggle .chev { transition: transform .15s; display: inline-block; }
     .shared-toggle.open .chev { transform: rotate(90deg); }
     .shared-toggle .ss-count { font-weight: 700; color: var(--text); }
-    .ss-chips { display: flex; gap: 7px; overflow-x: auto; flex: 1 1 auto; padding-bottom: 2px; }
+    .ss-chips { display: flex; gap: 7px; overflow-x: auto; padding-bottom: 2px; }
     .ss-chips[hidden] { display: none; }
     .ss-card {
       flex: 0 0 auto; max-width: 190px; background: var(--card-bg); border: 1px solid var(--border);
@@ -203,10 +203,12 @@
       grid-template-rows: auto repeat(4, minmax(0, 1fr));
       gap: 7px;
     }
+    /* 축 범례. 8px 한 줄은 읽히지 않아 사실상 장식이었다 — 두 줄로 풀어 9.5px로 올린다
+       (열 헤더 높이 안에 들어가므로 매트릭스 높이는 그대로). */
     .corner {
       grid-row: 1; grid-column: 1;
-      display: flex; align-items: center; justify-content: center; text-align: center;
-      font-family: var(--mono); font-size: 8px; letter-spacing: 0.02em; color: var(--muted); line-height: 1.3;
+      display: flex; flex-direction: column; align-items: flex-start; justify-content: center;
+      font-size: 9.5px; color: var(--muted); line-height: 1.35; white-space: nowrap;
     }
     /* 그리드 위치는 CSS가 소유한다 — JS는 좌표(data-row/data-col, 0-based)만 표기하고 배치는
        하지 않는다. 인라인 style.gridRow/Column은 캐스케이드상 미디어쿼리가 이길 수 없어
@@ -255,12 +257,13 @@
     .cell.pending { cursor: default; }
     .cell.pending:hover { transform: none; box-shadow: none; }
 
+    /* 헤드는 한 줄이다(코드 배지 + 이름). 두 줄이면 16셀 × 18px가 본문에서 빠진다 —
+       셀의 세로 예산은 전부 본문 몫이고, 머리글은 식별에 필요한 최소만 차지한다. */
     .cell .c-head {
-      flex: 0 0 auto; padding: 7px 9px 5px;
-      display: flex; flex-direction: column; gap: 2px;
+      flex: 0 0 auto; padding: 6px 9px 5px;
+      display: flex; align-items: center; gap: 6px;
       border-bottom: 1px solid var(--border-soft);
     }
-    .cell .c-code-row { display: flex; align-items: center; gap: 6px; }
     /* 절제2: 배지 완전 중립(무채색) + 축색은 좌측 2px 보더로만(도트 대신). 원색 fill 제거. */
     .cell .c-code {
       font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: 0.1em;
@@ -269,6 +272,7 @@
       border-radius: 0 4px 4px 0; padding: 1.5px 6px; flex: 0 0 auto;
     }
     .cell .c-name {
+      flex: 1 1 auto; min-width: 0;
       font-size: 12px; font-weight: 700; color: var(--text); line-height: 1.25;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
@@ -289,9 +293,14 @@
       -webkit-mask-image: none; mask-image: none;
     }
     /* 본문 = 흐르는 전문. 남는 공간을 채우고(flex:1) 넘치면 하단 페이드로 자연스럽게 잘림.
-       짧은 답변은 짧게, 풍부한 답변은 풍부하게(훑기는 한 화면, 깊이는 클릭). */
+       짧은 답변은 짧게, 풍부한 답변은 풍부하게(훑기는 한 화면, 깊이는 클릭).
+       min-height는 **본문 우선 안전벨트**다: 고정높이 형제(대표책 줄)가 늘면 flex는
+       min-height:0인 이 칸부터 0px로 눌러 본문을 통째로 지운다(2026-08-04 실측 — picks를
+       전량 렌더하던 회귀로 16셀 전부 c-flow 높이 0, 내용 165px). 형제가 잘리는 편이 본문이
+       사라지는 것보다 언제나 낫다. 2줄은 마지막 방어선이지 목표가 아니다 — 더 높이면
+       짧은 뷰포트(720p)에서 floor가 대표책 줄을 반쯤 잘라 먹는다(실측). */
     .cell .c-flow {
-      flex: 1 1 auto; min-height: 0; overflow: hidden;
+      flex: 1 1 auto; min-height: calc(2 * 1.5 * 11.5px); overflow: hidden;
       font-size: 11.5px; line-height: 1.5; color: var(--text);
       white-space: pre-wrap; word-break: break-word;
       -webkit-mask-image: linear-gradient(180deg, #000 78%, transparent 100%);
@@ -300,12 +309,6 @@
     .cell .c-pick {
       flex: 0 0 auto; display: flex; align-items: center; gap: 6px;
       padding-top: 6px; border-top: 1px dashed var(--border-soft);
-    }
-    /* 접힌 조사 과정 = 한 줄 표시만. 셀 본문은 overflow:hidden + 하단 페이드라 여기서
-       펼치면 잘려서 못 읽는다 — 펼침은 공간이 있는 모달(.m-process)이 담당한다. */
-    .cell .c-process {
-      flex: 0 0 auto; font-size: 10.5px; color: var(--muted);
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
     /* 정직 폴백 셀(책 못 찾음/추천 미완성)은 살짝 muted로 구분. */
     .cell.fallback { opacity: 0.62; }
@@ -321,19 +324,20 @@
     .cell .c-pick-cover.loaded { opacity: 1; }
     .cell .c-pick-title { font-size: 11.5px; font-weight: 700; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1 1 auto; }
     .cell .c-pick-price { font-family: var(--mono); font-size: 10px; font-weight: 700; color: var(--col-hue, var(--accent)); white-space: nowrap; flex: 0 0 auto; }
+    /* "+3" = 이 셀이 고른 나머지 책 수. 대표 1권만 줄로 나오는 이유를 밝히고 클릭을 부른다. */
+    .cell .c-pick-more { font-family: var(--mono); font-size: 10px; font-weight: 700; color: var(--muted); white-space: nowrap; flex: 0 0 auto; }
 
-    .cell .c-foot {
-      flex: 0 0 auto; padding: 4px 8px 6px; display: flex; align-items: center; gap: 4px;
-      overflow-x: auto;
+    /* 인용 칩 = 모달 하단의 출처 목록. `.cell` 종속이 아니다 — 모달 칩(.m-chips)에도 같은
+       규칙이 걸려야 하는데 셀렉터가 셀 안으로 한정돼 있어 모달에선 무스타일 숫자로 새고
+       있었다(2026-08-04 실측). 셀 안 칩 줄(.c-foot)은 삭제했다: 16셀에서 25px씩 본문을
+       가져가면서 한눈 비교엔 기여하지 않았고, 본문 마커 클릭이 그 셀 모달을 연다. */
+    .c-chip {
+      flex: 0 0 auto; font-size: 10.5px; font-weight: 700; color: #fff; background: var(--accent);
+      border-radius: 5px; min-width: 18px; height: 18px; display: inline-flex; align-items: center;
+      justify-content: center; padding: 0 5px; cursor: pointer;
     }
-    .cell .c-foot:empty { display: none; }
-    .cell .c-chip {
-      flex: 0 0 auto; font-size: 9.5px; font-weight: 700; color: #fff; background: var(--accent);
-      border-radius: 4px; min-width: 15px; height: 15px; display: inline-flex; align-items: center;
-      justify-content: center; padding: 0 3px; cursor: pointer;
-    }
-    .cell .c-chip.web { background: var(--web); }
-    .cell .c-chip.hl { outline: 2px solid var(--text); outline-offset: 1px; }
+    .c-chip.web { background: var(--web); }
+    .c-chip.hl { outline: 2px solid var(--text); outline-offset: 1px; }
 
     /* 인용 마커 */
     sup.marker {
@@ -342,6 +346,9 @@
     }
     sup.marker:hover { text-decoration: underline; }
     sup.marker + sup.marker { margin-left: 2px; }
+    /* 셀 안 마커는 한 톤 낮춘다: 매트릭스 id는 전역화로 네 자리([6001])라 11.5px 본문에서
+       원래 크기·채도로 붙으면 4연속 인용이 문장보다 눈에 띈다. 모달·토너먼트는 그대로. */
+    .cell sup.marker { font-size: 0.62em; opacity: 0.7; }
 
     /* 마크다운 블록(index.html 파서 이식) — 헤더·파이프 테이블. 크기는 em 기반이라 셀(11.5px)·
        모달(14px)·토너먼트 요지(12px) 어느 컨테이너에서든 본문에 비례해 렌더된다. */
@@ -387,7 +394,7 @@
 
     /* (2) 열 도착: 콘텐츠 페이드업(절제: 스캔라인 스윕 제거). */
     @keyframes cardIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
-    .cell.filled .c-head, .cell.filled .c-body, .cell.filled .c-foot { animation: cardIn 0.4s ease both; }
+    .cell.filled .c-head, .cell.filled .c-body { animation: cardIn 0.4s ease both; }
 
     /* (3) 모달 스프링(오버슈트) + 백드롭 페이드 */
     @keyframes modalIn { 0% { opacity: 0; transform: translateY(10px) scale(0.955); } 100% { opacity: 1; transform: none; } }
@@ -551,7 +558,12 @@
          명시도이고 뒤에 오므로 이긴다 — 배치가 CSS 소유라 가능한 오버라이드다. */
       .matrix .cell[data-row], .matrix .cell[data-col] { grid-row: auto; grid-column: auto; }
       .cell { min-height: 210px; }
-      .cell .c-body { -webkit-mask-image: none; mask-image: none; overflow-y: auto; }
+      /* 셀이 내용만큼 늘고 페이지가 스크롤하는 모드다 — 잘림이 없으니 페이드도 없어야 한다.
+         본문(.c-flow)의 마스크를 안 지우면 셀 하단 22%가 통째로 흐려진다(920px 본문에서
+         200px). 셀 안 스크롤러도 만들지 않는다(스크롤은 페이지 하나). */
+      .cell .c-body, .cell .c-flow {
+        -webkit-mask-image: none; mask-image: none; overflow: visible;
+      }
     }
     @media (max-width: 540px) {
       .matrix { grid-template-columns: 1fr; }
@@ -578,15 +590,13 @@
       <div class="controls-row">
         <div class="status-bar" id="status"><span class="dot"></span><span id="status-text">Yes24 도서 질문을 입력하면 16유형이 함께 비교합니다.</span><span class="count" id="count"></span><span class="models" id="model-info" hidden></span></div>
         <button class="tourney-btn" id="tourney-btn" hidden>내 취향 찾기 →</button>
-        <span style="flex:1 1 auto"></span>
+        <button class="shared-toggle" id="shared-toggle" aria-expanded="false">
+          공유 출처 <span class="ss-count" id="ss-count">0</span><span class="chev">▸</span>
+        </button>
         <div class="filters" id="filters"></div>
       </div>
-    </div>
-
-    <div class="shared">
-      <button class="shared-toggle" id="shared-toggle" aria-expanded="false">
-        공유 출처 <span class="ss-count" id="ss-count">0</span><span class="chev">▸</span>
-      </button>
+      <!-- 펼친 출처 칩은 컨트롤 줄 아래로 흐른다(접힘이 기본이라 평소엔 자리를 안 먹는다).
+           별도 행이던 것을 패널 안으로 합쳐 매트릭스에 세로 32px를 돌려줬다. -->
       <div class="ss-chips" id="ss-chips" hidden></div>
     </div>
 
@@ -790,7 +800,11 @@
 
       const corner = document.createElement("div");
       corner.className = "corner";
-      corner.textContent = "패턴·처리 ↓ / 폭·동기 →";
+      for (const legend of ["→ 폭·동기", "↓ 패턴·처리"]) {
+        const line = document.createElement("span");
+        line.textContent = legend;
+        corner.appendChild(line);
+      }
       matrixEl.appendChild(corner);
 
       COL_ORDER.forEach((ck, i) => {
@@ -839,17 +853,14 @@
 
       const head = document.createElement("div");
       head.className = "c-head";
-      const codeRow = document.createElement("div");
-      codeRow.className = "c-code-row";
       const codeBadge = document.createElement("span");
       codeBadge.className = "c-code";
       codeBadge.textContent = code;
       // 절제2: 셀 안 축 라벨(완독-분석-깊이-정보)은 열/행 헤더와 중복 → 제거(모달에서만 표기).
-      codeRow.append(codeBadge);
       const nameEl = document.createElement("div");
       nameEl.className = "c-name";
       nameEl.textContent = "생성 대기 중…";
-      head.append(codeRow, nameEl);
+      head.append(codeBadge, nameEl);
 
       const body = document.createElement("div");
       body.className = "c-body empty";
@@ -861,13 +872,10 @@
       });
       body.appendChild(sk);
 
-      const foot = document.createElement("div");
-      foot.className = "c-foot";
-
-      el.append(head, body, foot);
+      el.append(head, body);
 
       const handle = {
-        el, code, nameEl, body, foot,
+        el, code, nameEl, body,
         name: "", axisLabel: deriveAxisLabel(code), text: "", processChars: 0,
         sources: [], picks: [], filled: false,
       };
@@ -894,65 +902,68 @@
       body.className = "c-body structured";
       body.textContent = "";
 
-      // 조사 과정은 셀 상단 한 줄로 접는다(채팅과 같은 "💭" 문법). 전문은 모달에서 펼친다.
-      if (processText(card).trim()) {
-        const fold = document.createElement("div");
-        fold.className = "c-process";
-        fold.textContent = "💭 생각·탐색 과정";
-        fold.title = "카드를 열면 과정을 볼 수 있어요";
-        body.appendChild(fold);
-      }
-
       // 흐르는 전문 + 인용 마커([n]). 셀 높이만큼 채우고 넘치면 하단 페이드(CSS). 상세는 모달.
+      // 마커 클릭 = 이 셀 열기: 셀엔 칩 줄이 없으므로 마커가 가리킬 곳은 출처·표지·과정을
+      // 모두 담은 모달뿐이다(마커 클릭이 stopPropagation으로 셀 클릭을 삼켜 무동작이 되는
+      // 것을 막는다 — md.js makeMarker 계약).
       const flow = document.createElement("div");
       flow.className = "c-flow";
-      renderBody(flow, answerText(card), { isCitation: isPooled, onMarker: (sid) => highlightChip(card, sid) });
+      renderBody(flow, answerText(card), { isCitation: isPooled, onMarker: () => openModal(card) });
       body.appendChild(flow);
 
-      // 선택 책 슬롯(『』·표지·세로바)은 **책만** 채운다 — 웹 출처(뉴스·유튜브)가 섞인 비도서
-      // 질문(환율 등)에서 picks[0]이 type=web이면 『뉴스 제목』으로 책처럼 오도된다. 웹 출처는
-      // 이미 하단 인용 칩(c-foot)에 링크로 있으니 대표책 줄에서만 뺀다(type 신호로 판정).
+      // 대표책 = 첫 번째 **책** 픽 한 줄. 셀은 한 화면 비교용이라 세로 예산이 본문 몫이고,
+      // 픽을 전부 줄로 깔면 고정높이 형제가 본문을 0px로 눌러 지운다(2026-08-04 회귀 실측).
+      // 나머지 책은 모달의 표지 스트립이 전부 보여준다 — "훑기는 한 화면, 깊이는 클릭".
+      // 책만 채운다: 웹 출처(뉴스·유튜브)가 섞인 비도서 질문에서 picks[0]이 type=web이면
+      // 『뉴스 제목』으로 책처럼 오도된다(type 신호로 판정, 본문 파싱 금지).
       const bookPicks = card.picks.filter((p) => !WEB_TYPES.has(p.type));
-      if (!bookPicks.length) return; // 델타 시점·폴백·비도서 셀 — 선택 책 줄 없음
-      for (const selected of bookPicks) {
-        const pick = document.createElement("div");
-        pick.className = "c-pick";
+      if (!bookPicks.length) return; // 델타 시점·폴백·비도서 셀 — 대표책 줄 없음
+      const rep = bookPicks[0];
+      const pick = document.createElement("div");
+      pick.className = "c-pick";
 
-        // 표지가 있으면 표지, 없으면 축색 틱(우아한 폴백). 로드 실패 시에도 틱으로 되돌아간다.
-        const tick = document.createElement("span");
-        tick.className = "c-pick-ico";
-        tick.setAttribute("aria-hidden", "true");
-        pick.appendChild(tick);
-        const url = coverUrl(selected);
-        if (url) {
-          const cover = document.createElement("img");
-          cover.className = "c-pick-cover";
-          // loading=lazy는 스크롤 없는 100vh 뷰포트에 JS로 삽입된 이미지의 IntersectionObserver를
-          // 트리거하지 못해 로드가 멈춘다(Chrome 쿼크) — 항상 보이는 썸네일이라 즉시 로드가 옳다.
-          cover.decoding = "async";
-          cover.alt = "";
-          cover.addEventListener("load", () => { cover.classList.add("loaded"); tick.style.display = "none"; });
-          cover.addEventListener("error", () => cover.remove());
-          pick.insertBefore(cover, tick);
-          cover.src = url;
-        }
-
-        const title = document.createElement("span");
-        title.className = "c-pick-title";
-        title.textContent = "『" + selected.title + "』";
-        title.title = selected.title;
-        pick.appendChild(title);
-        // 가격 키는 sale_price(할인 적용 판매가)다 — 평면 price는 개명 전 스냅샷 호환 폴백.
-        const priceRaw = (selected.sale_price != null) ? selected.sale_price : selected.price;
-        if (priceRaw != null && priceRaw !== "") {
-          const price = document.createElement("span");
-          price.className = "c-pick-price";
-          const n = Number(priceRaw);
-          price.textContent = (Number.isFinite(n) && n > 0 ? n.toLocaleString("ko-KR") : String(priceRaw)) + "원";
-          pick.appendChild(price);
-        }
-        body.appendChild(pick);
+      // 표지가 있으면 표지, 없으면 축색 틱(우아한 폴백). 로드 실패 시에도 틱으로 되돌아간다.
+      const tick = document.createElement("span");
+      tick.className = "c-pick-ico";
+      tick.setAttribute("aria-hidden", "true");
+      pick.appendChild(tick);
+      const url = coverUrl(rep);
+      if (url) {
+        const cover = document.createElement("img");
+        cover.className = "c-pick-cover";
+        // loading=lazy는 스크롤 없는 100vh 뷰포트에 JS로 삽입된 이미지의 IntersectionObserver를
+        // 트리거하지 못해 로드가 멈춘다(Chrome 쿼크) — 항상 보이는 썸네일이라 즉시 로드가 옳다.
+        cover.decoding = "async";
+        cover.alt = "";
+        cover.addEventListener("load", () => { cover.classList.add("loaded"); tick.style.display = "none"; });
+        cover.addEventListener("error", () => cover.remove());
+        pick.insertBefore(cover, tick);
+        cover.src = url;
       }
+
+      const title = document.createElement("span");
+      title.className = "c-pick-title";
+      title.textContent = "『" + rep.title + "』";
+      title.title = rep.title;
+      pick.appendChild(title);
+      // 가격 키는 sale_price(할인 적용 판매가)다 — 평면 price는 개명 전 스냅샷 호환 폴백.
+      const priceRaw = (rep.sale_price != null) ? rep.sale_price : rep.price;
+      if (priceRaw != null && priceRaw !== "") {
+        const price = document.createElement("span");
+        price.className = "c-pick-price";
+        const n = Number(priceRaw);
+        price.textContent = (Number.isFinite(n) && n > 0 ? n.toLocaleString("ko-KR") : String(priceRaw)) + "원";
+        pick.appendChild(price);
+      }
+      // 나머지 책 수 — 클릭하면 더 있다는 어포던스(모달 표지 스트립으로 이어진다).
+      if (bookPicks.length > 1) {
+        const more = document.createElement("span");
+        more.className = "c-pick-more";
+        more.textContent = "+" + (bookPicks.length - 1);
+        more.title = bookPicks.length + "권 중 대표 1권";
+        pick.appendChild(more);
+      }
+      body.appendChild(pick);
     }
 
     // ── 열 채우기 ──
@@ -1010,7 +1021,6 @@
       // 풀·picks가 갖춰졌으니 본문을 다시 렌더한다 — 델타 시점엔 아직 풀에 없어 평문으로 남았던
       // 인용이 배지로 승격되고, 대표책 줄이 이때 붙는다.
       renderCellBody(card);
-      renderChips(card);
 
       // 폴백 판정의 단일 출처 = col done의 fallback 플래그(백엔드가 모든 열에 항상 싣는다:
       // matrix_runner fallback = 빈 본문 — 답을 못 낸 셀만 폴백이다). 본문 문구 매칭 금지.
@@ -1022,28 +1032,6 @@
       // gate_reason은 muted 셀 툴팁(hover만, 사용자 화면 비노출)으로 — 디버깅 보조.
       if (flag && reason) card.el.title = "정직 폴백 · 사유: " + reason;
       else card.el.removeAttribute("title");
-    }
-
-    function renderChips(card) {
-      card.foot.textContent = "";
-      for (const src of card.sources) {
-        const chip = document.createElement("span");
-        chip.className = WEB_TYPES.has(src.type) ? "c-chip web" : "c-chip";
-        chip.textContent = src.id;
-        chip.dataset.sid = String(src.id);
-        chip.title = src.title || "";
-        chip.addEventListener("click", (e) => { e.stopPropagation(); safeOpen(src.url); });
-        card.foot.appendChild(chip);
-      }
-    }
-
-    function highlightChip(card, sid) {
-      const chip = card.foot.querySelector('.c-chip[data-sid="' + CSS.escape(String(sid)) + '"]');
-      if (!chip) return;
-      card.foot.querySelectorAll(".c-chip.hl").forEach((c) => c.classList.remove("hl"));
-      chip.classList.add("hl");
-      chip.scrollIntoView({ block: "nearest", inline: "center", behavior: "smooth" });
-      setTimeout(() => chip.classList.remove("hl"), CHIP_HIGHLIGHT_MS);
     }
 
     // 채택 시 RBTI 코드와 함께 {방금 질문, 그 셀의 대표책}을 1회성 핸드오프로 넘긴다.
