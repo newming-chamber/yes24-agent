@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.events import Event, EventActions
 from google.adk.runners import Runner
+from google.adk.sessions import BaseSessionService
 from google.genai import types
 from google.genai.errors import APIError
 
@@ -349,7 +350,11 @@ def _closeout_error_frames(
 
 
 async def run_agent_stream(
-    message: str, session_id: str | None, rbti: str | None = None, model: str | None = None
+    message: str,
+    session_id: str | None,
+    rbti: str | None = None,
+    model: str | None = None,
+    session_service: BaseSessionService | None = None,
 ) -> AsyncIterator[str]:
     """사용자 메시지 1건을 처리하며 SSE 프레임 문자열을 순서대로 yield한다.
 
@@ -358,6 +363,10 @@ async def run_agent_stream(
     `refs`(마커 렌더용 id·url 힌트)를 실어 본문 [n]보다 먼저 도착하고, 검증을 통과한
     **최종 인용 출처만** source·done.sources로 나간다(원칙 4). 어떤 예외가 나도
     제너레이터가 예외로 죽지 않고 error+done을 흘려보낸 뒤 정상 종료한다.
+
+    session_service를 주입하면 sqlite 싱글턴 대신 그 서비스를 쓴다 — 매트릭스가
+    1회성 셀 세션을 InMemorySessionService로 돌려 sqlite 동시 쓰기 경합
+    (`database is locked`, 2026-08-04 상용 실측)을 피하는 경로다. 채팅(None)은 종전대로.
     """
     settings = get_settings()
     # 웹 선제 실행: 모델 1라운드 사고와 그라운딩 서브콜을 병렬화하는 순수 지연 최적화.
@@ -374,7 +383,7 @@ async def run_agent_stream(
         # 못 하는 상황 — error+done으로 알리고 종료한다. DB 락(OperationalError)·디렉토리
         # 오류(OSError) 등 어떤 예외가 나도 "done 정확히 1회" 불변식을 지킨다.
         try:
-            service = _get_session_service()
+            service = session_service if session_service is not None else _get_session_service()
             session = await _resolve_session(service, session_id)
             # 현재 UI 요청을 RBTI state의 정본으로 본다. 유효 코드는 저장하고 None·무효 코드는
             # 기존 값을 명시적으로 지워, 이전 요청의 페르소나가 다음 기본 채팅에 남지 않게 한다.

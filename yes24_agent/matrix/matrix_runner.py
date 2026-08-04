@@ -30,6 +30,8 @@ import re
 import uuid
 from collections.abc import AsyncIterator
 
+from google.adk.sessions import InMemorySessionService
+
 from yes24_agent.rbti.persona import axis_label, get_archetype_name, matrix_codes
 from yes24_agent.runner import run_agent_stream
 from yes24_agent.sse import (
@@ -124,12 +126,17 @@ def _parse_frame(frame: str) -> tuple[str, dict]:
     return event, data
 
 
-async def _run_cell(question: str, code: str, model: str | None) -> dict:
+async def _run_cell(
+    question: str, code: str, model: str | None, session_service: InMemorySessionService
+) -> dict:
     """페르소나 코드 하나로 채팅을 끝까지 돌려 그 셀의 구조화 결과를 모은다.
 
     **채팅 runner를 그대로 소비한다 — 모듈·로직 동일, 유일한 차이는 rbti(페르소나) 주입뿐.**
     모델도 채팅에서 고른 것을 그대로 따른다(매트릭스 전용 모델 없음). 각 셀은 독립
     세션(session_id=None → runner가 고유 id 부여)이라 서로의 맥락을 오염시키지 않는다.
+    세션 서비스는 런 스코프 인메모리를 주입받는다 — 셀 세션은 1회성(후속 턴 없음)인데
+    16셀이 sqlite 한 파일에 동시 append하면 `database is locked`로 셀이 죽는다
+    (2026-08-04 상용 실측 6~8셀 사망). 영속이 필요 없으므로 공유 쓰기 자원을 뺀다.
     최종 done 프레임의 text·sources만 취해 열 프레임으로 재조립한다. 여기에
     **라운드 경계 오프셋(process_chars)**을 더한다: 채팅 화면이 조사 과정을 접는 근거는
     텍스트가 아니라 **도구 스텝 프레임이 본문을 끊는다는 이벤트 순서**인데, 셀은 본문 통째
@@ -148,7 +155,9 @@ async def _run_cell(question: str, code: str, model: str | None) -> dict:
     # 셀의 Yes24 요청을 0.667초 간격으로 직렬화하던 병목을 없앤다(2026-07-24 실측: 89→~52초).
     # 채팅 단일 경로는 이 컨텍스트가 꺼져 있어 rps=1.5 그대로 — 매트릭스만 빨라진다.
     with high_throughput_client():
-        async for frame in run_agent_stream(question, session_id=None, rbti=code, model=model):
+        async for frame in run_agent_stream(
+            question, session_id=None, rbti=code, model=model, session_service=session_service
+        ):
             event, data = _parse_frame(frame)
             if event == "delta" and not settled:
                 streamed.append(data.get("text", ""))
@@ -217,7 +226,16 @@ async def run_matrix_stream(
     try:
         yield sse_status("generating", "16가지 독서 성향으로 살펴보고 있어요")
 
-        tasks = [asyncio.ensure_future(_run_cell(question, code, model)) for code in codes]
+        # 런 스코프 인메모리 세션 서비스 — 16셀이 공유하되 런이 끝나면 통째로 GC된다
+        # (프로세스 싱글턴이면 런마다 16세션의 도구 결과가 메모리에 영구 누적된다).
+        # 수용한 트레이드오프: 셀 세션이 sqlite에 안 남으므로 admin 세션 브라우저에서
+        # 매트릭스 실행 이력(셀별 도구 호출 타임라인)이 보이지 않는다 — 매트릭스는 개발
+        # 확인용이고 셀 결과는 SSE로 전량 프론트에 가므로, 상용 셀 사망과 맞바꿀 가치가 없다.
+        cell_sessions = InMemorySessionService()
+        tasks = [
+            asyncio.ensure_future(_run_cell(question, code, model, cell_sessions))
+            for code in codes
+        ]
         for finished in asyncio.as_completed(tasks):
             cell = await finished
             col = col_of[cell["code"]]
