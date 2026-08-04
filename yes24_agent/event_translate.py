@@ -127,7 +127,15 @@ _PUBLIC_SOURCE_FIELDS = (
 
 
 def project_public_source(source: dict) -> dict:
-    """내부 출처를 API의 단일 public source DTO로 투영한다."""
+    """내부 출처를 API의 단일 public source DTO로 투영한다.
+
+    공개 DTO 계약은 기본 필드 + **선택적 스칼라**다(qa/README 판정 절). 그래서 필드 이름이
+    목록에 있어도 값이 스칼라가 아니면 싣지 않는다 — `_PUBLIC_SOURCE_FIELDS`는
+    `GROUNDING_FIELDS`에서 파생되는데, 그 상류(`_ITEM_FIELDS`)는 도구 결과·접지용이라
+    구조 값이 들어올 수 있다(2026-08-04 실사고: `other_formats` 리스트가 여기로 새어
+    다른 상품의 가격·URL이 공개 페이로드에 실렸다). 이름 열거로 막으면 다음 구조 필드에서
+    재발하므로 형태로 거른다.
+    """
     meta = source.get("meta") if isinstance(source.get("meta"), dict) else {}
     event = {
         "id": source.get("id", source.get("source_id")),
@@ -137,9 +145,13 @@ def project_public_source(source: dict) -> dict:
     }
     for field in _PUBLIC_SOURCE_FIELDS:
         if field in source:
-            event[field] = source[field]
+            value = source[field]
         elif field in meta:
-            event[field] = meta[field]
+            value = meta[field]
+        else:
+            continue
+        if value is None or isinstance(value, (str, int, float, bool)):
+            event[field] = value
     return event
 
 

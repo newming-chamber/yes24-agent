@@ -308,13 +308,19 @@ def _grounding_prompt(questions: list[str]) -> str:
     )
 
 
-async def _fetch_page_title(url: str, settings: Settings) -> str | None:
-    """리다이렉트를 따라가 페이지 <title>만 가볍게 긁어온다(표시 보강용, 실패 무해).
+async def _fetch_page_meta(url: str, settings: Settings) -> tuple[str | None, str | None]:
+    """리다이렉트를 따라가 **최종 URL과 페이지 <title>**을 가볍게 긁어온다(실패 무해).
 
-    그라운딩 API는 페이지 제목을 주지 않아(title=도메인, 2026-07-29 실측) 카드가 도메인
-    문자열뿐이었다 — 사용자 방향: "그 주소의 title만 따오면 안 되나". 본문 스트림을 제목
-    태그가 나올 만큼만 읽고 끊으며(대형 뉴스 페이지 전체 다운로드 방지), 어떤 실패도
-    None(도메인 유지)으로 삼킨다. 인용 근거가 아니라 순수 표시 메타다.
+    그라운딩 API가 청크마다 주는 값은 `uri`(불투명 리다이렉트)와 `title`(발행처 도메인)
+    둘뿐이다 — `domain` 필드는 SDK 스키마에 있으나 항상 null이다(2026-08-03 실측). 그래서
+    리다이렉트 URL을 그대로 두면 사용자는 카드를 클릭하기 전까지 뉴스핌인지 개인 블로그인지
+    알 수 없다(발행처 신뢰 판단이 출처 표시의 목적인데 그게 막힌다).
+
+    최종 URL은 **추가 비용이 0이다** — 제목을 읽으려 이미 follow_redirects로 열어 둔 응답의
+    `response.url`이 곧 리다이렉트가 풀린 실제 주소다. 요청을 더 보내지 않으므로 지연이
+    늘지 않는다. 본문 스트림은 제목 태그가 나올 만큼만 읽고 끊으며(대형 뉴스 페이지 전체
+    다운로드 방지), 어떤 실패도 (None, None)으로 삼켜 원래의 리다이렉트 URL·도메인 표기를
+    유지한다. 인용 근거가 아니라 순수 표시 메타다.
     """
     try:
         client = _get_client(settings)
@@ -324,14 +330,15 @@ async def _fetch_page_title(url: str, settings: Settings) -> str | None:
             timeout=settings.web_title_fetch_timeout_s,
         ) as response:
             if response.status_code != 200:
-                return None
+                return None, None
+            final_url = str(response.url)
             async for chunk in response.aiter_bytes():
                 buf += chunk
                 if b"</title>" in buf.lower() or len(buf) > 65536:
                     break
         match = re.search(rb"<title[^>]*>(.*?)</title>", buf, re.S | re.I)
         if not match:
-            return None
+            return final_url, None
         raw = match.group(1)
         for encoding in ("utf-8", "cp949"):
             try:
@@ -340,11 +347,11 @@ async def _fetch_page_title(url: str, settings: Settings) -> str | None:
             except UnicodeDecodeError:
                 continue
         else:
-            return None
+            return final_url, None
         title = html.unescape(" ".join(text.split()))
-        return title[:120] or None
-    except Exception:  # noqa: BLE001 — 표시 보강 전용: 어떤 실패도 도메인 폴백
-        return None
+        return final_url, title[:120] or None
+    except Exception:  # noqa: BLE001 — 표시 보강 전용: 어떤 실패도 원래 값 유지
+        return None, None
 
 
 async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
@@ -380,15 +387,29 @@ async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
     if last_error is not None:
         raise last_error
     if raw_results:
-        # 제목 보강(병렬·실패 무해). 프리페치 파이프라인 안에서도 실행되므로 대부분의
-        # 지연이 모델 사고 시간에 숨는다.
-        titles = await asyncio.gather(
-            *(_fetch_page_title(item["url"], settings) for item in raw_results),
+        # 최종 URL·제목 보강(병렬·실패 무해, 요청 1회로 둘 다). 프리페치 파이프라인 안에서도
+        # 실행되므로 대부분의 지연이 모델 사고 시간에 숨는다.
+        metas = await asyncio.gather(
+            *(_fetch_page_meta(item["url"], settings) for item in raw_results),
             return_exceptions=True,
         )
-        for item, title in zip(raw_results, titles):
-            if isinstance(title, str) and title:
+        for item, meta in zip(raw_results, metas):
+            if isinstance(meta, BaseException):
+                continue
+            final_url, title = meta
+            if final_url:
+                item["url"] = final_url
+            if title:
                 item["title"] = title
+        # 서로 다른 리다이렉트 URI가 같은 원문으로 풀리면 출처는 하나다 — 등록 전에 근거
+        # 발췌를 합친다(같은 url 재등록은 state에서 나중 관측이 이겨 앞 발췌가 사라진다).
+        merged: dict[str, dict] = {}
+        for item in raw_results:
+            kept = merged.setdefault(item["url"], item)
+            if kept is not item:
+                lines = f"{kept['snippet']}\n{item['snippet']}".split("\n")
+                kept["snippet"] = "\n".join(dict.fromkeys(lines))
+        raw_results = list(merged.values())
     return raw_results
 
 

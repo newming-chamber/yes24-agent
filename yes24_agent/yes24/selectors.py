@@ -87,6 +87,16 @@ PRODUCT_GOODS_NAME_JS_RE = r"g_GoodsName\s*=\s*'([^']*)'"
 PRODUCT_IS_EBOOK_JS_RE = r"g_isEbook\s*=\s*'([YN])'"
 PRODUCT_SALE_PRICE_JS_RE = r"g_GoodsSalePrice\s*=\s*([\d.]+)"
 
+# 다른 판형 안내 위젯("eBook 12,000원 이동", "중고상품"). 같은 작품의 **다른 판형과 그
+# 판매가**를 담으며, 값의 임자는 이 페이지의 상품이 아니라 링크가 가리키는 다른 상품이다.
+# 컨테이너로 잡는 이유: 이 값을 범용 관련상품 링크로 흘리면 앵커 텍스트에 금액만 남고
+# 임자가 사라져, 모델이 열람 중인 상품의 출처에 그 금액을 건다(실측 2026-08-03 —
+# links[0].title="eBook 12,000원 이동"을 종이책 출처 [1]에 인용). 가격은 판형 링크마다
+# em.txC_blue 하나로, 없는 판형(중고상품)도 있으므로 없으면 None으로 둔다.
+PRODUCT_FORMAT_CONTAINER = "#divFormatInfo"
+PRODUCT_FORMAT_LINK = "a.formatLnk"
+PRODUCT_FORMAT_PRICE = "em.txC_blue"
+
 # 책소개/목차/출판사리뷰 블록. 실제 본문은
 # `<textarea class="txtContentText" style="display:none;">` 안에 HTML 태그가
 # 이스케이프 없이 그대로 든 문자열로 들어있다(페이지 JS가 나중에 이 값을 innerHTML로

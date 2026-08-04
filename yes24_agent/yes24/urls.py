@@ -85,6 +85,17 @@ POLICY_SEEDS: dict[str, dict[str, str]] = {
         "url": "https://www.yes24.com/Mall/Help/FAQ",
         "role": "directory",
     },
+    # 크레마클럽은 **별도 서브도메인의 자사 서비스**라 www 고객센터 FAQ 입구에서 링크로
+    # 도달하지 않는다. 그래서 요금제(월 5,500~9,900원 — 실제 결제로 이어지는 금액)를 물으면
+    # 입구를 열고도 못 찾아 web_search로 새고, 나무위키·개인 블로그가 자사 가격의 근거가 되던
+    # 실측이 있었다(2026-08-04, 3/3). 이 페이지는 요금제 표를 SSR로 실으며 허브 링크
+    # (가입하기·공지사항·FAQ·이용권)도 함께 렌더해 세부는 링크 팔로우로 이어간다.
+    # robots.txt는 `Allow: /BookClub/`로 명시 허용(Disallow는 `/Guide/` 최상위 경로만).
+    "cremaclub": {
+        "label": "크레마클럽(eBook 월정액 구독) 이용안내·요금제",
+        "url": "https://cremaclub.yes24.com/BookClub/Guide",
+        "role": "document",
+    },
 }
 
 

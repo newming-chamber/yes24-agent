@@ -178,6 +178,64 @@ export function canSplitAfter(text) {
   return !MD_PIPE_RE.test(lastContent);      // 마지막 내용 줄이 표 행이면 표 안이다
 }
 
+// 정렬 비교용 정규화: 마커 토큰과 가로 공백을 걷어내고, 남은 글자의 **원문 인덱스**를 함께
+// 만든다(→ {text, map}). 인용 검증이 정본에서 바꾸는 것은 마커 표기뿐인데, 무효 마커를 지울
+// 때 seam의 공백까지 흡수하므로(백엔드 postprocess) 마커만 눈감으면 공백 한 칸에 대조가
+// 깨진다. 줄바꿈은 남긴다 — 검증이 건드리지 않고, 문단(=블록) 경계의 의미를 지킨다.
+const ALIGN_SKIP_RE = new RegExp(MARKER_RE.source + "|[ \\t]+", "y");
+function normalizeForAlign(text) {
+  const kept = [];
+  const map = [];
+  let i = 0;
+  while (i < text.length) {
+    ALIGN_SKIP_RE.lastIndex = i;
+    if (ALIGN_SKIP_RE.exec(text)) {
+      i = ALIGN_SKIP_RE.lastIndex;
+      continue;
+    }
+    map.push(i);
+    kept.push(text[i]);
+    i++;
+  }
+  return { text: kept.join(""), map };
+}
+
+/**
+ * 정본 본문(text)을 이미 흐른 블록들(streamed: 블록별 텍스트)에 다시 배분한다.
+ * → { kept, segments } — segments[k]가 최종 k번째 블록의 텍스트이고, 앞 kept개는 **기존
+ *   블록 그대로**(위치·DOM 유지), 그 뒤는 새 블록 몫이다.
+ *
+ * 정본은 스트리밍 본문과 마커 표기만 다르므로(인용 검증의 제거·재번호) 블록 경계를 그대로
+ * 옮길 수 있다. 이 재배분이 필요한 이유는 **접힘이 블록의 DOM 위치에서 파생되는 표현**이기
+ * 때문이다 — 정본을 통짜 블록 하나로 다시 그리면 이미 접힘으로 옮겨진 조사 서술이 최종 답
+ * 머리로 되살아난다(재번호 도입 뒤엔 인용 있는 모든 턴이 이 경로다).
+ * 맞출 수 없는 블록부터는 버리고(kept가 거기서 멈춘다) 남은 정본을 새 블록 하나에 담는다 —
+ * 구조를 못 믿는 경우에도 본문은 정본 전량을 싣는다(원칙 4b).
+ *
+ * **같은 규칙의 사본이 백엔드에도 있다**: `matrix/matrix_runner.py`의 `_aligned_offset`
+ * (매트릭스 셀은 본문을 통째 1회로 방출해 프론트에 블록 경계가 없으므로 백엔드가 오프셋을
+ * 계산한다). 런타임이 달라 사본이 둘일 뿐 규칙은 하나다 — **한쪽만 고치지 말 것.**
+ */
+export function redistributeCanonical(text, streamed) {
+  const canonical = normalizeForAlign(text);
+  const segments = [];
+  let pos = 0;   // 정규화 본문에서 소비한 위치
+  let cut = 0;   // 정본 원문에서의 블록 경계
+  for (const chunk of streamed) {
+    const norm = normalizeForAlign(chunk).text;
+    if (canonical.text.slice(pos, pos + norm.length) !== norm) break;
+    pos += norm.length;
+    // 경계는 **다음 글자의 원문 위치**다 — 사이에 낀 공백·마커는 뒤 블록이 가져간다.
+    const next = pos < canonical.map.length ? canonical.map[pos] : text.length;
+    segments.push(text.slice(cut, next));
+    cut = next;
+  }
+  const kept = segments.length;
+  const rest = text.slice(cut);
+  if (rest) segments.push(rest);
+  return { kept, segments };
+}
+
 function splitCells(line) {
   return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((s) => s.trim());
 }

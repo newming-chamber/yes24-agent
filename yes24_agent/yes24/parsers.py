@@ -43,6 +43,9 @@ from yes24_agent.yes24.selectors import (
     LINK_PRODUCT_PATH_RE,
     NO_RESULTS_MARKER,
     PRODUCT_AUTHOR,
+    PRODUCT_FORMAT_CONTAINER,
+    PRODUCT_FORMAT_LINK,
+    PRODUCT_FORMAT_PRICE,
     PRODUCT_GOODS_NAME_JS_RE,
     PRODUCT_GOODS_NO_JS_RE,
     PRODUCT_INTRO,
@@ -67,10 +70,14 @@ from yes24_agent.yes24.selectors import (
 )
 from yes24_agent.yes24.urls import BROWSE_SEED_URLS, product_url
 
-# 상품형 아이템(검색·베스트셀러·신간·크레마클럽)이 공통으로 싣는 필드 집합.
+# 상품형 아이템(검색·베스트셀러·신간·크레마클럽·상세)이 실을 수 있는 필드의 **합집합**.
 # 마크업이 같은 검색/베스트셀러/신간은 _parse_item 하나로 뽑고, 마크업이 다른
 # 크레마클럽도 이 키 집합을 그대로 채운다(없는 필드는 None) — 도구가 파서마다 다른 키
 # 집합을 상대하지 않게 하기 위함이다(필드 소실 드리프트 원천 차단).
+# 목록에 구조적으로 없는 필드(page_count·is_ebook·other_formats — 상세에서만 관측된다)도
+# 여기 담는다. 그런 필드는 _item_fields의 키 생략으로 "관측 불가"가 표시되므로, 합집합에
+# 두는 편이 안전하다: 상세 전용 필드를 뺐다가 도구가 손으로 되붙이면(과거 is_ebook이 그랬다)
+# product_fields를 우회해 **출처 레코드(meta)에서만 소실**된다.
 _ITEM_FIELDS = (
     "goods_no",
     "title",
@@ -84,9 +91,14 @@ _ITEM_FIELDS = (
     "sale_index",
     "review_count",
     "image_url",
+    "is_ebook",
+    "other_formats",
 )
 
 _WHITESPACE_RE = re.compile(r"\s+")
+
+# 글자(문자·숫자)가 하나라도 있는가 — 본문 블록이 실재하는지 판정하는 유일한 기준.
+_WORD_CHAR_RE = re.compile(r"\w", re.UNICODE)
 
 
 class ParseError(Exception):
@@ -185,8 +197,10 @@ def parse_product(html: str, *, base_url: str) -> dict:
     """Yes24 상품 상세 페이지 HTML을 파싱해 상세 정보를 반환한다.
 
     반환 dict 키: goods_no, title, url, author, publisher, pub_date, sale_price(int|None),
-    rating(float|None), is_ebook(bool), intro, toc, pub_review, weekly_reviews(list[str]).
+    rating(float|None), is_ebook(bool), other_formats(list[dict]), intro, toc, pub_review,
+    weekly_reviews(list[str]).
     텍스트 블록(intro/toc/pub_review)은 없으면 None, weekly_reviews는 없으면 빈 리스트.
+    other_formats는 다른 판형이 없는 상품이면 빈 리스트다(관측했으나 없음).
 
     가격·goods_no·eBook 여부는 CSS가 아니라 페이지 인라인 <script>의 전역변수를
     정규식으로 추출한다 — 상세페이지 CSS 가격(em.yes_b)은 번들가·중고가까지 섞여
@@ -231,11 +245,47 @@ def parse_product(html: str, *, base_url: str) -> dict:
         "rating": _parse_rating(soup.select_one(PRODUCT_RATING)),
         "page_count": _parse_page_count(soup),
         "is_ebook": is_ebook,
+        "other_formats": _extract_other_formats(soup, base_url=base_url),
         "intro": _extract_infoset_text(soup, PRODUCT_INTRO),
         "toc": _extract_infoset_text(soup, PRODUCT_TOC),
         "pub_review": _extract_infoset_text(soup, PRODUCT_PUB_REVIEW),
         "weekly_reviews": _extract_weekly_reviews(soup),
     }
+
+
+def _extract_other_formats(soup: BeautifulSoup, *, base_url: str) -> list[dict]:
+    """같은 작품의 다른 판형(eBook·중고 등)과 그 판매가를 레코드로 뽑는다.
+
+    Yes24 상세는 다른 판형을 링크로 싣고 라벨에 금액을 함께 렌더한다("eBook 12,000원 이동").
+    이걸 범용 관련상품 링크로 흘리면 앵커 텍스트에 금액만 남고 **그 금액의 임자**가 사라져,
+    모델이 열람 중인 상품의 출처에 다른 판형의 가격을 건다(실측 2026-08-03
+    multiturn-reference: 종이책 출처 [1]에 "eBook 판매가 12,000원" 인용 — 값 자체는 참이고
+    페이지에도 있었으나, 그 값을 관측한 상품은 [1]이 아니었다). 판형·가격·url을 한 레코드로
+    묶어 임자를 되돌려준다.
+
+    가격 없는 판형(중고상품 판매 신청 링크)은 sale_price=None으로 둔다 — 형제 파서와 같은
+    degrade 규약이다. 위젯이 아예 없는 상품은 빈 리스트(관측했으나 다른 판형 없음).
+    """
+    container = soup.select_one(PRODUCT_FORMAT_CONTAINER)
+    if container is None:
+        return []
+
+    formats: list[dict] = []
+    for anchor in container.select(PRODUCT_FORMAT_LINK):
+        # 판형 이름은 앵커의 **직계** 텍스트다 — 자손(가격 em·"이동" 아이콘)까지 긁으면
+        # 이름과 금액이 도로 한 문자열로 붙는다. 이 함수가 없애려는 바로 그 형태다.
+        name = _normalize_whitespace(" ".join(anchor.find_all(string=True, recursive=False)))
+        if not name:
+            continue
+        href = (anchor.get("href") or "").strip()
+        formats.append(
+            {
+                "format": name,
+                "sale_price": _parse_grouped_int(anchor.select_one(PRODUCT_FORMAT_PRICE)),
+                "url": urljoin(base_url, href) if href else None,
+            }
+        )
+    return formats
 
 
 def _parse_page_count(soup: BeautifulSoup) -> int | None:
@@ -453,18 +503,30 @@ def extract_links(
     제외한다. URL이 중복되면 문서에 먼저 등장한 것(=먼저 만난 비어있지 않은
     앵커 텍스트)만 남긴다.
 
+    상대 href는 `page_url`(없으면 base_url) 기준으로 절대화한다 — 서브도메인 페이지의
+    상대 링크가 www로 새면 같은 경로라도 내용이 다른(빈) 페이지를 가리키게 된다.
+
     반환 순서: product 링크를 page 링크보다 앞에 배치한다. `page_url`(현재 열람 중인
-    페이지의 URL)이 주어지면 page 링크 중 "현재 페이지 맥락의 하위 링크"(현재 페이지
-    경로 자신 또는 그 하위 경로를 가리키는 링크)를 나머지 page 링크보다 앞으로 당긴다.
-    고객센터 FAQ 메인처럼 글로벌 카테고리 메가메뉴가 수백 개 깔린 페이지에서, 정작
-    그 페이지 고유의 유용한 하위 링크(예: `/Mall/Help/FAQ?faqGb=...` 정책 링크)가
-    글로벌 네비에 밀려 limit 밖으로 잘려나가는 것을 막기 위함이다. 그 후 limit로 자른다.
+    페이지의 URL)이 주어지면 page 링크는 _context_first가 (맥락, 경로 다양성)으로
+    재정렬한다 — 현재 페이지 맥락의 하위 링크가 앞서고, 같은 경로의 쿼리 변주는 서로 다른
+    경로가 한 번씩 나온 뒤로 밀린다. 고객센터 FAQ 메인·크레마클럽처럼 메가메뉴가 수백 개
+    깔린 페이지에서, 정작 그 페이지 고유의 유용한 링크(`/Mall/Help/FAQ?faqGb=...` 정책
+    링크, `/BookClub/Guide` 요금 안내)가 limit 밖으로 잘려나가는 것을 막기 위함이다.
+    그 후 limit로 자른다.
 
     이 함수는 순수 함수다(설정값을 직접 참조하지 않고 호출자가 주입한다) — 도메인·robots
     허용 정책의 최종 판단은 client가 하고, 여기서는 그 규칙으로 후보를 줄이고 현재 페이지
     맥락의 신호를 앞세워 신호 대 잡음비를 높인다.
     """
     soup = BeautifulSoup(html, "lxml")
+
+    # 다른 판형 위젯은 parse_product가 판형·가격·url 레코드(other_formats)로 이미 싣는다.
+    # 여기서 또 내보내면 같은 값이 두 경로로 나가고, 링크 쪽은 임자 없는 라벨 문자열
+    # ("eBook 12,000원 이동")이라 오귀속의 발판이 된다. 도달 경로가 사라지는 것은 아니다 —
+    # 같은 url이 other_formats[].url에 그대로 있어 거기서 이어서 열람할 수 있다.
+    # 판정은 컨테이너 구조이지 라벨 문구가 아니며, 상세가 아닌 페이지에선 무동작이다.
+    for widget in soup.select(PRODUCT_FORMAT_CONTAINER):
+        widget.decompose()
 
     # 도메인 허용 판정은 client와 같은 헬퍼 하나를 공유한다(hostname 기준 suffix 일치).
     internal_domain = allowed_domain(base_url)
@@ -482,7 +544,13 @@ def extract_links(
         if not title:
             continue
 
-        url = urljoin(base_url, href)
+        # 상대 경로는 **열람 중인 페이지**를 기준으로 절대화한다. base_url(www) 기준으로
+        # 붙이면 서브도메인 페이지의 상대 링크가 전부 www로 새어 나간다 — 실측 2026-08-03:
+        # 크레마클럽 Main의 `/BookClub/Guide`가 www.yes24.com/BookClub/Guide(본문 2,227자
+        # 빈 껍데기, 요금 없음)로 나왔고, 같은 경로를 cremaclub.yes24.com으로 열면
+        # 133,914자에 5,500·7,700·9,900원이 전부 들어 있다. 도메인 허용 판정은 아래
+        # is_allowed_host가 여전히 base_url 계열로 하므로 게이트는 그대로다.
+        url = urljoin(page_url or base_url, href)
         parsed = urlparse(url)
         host = parsed.hostname
 
@@ -542,13 +610,25 @@ def extract_faq_entries(soup: BeautifulSoup) -> list[dict[str, str]]:
 
 
 def _context_first(pages: list[dict], page_url: str | None) -> list[dict]:
-    """page 링크를 현재 페이지 맥락의 하위 링크가 앞서도록 안정 정렬한다.
+    """page 링크를 (현재 페이지 맥락, 경로 다양성) 순으로 안정 정렬한다.
 
-    page_url이 없으면 원래(DOM 등장) 순서를 그대로 유지한다. 있으면 현재 페이지
-    경로(자기 자신 포함)의 하위를 가리키는 링크를 앞으로 당기되, 안정 정렬이라 각
-    그룹 내부의 DOM 순서는 보존한다. FAQ 하위 정책 링크는 경로가 현재 페이지와
-    같고 쿼리스트링만 다르므로(예: `/Mall/Help/FAQ?faqGb=34`) "자기 자신 경로"
-    일치로 잡힌다.
+    page_url이 없으면 원래(DOM 등장) 순서를 그대로 유지한다. 있으면 두 키로 정렬한다.
+
+    1) 맥락: 현재 페이지 경로(자기 자신 포함)의 하위를 가리키는 링크를 앞으로 당긴다.
+       FAQ 하위 정책 링크는 경로가 현재 페이지와 같고 쿼리스트링만 다르므로
+       (예: `/Mall/Help/FAQ?faqGb=34`) "자기 자신 경로" 일치로 잡힌다.
+    2) 경로 다양성: 같은 경로의 n번째 링크는 n번째 순번으로 밀린다. 즉 서로 다른
+       경로가 한 번씩 다 나온 뒤에야 같은 경로의 두 번째 링크가 나온다.
+
+    (2)가 필요한 이유(실측 2026-08-03, 크레마클럽 Main): 후보 360건 중 331건이
+    `/BookClub/Category?dispNo=...` **한 경로의 쿼리 변주**(장르 메가메뉴)라 요금제
+    안내(`/BookClub/Guide`, DOM 254번째)가 limit 48 밖으로 잘렸다. 메가메뉴는 (1)의
+    맥락 판정으로는 못 거른다 — 메뉴 자신이 현재 페이지의 형제·이웃 경로이기 때문이다
+    (승격 범위를 형제로 넓히는 안은 표적 무변화 + 공지사항 48건 중 47건 교체로 기각).
+    구분되는 구조 신호는 경로의 **중복도**이지 링크 문구나 도메인이 아니다. 같은 경로가
+    한 슬롯만 먼저 쓰게 하면 고유 경로(이용안내·요금제·공지·FAQ)가 자동으로 올라온다.
+
+    두 키 모두 안정 정렬이라 각 그룹 내부의 DOM 순서는 보존된다.
     """
     if not pages or not page_url:
         return pages
@@ -557,11 +637,21 @@ def _context_first(pages: list[dict], page_url: str | None) -> list[dict]:
     if not context_prefix:  # 현재 페이지가 사이트 루트면 맥락 기준이 없다
         return pages
 
-    def _in_context(entry: dict) -> bool:
-        link_path = urlparse(entry["url"]).path.lower().rstrip("/")
-        return link_path == context_prefix or link_path.startswith(context_prefix + "/")
+    seen_in_group: dict[tuple[int, str, str], int] = {}
+    ranked: list[tuple[tuple[int, int], dict]] = []
+    for entry in pages:
+        parsed = urlparse(entry["url"])
+        link_path = parsed.path.lower().rstrip("/")
+        in_context = link_path == context_prefix or link_path.startswith(context_prefix + "/")
+        group = 0 if in_context else 1
+        # 다양성 판정 단위는 host+path다. 서브도메인 첫 화면들(ticket./global./cn.)은
+        # 경로가 다 같은 빈 문자열이라 host를 빼면 서로 중복으로 몰려 뒤로 밀린다.
+        bucket = (group, parsed.hostname or "", link_path)
+        occurrence = seen_in_group.get(bucket, 0)
+        seen_in_group[bucket] = occurrence + 1
+        ranked.append(((group, occurrence), entry))
 
-    return sorted(pages, key=lambda entry: 0 if _in_context(entry) else 1)
+    return [entry for _, entry in sorted(ranked, key=lambda item: item[0])]
 
 
 def _extract_infoset_text(soup: BeautifulSoup, container_selector: str) -> str | None:
@@ -576,6 +666,10 @@ def _extract_infoset_text(soup: BeautifulSoup, container_selector: str) -> str |
     (goods_paper.html은 `<br/>`, goods_ebook.html은 `</br>`). lxml은 `</br>`를
     빈 요소로 취급해 그냥 버리므로 재파싱 전 `<br/>`로 정규화해야 단어가 붙어
     나오지 않는다.
+
+    글자가 하나도 없는 블록(실측: 굿즈 상세의 책소개가 문자열 `""` 하나)은 본문이 아니라
+    빈 자리 표시라 None으로 돌려준다 — 그대로 통과시키면 상류에서 "설명 있음"으로 세어져
+    근거 없는 서술의 발판이 된다(_prose_or_none).
     """
     container = soup.select_one(container_selector)
     if container is None:
@@ -583,11 +677,11 @@ def _extract_infoset_text(soup: BeautifulSoup, container_selector: str) -> str |
 
     textarea = container.select_one(PRODUCT_TEXTAREA_CONTENT)
     if textarea is None:
-        return _text_or_none(container)
+        return _prose_or_none(_text_or_none(container))
 
     raw = textarea.get_text().replace("</br>", "<br/>")
     text = BeautifulSoup(raw, "lxml").get_text(" ", strip=True)
-    return _normalize_whitespace(text) or None
+    return _prose_or_none(_normalize_whitespace(text))
 
 
 def _extract_weekly_reviews(soup: BeautifulSoup) -> list[str]:
@@ -605,11 +699,21 @@ def _extract_weekly_reviews(soup: BeautifulSoup) -> list[str]:
         full_el = item.select_one(PRODUCT_REVIEW_WEEK_FULL_TEXT)
         if full_el is None:
             continue
-        text = _normalize_whitespace(full_el.get_text(" ", strip=True))
+        text = _prose_or_none(_normalize_whitespace(full_el.get_text(" ", strip=True)))
         if text:
             reviews.append(text)
 
     return reviews
+
+
+def _prose_or_none(text: str | None) -> str | None:
+    """글자가 하나라도 있으면 그대로, 없으면(빈 문자열·문장부호뿐) None을 반환한다.
+
+    "본문이 있나 없나"를 문자 수 임계값 없이 판정한다 — 실측 분포상 진짜 설명은 226자짜리
+    짧은 것도 있어(임계값을 두면 실제 근거를 지운다) 길이로는 가를 수 없고, 창작의 발판이
+    된 블록은 글자가 0개인 자리표시자였다.
+    """
+    return text if text and _WORD_CHAR_RE.search(text) else None
 
 
 def _normalize_whitespace(text: str) -> str:

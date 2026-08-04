@@ -9,7 +9,7 @@
   - 글로벌 프레임(col 없음): status{stage,detail} · source{id,title,url,type} ·
     done{sources,session_id}(종료 신호=col 없는 done 1개).
   - 열 프레임(col=0~15): delta{text,col,code?,name?,axis_label?}(카드 본문 전체 1회 + 정체성) ·
-    done{sources,cited_ids,col}(그 열 인용검증 출처=공유풀 부분집합).
+    done{sources,picks,fallback,col}(그 열 인용검증 출처=공유풀 부분집합, picks=그중 책).
   - 열은 완료 순서로 도착 → col/code로 카드에 라우팅.
 
   레이아웃 철학(사용자 요구): "훑기는 한 화면, 깊이는 클릭".
@@ -1013,7 +1013,7 @@
       renderChips(card);
 
       // 폴백 판정의 단일 출처 = col done의 fallback 플래그(백엔드가 모든 열에 항상 싣는다:
-      // matrix_runner fallback = not cell.cited_ids — 인용 0이면 정직 폴백). 본문 문구 매칭 금지.
+      // matrix_runner fallback = 빈 본문 — 답을 못 낸 셀만 폴백이다). 본문 문구 매칭 금지.
       // gate_reason만 있는 페이로드(구 스냅샷)는 사유 유무로 파생한다.
       const reason = data.gate_reason != null ? data.gate_reason : null;
       const flag = typeof data.fallback === "boolean" ? data.fallback : reason != null;

@@ -29,6 +29,15 @@ def today_kst() -> str:
     return f"{now.year}년 {now.month}월 {now.day}일"
 
 
+def time_kst() -> str:
+    """현재 KST 시각(분 단위 절사)을 에이전트 프롬프트가 쓰는 형식으로 반환한다.
+
+    날짜만 주입하던 동안 모델이 시각은 웹에 물어봤고, 그라운딩이 돌려준 UTC를 KST로 라벨링해
+    9시간 어긋난 답이 나왔다(2026-08-03 QA: 4문항 중 3오답). 초는 답변에 무의미하고 프롬프트만
+    더 자주 바꾸므로 분에서 끊는다."""
+    return datetime.now(KST).strftime("%H시 %M분")
+
+
 def now_checked_at() -> str:
     """도구 결과의 checked_at(KST 기준 "YYYY-MM-DD HH:MM")을 조립한다.
 

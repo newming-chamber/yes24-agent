@@ -497,7 +497,7 @@
     // ?v=1은 **일회성** 캐시 탈출구다: no-cache 헤더가 붙기 전 구버전을 heuristic-freshness로
     // 붙든 브라우저가 무쿼리 URL을 재요청하지 않는 문제를, 한 번도 캐시된 적 없는 새 URL로 우회한다.
     // 이후 모듈이 바뀌어도 이 숫자를 올릴 필요 없다 — 서버 no-cache가 매번 재검증하니까(자라지 않음).
-    import { renderBody as renderMarkdown, canSplitAfter } from "/static/lib/md.js?v=1";
+    import { renderBody as renderMarkdown, canSplitAfter, redistributeCanonical } from "/static/lib/md.js?v=1";
     import { readEventStream } from "/static/lib/sse.js?v=1";
     import {
       AXES as RBTI_AXES, parseCode as parseRbtiCode, deriveCode, deriveAxisLabel,
@@ -877,6 +877,10 @@
       let modelSaved = "";      // 최종 public model — 스냅샷 복원 시 같은 메타를 표시
       let errorText = "";      // 오류로 끝난 턴의 안내 문구(스냅샷용)
       let firstDelta = false;
+      // reset 이후 재전송 중인 정본(대기 아니면 null). 백엔드 reset은 "정본이 곧 다시 온다"는
+      // 뜻이라 그 자리에서 화면을 비울 이유가 없다 — 비우면 접힘 안으로 옮겨진 내레이션
+      // 블록까지 사라진다(resetBody 주석).
+      let restating = null;
       let errored = false;
       let activeStep = null;   // 현재 진행 중(스핀) 단계 요소
       let lastStepKey = null;  // 직전 단계 키(연속 중복 방지)
@@ -1084,14 +1088,13 @@
         title.className = "title";
         title.textContent = src.title || "(제목 없음)";
         main.append(top, title);
-        // 상품 카드(비웹)엔 저자·판매가를 노출한다. 데이터가 오는 형태가 여럿이라 관대하게
-        // 읽는다: 현행 공개 DTO는 author/sale_price 평면 필드이고, 아래 fallback은 가격 키가
-        // sale_price로 바뀌기 전 저장된 스냅샷(평면 price·meta.price) 호환 경로다.
-        // 값이 없으면 placeholder 없이 그 줄을 생략한다.
+        // 상품 카드(비웹)엔 저자·판매가를 노출한다. 현행 공개 DTO는 author/sale_price 평면
+        // 필드이고, price는 가격 키가 sale_price로 바뀌기 전 저장된 스냅샷 호환 경로다
+        // (meta.* 가지는 발화 불가라 삭제 — sse_source가 meta를 방출한 적이 없고
+        // sourceSnapshot 화이트리스트에도 없다). 값이 없으면 그 줄을 생략한다.
         if (!isWeb) {
           const author = src.author || src.snippet;
-          const priceRaw = [src.sale_price, src.price, src.meta && src.meta.sale_price, src.meta && src.meta.price]
-            .find((v) => v != null);
+          const priceRaw = [src.sale_price, src.price].find((v) => v != null);
           if (author) {
             const au = document.createElement("div");
             au.className = "info author";
@@ -1135,17 +1138,25 @@
         );
       }
 
-      // 본문 전체를 done.text 한 덩어리로 다시 그린다. reset(인용 검증이 본문을 바꿈)과
-      // finalize(정본 교체)가 **같은 코드**를 쓴다 — reset은 정본이 빈 특수 케이스일 뿐이다.
+      // 정본(done.text·reset 재전송분)으로 본문을 갈아끼운다. reset과 finalize가 **같은
+      // 코드**를 쓴다.
+      //
+      // 블록을 새로 만들지 않고 **기존 블록에 정본 조각을 다시 배분**한다(md.js
+      // redistributeCanonical — 접힘이 블록 위치에서 파생되는 표현이라, 통짜로 다시 그리면
+      // 이미 접힌 조사 서술이 최종 답 머리로 되살아난다).
       function replaceBody(text) {
+        pendingSplit = false;
+        const { kept, segments } = redistributeCanonical(text, blocks.map((b) => b.text));
         // 본문 블록만 지운다 — 도구 스텝 줄은 blocks 밖(flow 직속)이라 조사 기록이
         // reset 턴에서도 살아남는다(인라인 타임라인의 부수 이득).
-        blocks.splice(0).forEach((b) => b.el.remove());
-        pendingSplit = false;
-        if (!text) { firstDelta = false; return; }
-        const block = pushBlock();
-        block.text = text;
-        renderBlock(block);
+        blocks.slice(kept).forEach((b) => b.el.remove());
+        blocks.length = kept;
+        segments.forEach((seg, k) => {
+          const block = k < kept ? blocks[k] : pushBlock();
+          block.text = seg;
+          renderBlock(block);
+        });
+        if (!blocks.length) firstDelta = false;
       }
 
       return {
@@ -1206,6 +1217,15 @@
           scrollToBottom();
         },
         appendDelta(chunk) {
+          // reset 이후의 재전송분은 **정본 전량**이다. 새 블록을 열지 않고 기존 블록 구조에
+          // 다시 배분한다(replaceBody). 여러 조각으로 와도 누적본으로 매번 다시 배분하면
+          // 되므로 프레임 분할에 의존하지 않는다.
+          if (restating !== null) {
+            restating += chunk;
+            replaceBody(restating);
+            scrollToBottom();
+            return;
+          }
           if (!firstDelta) {
             firstDelta = true;
             clearTyping();
@@ -1221,12 +1241,17 @@
           renderBlock(block);
           scrollToBottom();
         },
-        // 백엔드 reset: 흘린 본문을 비우고 정본을 다시 받는다(인용 검증이 본문을 바꾼 경우).
+        // 백엔드 reset: 인용 검증이 본문을 바꿨으니 정본을 다시 받는다. **여기서 화면을
+        // 비우지 않는다** — 비우면 접힘 안으로 옮겨진 내레이션 블록까지 DOM에서 사라지고
+        // (processFold 상태는 남아 재계산도 막힌다) 뒤이어 온 정본이 통짜 블록으로 붙어
+        // 조사 서술이 최종 답 머리에 노출된다. 정본 대기 상태로만 들어가고, 교체는 정본이
+        // 도착한 뒤 replaceBody가 기존 블록 위에서 한다.
         // 힌트(hintMap)는 **보존한다** — 비우면 재렌더된 본문의 마커가 다시 생 대괄호가 된다.
         resetBody() {
-          replaceBody("");
+          restating = "";
         },
         finalize(payload, elapsedSec) {
+          restating = null;  // 정본 대기는 done으로 끝난다(아래 교체가 최종 판정)
           // error로 끝난 턴이면(백엔드가 error 뒤 done을 함께 보냄) 빨간 안내 말풍선을
           // 그대로 두고 "응답 X초" meta를 붙이지 않는다.
           if (errored) return;

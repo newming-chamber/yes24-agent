@@ -140,7 +140,14 @@ async def yes24_fetch(
     Returns:
         성공 시 status="ok"와 인용용 source_id, 본문 내용을 담은 dict. 상품 상세는
         type="book_detail"로 줄거리·목차 등을, 공지 페이지는 type="notice"로 text를
-        담는다. 본문이 상한보다 길어 잘렸으면 truncated=True와 total_chars(전체 길이)가
+        담는다. 상품 페이지에 설명 본문이 아예 없으면(굿즈·문구 등 비도서에서 흔하다)
+        intro·toc·pub_review·snippet이 모두 null이고 message가 그 사실을 명시한다 —
+        그 상품에 대해 관측된 것은 함께 실린 상품 정보 필드(가격·평점·제목 등)뿐이다.
+        상품 페이지에는 배송 소요·수령 예정일·재고 상태가 어떤 필드로도 담기지 않는다 —
+        주문 시점과 배송지에 따라 주문 화면에서 계산되는 값이라 페이지 본문에 실리지 않으며,
+        상세를 열어도 관측되지 않는다. 배송 소요·마감 시각·수령일 기준이 실제로 관측되는
+        곳은 배송 정책 페이지 본문뿐이다.
+        본문이 상한보다 길어 잘렸으면 truncated=True와 total_chars(전체 길이)가
         함께 온다 — 찾는 내용이 안 보이면 find 키워드로 재호출해 뒷부분을 읽는다.
         함께 오는 links는 이 페이지에서 더 볼 수 있는 다른 Yes24 페이지 후보
         목록이다(아직 열지 않은 페이지 — 인용 대상이 아니며, 필요하면 그 url로 다시
@@ -260,7 +267,13 @@ def _fetch_product(
     # 검색·브라우즈와 같은 필드 집합(product_fields) — 상세만 연 턴에서도 게이트가 대조할
     # 접지 필드(publisher·rating·sale_price·pub_date…)를 빠짐없이 싣는다.
     fields = product_fields(product)
-    content = "\n\n".join(block for block in (intro, toc, pub_review, *weekly_reviews) if block)
+    # 설명 블록이 하나도 없는 상품(굿즈·문구 등)은 페이지에 설명 본문 자체가 없다. 이때 빈
+    # 문자열을 근거(snippet)로 등록하면 모델에 남는 신호가 "열어봤다"뿐이라, 열어보고도 못 본
+    # 내용을 파라메트릭으로 채운다(실측 2026-08-03: 책갈피·독서대 답변의 '특징'이 전부 창작,
+    # 출처 snippet 길이 0). 없음을 값으로 위장하지 않고 None으로 두어 아래 message로 명시한다.
+    content = (
+        "\n\n".join(block for block in (intro, toc, pub_review, *weekly_reviews) if block) or None
+    )
     # 상품 상세의 page 링크는 전 페이지 공통 GNB(국내도서·카테고리 트리 …)라 정보가 0이다
     # (실측 48건 중 35건). 공지·목록 페이지에서는 같은 kind가 정책 내비의 근간이므로
     # _fetch_generic은 전부 유지한다 — 걸러내는 기준은 페이지 유형이지 링크 문구가 아니다.
@@ -276,11 +289,8 @@ def _fetch_product(
     )
 
     logger.info(
-        "yes24_fetch url=%r status=ok type=book_detail total=%d truncated=%s find=%r",
-        url,
-        trunc.total_chars,
-        trunc.truncated,
-        find,
+        f"yes24_fetch url={url!r} status=ok type=book_detail total={trunc.total_chars} "
+        f"truncated={trunc.truncated} detail_text={content is not None} find={find!r}"
     )
     detail = {
         "status": "ok",
@@ -289,7 +299,6 @@ def _fetch_product(
         "url": url,
         "type": "book_detail",
         **fields,
-        "is_ebook": product.get("is_ebook"),
         # snippet은 블록들의 연접이라 모델에겐 중복이지만, **공개 출처 DTO의 근거 본문**이다.
         # done.sources는 세션 레지스트리가 아니라 이 도구 응답에서 만들어지므로
         # (_sources_from_response), 여기서 빼면 출처 카드·인용 검증·QA 판정이 근거를 잃는다 —
@@ -303,6 +312,15 @@ def _fetch_product(
         "links": links,
         "checked_at": checked_at,
     }
+    if content is None:
+        # 페이지는 열렸고 가격·평점 등 구조 필드는 실제로 관측됐으므로 status=error로 버리지
+        # 않는다(그러면 정당한 가격 인용까지 사라진다). 대신 없는 것을 없다고 명시한다 —
+        # _fetch_generic의 error_type="empty"와 같은 정신이되, 관측된 사실은 살린 형태다.
+        detail["message"] = (
+            "이 상품 페이지에는 설명 본문(책소개·목차·출판사 서평·주간 우수리뷰)이 없습니다. "
+            "이 상품에 대해 관측된 내용은 함께 실린 상품 정보 필드가 전부이며, 재질·디자인·"
+            "용도·사용감 등 서술은 이 페이지에서 확인되지 않았습니다."
+        )
     if trunc.truncated:
         # 가법 필드: 잘리지 않은 상세의 반환 형태는 기존과 동일하다.
         detail["truncated"] = True

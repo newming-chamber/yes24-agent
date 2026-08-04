@@ -4,13 +4,15 @@ instruction·도구·페르소나를 조립해 단일 루트(pro) LlmAgent를 �
 시점 날짜를 반영하는 콜러블이며, 단일 순차 도구 루프는 runner가 돌린다.
 """
 
+from functools import lru_cache
+
 from google.adk.agents import LlmAgent
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.genai import types
 
 from yes24_agent.config import get_settings
 from yes24_agent.rbti.persona import axis_label, build_persona_block
-from yes24_agent.sources import today_kst
+from yes24_agent.sources import time_kst, today_kst
 from yes24_agent.tools.fetch_many import fetch_many
 from yes24_agent.tools.reply_directly import reply_directly
 from yes24_agent.tools.web_fetch import web_fetch
@@ -213,22 +215,24 @@ _NARRATIVE_CONTRACT = """
   제공되지 않았다고 밝히세요.
 """
 
-# 날짜는 매일 바뀌므로 본문 중간이 아니라 **말미**에 둔다 — 앞의 본문이 바이트 동일한 프리픽스로
-# 유지돼 Gemini implicit caching이 히트한다(TTFT·비용 절감). rbti 없는 경로(대다수 트래픽)에서는
-# 프롬프트 전체가 이 51자 말미만 빼고 캐시 가능한 프리픽스가 된다.
+# 날짜·시각은 계속 바뀌므로 본문 중간이 아니라 **말미**에 둔다 — 앞의 본문이 바이트 동일한
+# 프리픽스로 유지돼 Gemini implicit caching이 히트한다(TTFT·비용 절감). rbti 없는 경로(대다수
+# 트래픽)에서는 프롬프트 전체가 이 한 줄 말미만 빼고 캐시 가능한 프리픽스가 된다.
+# 시각까지 넣으면 말미가 분마다 달라져 이 프리픽스 뒤(대화 히스토리)는 턴 간 재사용이 끊긴다
+# — 정확도 대 캐시 할인의 교환이며, 초 단위가 아닌 분 단위 절사가 그 완화다(sources.time_kst).
 #
 # persona_directive는 여기 넣지 않는다: 말미로 옮겼을 때 페르소나가 증거 계약보다 뒤(최신 위치)로
 # 밀려 RBTI 경로에서 무인용 추천(도구 없이 파라메트릭 지식으로 책 추천)이 관측됐다
 # (2026-07-20 A/B: 말미 2건/7런 vs 원위치 0건/6런). 캐시 이득보다 인용 계약이 우선이라 원위치 유지.
 _DYNAMIC_TAIL_TEMPLATE = """
-오늘은 {today}입니다. 상대 시점과 최신성은 이 날짜를 기준으로 판단합니다."""
+오늘은 {today}이고 지금은 {now}(KST)입니다. 상대 시점과 최신성은 이 날짜·시각을 기준으로 판단합니다."""
 
 
 def build_system_prompt(persona_directive: str = "") -> str:
-    """정적 본문에 (채팅 전용) 페르소나 지시를 채우고, 말미에 현재 날짜(KST)를 붙여 조립한다.
+    """정적 본문에 (채팅 전용) 페르소나 지시를 채우고, 말미에 현재 날짜·시각(KST)을 붙여 조립한다.
 
     persona_directive가 ""(기본)이면 해당 자리에 빈 문자열이 들어가 rbti 없는 경로와 바이트 동일.
-    그 경로에서는 날짜 말미를 뺀 앞부분 전체가 매 인보케이션 바이트 동일한 캐시 프리픽스다.
+    그 경로에서는 날짜·시각 말미를 뺀 앞부분 전체가 매 인보케이션 바이트 동일한 캐시 프리픽스다.
     """
     # RBTI 소개 단락은 2026-07-29 삭제 — RBTI/매트릭스는 개발자용 검증 뷰이지 사용자에게
     # 소개·영업할 앱 기능이 아니다(사용자 확인: "내가 보기 위한 뷰"). 페르소나 선택 시의
@@ -237,27 +241,42 @@ def build_system_prompt(persona_directive: str = "") -> str:
         policy_seeds=_format_policy_seeds(),
         persona_directive=persona_directive,
     )
-    tail = _DYNAMIC_TAIL_TEMPLATE.format(today=today_kst())
+    tail = _DYNAMIC_TAIL_TEMPLATE.format(today=today_kst(), now=time_kst())
     return f"{core}{_NARRATIVE_CONTRACT}{tail}"
 
 
+@lru_cache(maxsize=64)
+def _invocation_instruction(invocation_id: str, code: str) -> str:
+    """한 인보케이션(사용자 발화 1건)이 처음 조립한 instruction을 그 턴 내내 재사용한다.
+
+    ADK는 instruction 콜러블을 인보케이션이 아니라 **LLM 요청마다** 평가한다. 그래서 도구
+    루프가 분 경계를 넘으면 라운드 1이 본 시각과 라운드 3이 본 시각이 달라진다 — 같은 발화를
+    처리하는 중에 기준 시각이 흔들리면 마감 경계(당일배송 등) 판단이 턴 중간에 뒤집힐 수 있다.
+    시각의 자연스러운 유효 범위는 인보케이션이며, 이 캐시가 그 범위를 코드로 고정한다.
+    (부수 효과로 프롬프트 프리픽스가 턴 내내 바이트 동일해져 implicit caching 재사용도 산다.)
+
+    상한 64는 동시에 진행 중인 인보케이션 수의 여유 상한이다 — 매트릭스 16셀이 동시에 돌아도
+    남는다. LRU가 오래된 항목을 퇴출하므로 장수 프로세스에서 무한 증식하지 않는다.
+    """
+    directive = persona_tool_directive(code) if code else ""
+    base = build_system_prompt(persona_directive=directive)
+    block = build_persona_block(code) if code else ""
+    return f"{base}\n\n{block}" if block else base
+
+
 def _instruction_provider(ctx: ReadonlyContext) -> str:
-    """ADK가 매 인보케이션마다 호출하는 동적 instruction — core·서술·독자 페르소나 조립.
+    """ADK가 LLM 요청마다 호출하는 동적 instruction — core·서술·독자 페르소나 조립.
 
     LlmAgent.instruction은 str뿐 아니라 (ReadonlyContext) -> str 콜러블을 받으며,
-    호출 시점에 평가된다. 날짜를 여기서 계산해 날짜 경계를 넘겨도 서버 재시작 없이
-    "오늘"이 정확히 유지되도록 한다.
+    호출 시점에 평가된다. 날짜·시각을 여기서 계산해 경계를 넘겨도 서버 재시작 없이
+    "오늘"·"지금"이 정확히 유지되도록 한다(턴 내부 고정은 _invocation_instruction).
 
     세션 state에 RBTI 코드가 있으면(플러밍이 저장) **두 지점**에 페르소나를 얹는다: 상단
     도구-반영 지시(persona_tool_directive, 검색·선택에 실제 적용)와 끝의 상세 블록
     (build_persona_block, 후보 구성·읽기 권유·강조 관점). 코드가 없거나 무효면 둘 다 ""이라 base와 바이트 동일
     (회귀 0). ctx.state는 세션 state의 읽기전용 뷰(MappingProxyType)다.
     """
-    code = ctx.state.get("rbti")
-    directive = persona_tool_directive(code) if code else ""
-    base = build_system_prompt(persona_directive=directive)
-    block = build_persona_block(code) if code else ""
-    return f"{base}\n\n{block}" if block else base
+    return _invocation_instruction(ctx.invocation_id, ctx.state.get("rbti") or "")
 
 
 def _force_tool_first_turn(callback_context, llm_request):

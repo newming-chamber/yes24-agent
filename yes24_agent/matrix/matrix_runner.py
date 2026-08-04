@@ -76,6 +76,44 @@ def _remap_marker_text(text: str, id_map: dict[int, int]) -> str:
     return _MARKER_RE.sub(_sub_group, text)
 
 
+# 정렬 비교에서 건너뛸 것: 마커 토큰과 가로 공백. 인용 검증이 정본에서 바꾸는 것은 마커
+# 표기뿐인데, 무효 마커를 지울 때 seam의 공백까지 흡수하므로(postprocess) 마커만 눈감으면
+# 공백 한 칸에 대조가 깨진다. 줄바꿈은 남긴다(검증이 건드리지 않는다).
+_ALIGN_SKIP_RE = re.compile(_MARKER_RE.pattern + r"|[ \t]+")
+
+
+def _normalize_for_align(text: str) -> tuple[str, list[int]]:
+    """마커·가로공백을 걷어낸 본문과, 남은 글자의 원문 인덱스를 돌려준다."""
+    kept: list[str] = []
+    index_map: list[int] = []
+    i = 0
+    while i < len(text):
+        skip = _ALIGN_SKIP_RE.match(text, i)
+        if skip:
+            i = skip.end()
+            continue
+        kept.append(text[i])
+        index_map.append(i)
+        i += 1
+    return "".join(kept), index_map
+
+
+def _aligned_offset(text: str, streamed: str) -> int:
+    """정본 text에서 이미 흐른 조각(streamed)이 끝나는 위치. 못 맞추면 -1.
+
+    인용 검증은 무효 마커를 지우고 남은 것을 1..n으로 다시 매기므로(postprocess), 정본은
+    스트리밍 본문과 **마커 표기만** 다르다. 그 차이에 눈감고 대조해 재번호에도 경계를 잃지
+    않는다 — 프론트의 같은 판정(md.js redistributeCanonical)과 한 쌍이다(런타임이 달라
+    사본이 둘일 뿐, 규칙은 하나다).
+    """
+    norm_text, index_map = _normalize_for_align(text)
+    norm_streamed, _ = _normalize_for_align(streamed)
+    if not norm_text.startswith(norm_streamed):
+        return -1
+    position = len(norm_streamed)
+    return index_map[position] if position < len(index_map) else len(text)
+
+
 def _parse_frame(frame: str) -> tuple[str, dict]:
     """SSE 프레임 문자열(event:/data:)을 (event, payload)로 되돌린다."""
     lines = frame.strip().split("\n")
@@ -90,7 +128,7 @@ async def _run_cell(question: str, code: str, model: str | None) -> dict:
     **채팅 runner를 그대로 소비한다 — 모듈·로직 동일, 유일한 차이는 rbti(페르소나) 주입뿐.**
     모델도 채팅에서 고른 것을 그대로 따른다(매트릭스 전용 모델 없음). 각 셀은 독립
     세션(session_id=None → runner가 고유 id 부여)이라 서로의 맥락을 오염시키지 않는다.
-    최종 done 프레임의 text·sources·cited_ids만 취해 열 프레임으로 재조립한다. 여기에
+    최종 done 프레임의 text·sources만 취해 열 프레임으로 재조립한다. 여기에
     **라운드 경계 오프셋(process_chars)**을 더한다: 채팅 화면이 조사 과정을 접는 근거는
     텍스트가 아니라 **도구 스텝 프레임이 본문을 끊는다는 이벤트 순서**인데, 셀은 본문 통째
     1회로 방출돼 그 순서 정보가 프론트에 남지 않는다. 본문에 라운드 구분자가 들어가긴
@@ -100,7 +138,6 @@ async def _run_cell(question: str, code: str, model: str | None) -> dict:
     """
     text = ""
     sources: list[dict] = []
-    cited_ids: list = []
     streamed: list[str] = []  # 흐른 본문 조각(라운드 경계를 세기 위한 것 — 방출하지 않는다)
     process_prefix = ""       # 마지막 도구 스텝까지 흐른 본문 = 경계의 정본
     settled = False           # reset 이후 = 정본 재전송, 라운드 경계를 더 셀 수 없다
@@ -115,8 +152,8 @@ async def _run_cell(question: str, code: str, model: str | None) -> dict:
                 streamed.append(data.get("text", ""))
             elif event == "reset":
                 # 인용 검증이 본문을 바꿔 정본이 통째로 다시 온다. 그 덩어리엔 경계가 없지만
-                # **이미 센 경계는 버리지 않는다** — 지워진 마커가 답 구간에 있었다면 과정
-                # 접두는 정본에서도 그대로다(아래 대조가 판정한다).
+                # **이미 센 경계는 버리지 않는다** — 바뀌는 것은 마커 표기뿐이라 과정 접두는
+                # 정본에서도 찾을 수 있다(아래 _aligned_offset 대조가 판정한다).
                 settled = True
             elif (
                 not settled
@@ -132,18 +169,19 @@ async def _run_cell(question: str, code: str, model: str | None) -> dict:
             elif event == "done":
                 text = data.get("text", "") or text
                 sources = data.get("sources", sources)
-                cited_ids = data.get("cited_ids", cited_ids)
-    # 오프셋은 **정본 위에서 유효해야** 쓴다: 과정 접두가 정본의 접두와 다르거나(인용 검증이
-    # 그 구간을 고친 경우) 경계 뒤에 남는 답이 없으면(도구 호출 후 본문 없이 끝난 셀) 접지
+    # 오프셋은 **정본 위에서 유효해야** 쓴다: 과정 접두를 정본에서 못 찾거나(인용 검증이 그
+    # 구간을 고친 경우) 경계 뒤에 남는 답이 없으면(도구 호출 후 본문 없이 끝난 셀) 접지
     # 않는다 — 과정만 남고 답이 사라지는 표시는 어떤 경우에도 만들지 않는다.
-    if not text.startswith(process_prefix) or not text[len(process_prefix) :].strip():
-        process_prefix = ""
+    # 대조는 마커 표기에 눈감는다: 재번호는 접두의 **표기만** 바꾸므로 그걸로 접힘을
+    # 포기하면 인용 있는 셀이 죄다 조사 로그로 시작한다(채팅 쪽 reset 회귀와 같은 뿌리).
+    cut = _aligned_offset(text, process_prefix) if process_prefix else 0
+    if cut < 0 or not text[cut:].strip():
+        cut = 0
     return {
         "code": code,
         "text": text,
         "sources": sources,
-        "cited_ids": cited_ids,
-        "process_chars": len(process_prefix),
+        "process_chars": cut,
     }
 
 
