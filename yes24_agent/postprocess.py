@@ -52,6 +52,43 @@ def _within_code_span(pos: int, ranges: list[tuple[int, int]]) -> bool:
     return any(start <= pos < end for start, end in ranges)
 
 
+# 인용 마커의 **방언**: 모델이 canonical `[n]` 대신 도구 결과의 필드명을 라벨로 달아 쓰는 형태
+# (`[source:6]`·`[출처 3]`·`[src 1]`). 2026-08-04 라이브 QA에서 한 턴 전체가 이 표기로 나와
+# 마커가 하나도 인식되지 않았고, 깨진 리터럴이 본문에 노출된 채 done.sources가 0건이 됐다 —
+# 접지가 통째로 새는 구멍이다.
+#
+# 라벨을 **열거로 좁힌 것이 이 규칙의 핵심**이다. 이것은 콘텐츠 키워드 매칭이 아니라 우리
+# 인용 프로토콜이 자기 어휘(`source_id`와 그 표기 변형)의 별칭을 받아들이는 문법 확장이다.
+# 임의 라벨까지 열면 `[그림 1]`·`[표 2]` 같은 일반 프로즈 대괄호를 인용으로 오인해, 이번에
+# 고치려는 것과 반대 방향의 본문 파손이 생긴다(P0 2026-07-20과 같은 병).
+# `(?!\()`는 마크다운 링크(`[source: 1](url)`)를 제외한다.
+_DIALECT_LABELS = ("source_id", "source", "src", "출처")
+_DIALECT_MARKER_PATTERN = re.compile(
+    r"(?<!\\)\[\s*(?:" + "|".join(_DIALECT_LABELS) + r")\s*[:#]?\s*"
+    r"(\d+(?:\s*,\s*\d+)*)\s*\](?!\()",
+    re.IGNORECASE,
+)
+
+
+def normalize_marker_dialects(text: str) -> str:
+    """마커 방언을 canonical `[n]`·`[n, m]`으로 재작성한다(검증은 그 뒤 기존 경로가 한다).
+
+    정규화는 인용을 **인정**하지 않는다 — 형태만 맞춰 줄 뿐이라, 존재하지 않는 id를 가리키는
+    방언은 이어지는 `validate_citations`가 평소처럼 지운다. 코드 스팬 안의 방언은 리터럴이므로
+    마커 검증과 **같은 눈**(`_code_span_ranges`)으로 건너뛴다 — 판정을 두 벌 두면 한 벌만
+    고치는 실수가 반복된다.
+    """
+    code_ranges = _code_span_ranges(text)
+
+    def _replace(match: re.Match) -> str:
+        if _within_code_span(match.start(), code_ranges):
+            return match.group(0)
+        ids = ", ".join(part.strip() for part in match.group(1).split(","))
+        return f"[{ids}]"
+
+    return _DIALECT_MARKER_PATTERN.sub(_replace, text)
+
+
 # 소수점은 문장 경계가 아니다. 점 양쪽이 모두 숫자인 경우만 제외하고 나머지 문장부호를 찾는다.
 SENTENCE_BOUNDARY_PATTERN = re.compile(r"(?<!\d)\.|\.(?!\d)|[!?\n]")
 _PUNCT = re.compile(r"[^\w\s]")
@@ -133,7 +170,11 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
 
     코드 스팬(펜스 블록·인라인 코드) 안의 `[n]`은 배열 인덱스·수식이므로 마커 검증에서
     제외하고 원문 그대로 보존한다(`_code_span_ranges`).
+
+    검증 전에 마커 방언(`[source:6]` 등)을 canonical 형태로 정규화한다
+    (`normalize_marker_dialects`) — 표기가 무엇이든 검증·제거 규칙은 하나다.
     """
+    text = normalize_marker_dialects(text)
     valid_ids = {source["id"] for source in sources}
     code_ranges = _code_span_ranges(text)
 
