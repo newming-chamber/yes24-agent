@@ -59,29 +59,16 @@ def _with_col(data: dict, col: int | None) -> dict:
 
 
 def sse_source(source: dict, col: int | None = None) -> str:
-    """최종 인용 검증을 통과한 출처 이벤트를 공개 DTO로 직렬화한다.
+    """최종 인용 검증을 통과한 출처 이벤트를 공개 DTO 그대로 직렬화한다.
 
-    image_url·author·sale_price는 있는 상품 출처에만 싣고, 웹·정책 출처에서는 생략한다.
-    가격 키가 sale_price인 것은 파서가 뽑는 값이 정가가 아니라 할인 적용 판매가이기
-    때문이다(parsers.parse_product 참조) — 중립적인 이름으로 내보내면 소비자가 어느
-    가격인지 추측하게 된다.
+    **필드 선별은 여기서 하지 않는다** — 모든 호출부(runner 마감 2곳·matrix 재방출)가
+    이미 `project_public_source`를 거친 공개 DTO(`done.sources` 항목)를 넘기며, 무엇이
+    공개 가능한지의 판정은 그 투영 계층이 소유한다. 예전엔 여기서 id·title·url·type·상품
+    3필드만 다시 열거해 걸렀는데, 같은 판정의 중복 구현이라 공개 DTO에 필드가 늘 때마다
+    (예: dc_post의 gallery·write_time) 라이브 카드만 조용히 탈락하는 드리프트를 냈다
+    (2026-08-04 실측: 카드 정보줄이 새로고침 후에만 표시).
     """
-    data = {
-        "id": source["id"],
-        "title": source["title"],
-        "url": source["url"],
-        "type": source["type"],
-    }
-    image_url = source.get("image_url")
-    if image_url:
-        data["image_url"] = image_url
-    author = source.get("author")
-    if author:
-        data["author"] = author
-    sale_price = source.get("sale_price")
-    if sale_price is not None:
-        data["sale_price"] = sale_price
-    return format_sse("source", _with_col(data, col))
+    return format_sse("source", _with_col(dict(source), col))
 
 
 def sse_delta(text: str, col: int | None = None, extra: dict | None = None) -> str:
