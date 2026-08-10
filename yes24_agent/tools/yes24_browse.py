@@ -242,6 +242,7 @@ async def yes24_browse(
             snippet=item.get("author"),
             checked_at=checked_at,
             meta={**fields, "rank": item.get("rank")},
+            invocation_id=getattr(tool_context, "invocation_id", None),
         )
         results.append(
             {

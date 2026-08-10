@@ -7,7 +7,7 @@
 """
 
 from yes24_agent.sources import merge_source_records
-from yes24_agent.yes24.parsers import GROUNDING_FIELDS
+from yes24_agent.toolsets import TOOLSET_SOURCE_TYPES
 from yes24_agent.yes24.urls import BROWSE_SEED_URLS
 
 
@@ -47,7 +47,7 @@ def _status_for_call(call) -> tuple[str, str] | None:
     if name in ("yes24_search", "web_search"):
         angles = _angles(args.get("queries"))
         if angles:
-            stage = "searching" if name == "yes24_search" else "searching_web"
+            stage = "searching_web" if name == "web_search" else "searching"
             return stage, " · ".join(angles)
         return None
     if name == "yes24_fetch":
@@ -115,8 +115,19 @@ def _status_for_result(count: int) -> tuple[str, str] | None:
 # 끝까지 안 실렸다(실측 회귀). 조립을 한 곳에 두면 계약 드리프트가 구조적으로 불가능해진다.
 # 상품 결과에만 있는 필드(author·sale_price·rating·publisher·image_url)는 웹 출처에선 None이고,
 # 프론트가 생략한다.
+# toolset이 선언한 출처 타입별 공개 필드를 **레지스트리에서 합집합으로** 끌어온다 — 도구
+# 모듈을 직수입하면 새 toolset마다 이 파일을 고쳐야 하고, 같은 목록이 두 벌이 되어 한쪽만
+# 고치는 드리프트가 난다. 스칼라 형태 필터는 아래에서 동일 적용된다.
+_REGISTERED_SOURCE_FIELDS = tuple(
+    dict.fromkeys(
+        field
+        for types in TOOLSET_SOURCE_TYPES.values()
+        for fields in types.values()
+        for field in fields
+    )
+)
 _PUBLIC_SOURCE_FIELDS = (
-    *GROUNDING_FIELDS,
+    *_REGISTERED_SOURCE_FIELDS,
     "rank",
     "is_ebook",
     "snippet",

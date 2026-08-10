@@ -62,7 +62,7 @@ from yes24_agent.sse import (
     sse_status,
 )
 from yes24_agent.thought_translation import translate_thought_label
-from yes24_agent.tools.web_search import start_web_prefetch
+from yes24_agent.toolsets import get_resolved_app
 
 logger = logging.getLogger(__name__)
 
@@ -355,6 +355,7 @@ async def run_agent_stream(
     rbti: str | None = None,
     model: str | None = None,
     session_service: BaseSessionService | None = None,
+    app=None,
 ) -> AsyncIterator[str]:
     """사용자 메시지 1건을 처리하며 SSE 프레임 문자열을 순서대로 yield한다.
 
@@ -372,7 +373,9 @@ async def run_agent_stream(
     # 웹 선제 실행: 모델 1라운드 사고와 그라운딩 서브콜을 병렬화하는 순수 지연 최적화.
     # 힌트 오판·실패·미소비 전부 정상 경로 폴백이라 답 내용·도구 선택에 영향이 없다
     # (계약·격리·매트릭스 공유는 web_search.py의 프리페치 절 참조).
-    start_web_prefetch(message)
+    app = app if app is not None else get_resolved_app()
+    for prefetch in app.prefetch_hooks:
+        prefetch(message, app.active)
     # 같은 session_id 동시 요청을 순차화한다(입력 id 기준). 신규 세션(None)은 create_session이
     # 고유 id를 부여하므로 충돌하지 않아 락이 불필요하다.
     lock = _get_session_lock(session_id) if session_id else None
@@ -456,7 +459,7 @@ async def run_agent_stream(
         # 사용자가 UI에서 고른 모델의 에이전트(무효·미지정이면 config 기본 모델). 자동 라우팅이
         # 아니라 명시 선택이라 단일 루프 원칙은 유지된다 — 프롬프트·도구·thinking 구성은
         # 모델과 무관하게 동일하고, done.model이 실제 사용 모델을 싣는다.
-        agent = get_agent(model)
+        agent = get_agent(model, app)
         active_model = str(agent.model)
 
         runner = Runner(
@@ -521,7 +524,8 @@ async def run_agent_stream(
                             retried_overload = True
                             # 재시도 스트림에도 프리페치를 다시 연다 — 첫 시도가 이미
                             # 소비했어도 캐시가 완료 task를 돌려주므로 추가 비용이 없다.
-                            start_web_prefetch(message)
+                            for prefetch in app.prefetch_hooks:
+                                prefetch(message, app.active)
                             raw_body = []
                             streamed = []
                             renumberer = StreamRenumberer()

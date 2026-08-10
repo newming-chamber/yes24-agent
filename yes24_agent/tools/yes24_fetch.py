@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
-from yes24_agent.sources import now_checked_at, register_source
+from yes24_agent.sources import DETAIL_FIDELITY, now_checked_at, register_source
 from yes24_agent.tools.yes24_search import _get_client
 from yes24_agent.yes24.client import Yes24FetchError
 from yes24_agent.yes24.parsers import (
@@ -283,9 +283,12 @@ def _fetch_product(
         title=title,
         url=url,
         source_type="book_detail",
+        # 상세 관측이라 같은 URL의 목록 요약보다 우선한다(코어는 이 숫자만 비교한다).
+        fidelity=DETAIL_FIDELITY,
         snippet=content,
         checked_at=checked_at,
         meta=fields,
+        invocation_id=getattr(tool_context, "invocation_id", None),
     )
 
     logger.info(
@@ -399,6 +402,7 @@ def _fetch_generic(
         source_type="notice",
         snippet=window,
         checked_at=checked_at,
+        invocation_id=getattr(tool_context, "invocation_id", None),
     )
 
     logger.info(

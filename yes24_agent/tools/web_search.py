@@ -218,8 +218,15 @@ def _log_prefetch_outcome(task: asyncio.Task) -> None:
         logger.info(f"web_search prefetch 실패(정상 경로 폴백): {task.exception()!r:.120}")
 
 
-def start_web_prefetch(message: str) -> None:
-    """이번 턴의 웹 프리페치를 시작한다(러너가 턴 시작에 호출, 실패·미소비 무해)."""
+def start_web_prefetch(message: str, active: frozenset[str]) -> None:
+    """이번 턴의 웹 프리페치를 시작한다(러너가 턴 시작에 호출, 실패·미소비 무해).
+
+    `active`는 **이번 요청의** 활성 toolset이다. 전역 구성을 여기서 다시 읽으면 UI에서 web을
+    끈 요청도 프리페치가 돌아, 도구는 없는데 웹 서브콜만 나가는 어긋남이 된다 — 도구 등록·
+    프롬프트 조립과 같은 구성을 봐야 한다.
+    """
+    if "web" not in active:
+        return
     settings = get_settings()
     if not (settings.web_prefetch_enabled and settings.web_search_backend == "grounding"):
         return
@@ -503,6 +510,7 @@ async def _grounded_search(
             snippet=snippet,
             checked_at=checked_at,
             meta={"published_at": None, "last_updated": None},
+            invocation_id=getattr(tool_context, "invocation_id", None),
         )
         results.append(
             {
@@ -770,6 +778,7 @@ async def web_search(
                 snippet=snippet,
                 checked_at=checked_at,
                 meta={"published_at": published_at, "last_updated": last_updated},
+                invocation_id=getattr(tool_context, "invocation_id", None),
             )
             url_to_index[url] = len(results)
             results.append(

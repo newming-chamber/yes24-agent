@@ -264,6 +264,7 @@ async def yes24_search(
                 snippet=item.get("author"),
                 checked_at=checked_at,
                 meta=fields,
+                invocation_id=getattr(tool_context, "invocation_id", None),
             )
             key_to_index[key] = len(results)
             results.append(

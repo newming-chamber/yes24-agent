@@ -43,6 +43,15 @@ class Settings(BaseSettings):
     # 일치. ANY의 보호는 입구(도구 강제)에서 출구(validate_citations 인용 검증)로 이동해도
     # 유지됨이 실증됐다. True로 되돌리면 예전 ANY 가드(느리지만 사전 차단)로 복귀.
     force_first_turn_tool: bool = False
+    # 활성 도구셋(toolsets.TOOLSETS 키 부분집합). 도구 등록·프롬프트 fragment 활성·프론트
+    # 브랜딩이 여기서 파생된다. 순서는 레지스트리 선언 순서가 정본(이 리스트는 켜고 끄기만).
+    # 미등록 이름·빈 목록은 기동 시 ValueError(fail-loud — toolsets.resolve_app).
+    # 타입이 list[str]인 이유: config는 레지스트리를 모른다(Literal 금지 — 계층 역전 방지).
+    # env: ENABLED_TOOLSETS='["yes24","web"]'
+    enabled_toolsets: list[str] = ["yes24", "web"]
+    # 정체성·브랜딩 페르소나(toolsets.PERSONAS 키). 프롬프트 정체성 fragment와 프론트
+    # 문안(제목·인사·예시 칩)이 파생된다.
+    agent_persona: str = "yes24"
     # 추론 예산. -1 = 동적(모델이 질의별로 사고량을 스스로 결정). 과거 512 고정의 근거였던
     # "-1은 첫 토큰 ~10.8s" 실측은 사고 요약 스트리밍 도입 후 재현되지 않는다(2026-07-28
     # A/B: 첫 반응 -1·512 모두 3.2~3.8s 동일). 총시간은 쉬운 질문에서 -1이 우세(평균 5.9s
@@ -232,6 +241,18 @@ class Settings(BaseSettings):
     # 활성화돼 미들웨어가 보호 경로(/ ·/matrix ·/chat/*)를 쿠키로 가린다. env `ACCESS_PASSWORD`로
     # 주입한다(하드코딩 대신 env). 진짜 인증이 아니라 데모 접근을 막는 단일 공유 비밀번호 게이트다.
     access_password: str = ""
+    # 로그인월의 두 번째 비밀번호(세팅 조정용, env `ADMIN_ACCESS_PASSWORD`). 이 값으로 로그인한
+    # 세션만 모델 선택·도구 토글·모델명 노출(/models·/toolsets·done.model)이 허용되고,
+    # access_password(데모) 로그인에는 전부 숨긴다. 빈 문자열이면 역할 구분 없음(모든 로그인이
+    # 세팅 접근 가능 — 기존 동작). access_password가 켜져 있을 때만 의미가 있으며,
+    # admin_password(/admin 운영 데이터 열람)와는 별개다.
+    admin_access_password: str = ""
+    # 데모 로그인(access_password) 세션에 강제되는 앱 구성(페르소나·도구). 역할 분리가 활성일
+    # 때(두 비밀번호 모두 설정) 데모 세션은 서버 기본(agent_persona·enabled_toolsets)·요청
+    # 필드와 무관하게 이 구성으로 고정된다 — 브랜딩·프롬프트 정체성·도구가 전부 여기서
+    # 파생된다. 세팅 로그인·로그인월 비활성은 기존대로 서버 기본을 따른다.
+    demo_persona: str = "yes24"
+    demo_enabled_toolsets: list[str] = ["yes24", "web"]
     # 로그인 쿠키 유효기간(초). 데모 접근 게이트라 재로그인 성가심을 줄이되 무한은 아니게 7일.
     access_cookie_max_age_s: int = 7 * 24 * 60 * 60
     # 로그인·admin 쿠키에 `Secure`를 붙일지. **기본 False가 의도**다 — 현재 배포(deploy-mq.sh)는

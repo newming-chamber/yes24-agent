@@ -65,7 +65,7 @@ def sse_source(source: dict, col: int | None = None) -> str:
     이미 `project_public_source`를 거친 공개 DTO(`done.sources` 항목)를 넘기며, 무엇이
     공개 가능한지의 판정은 그 투영 계층이 소유한다. 예전엔 여기서 id·title·url·type·상품
     3필드만 다시 열거해 걸렀는데, 같은 판정의 중복 구현이라 공개 DTO에 필드가 늘 때마다
-    (예: dc_post의 gallery·write_time) 라이브 카드만 조용히 탈락하는 드리프트를 냈다
+    (예: 새 출처 타입의 메타 필드) 라이브 카드만 조용히 탈락하는 드리프트를 냈다
     (2026-08-04 실측: 카드 정보줄이 새로고침 후에만 표시).
     """
     return format_sse("source", _with_col(dict(source), col))

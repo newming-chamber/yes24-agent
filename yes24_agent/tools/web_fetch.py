@@ -155,6 +155,7 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
         source_type="web",
         snippet=text,
         checked_at=checked_at,
+        invocation_id=getattr(tool_context, "invocation_id", None),
     )
 
     logger.info(

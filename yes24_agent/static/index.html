@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Yes24 AI 어시스턴트</title>
+  <title>__BRAND_TITLE__</title>
   <style>
     :root {
       --bg: #f7f7f8;
@@ -104,6 +104,30 @@
       cursor: pointer; max-width: 150px;
     }
     .model-select:hover { color: var(--text); border-color: var(--accent); }
+    /* 도구 토글 — 모델 선택기와 같은 톤. 목록·잠금은 /toolsets(레지스트리)가 단일 진실이라
+       프론트에 toolset 키를 박지 않는다. <details>라 열고 닫는 JS·백드롭이 필요 없다. */
+    .tools-menu { position: relative; }
+    .tools-menu > summary {
+      font-size: 12px; color: var(--muted); background: transparent;
+      border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px;
+      cursor: pointer; list-style: none; user-select: none;
+    }
+    .tools-menu > summary::-webkit-details-marker { display: none; }
+    .tools-menu > summary:hover,
+    .tools-menu[open] > summary { color: var(--text); border-color: var(--accent); }
+    .tools-pop {
+      position: absolute; z-index: 50; top: calc(100% + 6px); right: 0; min-width: 170px;
+      background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+      padding: 8px; display: flex; flex-direction: column; gap: 2px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+    }
+    .tools-pop label {
+      display: flex; align-items: center; gap: 7px; font-size: 12.5px;
+      color: var(--text); padding: 4px 6px; border-radius: 7px; cursor: pointer;
+    }
+    .tools-pop label:hover { background: var(--accent-soft); }
+    .tools-pop input:disabled { cursor: default; }
+    .tools-pop input:disabled + span { color: var(--muted); }
 
     #conversation {
       flex: 1 1 auto;
@@ -440,15 +464,21 @@
 <body>
   <div class="app landing" id="app">
     <header>
-      <span class="logo">📚</span>
-      <h1>Yes24 AI 어시스턴트</h1>
+      <span class="logo">💬</span>
+      <h1>__BRAND_TITLE__</h1>
       <span class="spacer"></span>
       <a id="matrix-navlink" class="navlink" href="/matrix" title="한 질문을 16가지 독서 성향으로 비교해 보기" hidden>🧭 16유형 비교</a>
       <select id="model-select" class="model-select" title="답변 생성 모델" aria-label="답변 모델 선택"></select>
+      <details id="tools-menu" class="tools-menu">
+        <summary title="이 브라우저에서 사용할 도구" aria-label="도구 선택">🧰 도구</summary>
+        <div class="tools-pop" id="tools-pop"></div>
+      </details>
       <button id="persona-badge" class="persona-badge" aria-haspopup="dialog" aria-expanded="false">
         <span class="pb-ico">📖</span><span id="persona-label">독서 성향</span>
       </button>
       <button id="new-chat">새 대화</button>
+      <!-- 로그인 역할 배지 겸 로그아웃 링크 — 서버 마커 치환(ACCESS_ROLE)이 있을 때만 표시 -->
+      <a id="access-badge" class="navlink" href="/logout" title="로그아웃하고 다른 비밀번호로 전환" hidden></a>
     </header>
 
     <div class="persona-backdrop" id="persona-backdrop" hidden></div>
@@ -466,7 +496,7 @@
       </div>
     </div>
 
-    <!-- 인사(intro)는 JS가 상수(LANDING_GREETING/LANDING_SUBTITLE)로 그린다 — 문구 단일 출처. -->
+    <!-- 인사(intro)는 JS가 서버 주입 BRANDING(마커 치환)으로 그린다 — 문구 단일 출처는 toolsets.PERSONAS. -->
     <div id="conversation"></div>
 
     <div class="jump-anchor"><button id="jump-latest" class="jump-latest" hidden>↓ 최신</button></div>
@@ -516,16 +546,20 @@
         .catch(() => { /* 실패 시 숨김 유지(fail-closed) */ });
     })();
 
-    // 랜딩(빈 대화) 인사 — 문구는 여기 한 곳에서만 정의한다.
-    const LANDING_GREETING = "무엇을 도와드릴까요?";
-    const LANDING_SUBTITLE = "무엇이든 물어보세요. 책과 상품은 Yes24 실시간 근거로 더 정확하게 답해드려요.";
-
-    const EXAMPLES = [
-      "요즘 인기 에세이 추천해줘",
-      "YES24 단순 변심 반품 조건 알려줘",
-      "오늘 주요 경제 뉴스 요약해줘",
-      "이 문장을 더 따뜻하게 다듬어줘",
-    ];
+    // 랜딩(빈 대화) 인사·예시 칩 — 서버가 마커를 persona 문안(JSON)으로 치환해 주입한다.
+    // 파일을 직접 열면(마커 미치환) null — 사용처는 전부 null 가드라 JS 무에러(폴백 사본 금지).
+    const BRANDING = /*__BRANDING__*/null;
+    // 로그인 역할 배지 — GET /me {"role":"admin"|"demo"|null}. null·조회 실패면 비표시.
+    // 서버 API가 단일 계약(외부 프론트 동일 경로)이고, 실제 세팅 강제는 서버 몫이라 표시용이다.
+    (async () => {
+      const accessBadge = document.getElementById("access-badge");
+      try {
+        const { role } = await (await fetch("/me")).json();
+        if (!role) return;
+        accessBadge.textContent = (role === "admin" ? "세팅" : "데모") + " · 로그아웃";
+        accessBadge.hidden = false;
+      } catch (e) { /* 조회 실패 시 배지 숨김 유지 */ }
+    })();
     const STATUS_ICON = {
       thinking: "💭", searching: "🔎", searching_web: "🌐", reading: "📖",
       browsing: "📚", notice: "⚠️", found: "✅",
@@ -572,6 +606,53 @@
         else localStorage.removeItem(MODEL_STORAGE_KEY);
       } catch (e) {}
     });
+
+    // ── 도구 토글: /toolsets(레지스트리 파생)로 채우고 선택을 localStorage에 지속 ──
+    // 서버 기본 구성과 같으면 payload에서 생략한다(요청 = 기본). 잠금 항목은 없다 —
+    // 비어있지만 않으면 모든 조합이 유효하고, 정체성은 켜진 toolset에서 파생된다.
+    const toolsMenu = document.getElementById("tools-menu");
+    const toolsPop = document.getElementById("tools-pop");
+    const TOOLS_STORAGE_KEY = "yes24_chat_toolsets";
+    let enabledToolsets = null;   // null이면 서버 기본 구성
+    const sameSet = (a, b) => a.length === b.length && a.every((k) => b.includes(k));
+    (async () => {
+      try {
+        const r = await fetch("/toolsets");
+        const { toolsets, active } = await r.json();
+        const keys = toolsets.map((t) => t.key);
+        let saved = null;
+        try { saved = JSON.parse(localStorage.getItem(TOOLS_STORAGE_KEY)); } catch (e) {}
+        const valid = Array.isArray(saved) && saved.length
+          && saved.every((k) => keys.includes(k));
+        const chosen = valid ? saved : active;
+        let lastPicked = null;   // 전부 해제 시 되돌릴 마지막 체크 항목
+        const sync = () => {
+          const picked = [...toolsPop.querySelectorAll("input:checked")].map((b) => b.value);
+          // 전부 해제는 무효 조합이라 마지막 하나는 되돌린다(서버도 400으로 거절한다).
+          if (!picked.length) { lastPicked.checked = true; picked.push(lastPicked.value); }
+          enabledToolsets = sameSet(picked, active) ? null : picked;
+          try {
+            if (enabledToolsets) localStorage.setItem(TOOLS_STORAGE_KEY, JSON.stringify(picked));
+            else localStorage.removeItem(TOOLS_STORAGE_KEY);
+          } catch (e) {}
+        };
+        for (const t of toolsets) {
+          const label = document.createElement("label");
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          box.value = t.key;
+          box.checked = chosen.includes(t.key);
+          const span = document.createElement("span");
+          span.textContent = t.key;
+          span.title = t.tools.join(", ");
+          label.append(box, span);
+          box.addEventListener("change", () => { if (box.checked) lastPicked = box; sync(); });
+          if (box.checked) lastPicked = box;
+          toolsPop.appendChild(label);
+        }
+        sync();
+      } catch (e) { toolsMenu.hidden = true; }  // /toolsets 실패 시 숨김(기본 구성 유지)
+    })();
 
     // 채팅↔매트릭스 왕복(전체 페이지 네비게이션)에도 세션이 이어지도록 sessionId를
     // sessionStorage에 영속한다(페이지별 키 분리 — 매트릭스는 별도 키). 서버가 세션 히스토리를
@@ -715,7 +796,7 @@
 
     function renderChipsInto(target) {
       target.textContent = "";
-      for (const ex of EXAMPLES) {
+      for (const ex of BRANDING?.examples ?? []) {
         const chip = document.createElement("button");
         chip.className = "chip";
         chip.textContent = ex;
@@ -739,9 +820,9 @@
       intro.id = "intro";
       const big = document.createElement("div");
       big.className = "big";
-      big.textContent = LANDING_GREETING;
+      big.textContent = BRANDING?.greeting ?? "";
       const sub = document.createElement("p");
-      sub.textContent = LANDING_SUBTITLE;
+      sub.textContent = BRANDING?.subtitle ?? "";
       intro.append(big, sub);
       conversation.appendChild(intro);
     }
@@ -1082,7 +1163,8 @@
         num.textContent = src.id;
         const type = document.createElement("span");
         type.className = "type";
-        type.textContent = TYPE_LABEL[src.type] || "검색결과";
+        // 미지 타입(새 toolset)은 "검색결과"로 거짓 라벨을 붙이지 않고 타입명을 그대로 쓴다.
+        type.textContent = TYPE_LABEL[src.type] || src.type || "출처";
         top.append(num, type);
         const title = document.createElement("div");
         title.className = "title";
@@ -1127,14 +1209,14 @@
         return card;
       }
 
+      // 복원 스냅샷은 **형태로 거른다** — 이름 목록을 두면 새 toolset의 카드 필드가 목록에
+      // 없다는 이유로 새로고침 후 조용히 사라진다(목록 유지가 곧 드리프트다). 서버 공개 DTO는
+      // 이미 스칼라만 싣는 계약(project_public_source)이라 그 형태를 그대로 신뢰한다.
       function sourceSnapshot(src) {
-        const fields = [
-          "id", "title", "url", "type", "author", "sale_price", "price", "image_url", "rating",
-          "publisher", "published_at", "last_updated", "checked_at", "snippet"
-        ];  // snippet: 저자 없는 출처의 카드 저자줄 폴백(makeCard) — 복원 시에도 유지
-            // price: sale_price 개명 전 스냅샷 복원 경로(makeCard 폴백과 한 세트)
         return Object.fromEntries(
-          fields.filter((field) => src[field] !== undefined).map((field) => [field, src[field]])
+          Object.entries(src).filter(
+            ([, value]) => value === null || typeof value !== "object"
+          )
         );
       }
 
@@ -1462,6 +1544,8 @@
         if (rbtiCode) payload.rbti = rbtiCode;
         // 모델 미선택·기본이면 필드 생략(서버 기본 pro). 화이트리스트 밖은 서버가 폴백.
         if (selectedModel) payload.model = selectedModel;
+        // 기본 구성과 같으면 생략. 무효 조합은 서버가 400으로 끊는다(조용한 폴백 없음).
+        if (enabledToolsets) payload.enabled_toolsets = enabledToolsets;
         const resp = await fetch("/chat/stream", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
