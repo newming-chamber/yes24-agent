@@ -533,7 +533,7 @@
       AXES as RBTI_AXES, parseCode as parseRbtiCode, deriveCode, deriveAxisLabel,
       RBTI_STORAGE_KEY, MATRIX_HANDOFF_KEY,
     } from "/static/lib/rbti.js?v=1";
-    import { WEB_TYPES, coverUrl, isSafeUrl, safeOpen } from "/static/lib/sources.js?v=1";
+    import { WEB_TYPES, coverUrl, isSafeUrl, safeOpen, formatPrice, makeCoverImg, relayTypingFocus } from "/static/lib/sources.js?v=1";
 
     // 16유형 비교(/matrix) 네비 링크는 서버 배포 게이팅(matrix_enabled)을 따라간다.
     // 기본 hidden(fail-closed: 프로드 숨김)이고, /matrix가 살아 있을 때만(200) 노출한다.
@@ -886,12 +886,9 @@
       jumpLatestBtn.hidden = near;
     });
 
-    // "↓ 최신" 클릭 — 부드럽게 하단으로(자연스러운 복귀). 자동추적 재개.
-    jumpLatestBtn.addEventListener("click", () => {
-      autoFollow = true;
-      jumpLatestBtn.hidden = true;
-      conversation.scrollTo({ top: conversation.scrollHeight, behavior: "smooth" });
-    });
+    // "↓ 최신" 클릭 — 즉시 하단으로, 자동추적 재개. smooth는 애니메이션 중간 scroll 이벤트가
+    // 위 핸들러를 거쳐 autoFollow를 도로 꺼버려(스트리밍 중엔 목표 높이도 낡는다) 자기간섭이다.
+    jumpLatestBtn.addEventListener("click", () => scrollToBottom(true));
 
     function addUserMessage(text) {
       const msg = document.createElement("div");
@@ -1140,19 +1137,9 @@
         const card = document.createElement("div");
         card.className = isWeb ? "card web" : "card";
 
-        // 좌측 표지 썸네일(있을 때만). matrix 셀과 같은 결: decoding=async, loading=lazy 금지
-        // (스크롤 없는 뷰포트에서 lazy가 로드를 멈추는 Chrome 쿼크 — matrix-ux 실측), 실패 시
-        // 이미지를 제거해 깨진 아이콘 대신 본문만 남긴다. 없으면 현행 그대로(표지 없음).
+        // 좌측 표지 썸네일(있을 때만, 규약은 공용 모듈). 없으면 현행 그대로(표지 없음).
         const url = coverUrl(src);
-        if (url) {
-          const cover = document.createElement("img");
-          cover.className = "cover";
-          cover.decoding = "async";
-          cover.alt = "";
-          cover.addEventListener("error", () => cover.remove());
-          card.appendChild(cover);
-          cover.src = url; // 핸들러 등록 후 src 설정
-        }
+        if (url) card.appendChild(makeCoverImg(url, "cover"));
 
         const main = document.createElement("div");
         main.className = "card-main";
@@ -1170,27 +1157,21 @@
         title.className = "title";
         title.textContent = src.title || "(제목 없음)";
         main.append(top, title);
-        // 상품 카드(비웹)엔 저자·판매가를 노출한다. 현행 공개 DTO는 author/sale_price 평면
-        // 필드이고, price는 가격 키가 sale_price로 바뀌기 전 저장된 스냅샷 호환 경로다
-        // (meta.* 가지는 발화 불가라 삭제 — sse_source가 meta를 방출한 적이 없고
-        // sourceSnapshot 화이트리스트에도 없다). 값이 없으면 그 줄을 생략한다.
+        // 상품 카드(비웹)엔 저자·판매가를 노출한다(가격 키·표기는 공용 formatPrice가 소유). meta.*
+        // 가지는 발화 불가라 삭제 — sse_source가 meta를 방출한 적이 없고 스냅샷에도 없다.
         if (!isWeb) {
           const author = src.author || src.snippet;
-          const priceRaw = [src.sale_price, src.price].find((v) => v != null);
+          const price = formatPrice(src);
           if (author) {
             const au = document.createElement("div");
             au.className = "info author";
             au.textContent = author;
             main.append(au);
           }
-          if (priceRaw != null && priceRaw !== "") {
+          if (price) {
             const pr = document.createElement("div");
             pr.className = "info price";
-            // 숫자면 천단위 콤마+원, 이미 문자열이면 그대로(도구가 문자열 가격을 줄 여지 대비).
-            const n = Number(priceRaw);
-            pr.textContent = Number.isFinite(n) && n > 0
-              ? n.toLocaleString("ko-KR") + "원"
-              : String(priceRaw);
+            pr.textContent = price;
             main.append(pr);
           }
         }
@@ -1611,20 +1592,9 @@
       updateSendState();
     });
 
-    // 컴포저 밖에서 타이핑 시작 → 포커스만 컴포저로 옮기고 글자 삽입은 브라우저 기본 동작에
-    // 맡긴다. 문자를 직접 삽입하는 릴레이는 공백·문장부호·Enter·한글 IME 조합을 흘리므로 금지.
-    // Enter·화살표 등 비프린터블은 릴레이하지 않는다(포커스된 버튼의 기본 동작 보존).
-    function isEditableTarget(el) {
-      return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
-    }
-    document.addEventListener("keydown", (e) => {
-      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
-      if (isEditableTarget(e.target)) return;
-      if (!personaPop.hidden) return; // 팝오버 열림 — 팝오버 키 조작 우선
-      if (input.disabled) return;     // 전송 중
-      // 프린터블 1글자(공백·문장부호 포함) 또는 IME 조합 키(한글 첫 타, e.key="Process").
-      if (e.key.length === 1 || e.key === "Process") input.focus();
-    });
+    // 컴포저 밖 타이핑 → 컴포저로 포커스 이동(계약은 공용 모듈). 페르소나 팝오버가 열려 있으면
+    // 팝오버 키 조작이 우선이라 넘겨준다.
+    relayTypingFocus(input, () => !personaPop.hidden);
 
     // 매트릭스 "이 성향으로 채팅하기" 핸드오프: 채택한 셀의 {질문, 답변 요지(대표책)}를
     // 컴포저에 *보이는* 프리필로 얹는다 — 숨은 컨텍스트 주입 금지(사용자가 보는 것 = 모델이

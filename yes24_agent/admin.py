@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import sqlite3
 from contextlib import closing
 from hashlib import sha256
@@ -25,6 +26,8 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from yes24_agent.config import Settings
+
+logger = logging.getLogger(__name__)
 
 _ADMIN_HTML = Path(__file__).parent / "static" / "admin.html"
 
@@ -38,6 +41,16 @@ _TOKEN_MESSAGE = b"yes24-agent-admin-v1"
 def _expected_token(password: str) -> str:
     """비밀번호에서 결정론적 admin 토큰(HMAC-SHA256 hex)을 만든다(세션 저장소 불필요)."""
     return hmac.new(password.encode("utf-8"), _TOKEN_MESSAGE, sha256).hexdigest()
+
+
+def client_ip(request: Request) -> str:
+    """요청 출발지 IP — 프록시 뒤에서는 X-Forwarded-For 첫 항목을 쓴다.
+
+    로그인월(main.py)과 admin 로그인이 같이 쓴다. 위조 가능한 헤더라 차단 근거가 아니라
+    실패 시도를 사후에 알아볼 **관측 신호**로만 쓴다(차단은 프록시 계층 몫).
+    """
+    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    return forwarded or (request.client.host if request.client else "unknown")
 
 
 def _authorized(request: Request, password: str) -> bool:
@@ -321,6 +334,7 @@ def register_admin(app: FastAPI, settings: Settings) -> None:
         if not compare_digest(
             candidate.encode("utf-8"), settings.admin_password.encode("utf-8")
         ):
+            logger.warning(f"admin 로그인 실패: ip={client_ip(request)}")
             return JSONResponse({"detail": "비밀번호가 올바르지 않습니다."}, status_code=401)
         resp = JSONResponse({"ok": True})
         resp.set_cookie(

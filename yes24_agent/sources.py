@@ -22,14 +22,25 @@ SOURCES_STATE_KEY = "sources"
 SUMMARY_FIDELITY = 0
 DETAIL_FIDELITY = 1
 
+# 세션 레지스트리 레코드의 필드 계약 = **state에 남는 유일한 형태**. `register_source`가 이
+# 형태로 만들고, 러너의 복구 write도 되쓰기 전에 관측을 이 형태로 맞춘다
+# (`event_translate.project_registry_record`). 도구 응답 원문을 그대로 영속시키면 본문
+# 스캐폴딩(intro·toc·links·weekly_reviews)이 sqlite state에 박혀 매 턴 재로드되고, 무엇보다
+# payload에 없는 fidelity가 빠져 복구된 상세가 다음 관측에 격하된다.
+# 두 축의 의미가 다르다: **최상위 필드는 기록의 정체성·본문**(충실도가 지킨다), **meta는
+# 관측 시점의 값**(최신 관측이 이긴다) — `merge_source_records`가 그 판정의 유일한 구현이다.
+REGISTRY_RECORD_FIELDS = ("id", "title", "url", "type", "snippet", "checked_at", "meta", "fidelity")
+
 # 인보케이션 스코프 id 워터마크. id 발급은 `max(state의 기존 id)+1`이라 read-modify-write이고,
 # 한 턴의 병렬 function call이 상대의 write를 보기 전에 자기 스냅샷을 읽으면 **둘 다 같은
-# 번호**를 딴다. 그러면 `_reconcile_sources`가 id 기준 병합으로 서로 다른 출처를 한 레코드에
+# 번호**를 딴다. 그러면 `settle_sources`가 id 기준 병합으로 서로 다른 출처를 한 레코드에
 # 합쳐(서로 다른 타입의 키메라) 공개 DTO를 오염시키고, 모델도 "id n"이 둘인 결과를 받아
-# 인용이 중의적이 된다. **역할 분담**: 턴 내 충돌은 이 워터마크가 막고, 턴 간 id 재사용으로
-# 생기는 키메라는 merge_source_records의 정체성 가드가 막는다 — 관측된 증상(2026-08-06
-# 도그푸딩: search_result 카드에 다른 타입의 메타 필드 동거)의 원인 경로는 후자로 추정되며
-# 라이브 재현으로 확정된 바 없다. 이 픽스가 그 증상을 막았다고 단정하지 말 것.
+# 인용이 중의적이 된다. **역할 분담**: 턴 내 충돌은 이 워터마크가 막고, 턴 간 id 재사용은
+# 애초에 일어나지 않게 러너가 턴 마감에 유실분을 레지스트리로 복구하며
+# (`runner._settle_turn_sources`), 그래도 같은 id로 다른 문서가 만나면 merge_source_records의
+# 정체성 가드가 키메라를 막는다 — 관측된 증상(2026-08-06 도그푸딩: search_result 카드에 다른
+# 타입의 메타 필드 동거)의 원인 경로는 라이브 재현으로 확정된 바 없다(같은 턴의 상세→목록
+# 관측 격하로도 같은 모양이 나온다). 이 픽스들이 그 증상을 막았다고 단정하지 말 것.
 # 정상 경로(ADK State write-through)에서는 스냅샷이 공유돼 충돌이 안 나지만, 그 보호는 ADK 내부
 # 구현에 딸린 것이라(`State.__setitem__`에 "delta에만 쓰도록 바꾸자"는 TODO가 달려 있다) 발급
 # 자체를 스냅샷과 무관하게 단조로 만든다. 같은 턴의 도구는 invocation_id를 공유하므로 번호가
@@ -101,61 +112,76 @@ def _merge_evidence_segments(existing: object, incoming: object) -> list[dict]:
     return list(merged.values())
 
 
+def _meta_of(record: dict) -> dict:
+    """레코드의 관측값 묶음(meta). 없거나 dict가 아니면 빈 dict."""
+    meta = record.get("meta")
+    return meta if isinstance(meta, dict) else {}
+
+
+def _by_observation_time(existing: dict, incoming: dict) -> tuple[dict, dict]:
+    """두 관측을 (늦은 것, 이른 것)으로 정렬한다.
+
+    `checked_at`은 `now_checked_at`이 만드는 "YYYY-MM-DD HH:MM"이라 사전순이 곧 시간순이다.
+    시각이 없는 관측은 가장 이른 것으로 본다(없는 시각을 최신이라 우길 근거가 없다).
+    동률이면 이번 관측(incoming)이 늦은 쪽이다 — 같은 분에 두 번 봤으면 나중에 온 것이 나중이다.
+    """
+    if (existing.get("checked_at") or "") > (incoming.get("checked_at") or ""):
+        return existing, incoming
+    return incoming, existing
+
+
 def merge_source_records(existing: dict, incoming: dict) -> dict:
-    """동일 출처 관측을 합치되 상품 상세 충실도를 보존한다.
+    """동일 출처의 두 관측을 합친다 — **정체성은 충실도가, 관측값은 시각이** 가른다.
 
     세션 레지스트리(멀티턴 카탈로그: source id·읽은 상세 보존)와 이번 턴 스트림 스냅샷
     양쪽에서 같은 병합 판정을 쓴다 — 범위 구분은 호출자가 어떤 컬렉션에 쌓느냐로 정해진다.
 
+    **두 축을 나누는 것이 이 함수의 전부다.** 레지스트리 스키마
+    (`REGISTRY_RECORD_FIELDS`)가 이미 그 구분을 담고 있어 필드명을 열거할 필요가 없다:
+
+    - **최상위 필드**(type·snippet·title·url)는 기록의 정체성과 본문이다. 충실도가 높은
+      관측이 지킨다 — 검색 목록 요약이 이미 읽어 둔 상세를 `search_result`로 뒤집거나
+      상세 본문을 한 줄 요약으로 덮지 못한다.
+    - **meta**는 관측 시점의 값(가격·평점·순위)이다. `checked_at`이 늦은 관측이 이긴다 —
+      지난 턴 상세의 15,300원이 이번 턴 검색이 실제로 본 9,900원을 누르면 본문과 카드가
+      어긋나고, "상품 사실은 이번 턴 도구 결과에 근거한다"(원칙 4a)가 깨진다. 한쪽만
+      관측한 값(상세에만 있는 page_count)은 상대가 덮을 것이 없으므로 그대로 남는다.
+    - `checked_at` 자체는 정의상 마지막으로 확인한 시각이라 늦은 관측의 것을 쓴다.
+
     **정체성 가드**: 두 레코드가 모두 url을 갖고 서로 다르면 병합하지 않고 incoming을 그대로
     돌려준다. 같은 id로 만났더라도 url이 다르면 다른 문서이며, 그때 합치면 한 레코드에 두
     문서의 필드가 동거하는 키메라가 된다(2026-08-06 실측: search_result 카드에 다른 타입의
-    메타 필드 동거). 이 함수가 turn 내(_reconcile_sources)와 turn 간(runner의 known_sources 시드)
-    두 노출면의 공통 원시함수라, 가드를 여기 한 곳에 두면 둘 다 덮인다. 원칙 4의 "같은 id는
+    메타 필드 동거). 이 함수가 등록(register_source)과 턴 마감 화해(settle_sources) 두
+    노출면의 공통 원시함수라, 가드를 여기 한 곳에 두면 둘 다 덮인다. 원칙 4의 "같은 id는
     이번 턴 관측이 이김"의 구현이기도 하다. 한쪽 url이 비면 정체성을 단정할 수 없으므로
     보수적으로 기존 병합을 유지한다(빈 dict를 seed로 넘기는 누적 경로가 이 분기를 탄다).
+
+    관측값을 최상위로 평면화하던 블록은 삭제했다 — `project_public_source`가 meta를 이미
+    읽으므로 공개 DTO에 필요가 없었고, 그 평면화가 남긴 최상위 잔재가 "meta는 갱신됐는데
+    카드는 옛 값"이라는 두 번째 진실을 만들었다.
     """
     existing_url, incoming_url = existing.get("url"), incoming.get("url")
     if existing_url and incoming_url and existing_url != incoming_url:
         return incoming
+
     if (existing.get("fidelity") or SUMMARY_FIDELITY) > (
         incoming.get("fidelity") or SUMMARY_FIDELITY
     ):
         lower_fidelity, higher_fidelity = incoming, existing
     else:
         lower_fidelity, higher_fidelity = existing, incoming
-    winner_is_detail = (higher_fidelity.get("fidelity") or SUMMARY_FIDELITY) > SUMMARY_FIDELITY
-
     merged = dict(lower_fidelity)
     merged.update({key: value for key, value in higher_fidelity.items() if value is not None})
 
-    lower_meta = lower_fidelity.get("meta") if isinstance(lower_fidelity.get("meta"), dict) else {}
-    higher_meta = (
-        higher_fidelity.get("meta") if isinstance(higher_fidelity.get("meta"), dict) else {}
-    )
+    newer, older = _by_observation_time(existing, incoming)
+    if newer.get("checked_at") is not None:
+        merged["checked_at"] = newer["checked_at"]
     merged_meta = {
-        **lower_meta,
-        **{key: value for key, value in higher_meta.items() if value is not None},
+        **_meta_of(older),
+        **{key: value for key, value in _meta_of(newer).items() if value is not None},
     }
-    if winner_is_detail:
-        merged_meta.update(
-            {
-                key: higher_fidelity[key]
-                for key in merged_meta
-                if higher_fidelity.get(key) is not None
-            }
-        )
     if merged_meta:
         merged["meta"] = merged_meta
-    if winner_is_detail:
-        merged.update(merged_meta)
-        merged.update(
-            {
-                key: value
-                for key, value in higher_fidelity.items()
-                if value is not None and key != "meta"
-            }
-        )
 
     evidence_segments = _merge_evidence_segments(
         existing.get("_evidence_segments"),
@@ -180,11 +206,12 @@ def register_source(
 ) -> int:
     """출처를 등록하고 source_id를 반환한다.
 
-    동일 URL은 source_id를 유지하고 관측을 병합한다. 상품 상세는 이후 검색 목록 관측보다
-    정보 충실도가 높으므로 유형·본문·canonical 메타를 유지한다.
+    동일 URL은 source_id를 유지하고 관측을 `merge_source_records`로 병합한다 — 검색 목록
+    요약이 이미 읽어 둔 상세의 유형·본문을 낮추지 않고(충실도), 가격·평점처럼 시점의 값은
+    늦게 확인한 관측이 이긴다(checked_at). 판정의 구현은 그 함수 한 곳뿐이다.
 
-    `None`은 이번 도구가 해당 필드를 관측하지 않았다는 뜻이므로 기존 값을 유지한다. 같은
-    충실도의 새 관측과 새 상세는 기존 값을 갱신하고, 검색 요약은 저장된 상세를 낮추지 않는다.
+    `None`은 이번 도구가 해당 필드를 관측하지 않았다는 뜻이므로 기존 값을 유지한다.
+    레코드의 필드 계약은 `REGISTRY_RECORD_FIELDS`이며, state에 남는 형태는 이것뿐이다.
     """
     existing = state.get(SOURCES_STATE_KEY, [])
     for index, source in enumerate(existing):

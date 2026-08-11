@@ -29,7 +29,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, StringConstraints
 
-from yes24_agent.admin import register_admin
+from yes24_agent.admin import client_ip, register_admin
 from yes24_agent.config import ensure_google_api_key_env, get_settings
 from yes24_agent.matrix.matrix_runner import run_matrix_stream
 from yes24_agent.runner import run_agent_stream
@@ -323,7 +323,9 @@ def create_app() -> FastAPI:
                         secure=settings.cookie_secure,
                     )
                     return resp
-            # 실패: 로그인 페이지로 되돌리며 에러 표시(?error=1).
+            # 실패: 로그인 페이지로 되돌리며 에러 표시(?error=1). 공인 IP에 노출된 공유
+            # 비밀번호라 반복 추측이 눈에 띄도록 실패를 남긴다(차단은 프록시 계층 몫).
+            logger.warning(f"로그인월 인증 실패: ip={client_ip(request)}")
             return RedirectResponse("/login?error=1", status_code=303)
 
         @app.get("/logout")

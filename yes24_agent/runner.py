@@ -27,13 +27,12 @@ from yes24_agent.agent import (
 )
 from yes24_agent.config import get_settings
 from yes24_agent.event_translate import (
-    _reconcile_sources,
     _sources_from_response,
     _status_for_call,
     _status_for_error,
     _status_for_result,
-    project_public_source,
     project_source_ref,
+    settle_sources,
 )
 from yes24_agent.postprocess import (
     StreamRenumberer,
@@ -49,8 +48,8 @@ from yes24_agent.session_service import (
     _resolve_session,
 )
 from yes24_agent.sources import (
+    SOURCES_STATE_KEY,
     get_sources,
-    merge_source_records,
 )
 from yes24_agent.sse import (
     STREAM_ERROR_MESSAGE,
@@ -232,29 +231,61 @@ def _finalize_answer(
     return citation, payload
 
 
-def _citable_sources(turn_sources: list[dict], prior_sources: list[dict]) -> list[dict]:
-    """인용 검증이 쓸 유효 id 집합 = **이번 턴 관측본 ∪ 세션 레지스트리**.
+async def _settle_turn_sources(
+    service: BaseSessionService,
+    session_id: str,
+    observed_sources: list[dict],
+    prior_sources: list[dict],
+) -> list[dict]:
+    """턴을 마감하며 세션 출처 레지스트리를 스트림 관찰본으로 화해하고, 그 화해본을 돌려준다.
 
-    모델이 참조하는 id는 `sources.py`의 세션 레지스트리(멀티턴 영속) 것인데, 검증에는
-    이번 턴 스트림 관측본만 넘기고 있었다. 도구를 다시 부르지 않는 연속성 턴은 관측본이
-    비어 유효 집합이 공집합이 되고, **정상 인용이 통째로 폐기됐다**(실측 재현 3/5,
-    `removed=True sources=0`). 그 턴의 수치는 자기 턴1의 접지 수치와 바이트 단위로 같았고
-    라이브 대조에서 전부 사실이었다 — 창작이 아니라 대화 연속성이다.
+    인용 검증이 쓸 유효 id 집합은 **세션 레지스트리 ∪ 이번 턴 관측본**이다. 모델이
+    참조하는 id는 `sources.py`의 세션 레지스트리(멀티턴 영속) 것인데, 검증에 이번 턴
+    스트림 관측본만 넘기던 시절에는 도구를 다시 부르지 않는 연속성 턴에서 유효 집합이
+    공집합이 되어 **정상 인용이 통째로 폐기**됐다(실측 재현 3/5, `removed=True sources=0`).
 
-    이 합집합은 마커를 **더 지우는 게 아니라 덜 지운다**: 삭제 집합이 기존의 진부분집합이라
-    파괴 경로가 구조적으로 없다. 같은 id는 이번 턴 관측이 이긴다(레지스트리의 과거 상세·가격이
-    새 관측을 덮지 못하게 — `_reconcile_sources` 주석의 규율을 그대로 유지).
+    **복구 write**: 병렬 도구의 state_delta는 리스트 키에서 last-wins라 레지스트리가 한
+    도구의 출처를 통째로 잃을 수 있다(settle_sources 주석). 유실분이 있으면 화해본을
+    state_delta로 1회 되쓴다 — 그러지 않으면 다음 턴의 `_next_source_id`가 `max(기존 id)+1`로
+    **이미 쓴 번호를 다른 URL에 재발급**해, 모델이 히스토리의 `[9]`(책A)로 인용한 답변이
+    책C를 가리키는 카드와 함께 나간다(턴 간 오귀속). 매 턴 우회하던 유실을 턴 마감 한
+    지점에서 복구하는 구조라, 우회 코드가 늘어난 것이 아니라 자리를 옮긴 것이다.
+
+    레지스트리 재조회가 실패해도 마감은 멈추지 않는다 — 턴 시작 스냅샷(prior)으로 화해해
+    기존 동작으로 폴백한다(비파괴 원칙을 마감 전체로).
 
     원칙 4는 불변이다. 여기서 넓히는 것은 **검증 집합**일 뿐이고, 공개 `source`·
     `done.sources`는 `build_done_payload`가 `used_source_ids`로 걸러 **이번 턴 최종 본문이
     실제로 인용한 것만** 싣는다 — 인용되지 않은 레지스트리 출처는 카드로 새지 않는다.
     """
-    by_id: dict[int, dict] = {}
-    for source in (*prior_sources, *turn_sources):
-        source_id = source.get("id")
-        if source_id is not None:
-            by_id[source_id] = source
-    return [by_id[key] for key in sorted(by_id)]
+    session = None
+    registry = prior_sources
+    try:
+        # 턴 시작 스냅샷이 아니라 **마감 시점** 레지스트리를 base로 삼는다. 이번 턴 도구가
+        # 등록한 상세(fidelity)가 여기 살아 있어야 뒤이은 목록 관측이 카드를 격하시키지 않는다.
+        session = await _resolve_session(service, session_id)
+        registry = get_sources(session.state)
+    except Exception as exc:  # noqa: BLE001 — 마감은 어떤 세션 오류에도 멈추지 않는다
+        logger.warning(f"턴 마감 레지스트리 재조회 실패 — 턴 시작 스냅샷으로 화해합니다: {exc}")
+
+    settled = settle_sources(registry, observed_sources)
+    registry_ids = {source.get("id") for source in registry}
+    lost_ids = sorted(
+        source["id"] for source in observed_sources if source.get("id") not in registry_ids
+    )
+    if lost_ids and session is not None:
+        try:
+            await service.append_event(
+                session,
+                Event(
+                    author="system",
+                    actions=EventActions(state_delta={SOURCES_STATE_KEY: settled}),
+                ),
+            )
+            logger.warning(f"병렬 도구가 잃은 출처 {lost_ids}를 레지스트리에 복구했습니다.")
+        except Exception as exc:  # noqa: BLE001 — 복구 실패가 답변 마감을 막지 않는다
+            logger.warning(f"유실 출처 {lost_ids} 레지스트리 복구 write 실패: {exc}")
+    return settled
 
 
 def _best_effort_text(raw_body: list[str], final_text: str) -> str:
@@ -313,8 +344,7 @@ def _closeout_error_frames(
     streamed: list[str],
     known_sources: dict[int, dict],
     final_text: str,
-    observed_sources: list[dict],
-    prior_sources: list[dict],
+    sources: list[dict],
     active_model: str,
     session_id: str,
 ) -> list[str]:
@@ -323,20 +353,25 @@ def _closeout_error_frames(
     순서: sse_error → source* → 본문 → done. 내레이션 전환으로 본문은 이미 전량 흘렀으므로
     (홀드 없음) 여기서 붙일 잔여 조각은 없다 — 화면에 흐른 경과 서술("~찾아볼게요")은
     비파괴 원칙대로 done.text에 남고, 사용자는 error 프레임으로 실패를 안내받는다.
-    출처는 정상 경로와 동일하게 _reconcile_sources를 거친다 — 과거 두 실패 경로만 raw
-    observed_sources를 넘겨 병렬 도구 유실 보정이 빠지는 드리프트가 있었다(판정을 세 벌
-    두면 한 벌만 고치는 실수가 반복된다는 _emit_final_body docstring의 실례).
+    출처는 정상 경로와 동일하게 `_settle_turn_sources`를 거친 화해본을 받는다 — 과거 두
+    실패 경로만 raw observed_sources를 넘겨 병렬 도구 유실 보정이 빠지는 드리프트가
+    있었다(판정을 세 벌 두면 한 벌만 고치는 실수가 반복된다는 _emit_final_body의 실례).
     """
     frames = [sse_error(error_text)]
     # 이월해 둔 표시 번호 꼬리를 먼저 방류한다 — 실패 경로에서도 화면에 흐른 본문과
     # done.text의 대조(원칙 4b)가 같은 규약 위에서 이뤄져야 한다.
     frames.extend(_display_frames(renumberer, raw_body, known_sources, streamed, final=True))
     best_effort = _best_effort_text(raw_body, final_text)
-    _, error_done = _finalize_answer(
-        best_effort,
-        _citable_sources(_reconcile_sources(observed_sources), prior_sources),
-        session_id,
-    )
+    try:
+        _, error_done = _finalize_answer(best_effort, sources, session_id)
+    except Exception as exc:  # noqa: BLE001 — 마감이 실패해도 done은 정확히 1회 나가야 한다
+        # 원인 예외가 이 파이프라인에서 났다면 같은 입력으로 재발한다 — 인용 없이, 이미 흘린
+        # 본문 그대로 최소 마감한다(비파괴).
+        logger.exception(f"실패 마감의 인용 조립마저 실패했습니다: {exc}")
+        error_done = build_done_payload(
+            sources=[], used_source_ids=[], session_id=session_id, supports=[]
+        )
+        error_done["text"] = "".join(streamed)
     error_done["model"] = active_model
     if _ensure_substantive_text(error_done):
         logger.warning(
@@ -411,13 +446,17 @@ async def run_agent_stream(
             return
 
         resolved_session_id = session.id
-        # 이전 턴들이 남긴 출처 레지스트리(멀티턴 영속). 턴 시작 시점에 고정해 두고 인용
-        # **검증 집합**에만 합친다(_citable_sources). 공개 채널은 원칙 4대로 인용분만.
-        prior_sources = get_sources(session.state)
+        # 레지스트리 로드·에이전트/Runner 생성도 스트림 방어선(아래 try) 안에서 한다 —
+        # docstring의 "어떤 예외가 나도 error+done 후 정상 종료" 계약에 구멍을 두지 않는다.
+        # except·finally가 참조하는 이름만 여기서 미리 묶어 미바인딩을 막는다.
+        prior_sources: list[dict] = []
+        known_sources: dict[int, dict] = {}
+        active_model = ""
+        event_stream = timed_event_stream = None
 
-
-        # 스트림에서 관찰한 출처를 누적한다. 병렬 도구 실행 시 세션 state가 유실될 수
-        # 있어(_reconcile_sources 참고), done 조립의 유실 방지용 완전한 사본으로 쓴다.
+        # 스트림에서 관찰한 출처를 **원시 도구 응답 그대로** 누적한다. 병렬 도구 실행 시
+        # 세션 state가 유실될 수 있어(settle_sources 참고), 마감의 유실 방지용 완전한
+        # 사본으로 쓴다. 여기서 병합·투영하지 않는다 — 둘 다 마감 한 지점에서 한다.
         observed_sources: list[dict] = []
         # 이번 턴에 도구가 돈 횟수. 최후 방어 실패 로그(tools=%d)의 진단값으로만 쓴다.
         tool_call_count = 0
@@ -428,13 +467,6 @@ async def run_agent_stream(
         streamed: list[str] = []
         # 원시 id → 표시 번호 증분 치환기. 배정 규칙은 출구(renumber_for_display)와 공유한다.
         renumberer = StreamRenumberer()
-        # 이번 턴에 인용 가능한 출처(원시 id → 공개 DTO). 이전 턴 레지스트리에서 출발해
-        # 도구 응답마다 자란다 — 표시 번호 배정의 유효 id 집합이자 refs url의 출처다.
-        known_sources: dict[int, dict] = {
-            source["id"]: project_public_source(source)
-            for source in prior_sources
-            if source.get("id") is not None
-        }
         # 마지막 본문 청크 이후 도구가 돌았는가 = 다음 텍스트가 **새 조사 라운드**의 시작인가.
         # 이 신호로만 라운드 경계 구분자를 넣는다(_round_boundary_prefix).
         tool_ran_since_text = False
@@ -452,34 +484,43 @@ async def run_agent_stream(
         emitted_output = False
         retried_overload = False
 
-        run_config = RunConfig(
-            streaming_mode=StreamingMode.SSE,
-            max_llm_calls=settings.max_llm_calls,
-        )
-        # 사용자가 UI에서 고른 모델의 에이전트(무효·미지정이면 config 기본 모델). 자동 라우팅이
-        # 아니라 명시 선택이라 단일 루프 원칙은 유지된다 — 프롬프트·도구·thinking 구성은
-        # 모델과 무관하게 동일하고, done.model이 실제 사용 모델을 싣는다.
-        agent = get_agent(model, app)
-        active_model = str(agent.model)
-
-        runner = Runner(
-            agent=agent,
-            app_name=settings.app_name,
-            session_service=service,
-        )
-        new_message = types.Content(role="user", parts=[types.Part(text=message)])
-
-        # 이벤트 간격에 sse_timeout_s 상한을 건다. ADK 스트림은 하나의 고정 task가 소비해
-        # 여러 yield에 걸친 OpenTelemetry context의 소유권을 보존한다.
-        event_stream = runner.run_async(
-            user_id=_POC_USER_ID,
-            session_id=resolved_session_id,
-            new_message=new_message,
-            run_config=run_config,
-        )
-        timed_event_stream = iter_adk_events(event_stream, timeout_s=settings.sse_timeout_s)
-
         try:
+            # 이전 턴들이 남긴 출처 레지스트리(멀티턴 영속). 마감 화해가 실패할 때의
+            # 폴백 base다(_settle_turn_sources). 공개 채널은 원칙 4대로 인용분만.
+            prior_sources = get_sources(session.state)
+            # 이번 턴에 인용 가능한 출처(id → 출처 dict). 이전 턴 레지스트리에서 출발해
+            # 도구 응답마다 자란다 — 표시 번호 배정의 유효 id 집합이자 refs url의 출처다.
+            # id는 URL과 1:1이라 같은 id의 재관측은 url을 바꾸지 않는다(덮어쓰기로 충분).
+            known_sources = {
+                source["id"]: source for source in prior_sources if source.get("id") is not None
+            }
+            run_config = RunConfig(
+                streaming_mode=StreamingMode.SSE,
+                max_llm_calls=settings.max_llm_calls,
+            )
+            # 사용자가 UI에서 고른 모델의 에이전트(무효·미지정이면 config 기본 모델). 자동 라우팅이
+            # 아니라 명시 선택이라 단일 루프 원칙은 유지된다 — 프롬프트·도구·thinking 구성은
+            # 모델과 무관하게 동일하고, done.model이 실제 사용 모델을 싣는다.
+            agent = get_agent(model, app)
+            active_model = str(agent.model)
+
+            runner = Runner(
+                agent=agent,
+                app_name=settings.app_name,
+                session_service=service,
+            )
+            new_message = types.Content(role="user", parts=[types.Part(text=message)])
+
+            # 이벤트 간격에 sse_timeout_s 상한을 건다. ADK 스트림은 하나의 고정 task가 소비해
+            # 여러 yield에 걸친 OpenTelemetry context의 소유권을 보존한다.
+            event_stream = runner.run_async(
+                user_id=_POC_USER_ID,
+                session_id=resolved_session_id,
+                new_message=new_message,
+                run_config=run_config,
+            )
+            timed_event_stream = iter_adk_events(event_stream, timeout_s=settings.sse_timeout_s)
+
             while True:
                 while True:
                     try:
@@ -582,22 +623,14 @@ async def run_agent_stream(
                                 emitted_output = True
                                 yield sse_status(*result)
                             for source in _sources_from_response(payload):
-                                source_id = source.get("source_id")
-                                source_event = project_public_source(source)
-                                for index, observed in enumerate(observed_sources):
-                                    if observed.get("id") == source_id:
-                                        observed_sources[index] = merge_source_records(
-                                            observed, source_event
-                                        )
-                                        break
-                                else:
-                                    observed_sources.append(source_event)
+                                # 관측 순서대로 그대로 쌓는다. 병합은 마감에서 레지스트리를
+                                # base로 한 번에 한다 — 관찰본끼리 먼저 합치면 fidelity를
+                                # 모르는 두 관측이 last-wins가 되어 상세가 목록에 격하된다.
+                                observed_sources.append(source)
                                 # 인용 후보 풀만 넓힌다. 마커 렌더용 refs는 여기서 내지 않는다 —
                                 # 표시 번호가 배정되는 시점(_display_frames)에 나가야 프론트의
                                 # 힌트 맵이 본문 마커와 같은 번호 공간에 놓인다.
-                                known_sources[source_id] = merge_source_records(
-                                    known_sources.get(source_id, {}), source_event
-                                )
+                                known_sources[source["id"]] = source
                         continue
 
                     if event.partial:
@@ -644,11 +677,9 @@ async def run_agent_stream(
                     yield frame
 
                 answer_text = _best_effort_text(raw_body, final_text)
-                # 근거 스냅샷은 세션 state가 아니라 **스트림 관찰본**으로 만든다. ADK의
-                # deep_merge_dicts가 병렬 도구의 state_delta를 리스트 키에서 last-wins로
-                # 덮어써 한 도구의 출처가 통째로 유실될 수 있기 때문이다(_reconcile_sources
-                # 주석 참조). 이 유실은 상류 미수정이라 여기서 계속 우회한다.
-                sources = _citable_sources(_reconcile_sources(observed_sources), prior_sources)
+                sources = await _settle_turn_sources(
+                    service, resolved_session_id, observed_sources, prior_sources
+                )
 
                 citation, done_payload = _finalize_answer(
                     answer_text,
@@ -725,8 +756,9 @@ async def run_agent_stream(
                 streamed=streamed,
                 known_sources=known_sources,
                 final_text=final_text,
-                observed_sources=observed_sources,
-                prior_sources=prior_sources,
+                sources=await _settle_turn_sources(
+                    service, resolved_session_id, observed_sources, prior_sources
+                ),
                 active_model=active_model,
                 session_id=resolved_session_id,
             )
@@ -746,8 +778,9 @@ async def run_agent_stream(
                 streamed=streamed,
                 known_sources=known_sources,
                 final_text=final_text,
-                observed_sources=observed_sources,
-                prior_sources=prior_sources,
+                sources=await _settle_turn_sources(
+                    service, resolved_session_id, observed_sources, prior_sources
+                ),
                 active_model=active_model,
                 session_id=resolved_session_id,
             )
@@ -760,8 +793,13 @@ async def run_agent_stream(
                 task.cancel()
             if event_task is not None and not event_task.done():
                 event_task.cancel()
-            await timed_event_stream.aclose()
-            await event_stream.aclose()
+                # cancel은 요청일 뿐 — 제너레이터 안에 매달린 채로 aclose하면 "already
+                # running" RuntimeError가 나 뒤의 정리가 통째로 건너뛰어진다.
+                await asyncio.gather(event_task, return_exceptions=True)
+            if timed_event_stream is not None:
+                await timed_event_stream.aclose()
+            if event_stream is not None:
+                await event_stream.aclose()
     finally:
         if lock is not None:
             lock.release()

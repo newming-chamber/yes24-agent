@@ -188,6 +188,8 @@ class Settings(BaseSettings):
     web_grounding_model: str = "gemini-3.1-flash-lite"
     web_grounding_timeout_s: float = 40.0
     # 웹 출처 카드용 페이지 <title> 경량 fetch 상한(표시 보강 — 실패 시 도메인 폴백).
+    # 요청 하나의 상한이자 **보강 전체의 wall-clock 예산**이다(노브 하나로 표시 메타에 쓸
+    # 시간을 정한다). 요청별 상한만으로는 청크가 느리게 계속 흘러오는 서버를 못 막는다.
     web_title_fetch_timeout_s: float = 3.0
     # 웹 선제 실행(prefetch) — TTFT 실측(2026-07-28: 첫 본문 11.8s = 사고1 3.8 + 도구 2.8 +
     # 사고2 5.2 직렬)에서 도구 구간을 사고1과 병렬화하는 순수 지연 최적화. 턴 시작 시 경량

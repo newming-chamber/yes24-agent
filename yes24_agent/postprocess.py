@@ -52,6 +52,23 @@ def _within_code_span(pos: int, ranges: list[tuple[int, int]]) -> bool:
     return any(start <= pos < end for start, end in ranges)
 
 
+def prose_citation_ids(text: str) -> list[int]:
+    """본문 프로즈가 인용한 source_id를 등장 순서대로(중복 허용) 돌려준다.
+
+    본문만 보고 "무엇이 인용됐는가"를 물어야 하는 바깥(QA 하네스 등)을 위한 공개 진입점이다.
+    유효성 대조 없이 마커 판정만 하며, 코드 스팬 제외는 `validate_citations`와 **같은 눈**을
+    쓴다 — 판정을 두 벌 두면 한 벌만 고쳐진다(하네스가 자체 정규식을 들었을 때 코드블록 안
+    `[1]`을 인용으로 세어 정상 턴을 실패로 몰았다).
+    """
+    code_ranges = _code_span_ranges(text)
+    return [
+        int(part)
+        for match in MARKER_PATTERN.finditer(text)
+        if not _within_code_span(match.start(), code_ranges)
+        for part in match.group(1).split(",")
+    ]
+
+
 # 인용 마커의 **방언**: 모델이 canonical `[n]` 대신 도구 결과의 필드명을 라벨로 달아 쓰는 형태
 # (`[source:6]`·`[출처 3]`·`[src 1]`). 2026-08-04 라이브 QA에서 한 턴 전체가 이 표기로 나와
 # 마커가 하나도 인식되지 않았고, 깨진 리터럴이 본문에 노출된 채 done.sources가 0건이 됐다 —
@@ -61,29 +78,63 @@ def _within_code_span(pos: int, ranges: list[tuple[int, int]]) -> bool:
 # 인용 프로토콜이 자기 어휘(`source_id`와 그 표기 변형)의 별칭을 받아들이는 문법 확장이다.
 # 임의 라벨까지 열면 `[그림 1]`·`[표 2]` 같은 일반 프로즈 대괄호를 인용으로 오인해, 이번에
 # 고치려는 것과 반대 방향의 본문 파손이 생긴다(P0 2026-07-20과 같은 병).
-# `(?!\()`는 마크다운 링크(`[source: 1](url)`)를 제외한다.
+#
+# **링크형**(`[1](url)`·`[source: 1](url)`)도 같은 문법에 속한다: 라벨은 없어도 되지만 뒤에
+# 마크다운 링크가 붙으면 그 인용이다. url 부분은 흡수해서 지운다 — 출처 url의 정본 채널은
+# refs/카드이고, 본문 프로즈에 생 url을 노출하지 않는다. 예전엔 링크형을 `(?!\()`로 통째로
+# 비껴 갔는데, canonical MARKER_PATTERN에는 그 가드가 없어 `[1]`만 마커로 소비되고 `(url)`은
+# 프로즈에 남았다(무효 id면 고아 괄호 잔해). 흡수로 바꾸면 링크형도 canonical 검증 한 경로로
+# 수렴하므로 `(?!\()` 가드는 필요 없어져 삭제했다.
 _DIALECT_LABELS = ("source_id", "source", "src", "출처")
+# 마크다운 링크의 url 조각 — 괄호 한 겹 중첩(`(…_(bar))`)까지 받고, 공백이 끼면(제목 문법
+# `[1](url "t")`) 링크로 보지 않는다. 괄호 안이 **스킴 있는 주소**일 때만 링크로 인정한다:
+# 아무 괄호나 흡수하면 마커 뒤에 바로 붙은 삽입구(`[1](주석)`)를 지워 본문을 파손한다 —
+# 과잉 수용이 곧 본문 파손이라는 P0 2026-07-20의 교훈이 여기에도 그대로 적용된다.
+#
+# 링크 문법은 **출구(흡수)와 스트림 홀드(미확정 꼬리 판정)가 한 벌을 공유**한다. 두 벌로
+# 두면 한 벌만 고치는 실수가 반복된다 — 실제로 출구만 괄호 중첩을 받고 홀드가 못 받아,
+# 중첩 url이 도착하는 도중(`[1](…/문학_(` 시점) 홀드가 깨져 마커+미완성 url이 방출되고
+# 링크 완성 시 정규화된 본문이 짧아져 `feed`가 뒤 본문을 통째로 삼켰다(퍼즈 9,962/20,000).
+def _link_body(*, partial: bool) -> str:
+    """링크 몸통 문법. `partial`이면 **아직 닫히지 않은** 중첩 괄호까지 받는다(홀드 전용).
+
+    홀드가 물어야 하는 것은 "이 꼬리가 링크로 확정될 수 있는가"이므로, 완성형 문법의 모든
+    접두부를 받아야 한다. 닫는 괄호를 선택으로 여는 것이 그 접두부 집합과 정확히 같다.
+    """
+    return r"(?:[^()\s]|\([^()\s]*\)" + ("?" if partial else "") + r")*"
+
+
+_MARKER_LINK = r"\(\w[\w+.-]*://" + _link_body(partial=False) + r"\)"
+# 홀드 꼬리는 스킴도 닫는 괄호도 **요구하지 않는다** — `[1](ht`처럼 스킴이 아직 미완성인
+# 꼬리도 링크로 확정될 수 있어서다(스킴 문자는 `[^()\s]`의 부분집합이라 몸통 문법이 그
+# 접두부를 이미 덮는다). 과잉 홀드는 다음 청크에 전량 방류되므로 무해하고, 과소 홀드만이
+# 되돌릴 수 없는 부분 방류를 낳는다.
+_OPEN_LINK_TAIL = r"\(" + _link_body(partial=True)
 _DIALECT_MARKER_PATTERN = re.compile(
-    r"(?<!\\)\[\s*(?:" + "|".join(_DIALECT_LABELS) + r")\s*[:#]?\s*"
-    r"(\d+(?:\s*,\s*\d+)*)\s*\](?!\()",
+    r"(?<!\\)\[\s*(?P<label>(?:" + "|".join(_DIALECT_LABELS) + r")\s*[:#]?\s*)?"
+    r"(?P<ids>\d+(?:\s*,\s*\d+)*)\s*\](?P<link>" + _MARKER_LINK + r")?",
     re.IGNORECASE,
 )
 
 
 def normalize_marker_dialects(text: str) -> str:
-    """마커 방언을 canonical `[n]`·`[n, m]`으로 재작성한다(검증은 그 뒤 기존 경로가 한다).
+    """마커 방언·링크형을 canonical `[n]`·`[n, m]`으로 재작성한다(검증은 그 뒤 기존 경로가 한다).
 
     정규화는 인용을 **인정**하지 않는다 — 형태만 맞춰 줄 뿐이라, 존재하지 않는 id를 가리키는
     방언은 이어지는 `validate_citations`가 평소처럼 지운다. 코드 스팬 안의 방언은 리터럴이므로
     마커 검증과 **같은 눈**(`_code_span_ranges`)으로 건너뛴다 — 판정을 두 벌 두면 한 벌만
     고치는 실수가 반복된다.
+
+    라벨도 링크도 없는 마커는 이미 canonical이므로 손대지 않는다(모델이 쓴 공백 표기 보존).
     """
     code_ranges = _code_span_ranges(text)
 
     def _replace(match: re.Match) -> str:
         if _within_code_span(match.start(), code_ranges):
             return match.group(0)
-        ids = ", ".join(part.strip() for part in match.group(1).split(","))
+        if not match.group("label") and not match.group("link"):
+            return match.group(0)
+        ids = ", ".join(part.strip() for part in match.group("ids").split(","))
         return f"[{ids}]"
 
     return _DIALECT_MARKER_PATTERN.sub(_replace, text)
@@ -342,16 +393,35 @@ def assign_display_numbers(
     return mapping
 
 
-# 표시 번호 배정이 아직 흔들릴 수 있는 꼬리 — 청크 경계에 걸려 아직 닫히지 않은 마커
-# (`[4` + `9]`). 이 패턴에 걸리는 꼬리는 다음 청크가 올 때까지 방출을 미룬다.
-_OPEN_MARKER_TAIL = re.compile(r"\[\d*(?:\s*,\s*\d*)*\Z")
+# 표시 번호 배정·정규화가 아직 흔들릴 수 있는 꼬리 — 청크 경계에 걸려 아직 **어떤 형태로
+# 확정될지 모르는** 마커. 이 패턴에 걸리는 꼬리는 다음 청크가 올 때까지 방출을 미룬다.
+# 세 가지가 흔들린다:
+#   ① 닫히지 않은 마커(`[4` + `9]`),
+#   ② 아직 라벨을 다 못 받은 방언(`[sour` + `ce: 9]`) — 라벨 열거에서 **파생**한 접두부라
+#      목록이 두 벌로 갈라지지 않는다,
+#   ③ 닫혔지만 뒤에 링크가 붙을 수 있는 마커(`[1]` + `(url)`) — `[1]`을 먼저 흘리면 url이
+#      도착했을 때 이미 흘린 구간을 되돌려야 한다(append-only 위반 = 마감 reset).
+# ②·③의 문법은 둘 다 **출구 문법에서 파생**한다(`_LABEL_PREFIXES`·`_OPEN_LINK_TAIL`) —
+# 손으로 다시 적으면 두 벌이 갈라져, 출구는 흡수하는데 홀드는 놓치는 구멍이 생긴다.
+_LABEL_PREFIXES = sorted(
+    {label[:size] for label in _DIALECT_LABELS for size in range(1, len(label) + 1)},
+    key=len,
+    reverse=True,
+)
+_OPEN_MARKER_TAIL = re.compile(
+    r"(?<!\\)\[(?:\s*(?:" + "|".join(_LABEL_PREFIXES) + r")\s*[:#]?)?"
+    r"\s*\d*(?:\s*,\s*\d*)*\s*"
+    r"(?:\](?:" + _OPEN_LINK_TAIL + r")?)?\Z",
+    re.IGNORECASE,
+)
 
 
 def _stable_prefix(text: str) -> str:
     """표시 번호 배정이 확정된 접두부만 남긴다(불안정한 꼬리는 다음 청크로 이월).
 
     흔들리는 것은 둘뿐이다:
-    ① 아직 닫히지 않은 마커(`_OPEN_MARKER_TAIL`).
+    ① 형태가 아직 확정되지 않은 마커 꼬리(`_OPEN_MARKER_TAIL` — 미완성 마커·미완성 방언
+       라벨·링크가 붙을 수 있는 닫힌 마커).
     ② 마지막 줄의 **열린 인라인 코드 백틱** — 닫히는 순간 그 구간의 `[n]`은 마커가 아니라
        리터럴로 재분류된다(`_code_span_ranges`와 같은 눈). 백틱 앞에서 끊어 두면 재분류
        대상이 이미 흘러간 본문에 들어갈 수 없다.
@@ -383,7 +453,7 @@ class StreamRenumberer:
 
     def __init__(self) -> None:
         self._mapping: dict[int, int] = {}
-        self._consumed = 0  # 표시 번호로 확정·방출한 원시 본문 길이
+        self._consumed = 0  # 표시 번호로 확정·방출한 **정규화** 본문 길이
 
     def feed(
         self, raw_text: str, valid_ids, *, final: bool = False
@@ -392,8 +462,18 @@ class StreamRenumberer:
 
         `final=True`면 이월해 둔 꼬리까지 전부 방출한다(스트림 마감 — 홀드가 화면에서
         영구히 사라지는 구멍을 막는다).
+
+        마커 방언·링크형은 출구(`validate_citations`)와 **같은 함수**로 여기서 먼저 흡수한다.
+        예전엔 정규화가 출구에만 있어, 방언으로 쓴 턴은 스트리밍 내내 원시 세션 id가 방언
+        표기 그대로 노출되다가 출구에서 본문이 바뀌어 마감 reset을 확정적으로 탔다 —
+        2026-08-04 재설계가 없애려던 UX가 방언 턴에서만 되살아나 있었다.
+
+        정규화는 조각이 아니라 **누적 본문 전체**에 건다. 조각에 걸면 좌표(offset)가 어긋나고
+        청크 경계에 걸친 방언이 두 조각으로 쪼개져 문법을 빠져나간다. 누적본에 걸어도 방출본이
+        append-only인 근거는 `_stable_prefix`다 — 확정 접두부는 어떤 마커 후보의 중간에서도
+        끊기지 않으므로, 뒤에 무엇이 붙어도 이전 정규화 결과가 새 정규화 결과의 접두부다.
         """
-        stable = raw_text if final else _stable_prefix(raw_text)
+        stable = normalize_marker_dialects(raw_text if final else _stable_prefix(raw_text))
         if len(stable) <= self._consumed:
             return "", {}
         code_ranges = _code_span_ranges(stable)

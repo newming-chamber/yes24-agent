@@ -3,10 +3,10 @@
 `runner.py`에서 ADK 도구 이벤트(function_call/response)를 프론트 계약으로 옮기는
 순수 번역 함수들만 추출한 모듈이다(동작 불변). 도구 호출은 진행 status 라벨로,
 도구 응답은 출처 dict로 번역하고, 병렬 도구 실행 시 세션 state가 잃을 수 있는 출처를
-스트림 관찰본으로 보정한다(_reconcile_sources).
+스트림 관찰본으로 보정한다(settle_sources).
 """
 
-from yes24_agent.sources import merge_source_records
+from yes24_agent.sources import REGISTRY_RECORD_FIELDS, SUMMARY_FIDELITY, merge_source_records
 from yes24_agent.toolsets import TOOLSET_SOURCE_TYPES
 from yes24_agent.yes24.urls import BROWSE_SEED_URLS
 
@@ -166,6 +166,43 @@ def project_public_source(source: dict) -> dict:
     return event
 
 
+def project_registry_record(source: dict) -> dict:
+    """관측을 **세션 레지스트리 레코드 스키마**로 투영한다(`REGISTRY_RECORD_FIELDS`).
+
+    도구 응답은 관측을 평면으로 싣고(가격·쪽수가 최상위) 본문 스캐폴딩(intro·toc·links·
+    weekly_reviews·status)까지 동봉하지만, state에 남을 형태는 레지스트리 레코드 한 벌뿐이다.
+    원문을 그대로 영속시키면 상세 하나가 수 KB로 불어 매 턴 재로드되고, 무엇보다 형태가
+    달라 다음 턴 병합이 두 축(최상위=정체성 / meta=관측값)을 구분하지 못한다.
+
+    공개 스칼라 추림은 `project_public_source`가 이미 소유하므로 그대로 재사용한다 —
+    필드 열거를 두 벌 두지 않는다. 그 결과 최상위에 남는 것은 정체성·본문뿐이고, 나머지
+    관측값은 전부 meta로 모인다. 레지스트리 레코드를 다시 넣어도 같은 값이 나오며(멱등),
+    예전 평면화가 최상위에 흘려 둔 관측값 잔재는 이 투영에서 meta로 흡수된다.
+
+    **관측하지 않은 필드는 키 자체를 넣지 않는다** — 키-생략은 "관측 불가"의 신호이고
+    (parsers.product_fields와 같은 규약), 없던 키를 None으로 만들어 내면 그대로 공개 DTO에
+    실려 소비자가 "본문이 빈 출처"로 읽는다. 병합은 `.get`으로 읽어 없음과 None을 같게 본다.
+    """
+    public = project_public_source(source)
+    meta = {key: value for key, value in public.items() if key not in REGISTRY_RECORD_FIELDS}
+    record = {
+        "id": public["id"],
+        "title": public["title"],
+        "url": public["url"],
+        "type": public["type"],
+        "fidelity": source.get("fidelity") or SUMMARY_FIDELITY,
+    }
+    observed = {
+        "snippet": source.get("snippet"),
+        "checked_at": public.get("checked_at"),
+        "meta": meta or None,
+        # 근거 구간은 공개 필드가 아니지만 병합이 명시적으로 다루는 관측 데이터라 함께 옮긴다.
+        "_evidence_segments": source.get("_evidence_segments"),
+    }
+    record.update({key: value for key, value in observed.items() if value is not None})
+    return record
+
+
 def project_source_ref(source_event: dict) -> dict:
     """출처 이벤트에서 **스트리밍 중 마커를 렌더할 최소 정보만** 투영한다(id·url).
 
@@ -177,11 +214,17 @@ def project_source_ref(source_event: dict) -> dict:
 
 
 def _sources_from_response(payload: dict) -> list[dict]:
-    """도구 응답에서 노출할 출처 dict 목록을 방어적으로 뽑아낸다.
+    """도구 응답에서 노출할 출처 dict 목록을 **원시 그대로** 뽑아낸다(id 키만 정규화).
 
     yes24_search는 results 리스트를, yes24_fetch는 단일 source dict를 반환할 수
     있으므로 둘 다 허용한다(fetch 스키마는 아직 미확정). source_id를 가진 dict만
     출처로 인정한다.
+
+    여기서 투영하지 않는다 — 공개 DTO로의 투영은 출구(`build_done_payload`)가 이미
+    하고, 관측 즉시 투영하면 병합 판정에 필요한 정보(fidelity·meta)가 그 자리에서
+    사라져 상세 관측이 뒤따르는 목록 관측에 조용히 격하된다. 대신 도구의 `source_id`를
+    레지스트리 어휘인 `id`로 정규화해, 관찰본과 세션 레지스트리가 **한 vocabulary**로
+    만나 같은 병합 원시함수를 탈 수 있게 한다(추출 지점이 여기 하나뿐이라 드리프트 없음).
     """
     results = payload.get("results")
     if isinstance(results, list):
@@ -191,11 +234,15 @@ def _sources_from_response(payload: dict) -> list[dict]:
         candidates = [payload]
     else:
         candidates = []
-    return [c for c in candidates if isinstance(c, dict) and c.get("source_id") is not None]
+    return [
+        {**{key: value for key, value in c.items() if key != "source_id"}, "id": c["source_id"]}
+        for c in candidates
+        if isinstance(c, dict) and c.get("source_id") is not None
+    ]
 
 
-def _reconcile_sources(observed_sources: list[dict]) -> list[dict]:
-    """이번 턴의 done 조립·인용 검증에 쓸 출처 스냅샷을 만든다.
+def settle_sources(registry: list[dict], observed_sources: list[dict]) -> list[dict]:
+    """세션 레지스트리에 이번 턴 스트림 관찰본을 화해해 인용 가능 집합을 만든다.
 
     ADK 2.3.0은 한 턴에 나온 병렬 function call을 asyncio.gather로 동시 실행하고,
     각 도구의 state_delta를 deep_merge_dicts가 **리스트 키에 대해 last-wins로 덮어쓴다**
@@ -203,12 +250,26 @@ def _reconcile_sources(observed_sources: list[dict]) -> list[dict]:
     한 도구의 출처가 통째로 유실될 수 있고, postprocess가 유효한 [n] 인용을 잘라낸다.
 
     반면 병렬 function_response는 merge 시 parts가 모두 보존되므로, 런너가 스트림에서
-    관찰해 누적한 출처(observed)는 유실되지 않는다. 따라서 근거 스냅샷은 observed만 id 기준으로
-    합친다. 세션 레지스트리를 섞지 않아 과거 상세·가격이 새 검색 관측을 덮지 못하게 한다.
+    관찰해 누적한 출처(observed)는 유실되지 않는다. 둘을 합치면 **레지스트리는 판정을,
+    관찰본은 완전성을** 담당한다: 레지스트리 레코드가 base가 되어 `register_source`가
+    선언한 fidelity로 상세 관측이 목록 관측에 격하되는 것을 막고, 레지스트리가 잃은
+    출처는 관찰본이 되살린다. 병합 판정은 `merge_source_records` 한 곳뿐이라 레지스트리
+    (`register_source`)와 이번 턴 스냅샷이 서로 다른 규칙을 쓰는 드리프트가 없다.
+
+    **양쪽 모두 레지스트리 스키마로 맞춘 뒤 합친다.** 병합이 두 축(최상위=정체성,
+    meta=관측값)을 구분하려면 관측값이 meta에 있어야 하는데 도구 응답은 그것을 평면으로
+    싣는다. 화해본이 그대로 복구 write의 내용이 되므로, 여기서 맞춰 두면 state에 남는
+    형태가 한 벌로 유지된다(러너가 되쓰기 직전에 또 투영할 필요가 없다).
     """
-    by_id: dict[int, dict] = {}
-    for src in observed_sources:
-        sid = src.get("id")
-        if sid is not None:
-            by_id[sid] = merge_source_records(by_id.get(sid, {}), src)
-    return [by_id[key] for key in sorted(by_id)]
+    settled: dict[int, dict] = {
+        source["id"]: project_registry_record(source)
+        for source in registry
+        if source.get("id") is not None
+    }
+    for source in observed_sources:
+        source_id = source.get("id")
+        if source_id is not None:
+            settled[source_id] = merge_source_records(
+                settled.get(source_id, {}), project_registry_record(source)
+            )
+    return [settled[key] for key in sorted(settled)]

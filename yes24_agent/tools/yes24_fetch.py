@@ -301,6 +301,11 @@ def _fetch_product(
         "title": title,
         "url": url,
         "type": "book_detail",
+        # 관측 충실도를 **응답에도** 싣는다. 병렬 도구 유실로 세션 레지스트리가 이 출처를
+        # 잃으면 러너의 화해·복구는 이 응답만 갖고 레코드를 되세우는데, 여기에 충실도가
+        # 없으면 상세가 요약으로 저장돼 다음 목록 관측에 격하된다. 값은 register_source에
+        # 넘긴 것과 같은 상수이며, 코어는 이 숫자의 크기만 비교한다(T1: 도구가 선언).
+        "fidelity": DETAIL_FIDELITY,
         **fields,
         # snippet은 블록들의 연접이라 모델에겐 중복이지만, **공개 출처 DTO의 근거 본문**이다.
         # done.sources는 세션 레지스트리가 아니라 이 도구 응답에서 만들어지므로

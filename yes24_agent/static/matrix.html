@@ -645,7 +645,7 @@
       AXES, VAL, CODES, ROW_ORDER, COL_ORDER, rowKey, colKey, deriveAxisLabel,
       RBTI_STORAGE_KEY, MATRIX_HANDOFF_KEY,
     } from "/static/lib/rbti.js?v=1";
-    import { WEB_TYPES, coverUrl, safeOpen } from "/static/lib/sources.js?v=1";
+    import { WEB_TYPES, coverUrl, safeOpen, formatPrice, makeCoverImg, relayTypingFocus } from "/static/lib/sources.js?v=1";
 
     // 축 색 아이덴티티: 열(취향폭×동기)별 hue 밴드, 행 = 정보처리(분석 쿨 / 공감 웜) 코드배지.
     const COL_HUE = { DI: "#22d3ee", DF: "#a78bfa", BI: "#fbbf24", BF: "#34d399" };
@@ -691,7 +691,6 @@
     // 마커 승격 조건(공용 렌더러에 주입) — 공유 출처 풀에 있는 id만 인용 배지가 된다.
     const isPooled = (sid) => sourcesById.has(String(sid));
 
-    // ── W2: 표지 썸네일(coverUrl은 공용 모듈) ──
     // ── 공유 출처(접이식) ──
     function makeSharedCard(src) {
       const isWeb = WEB_TYPES.has(src.type);
@@ -929,16 +928,10 @@
       pick.appendChild(tick);
       const url = coverUrl(rep);
       if (url) {
-        const cover = document.createElement("img");
-        cover.className = "c-pick-cover";
-        // loading=lazy는 스크롤 없는 100vh 뷰포트에 JS로 삽입된 이미지의 IntersectionObserver를
-        // 트리거하지 못해 로드가 멈춘다(Chrome 쿼크) — 항상 보이는 썸네일이라 즉시 로드가 옳다.
-        cover.decoding = "async";
-        cover.alt = "";
-        cover.addEventListener("load", () => { cover.classList.add("loaded"); tick.style.display = "none"; });
-        cover.addEventListener("error", () => cover.remove());
+        const cover = makeCoverImg(url, "c-pick-cover", {
+          onLoad: () => { cover.classList.add("loaded"); tick.style.display = "none"; },
+        });
         pick.insertBefore(cover, tick);
-        cover.src = url;
       }
 
       const title = document.createElement("span");
@@ -946,13 +939,11 @@
       title.textContent = "『" + rep.title + "』";
       title.title = rep.title;
       pick.appendChild(title);
-      // 가격 키는 sale_price(할인 적용 판매가)다 — 평면 price는 개명 전 스냅샷 호환 폴백.
-      const priceRaw = (rep.sale_price != null) ? rep.sale_price : rep.price;
-      if (priceRaw != null && priceRaw !== "") {
+      const priceText = formatPrice(rep);
+      if (priceText) {
         const price = document.createElement("span");
         price.className = "c-pick-price";
-        const n = Number(priceRaw);
-        price.textContent = (Number.isFinite(n) && n > 0 ? n.toLocaleString("ko-KR") : String(priceRaw)) + "원";
+        price.textContent = priceText;
         pick.appendChild(price);
       }
       // 나머지 책 수 — 클릭하면 더 있다는 어포던스(모달 표지 스트립으로 이어진다).
@@ -1090,19 +1081,16 @@
         if (!url) continue;
         const book = document.createElement("div");
         book.className = "m-book";
-        const cover = document.createElement("img");
-        cover.className = "m-book-cover";
-        cover.decoding = "async";
-        cover.alt = "";
-        cover.addEventListener("load", () => cover.classList.add("loaded"));
-        cover.addEventListener("error", () => book.remove());
+        const cover = makeCoverImg(url, "m-book-cover", {
+          onLoad: () => cover.classList.add("loaded"),
+          onError: () => book.remove(), // 제목 줄만 남는 유령 카드를 막으려 부모째 제거
+        });
         const t = document.createElement("div");
         t.className = "m-book-title";
         t.textContent = src.title || "";
         book.append(cover, t);
         book.addEventListener("click", () => safeOpen(src.url));
         mBooks.appendChild(book);
-        cover.src = url;
       }
 
       mChips.textContent = "";
@@ -1482,20 +1470,9 @@
     stopBtn.addEventListener("click", () => { if (controller) controller.abort(); });
     qEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } });
 
-    // 컴포저 밖에서 타이핑 시작 → 포커스만 질문 입력으로 옮기고 글자 삽입은 브라우저 기본
-    // 동작에 맡긴다(index.html과 동일 계약 — 문자 직접 삽입 릴레이는 공백·문장부호·Enter·
-    // 한글 IME를 흘려서 금지). 모달·토너먼트가 열려 있거나(셀 Space=모달 열기 등 자체 키
-    // 조작 우선) 전송 중엔 개입하지 않는다. 비프린터블(Enter·화살표)은 릴레이 안 함.
-    function isEditableTarget(el) {
-      return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
-    }
-    document.addEventListener("keydown", (e) => {
-      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
-      if (isEditableTarget(e.target)) return;
-      if (!modalBackdrop.hidden || !tourneyBackdrop.hidden) return;
-      if (qEl.disabled) return;
-      if (e.key.length === 1 || e.key === "Process") qEl.focus();
-    });
+    // 컴포저 밖 타이핑 → 질문 입력으로 포커스 이동(계약은 공용 모듈). 모달·토너먼트가 열려
+    // 있으면 자체 키 조작(셀 Space=모달 열기 등)이 우선이라 넘겨준다.
+    relayTypingFocus(qEl, () => !modalBackdrop.hidden || !tourneyBackdrop.hidden);
 
     // ── 결과 스냅샷(왕복 복원) ──
     // 완료된 런의 클라이언트 상태(질문·16셀 텍스트·출처·폴백)를 sessionStorage에 저장하고,

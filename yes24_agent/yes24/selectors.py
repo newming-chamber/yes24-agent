@@ -92,8 +92,12 @@ PRODUCT_PAGE_COUNT_FIELD = "쪽수"
 # CSS 방식(예: em.yes_b)은 상세페이지에서 "함께 사면 좋은 상품" 번들가·중고가까지
 # 섞여 나와 오염 위험이 크다(docs/m2-scout-report.md 참조). JS 변수는 항상 SSR로
 # 박혀 있어 정규식 추출이 더 안전하다.
-PRODUCT_GOODS_NO_JS_RE = r"g_GoodsNo\s*=\s*'([^']*)'"
-PRODUCT_GOODS_NAME_JS_RE = r"g_GoodsName\s*=\s*'([^']*)'"
+# 캡처는 **값이 있을 때만** 매치해야 한다(`+`·`\d+`). `[^']*`로 빈 캡처를 허용하면
+# `g_GoodsNo = ''` 같은 빈 스캐폴딩이 goods_no="" (None 아님)로 잡혀, 제목 없는 페이지가
+# parse_product의 fail-loud 게이트(둘 다 None이면 ParseError)를 빠져나가 전 필드 공백
+# 레코드로 통과한다 — 모듈 docstring이 금지한 "빈 성공 위장"이다.
+PRODUCT_GOODS_NO_JS_RE = r"g_GoodsNo\s*=\s*'(\d+)'"
+PRODUCT_GOODS_NAME_JS_RE = r"g_GoodsName\s*=\s*'([^']+)'"
 PRODUCT_IS_EBOOK_JS_RE = r"g_isEbook\s*=\s*'([YN])'"
 PRODUCT_SALE_PRICE_JS_RE = r"g_GoodsSalePrice\s*=\s*([\d.]+)"
 

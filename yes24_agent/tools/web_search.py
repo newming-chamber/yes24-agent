@@ -405,14 +405,27 @@ async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
     if raw_results:
         # 최종 URL·제목 보강(병렬·실패 무해, 요청 1회로 둘 다). 프리페치 파이프라인 안에서도
         # 실행되므로 대부분의 지연이 모델 사고 시간에 숨는다.
-        metas = await asyncio.gather(
-            *(_fetch_page_meta(item["url"], settings) for item in raw_results),
-            return_exceptions=True,
-        )
-        for item, meta in zip(raw_results, metas):
-            if isinstance(meta, BaseException):
+        #
+        # 보강 **전체**에 wall-clock 예산 하나를 건다. 이것은 순수 표시 메타지 인용 근거가
+        # 아닌데(`_fetch_page_meta` 참조), 프리페치가 안 숨겨주는 경로(턴 내 두 번째 호출,
+        # 프리페치 미스·미소비)에서는 가장 느린 외부 사이트 한 곳이 도구 응답 전체를 붙잡는다.
+        # 요청별 httpx 타임아웃은 **위상별**이라 청크가 시한 미만 간격으로 계속 흘러오는
+        # 서버에서는 총 지연을 못 막는다 — 예산은 그 꼬리를 처음으로 진짜 벽에 가둔다.
+        # 시한 내 끝난 것만 반영하고 나머지는 취소해 리다이렉트 URL·도메인 표기를 그대로
+        # 둔다(개별 실패 폴백과 같은 형태라 경로가 갈라지지 않는다).
+        tasks = [
+            asyncio.ensure_future(_fetch_page_meta(item["url"], settings))
+            for item in raw_results
+        ]
+        _, pending = await asyncio.wait(tasks, timeout=settings.web_title_fetch_timeout_s)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for item, task in zip(raw_results, tasks):
+            if task.cancelled() or task.exception() is not None:
                 continue
-            final_url, title = meta
+            final_url, title = task.result()
             if final_url:
                 item["url"] = final_url
             if title:

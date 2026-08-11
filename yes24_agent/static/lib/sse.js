@@ -3,14 +3,17 @@
 // SSE 이벤트 블록(event:/data:)을 {event, data}로 파싱한다. data가 JSON이 아니면 {}.
 function parseEvent(block) {
   let event = "message";
-  let data = "";
+  const dataLines = [];
   for (const line of block.split("\n")) {
     if (line.startsWith("event:")) event = line.slice(6).trim();
-    else if (line.startsWith("data:")) data += line.slice(5).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
   }
+  const data = dataLines.join("\n"); // SSE 명세: 여러 data: 라인은 개행으로 결합
   let parsed = {};
   if (data) {
-    try { parsed = JSON.parse(data); } catch (e) { parsed = {}; }
+    // 폐기를 무신호로 두면 delta가 조용히 {}가 돼 "delta 합계 == done.text" 위반이 은폐된다.
+    try { parsed = JSON.parse(data); }
+    catch (e) { console.warn("[sse] JSON 파싱 실패 — 프레임 폐기:", event, data.slice(0, 200)); }
   }
   return { event, data: parsed };
 }

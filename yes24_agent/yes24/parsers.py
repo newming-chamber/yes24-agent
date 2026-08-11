@@ -115,30 +115,56 @@ def parse_search(html: str, *, base_url: str, limit: int = 10) -> list[dict]:
     열거하지 않는다 — 목록이 갈라지면 계약이 조용히 어긋난다.
     제목 또는 URL이 없는 아이템은 건너뛴다.
 
-    아이템 컨테이너(`ul#yesSchList`) 자체가 없으면 기본적으로 HTML 구조 변경으로 보고
-    ParseError를 발생시킨다. 단, Yes24는 검색 결과가 실제로 0건일 때 이 컨테이너 대신
-    "결과가 없습니다" 안내 블록(NO_RESULTS_MARKER)을 렌더링하므로, 컨테이너가 없어도
-    이 신호가 있으면 정상적인 빈 검색 결과로 보고 빈 리스트를 반환한다. 컨테이너는
-    있지만 아이템이 0개인 경우도 마찬가지로 빈 리스트. 컨테이너와 아이템이 있는데도
-    전부 파싱 실패하면 역시 ParseError(부분적 구조 변경 감지).
+    무결과·구조 파손 판정은 목록 파서 공통 골격(_parse_list)이 한다.
+    """
+    return _parse_list(
+        html,
+        limit=limit,
+        container_selector=SEARCH_LIST_CONTAINER,
+        item_selector=SEARCH_ITEM,
+        convert=lambda item: _parse_item(item, base_url),
+    )
+
+
+def _parse_list(
+    html: str,
+    *,
+    limit: int,
+    container_selector: str,
+    item_selector: str,
+    convert,
+) -> list[dict]:
+    """목록 페이지(검색·베스트셀러·신간·크레마클럽) 공통 파싱 골격.
+
+    목록마다 다른 것은 **아이템→dict 변환(convert)**뿐이므로 골격은 하나만 둔다 —
+    무결과 신호 판정과 전멸 기준이 목록마다 복제되면 셀렉터 개편 때 한 곳만 고쳐져
+    조용히 갈라진다. convert는 건너뛸 아이템에 None을 반환한다(rank 같은 가법 필드도
+    convert가 흡수한다).
+
+    아이템 컨테이너 자체가 없으면 기본적으로 HTML 구조 변경으로 보고 ParseError를
+    발생시킨다. 단, Yes24는 결과가 실제로 0건일 때 이 컨테이너 대신 "결과가 없습니다"
+    안내 블록(NO_RESULTS_MARKER)을 렌더링하므로, 컨테이너가 없어도 이 신호가 있으면
+    정상적인 빈 결과로 보고 빈 리스트를 반환한다. 컨테이너는 있지만 아이템이 0개인
+    경우도 마찬가지로 빈 리스트. 컨테이너와 아이템이 있는데도 전부 변환 실패하면 역시
+    ParseError(부분적 구조 변경 감지 — 빈 성공 위장 금지).
     """
     soup = BeautifulSoup(html, "lxml")
 
-    if soup.select_one(SEARCH_LIST_CONTAINER) is None:
+    if soup.select_one(container_selector) is None:
         if soup.select_one(NO_RESULTS_MARKER) is not None:
             return []
         raise ParseError(
-            f"검색 결과 컨테이너({SEARCH_LIST_CONTAINER})와 "
+            f"목록 컨테이너({container_selector})와 "
             f"무결과 신호({NO_RESULTS_MARKER}) 모두 찾을 수 없음 — HTML 구조 변경 의심"
         )
 
-    items = soup.select(SEARCH_ITEM)
+    items = soup.select(item_selector)
     if not items:
         return []
 
     results: list[dict] = []
     for item in items:
-        parsed = _parse_item(item, base_url)
+        parsed = convert(item)
         if parsed is None:
             continue
         results.append(parsed)
@@ -147,7 +173,7 @@ def parse_search(html: str, *, base_url: str, limit: int = 10) -> list[dict]:
 
     if not results:
         raise ParseError(
-            f"아이템 {len(items)}개 중 제목/URL을 추출한 것이 0개 — HTML 구조 변경 의심"
+            f"아이템 {len(items)}개 중 제목/식별자를 추출한 것이 0개 — HTML 구조 변경 의심"
         )
 
     return results
@@ -180,7 +206,7 @@ def _parse_item(item, base_url: str) -> dict | None:
         author=_author_or_none(item),
         publisher=_text_or_none(item.select_one(ITEM_PUBLISHER)),
         pub_date=_text_or_none(item.select_one(ITEM_PUB_DATE)),
-        sale_price=_parse_price(item.select_one(ITEM_SALE_PRICE)),
+        sale_price=_parse_grouped_int(item.select_one(ITEM_SALE_PRICE)),
         rating=_parse_rating(item.select_one(ITEM_RATING)),
         sale_index=_parse_grouped_int(item.select_one(ITEM_SALE_INDEX)),
         review_count=_parse_grouped_int(item.select_one(ITEM_REVIEW_COUNT)),
@@ -340,147 +366,70 @@ def parse_browse_list(html: str, *, base_url: str, section: str, limit: int = 24
         allowed = ", ".join(sorted(BROWSE_SEED_URLS))
         raise ValueError(f"지원하지 않는 section: {section!r} (허용값: {allowed})") from exc
 
-    # 마크업 종류 → 파서. 표에 없는 markup은 KeyError로 즉시 터진다(조용한 오분기 금지).
-    return _MARKUP_PARSERS[spec["markup"]](
+    # 마크업 종류 → 아이템 변환기. 표에 없는 markup은 KeyError로 즉시 터진다(조용한 오분기 금지).
+    return _parse_list(
         html,
-        base_url=base_url,
         limit=limit,
         container_selector=spec["list_container"],
         item_selector=spec["item"],
-        has_rank=spec["has_rank"],
+        convert=_MARKUP_CONVERTERS[spec["markup"]](base_url, has_rank=spec["has_rank"]),
     )
 
 
-def _parse_search_style_browse_list(
-    html: str,
-    *,
-    base_url: str,
-    limit: int,
-    container_selector: str,
-    item_selector: str,
-    has_rank: bool,
-) -> list[dict]:
-    """베스트셀러/신간처럼 검색 결과와 마크업이 동일한 섹션 목록을 파싱한다."""
-    soup = BeautifulSoup(html, "lxml")
+def _search_style_converter(base_url: str, *, has_rank: bool):
+    """베스트셀러/신간처럼 검색 결과와 마크업이 동일한 섹션의 아이템 변환기."""
 
-    if soup.select_one(container_selector) is None:
-        if soup.select_one(NO_RESULTS_MARKER) is not None:
-            return []
-        raise ParseError(
-            f"목록 컨테이너({container_selector})와 "
-            f"무결과 신호({NO_RESULTS_MARKER}) 모두 찾을 수 없음 — HTML 구조 변경 의심"
-        )
-
-    items = soup.select(item_selector)
-    if not items:
-        return []
-
-    results: list[dict] = []
-    for item in items:
+    def convert(item) -> dict | None:
         parsed = _parse_item(item, base_url)
         if parsed is None:
-            continue
-
-        rank = None
-        if has_rank:
-            rank_el = item.select_one(ITEM_RANK)
-            rank = _parse_int(rank_el.get_text(strip=True)) if rank_el else None
-
+            return None
         # rank만 가법 — 나머지 필드는 검색과 같은 _parse_item 결과 그대로다.
-        results.append({"rank": rank, **parsed})
-        if len(results) >= limit:
-            break
+        return {"rank": _parse_rank(item, ITEM_RANK, has_rank), **parsed}
 
-    if not results:
-        raise ParseError(
-            f"아이템 {len(items)}개 중 제목/URL을 추출한 것이 0개 — HTML 구조 변경 의심"
-        )
-
-    return results
+    return convert
 
 
-def _parse_cremaclub_list(
-    html: str,
-    *,
-    base_url: str,
-    limit: int,
-    container_selector: str,
-    item_selector: str,
-    has_rank: bool,
-) -> list[dict]:
-    """크레마클럽 인기(eBook 구독) 목록을 파싱한다. 검색/베스트셀러와 마크업이 다르다.
+def _cremaclub_converter(base_url: str, *, has_rank: bool):
+    """크레마클럽 인기(eBook 구독) 목록의 아이템 변환기. 검색/베스트셀러와 마크업이 다르다."""
 
-    시그니처는 _parse_search_style_browse_list와 같다 — 섹션 레코드의 markup 값으로 둘 중
-    하나를 골라 같은 방식으로 호출한다(섹션별 if 분기 없음).
-    """
-    soup = BeautifulSoup(html, "lxml")
-
-    if soup.select_one(container_selector) is None:
-        if soup.select_one(NO_RESULTS_MARKER) is not None:
-            return []
-        raise ParseError(
-            f"크레마클럽 목록 컨테이너({container_selector})와 "
-            f"무결과 신호({NO_RESULTS_MARKER}) 모두 찾을 수 없음 — HTML 구조 변경 의심"
-        )
-
-    items = soup.select(item_selector)
-    if not items:
-        return []
-
-    results: list[dict] = []
-    for item in items:
+    def convert(item) -> dict | None:
         goods_no_el = item.select_one(CREMACLUB_GOODS_NO_LINK)
         goods_no = goods_no_el.get(ITEM_GOODS_NO_ATTR) if goods_no_el else None
         title_el = item.select_one(CREMACLUB_TITLE_LINK)
         title = title_el.get_text(strip=True) if title_el else None
         if not title or not goods_no:
-            continue
-
-        rank = None
-        if has_rank:
-            rank_el = item.select_one(CREMACLUB_RANK)
-            rank = _parse_int(rank_el.get_text(strip=True)) if rank_el else None
+            return None
 
         # 검색/베스트셀러와 같은 필드 순서(_item_fields)를 따르되, 이 페이지에 필드 자체가
         # 없는 publisher·pub_date·sale_price·sale_index는 키를 내지 않는다(구독형 eBook 목록).
-        results.append(
-            {
-                "rank": rank,
-                **_item_fields(
-                    goods_no=goods_no,
-                    title=title,
-                    url=product_url(base_url, goods_no),
-                    author=_text_or_none(item.select_one(CREMACLUB_AUTHOR)),
-                    rating=_parse_rating(item.select_one(CREMACLUB_RATING)),
-                    review_count=_parse_grouped_int(item.select_one(ITEM_REVIEW_COUNT)),
-                    image_url=_image_url_or_none(item),
-                ),
-            }
-        )
-        if len(results) >= limit:
-            break
+        return {
+            "rank": _parse_rank(item, CREMACLUB_RANK, has_rank),
+            **_item_fields(
+                goods_no=goods_no,
+                title=title,
+                url=product_url(base_url, goods_no),
+                author=_text_or_none(item.select_one(CREMACLUB_AUTHOR)),
+                rating=_parse_rating(item.select_one(CREMACLUB_RATING)),
+                review_count=_parse_grouped_int(item.select_one(ITEM_REVIEW_COUNT)),
+                image_url=_image_url_or_none(item),
+            ),
+        }
 
-    if not results:
-        raise ParseError(
-            f"아이템 {len(items)}개 중 제목/goods_no를 추출한 것이 0개 — HTML 구조 변경 의심"
-        )
-
-    return results
+    return convert
 
 
-# 섹션 레코드의 markup 값(urls.BROWSE_SEED_URLS) → 파싱 함수. 두 함수는 시그니처가 같아
-# 서로 대체 가능하다 — 섹션별 if 분기 없이 이 표로만 고른다.
-_MARKUP_PARSERS = {
-    "search": _parse_search_style_browse_list,
-    "cremaclub": _parse_cremaclub_list,
+# 섹션 레코드의 markup 값(urls.BROWSE_SEED_URLS) → 아이템 변환기 팩토리. 파싱 골격은
+# _parse_list 하나뿐이고 마크업으로 갈리는 것은 변환기뿐이다 — 두 팩토리는 시그니처가 같아
+# 서로 대체 가능하며, 섹션별 if 분기 없이 이 표로만 고른다.
+_MARKUP_CONVERTERS = {
+    "search": _search_style_converter,
+    "cremaclub": _cremaclub_converter,
 }
 
 
-def _parse_int(text: str) -> int | None:
-    try:
-        return int(text)
-    except ValueError:
-        return None
+def _parse_rank(item, rank_selector: str, has_rank: bool) -> int | None:
+    """순위 마커가 선언된 섹션에서만 순위를 읽는다(마커가 없는 섹션은 항상 None)."""
+    return _parse_grouped_int(item.select_one(rank_selector)) if has_rank else None
 
 
 def extract_links(
@@ -774,18 +723,11 @@ def _image_url_or_none(item) -> str | None:
     return url or None
 
 
-def _parse_price(el) -> int | None:
-    if el is None:
-        return None
-    cleaned = el.get_text(strip=True).replace(",", "")
-    return int(cleaned) if cleaned.isdigit() else None
-
-
 def _parse_js_price(raw: str) -> int | None:
     """PRODUCT_SALE_PRICE_JS_RE가 캡처한 문자열("15300.00" 등)을 정수로 변환한다.
 
     캡처 그룹 자체가 `[\\d.]+`라 점이 여러 개인 값("1.2.3")도 매칭될 수 있어
-    `float()`가 ValueError를 던질 수 있다 — 형제 파서(_parse_int/_parse_rating)와
+    `float()`가 ValueError를 던질 수 있다 — 형제 파서(_parse_grouped_int/_parse_rating)와
     동일하게 가드해 파싱 불가 시 예외 대신 None으로 degrade한다.
     """
     try:
@@ -805,10 +747,11 @@ def _parse_rating(el) -> float | None:
 
 
 def _parse_grouped_int(el) -> int | None:
-    """판매지수·리뷰수처럼 라벨·쉼표가 섞인 정수를 뽑는다("판매지수 113,304"→113304).
+    """요소 텍스트에서 정수를 뽑는 **유일한** 파서(판매지수·리뷰수·판매가·순위 공용).
 
-    첫 숫자 뭉치(쉼표 포함)만 취해 앞뒤 라벨 텍스트("판매지수 "·"건")를 무시한다. 숫자가
-    없으면 None(빈 성공 위장 금지 — 형제 파서와 동일 degrade 규약)."""
+    "판매지수 113,304"→113304, "43,920"→43920. 첫 숫자 뭉치(쉼표 포함)만 취해 앞뒤 라벨
+    텍스트("판매지수 "·"건")를 무시한다. 같은 판정을 셀렉터마다 따로 구현하면 degrade
+    규약이 갈라지므로 한 함수로 둔다. 요소가 없거나 숫자가 없으면 None(빈 성공 위장 금지)."""
     if el is None:
         return None
     match = re.search(r"\d[\d,]*", el.get_text())
