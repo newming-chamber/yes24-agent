@@ -149,6 +149,9 @@ async def yes24_fetch(
         곳은 배송 정책 페이지 본문뿐이다.
         본문이 상한보다 길어 잘렸으면 truncated=True와 total_chars(전체 길이)가
         함께 온다 — 찾는 내용이 안 보이면 find 키워드로 재호출해 뒷부분을 읽는다.
+        상품 상세의 other_formats는 이 페이지가 함께 렌더한 **다른 판형**(eBook·중고 등)의
+        판형명·판매가·url이다 — 열람 중인 상품이 아니라 그 판형이 값의 임자이며, 가격이
+        관측된 판형은 자기 source_id를 갖는다(그 값을 답에 쓰면 그 번호로 인용한다).
         함께 오는 links는 이 페이지에서 더 볼 수 있는 다른 Yes24 페이지 후보
         목록이다(아직 열지 않은 페이지 — 인용 대상이 아니며, 필요하면 그 url로 다시
         yes24_fetch를 호출해 이어서 열람할 수 있다). 상품 상세에서는 관련 상품 링크만,
@@ -290,6 +293,14 @@ def _fetch_product(
         meta=fields,
         invocation_id=getattr(tool_context, "invocation_id", None),
     )
+    if "other_formats" in fields:
+        # 판형에도 번호를 준 새 dict로 갈아끼운다(레지스트리에 넘긴 meta는 건드리지 않는다).
+        fields = {
+            **fields,
+            "other_formats": _register_other_formats(
+                fields["other_formats"], title, checked_at, tool_context
+            ),
+        }
 
     logger.info(
         f"yes24_fetch url={url!r} status=ok type=book_detail total={trunc.total_chars} "
@@ -336,6 +347,53 @@ def _fetch_product(
     if find:
         detail["find_found"] = trunc.find_found
     return detail
+
+
+def _register_other_formats(
+    other_formats: list[dict],
+    product_title: str,
+    checked_at: str,
+    tool_context: ToolContext,
+) -> list[dict]:
+    """다른 판형 레코드에 각자의 source_id를 부여한다(가격이 관측된 판형만).
+
+    판형 위젯이 렌더하는 것은 **다른 상품**의 요약 관측(판형명·판매가·전용 url)이라, 열람
+    중인 상품의 출처에 담을 수 없다. 그렇다고 번호 없이 값만 주면 모델은 인용할 마커가 없어
+    옆 번호를 빌린다(실측 2026-08-11: 종이책 출처 [1]에 "eBook 판매가 12,000원"). 임자를
+    되돌려 준 다음 단계는 **그 임자에게 인용할 번호를 주는 것**이고, 이 관측은 종이책
+    페이지가 실제로 렌더한 값이라 창작이 아니다. 추가 열람(fetch)도 필요 없다.
+
+    가격이 없는 판형(중고상품 판매요청 링크)과 url이 없는 판형은 등록하지 않는다 — 인용할
+    값이 없는 출처는 번호만 앞으로 밀 뿐이다. 제목은 관측의 출처를 그대로 말한다("이 작품의
+    이 판형"), 충실도는 요약이라 나중에 그 url을 실제로 열면 상세 관측이 이긴다.
+    """
+    registered: list[dict] = []
+    for record in other_formats:
+        if not record.get("url") or record.get("sale_price") is None:
+            registered.append(record)
+            continue
+        format_title = f"{product_title} ({record['format']})"
+        source_id = register_source(
+            tool_context.state,
+            title=format_title,
+            url=record["url"],
+            source_type="other_format",
+            checked_at=checked_at,
+            meta={"sale_price": record["sale_price"]},
+            invocation_id=getattr(tool_context, "invocation_id", None),
+        )
+        # 검색 결과 항목과 같은 형태로 싣는다 — 출처 dict는 어디에 실리든 자기 정체성
+        # (source_id·type·title·checked_at)을 함께 갖는다(관측 경로가 그 형태로 읽는다).
+        registered.append(
+            {
+                **record,
+                "source_id": source_id,
+                "type": "other_format",
+                "title": format_title,
+                "checked_at": checked_at,
+            }
+        )
+    return registered
 
 
 def _fetch_generic(

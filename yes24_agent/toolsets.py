@@ -16,7 +16,6 @@ from types import SimpleNamespace
 
 from yes24_agent.config import get_settings
 from yes24_agent.tools.fetch_many import fetch_many
-from yes24_agent.tools.reply_directly import reply_directly
 from yes24_agent.tools.web_fetch import web_fetch
 from yes24_agent.tools.web_search import (
     aclose_shared_client as aclose_web_search_client,
@@ -83,6 +82,9 @@ TOOLSET_SOURCE_TYPES: dict[str, dict[str, tuple[str, ...]]] = {
         "search_result": GROUNDING_FIELDS,
         "book_detail": GROUNDING_FIELDS,
         "browse": GROUNDING_FIELDS,
+        # 상세가 함께 관측한 다른 판형(eBook·중고 등). 그 페이지를 연 것이 아니라 판형
+        # 위젯이 렌더한 값이라, 관측된 것은 판매가 하나뿐이다.
+        "other_format": ("sale_price",),
     },
     "web": {"web": ()},
 }
@@ -102,10 +104,6 @@ ACLOSE_HOOKS: dict[str, tuple] = {
     "yes24": (aclose_yes24_client,),
     "web": (aclose_web_search_client,),
 }
-
-# toolset이 아니라 코어 도구 — force_first_turn_tool 스위치·_force_tool_first_turn
-# 콜백과 한 세트라 항상 등록된다(끄면 잡담도 강제 검색이 된다).
-CORE_TOOLS = (reply_directly,)
 
 PERSONAS: dict[str, Persona] = {
     "yes24": Persona(
@@ -163,7 +161,7 @@ def resolve_app(settings) -> ResolvedApp:
     active = frozenset(enabled)
     tools = tuple(
         tool for key, toolset in TOOLSETS.items() if key in active for tool in toolset
-    ) + CORE_TOOLS
+    )
     aclose_hooks = tuple(hook for hooks in ACLOSE_HOOKS.values() for hook in hooks)
     prefetch_hooks = tuple(
         hook for key, hooks in PREFETCH_HOOKS.items() if key in active for hook in hooks

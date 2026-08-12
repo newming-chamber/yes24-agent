@@ -35,14 +35,6 @@ class Settings(BaseSettings):
         "Gemini 3.5 Flash": "gemini-3.5-flash",
         "Gemini 3.6 Flash": "gemini-3.6-flash",
     }
-    # 첫 모델 턴 도구 호출 강제(ANY). **커플링**: True로 켜면 reply_directly 도구가 탈출구로
-    # 반드시 함께 있어야 한다 — 스위치·_force_tool_first_turn·reply_directly는 한 세트다.
-    # 기본 False = Claude Code식 자율(AUTO 상시) —
-    # 2026-07-29 채점 채택: 첫 delta 6~30s → 2.5~4.0s, 내레이션 확률적(30~50%) → 도구턴
-    # 8/8 결정적, 4a 유혹 배터리(유명책 가격·평점·판매지수) 전수 무인용 0건 + 라이브 대조
-    # 일치. ANY의 보호는 입구(도구 강제)에서 출구(validate_citations 인용 검증)로 이동해도
-    # 유지됨이 실증됐다. True로 되돌리면 예전 ANY 가드(느리지만 사전 차단)로 복귀.
-    force_first_turn_tool: bool = False
     # 활성 도구셋(toolsets.TOOLSETS 키 부분집합). 도구 등록·프롬프트 fragment 활성·프론트
     # 브랜딩이 여기서 파생된다. 순서는 레지스트리 선언 순서가 정본(이 리스트는 켜고 끄기만).
     # 미등록 이름·빈 목록은 기동 시 ValueError(fail-loud — toolsets.resolve_app).

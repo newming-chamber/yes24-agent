@@ -376,32 +376,6 @@ def _make_instruction_provider(app):
 _instruction_provider = _make_instruction_provider(get_resolved_app())
 
 
-def _force_tool_first_turn(callback_context, llm_request):
-    """[롤백 레버] 첫 모델 턴 도구 강제(ANY) — 기본 비활성(config force_first_turn_tool 참조).
-
-    2026-07-29 이전의 기본 구조였다: 자체지식 직답(파라메트릭 가격 환각)을 입구에서 차단하되
-    순수 대화는 `reply_directly`로 탈출시켰다. AUTO 상시 전환 채점(4a 유혹 배터리 무인용
-    0건)으로 보호가 출구(validate_citations)만으로 충분함이 실증돼 기본에서 내려왔지만,
-    회귀 관측 시 즉시 되돌릴 수 있게 유지한다. **커플링**: 이 콜백을 켜면 reply_directly가
-    탈출구로 반드시 함께 있어야 한다(없으면 잡담도 강제 검색). 셋(스위치·콜백·reply_directly)은
-    한 세트로 유지·삭제한다."""
-    contents = getattr(llm_request, "contents", None) or []
-    parts = (getattr(contents[-1], "parts", None) or []) if contents else []
-    has_response = any(getattr(p, "function_response", None) is not None for p in parts)
-    mode = (
-        types.FunctionCallingConfigMode.AUTO
-        if has_response
-        else types.FunctionCallingConfigMode.ANY
-    )
-    calling_config = types.FunctionCallingConfig(mode=mode)
-    config = llm_request.config or types.GenerateContentConfig()
-    config.tool_config = types.ToolConfig(
-        function_calling_config=calling_config
-    )
-    llm_request.config = config
-    return None
-
-
 def create_agent(model_name: str | None = None, app=None) -> LlmAgent:
     """루트 LlmAgent를 생성한다(model_name 미지정 시 config 기본 = model_name 필드).
 
@@ -422,11 +396,6 @@ def create_agent(model_name: str | None = None, app=None) -> LlmAgent:
                 thinking_budget=settings.thinking_budget,
                 include_thoughts=settings.include_thoughts,
             )
-        ),
-        # 첫 턴 ANY 강제는 config 스위치로 뗄 수 있다(Claude Code식 자율 실험 —
-        # force_first_turn_tool 주석 참조). 끄면 AUTO 상시: 첫 토큰부터 내레이션 가능.
-        before_model_callback=(
-            _force_tool_first_turn if settings.force_first_turn_tool else None
         ),
     )
 

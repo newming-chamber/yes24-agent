@@ -213,12 +213,28 @@ def project_source_ref(source_event: dict) -> dict:
     return {"id": source_event.get("id"), "url": source_event.get("url") or ""}
 
 
+def _iter_source_dicts(value: object):
+    """`source_id`를 가진 dict를 payload 어디에 있든 등장 순서대로 훑는다.
+
+    판정 기준은 위치가 아니라 **번호를 갖고 있는가** 하나다. 도구마다 실리는 자리가 다르고
+    (search는 results, fetch는 payload 자체, 판형 레코드는 그 안, fetch_many는 다시 그 위에
+    results) 자리를 열거하면 새 자리가 생길 때마다 조용히 하나씩 빠진다 — 실제로 그 형태로
+    새면 그 출처를 인용한 본문이 스트리밍 내내 원시 세션 id로 흐르다 마감에서 다시 그려진다
+    (표시 번호는 관측본에서만 배정된다). 번호가 없는 dict(아직 열지 않은 links 후보)는
+    출처가 아니다.
+    """
+    if isinstance(value, dict):
+        if value.get("source_id") is not None:
+            yield value
+        for nested in value.values():
+            yield from _iter_source_dicts(nested)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_source_dicts(item)
+
+
 def _sources_from_response(payload: dict) -> list[dict]:
     """도구 응답에서 노출할 출처 dict 목록을 **원시 그대로** 뽑아낸다(id 키만 정규화).
-
-    yes24_search는 results 리스트를, yes24_fetch는 단일 source dict를 반환할 수
-    있으므로 둘 다 허용한다(fetch 스키마는 아직 미확정). source_id를 가진 dict만
-    출처로 인정한다.
 
     여기서 투영하지 않는다 — 공개 DTO로의 투영은 출구(`build_done_payload`)가 이미
     하고, 관측 즉시 투영하면 병합 판정에 필요한 정보(fidelity·meta)가 그 자리에서
@@ -226,18 +242,10 @@ def _sources_from_response(payload: dict) -> list[dict]:
     레지스트리 어휘인 `id`로 정규화해, 관찰본과 세션 레지스트리가 **한 vocabulary**로
     만나 같은 병합 원시함수를 탈 수 있게 한다(추출 지점이 여기 하나뿐이라 드리프트 없음).
     """
-    results = payload.get("results")
-    if isinstance(results, list):
-        candidates = results
-    elif payload.get("source_id") is not None:
-        # results 리스트 없이 payload 자체가 하나의 출처(fetch형).
-        candidates = [payload]
-    else:
-        candidates = []
     return [
-        {**{key: value for key, value in c.items() if key != "source_id"}, "id": c["source_id"]}
-        for c in candidates
-        if isinstance(c, dict) and c.get("source_id") is not None
+        {**{key: value for key, value in source.items() if key != "source_id"},
+         "id": source["source_id"]}
+        for source in _iter_source_dicts(payload)
     ]
 
 
