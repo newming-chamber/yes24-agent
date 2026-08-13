@@ -60,13 +60,23 @@ ssh "$SSH_HOST" bash -lc "'
 # MATRIX_ENABLED: RBTI 16뷰 매트릭스 노출 스위치. 2026-07-28 사용자 결정으로 기본 **노출(true)** —
 #   과거 "rbti 제외하고 띄우자"(기본 false) 방침을 뒤집었다. 숨김 배포는 MATRIX_ENABLED=false ./deploy-mq.sh.
 # ACCESS_PASSWORD: 공유 패스워드 로그인월. 주어졌을 때만 주입한다(미지정이면 월 비활성).
+# SERVE_FRONTEND: 내장 프론트(UI 페이지·정적 파일·로그인월) 서빙 스위치. 2026-08-12 사용자
+#   결정으로 **배포 기본은 백엔드 전용(false)** — 프론트 코드는 그대로 두고 라우트만 끈다.
+#   내장 UI까지 띄우려면 SERVE_FRONTEND=true ./deploy-mq.sh. 로컬 개발 기본은 config의 true.
+# SESSION_FALLBACK_ALLOWED: 세션 DB 생성 실패 시 InMemory 폴백 허용 여부. 배포 세션 DB는
+#   네트워크 MySQL이라 조용한 폴백은 "영속 중이라 믿는 비영속"(대화가 재시작마다 증발,
+#   admin·집계는 위장 정상)이 된다 — 배포 기본은 false(기동 실패로 즉시 드러낸다).
 MATRIX_ENABLED="${MATRIX_ENABLED:-true}"
+SERVE_FRONTEND="${SERVE_FRONTEND:-false}"
+SESSION_FALLBACK_ALLOWED="${SESSION_FALLBACK_ALLOWED:-false}"
 {
   cat "$LOCAL_DIR/.env"
   printf '\nMATRIX_ENABLED=%s\n' "$MATRIX_ENABLED"
+  printf 'SERVE_FRONTEND=%s\n' "$SERVE_FRONTEND"
+  printf 'SESSION_FALLBACK_ALLOWED=%s\n' "$SESSION_FALLBACK_ALLOWED"
   if [ -n "${ACCESS_PASSWORD:-}" ]; then printf 'ACCESS_PASSWORD=%s\n' "$ACCESS_PASSWORD"; fi
 } | ssh "$SSH_HOST" "install -m 600 /dev/stdin $REMOTE_BUILD/.env"
-echo "  → 원격 .env 전송(모드 600) · MATRIX_ENABLED=$MATRIX_ENABLED 주입(로컬 .env 불변)"
+echo "  → 원격 .env 전송(모드 600) · MATRIX_ENABLED=$MATRIX_ENABLED · SERVE_FRONTEND=$SERVE_FRONTEND · SESSION_FALLBACK_ALLOWED=$SESSION_FALLBACK_ALLOWED 주입(로컬 .env 불변)"
 if [ -n "${ACCESS_PASSWORD:-}" ]; then
   echo "  → ACCESS_PASSWORD 주입(로그인월 활성)"
 else

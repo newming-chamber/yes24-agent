@@ -17,7 +17,7 @@ from secrets import compare_digest
 from typing import Annotated
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
     FileResponse,
@@ -30,9 +30,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, StringConstraints
 
 from yes24_agent.admin import client_ip, register_admin
-from yes24_agent.config import ensure_google_api_key_env, get_settings
+from yes24_agent.auth import AuthenticatedUser, close_auth_service, get_authenticated_user
+from yes24_agent.config import Settings, ensure_google_api_key_env, get_settings
 from yes24_agent.matrix.matrix_runner import run_matrix_stream
 from yes24_agent.runner import run_agent_stream
+from yes24_agent.session_service import SQLITE_DIALECT, db_dialect, persistence_mode
 from yes24_agent.thought_translation import warmup_translation
 from yes24_agent.toolsets import TOOLSETS, get_resolved_app, resolve_app_for
 
@@ -196,7 +198,7 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
     # RBTI 독서 페르소나 코드(4글자, 예: "CADI"). 없거나 무효면 페르소나 미적용(기존 동작).
     rbti: str | None = None
-    # 사용자가 UI에서 고른 Gemini 모델ID. selectable_models 화이트리스트 값만 허용하고
+    # 사용자가 UI에서 고른 모델ID. selectable_models 화이트리스트 값만 허용하고
     # 그 밖(없음·임의 문자열)은 config 기본 모델로 폴백한다(임의 모델 주입 차단).
     model: str | None = None
     # 사용자가 UI에서 켠 toolset 키 목록. 미지정이면 config 기본 구성이다. 모델과 달리
@@ -260,22 +262,17 @@ async def lifespan(app: FastAPI):
     # 파생이라 새 toolset이 생겨도 여기는 무수정이다(미생성 클라이언트는 no-op).
     for hook in get_resolved_app().aclose_hooks:
         await hook()
+    # 인증 DB 커넥션 풀도 함께 닫는다(만들어진 적 없으면 no-op).
+    await close_auth_service()
 
 
-def create_app() -> FastAPI:
-    """FastAPI 앱을 조립한다."""
-    settings = get_settings()
-    app = FastAPI(title="yes24-agent", lifespan=lifespan)
+def _register_frontend(app: FastAPI, settings: Settings) -> None:
+    """내장 프론트(정적 모듈·페이지·로그인월)를 등록한다 — serve_frontend=False면 미호출.
 
-    # CORS: 자격증명 동반 요청과 `*`의 조합은 브라우저가 거부하므로 명시 목록만 허용.
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.cors_origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
+    로그인월도 여기 있다: 월은 내장 UI 접근을 가리는 프론트 관심사이고, 백엔드 전용
+    배포에서는 API 앞에 다른 인증(외부 프론트·게이트웨이)이 서기 때문이다. API 라우트
+    (/chat/stream ·/health ·/models ·/toolsets)는 게이트 밖에 남아 항상 등록된다.
+    """
     # 공유 패스워드 로그인월. access_password가 빈 문자열이면 미들웨어가 전부 통과(무월).
     # 값이 있으면 보호 경로에서 유효 쿠키를 요구한다: HTML 내비게이션(GET+Accept:text/html)은
     # /login으로 302, 그 외(API·fetch)는 401. /health·/login은 예외.
@@ -366,8 +363,8 @@ def create_app() -> FastAPI:
         """
         return {"role": access_role(request)}
 
-    # RBTI 16뷰 매트릭스는 배포 게이팅(matrix_enabled). off면 /matrix·/chat/matrix 라우트를
-    # 아예 등록하지 않아 404가 된다(프로드 숨김) — 채팅 경로(/ ·/chat/stream ·/health)는 무영향.
+    # RBTI 16뷰 매트릭스 UI도 배포 게이팅(matrix_enabled). off면 /matrix 라우트를 아예
+    # 등록하지 않아 404가 된다(프로드 숨김) — 채팅 경로(/ ·/chat/stream ·/health)는 무영향.
     if settings.matrix_enabled:
 
         # GET+HEAD 둘 다 등록한다 — 프론트 네비 링크가 HEAD로 활성 여부를 게이팅하는데,
@@ -377,13 +374,38 @@ def create_app() -> FastAPI:
             """16뷰 RBTI 매트릭스 시뮬레이터 UI를 반환한다(인증 없음)."""
             return FileResponse(_MATRIX_HTML, media_type="text/html")
 
+
+def create_app() -> FastAPI:
+    """FastAPI 앱을 조립한다."""
+    settings = get_settings()
+    app = FastAPI(title="yes24-agent", lifespan=lifespan)
+
+    # CORS: 자격증명 동반 요청과 `*`의 조합은 브라우저가 거부하므로 명시 목록만 허용.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    if settings.serve_frontend:
+        _register_frontend(app, settings)
+
     # 운영자 데이터 조회(admin). admin_password가 비어 있으면 라우트를 등록하지 않는다(404).
-    register_admin(app, settings)
+    # admin은 세션 sqlite 파일을 직접 여는 조회기라(mode=ro) 네트워크 DB에선 동작할 수
+    # 없다 — sqlite일 때만 등록해, 열리지 않는 페이지를 노출하지 않는다.
+    if db_dialect(settings.session_db_url) == SQLITE_DIALECT:
+        register_admin(app, settings)
 
     @app.get("/health")
     async def health() -> dict:
-        """헬스체크."""
-        return {"status": "ok"}
+        """헬스체크. persistence는 세션 서비스의 **실제** 영속 모드다.
+
+        네트워크 DB에서 InMemory 폴백이 조용히 발동하면 응답은 정상인데 대화가 재시작마다
+        증발한다 — 밖에서 관측 가능하게 노출한다(fail-fast는 session_fallback_allowed).
+        """
+        return {"status": "ok", "persistence": persistence_mode()}
 
     @app.get("/models")
     async def models(request: Request) -> dict:
@@ -416,8 +438,17 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/chat/stream")
-    async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingResponse:
-        """사용자 메시지를 받아 SSE로 답변을 스트리밍한다."""
+    async def chat_stream(
+        request: ChatRequest,
+        http_request: Request,
+        user: Annotated[AuthenticatedUser | None, Depends(get_authenticated_user)] = None,
+    ) -> StreamingResponse:
+        """사용자 메시지를 받아 SSE로 답변을 스트리밍한다.
+
+        `x-api-key`(= Yes24 service_cookie) 헤더가 있으면 그 사용자의 userNo가 세션
+        user_id가 되어 대화 기록이 사람 단위로 갈린다. 헤더가 없으면 익명(단일 POC
+        사용자)으로 종전과 동일하게 동작한다.
+        """
         # 세팅 잠금(데모 로그인) 세션은 모델·도구 구성을 조정할 수 없다 — 본문의 model·
         # enabled_toolsets를 무시하고 데모 전용 구성(demo_persona·demo_enabled_toolsets)으로
         # 고정 동작하며, done.model도 벗겨 보낸다.
@@ -441,6 +472,7 @@ def create_app() -> FastAPI:
             rbti=request.rbti,
             model=model,
             app=app_config,
+            user_id=str(user.user_no) if user and user.user_no else None,
         )
         return StreamingResponse(
             stream if unlocked else _hide_model_frames(stream),

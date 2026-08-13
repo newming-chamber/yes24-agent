@@ -15,6 +15,9 @@ dependencies = [
     # async SQLAlchemy 필수 런타임 의존성 — google-adk[db]가 안 끌어오는 환경(macOS arm) 대비 명시
     "greenlet>=3.0",
     "aiosqlite>=0.20",
+    # MySQL async 드라이버. google-adk[db]의 extra에는 없어 배포용 SESSION_DB_URL
+    # (mysql+aiomysql://…)을 쓰려면 별도 추가가 필요하다 — 로컬 sqlite 기본은 무영향.
+    "aiomysql>=0.2",
 ]
 
 [dependency-groups]

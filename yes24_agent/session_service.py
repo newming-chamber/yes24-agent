@@ -1,9 +1,9 @@
 """세션 서비스 획득·세션별 직렬화 락·세션 조회/생성.
 
 `runner.py`에서 SSE 스트리밍의 순수 세션 관심사만 추출한 모듈이다(동작 불변).
-DatabaseSessionService(sqlite) 싱글턴을 lazy 생성하되 디렉토리·드라이버 오류 시
-InMemorySessionService로 폴백해 서버 기동을 항상 보장하고, 같은 session_id로 들어온
-동시 요청을 세션별 asyncio.Lock으로 순차화한다.
+DatabaseSessionService(sqlite·MySQL) 싱글턴을 lazy 생성하되 디렉토리·드라이버 오류 시
+InMemorySessionService로 폴백해 서버 기동을 항상 보장하고(폴백은 config로 끌 수 있다),
+같은 session_id로 들어온 동시 요청을 세션별 asyncio.Lock으로 순차화한다.
 """
 
 import asyncio
@@ -22,8 +22,14 @@ from yes24_agent.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# POC 단계에서는 단일 사용자로 고정한다(인증 없음). 멀티유저는 이후 마일스톤.
+# 인증 없는 요청(x-api-key 헤더 없음·로컬 개발·매트릭스)의 단일 사용자 id. 인증된 요청은
+# Yes24 userNo가 user_id가 된다(auth.py) — ADK 세션 키가 (app_name, user_id, session_id)
+# 복합이라 사용자별로 대화가 갈린다.
 _POC_USER_ID = "poc-user"
+
+# 파일 기반 DB dialect. "파일이 있어야 성립하는 기능"(sqlite 디렉토리 보장, admin의 파일
+# 직접 열람)의 판정을 여기 한 곳에서 낸다 — 각자 URL 문자열을 훑으면 판정이 갈라진다.
+SQLITE_DIALECT = "sqlite"
 
 # 세션 서비스 싱글턴(lazy). 프로세스 전체가 하나의 DB 연결 풀을 공유한다.
 _session_service: BaseSessionService | None = None
@@ -48,13 +54,23 @@ def _get_session_lock(session_id: str) -> asyncio.Lock:
     return lock
 
 
+def db_dialect(db_url: str) -> str:
+    """DB URL의 dialect 이름 — `mysql+aiomysql://…` → `mysql`, `sqlite+aiosqlite:///…` → `sqlite`.
+
+    URL 어딘가에 이름이 들어 있는지(부분 문자열) 대신 스킴만 본다 — 파일 경로에 우연히
+    섞인 이름으로 판정이 뒤집히지 않게 한다.
+    """
+    scheme, _, _ = db_url.partition("://")
+    return scheme.partition("+")[0].lower()
+
+
 def _sqlite_dir(db_url: str) -> Path | None:
     """sqlite 파일 URL에서 DB 파일이 놓일 디렉토리를 추출한다.
 
     `sqlite+aiosqlite:///./data/sessions.db` → `./data`. 인메모리(`:memory:`)나
-    sqlite가 아닌 URL이면 None을 반환한다(디렉토리 생성 불필요).
+    sqlite가 아닌 URL(MySQL 등)이면 None을 반환한다(디렉토리 생성 불필요).
     """
-    if "sqlite" not in db_url or ":memory:" in db_url:
+    if db_dialect(db_url) != SQLITE_DIALECT or ":memory:" in db_url:
         return None
     # 스킴 구분자 `:///` 뒤가 파일 경로.
     _, _, path_part = db_url.partition(":///")
@@ -66,9 +82,10 @@ def _sqlite_dir(db_url: str) -> Path | None:
 def _get_session_service() -> BaseSessionService:
     """세션 서비스 싱글턴을 반환한다(최초 호출 시 생성).
 
-    DatabaseSessionService(sqlite) 생성을 시도하되, sqlite 파일 디렉토리를 먼저
-    보장한다. 드라이버·URL 오류로 생성이 실패하면 InMemorySessionService로 폴백해
-    서버 기동 자체는 항상 가능하게 한다(멀티턴 영속만 포기).
+    DatabaseSessionService 생성을 시도하되, sqlite면 파일 디렉토리를 먼저 보장한다.
+    드라이버·URL 오류로 생성이 실패하면 InMemorySessionService로 폴백해 서버 기동
+    자체는 항상 가능하게 한다(멀티턴 영속만 포기). `session_fallback_allowed=False`면
+    폴백하지 않고 예외를 그대로 올려 기동을 실패시킨다.
     """
     global _session_service
     if _session_service is not None:
@@ -85,10 +102,11 @@ def _get_session_service() -> BaseSessionService:
             # ./data가 파일로 존재(FileExistsError)하거나 읽기 전용 컨테이너
             # (PermissionError)면 DB 파일을 만들 수 없다. 인메모리로 폴백해
             # 서버 기동·응답은 유지한다(멀티턴 영속만 포기).
+            if not settings.session_fallback_allowed:
+                raise
             logger.warning(
-                "세션 DB 디렉토리(%s) 생성 실패(%s). InMemorySessionService로 폴백합니다.",
-                data_dir,
-                exc,
+                f"세션 DB 디렉토리({data_dir}) 생성 실패({exc}). "
+                "InMemorySessionService로 폴백합니다."
             )
             _session_service = InMemorySessionService()
             return _session_service
@@ -98,25 +116,42 @@ def _get_session_service() -> BaseSessionService:
     except (ValueError, ImportError) as exc:
         # DatabaseSessionService는 드라이버 미설치·URL 오류를 ValueError/ImportError로
         # 감싸 던진다. 영속을 포기하고 인메모리로 폴백한다.
+        if not settings.session_fallback_allowed:
+            raise
         logger.warning(
-            "DatabaseSessionService 생성 실패(%s). InMemorySessionService로 폴백합니다. "
-            "멀티턴 히스토리가 프로세스 재시작 시 사라집니다.",
-            exc,
+            f"DatabaseSessionService 생성 실패({exc}). InMemorySessionService로 폴백합니다. "
+            "멀티턴 히스토리가 프로세스 재시작 시 사라집니다."
         )
         _session_service = InMemorySessionService()
     return _session_service
 
 
-async def _resolve_session(service: BaseSessionService, session_id: str | None) -> Session:
+def persistence_mode() -> str:
+    """현재 세션 서비스의 영속 모드 — `"sqlite"` | `"mysql"` | `"in-memory"`.
+
+    /health가 노출한다. 폴백이 발동하면 URL은 그대로여도 서비스는 비영속이므로,
+    설정값이 아니라 **실제로 만들어진 서비스**를 보고 판정한다.
+    """
+    service = _get_session_service()
+    if isinstance(service, InMemorySessionService):
+        return "in-memory"
+    return db_dialect(get_settings().session_db_url)
+
+
+async def _resolve_session(
+    service: BaseSessionService, session_id: str | None, user_id: str | None = None
+) -> Session:
     """기존 세션을 조회하거나, 없으면 새로 만든다.
 
     session_id가 주어졌지만 조회에 실패(만료·오타·재시작 후 인메모리 유실)하면
-    클라이언트가 준 id를 그대로 재사용해 신규 세션을 만든다.
+    클라이언트가 준 id를 그대로 재사용해 신규 세션을 만든다. user_id가 None이면
+    인증 없는 단일 사용자(_POC_USER_ID)로 취급한다 — 조회·생성이 같은 키를 써야
+    남의 session_id로 요청해도 자기 user_id 밑에서만 세션이 성립한다.
     """
     if session_id:
         existing = await service.get_session(
             app_name=get_settings().app_name,
-            user_id=_POC_USER_ID,
+            user_id=user_id or _POC_USER_ID,
             session_id=session_id,
         )
         if existing is not None:
@@ -124,6 +159,6 @@ async def _resolve_session(service: BaseSessionService, session_id: str | None) 
 
     return await service.create_session(
         app_name=get_settings().app_name,
-        user_id=_POC_USER_ID,
+        user_id=user_id or _POC_USER_ID,
         session_id=session_id,
     )

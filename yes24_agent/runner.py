@@ -236,6 +236,7 @@ async def _settle_turn_sources(
     session_id: str,
     observed_sources: list[dict],
     prior_sources: list[dict],
+    user_id: str,
 ) -> list[dict]:
     """턴을 마감하며 세션 출처 레지스트리를 스트림 관찰본으로 화해하고, 그 화해본을 돌려준다.
 
@@ -263,7 +264,7 @@ async def _settle_turn_sources(
     try:
         # 턴 시작 스냅샷이 아니라 **마감 시점** 레지스트리를 base로 삼는다. 이번 턴 도구가
         # 등록한 상세(fidelity)가 여기 살아 있어야 뒤이은 목록 관측이 카드를 격하시키지 않는다.
-        session = await _resolve_session(service, session_id)
+        session = await _resolve_session(service, session_id, user_id)
         registry = get_sources(session.state)
     except Exception as exc:  # noqa: BLE001 — 마감은 어떤 세션 오류에도 멈추지 않는다
         logger.warning(f"턴 마감 레지스트리 재조회 실패 — 턴 시작 스냅샷으로 화해합니다: {exc}")
@@ -391,6 +392,7 @@ async def run_agent_stream(
     model: str | None = None,
     session_service: BaseSessionService | None = None,
     app=None,
+    user_id: str | None = None,
 ) -> AsyncIterator[str]:
     """사용자 메시지 1건을 처리하며 SSE 프레임 문자열을 순서대로 yield한다.
 
@@ -403,8 +405,14 @@ async def run_agent_stream(
     session_service를 주입하면 sqlite 싱글턴 대신 그 서비스를 쓴다 — 매트릭스가
     1회성 셀 세션을 InMemorySessionService로 돌려 sqlite 동시 쓰기 경합
     (`database is locked`, 2026-08-04 상용 실측)을 피하는 경로다. 채팅(None)은 종전대로.
+
+    user_id는 인증된 요청의 Yes24 userNo다(auth.py). None이면 인증 없는 단일 사용자
+    (_POC_USER_ID)로 돌아 로컬·익명·매트릭스 동작이 그대로다.
     """
     settings = get_settings()
+    # 세션 조회·생성·실행이 전부 같은 user_id를 봐야 한다 — 한 곳이라도 다르면 같은
+    # session_id가 두 사용자 밑에 갈라져 히스토리가 끊긴다.
+    session_user_id = user_id or _POC_USER_ID
     # 웹 선제 실행: 모델 1라운드 사고와 그라운딩 서브콜을 병렬화하는 순수 지연 최적화.
     # 힌트 오판·실패·미소비 전부 정상 경로 폴백이라 답 내용·도구 선택에 영향이 없다
     # (계약·격리·매트릭스 공유는 web_search.py의 프리페치 절 참조).
@@ -422,7 +430,7 @@ async def run_agent_stream(
         # 오류(OSError) 등 어떤 예외가 나도 "done 정확히 1회" 불변식을 지킨다.
         try:
             service = session_service if session_service is not None else _get_session_service()
-            session = await _resolve_session(service, session_id)
+            session = await _resolve_session(service, session_id, session_user_id)
             # 현재 UI 요청을 RBTI state의 정본으로 본다. 유효 코드는 저장하고 None·무효 코드는
             # 기존 값을 명시적으로 지워, 이전 요청의 페르소나가 다음 기본 채팅에 남지 않게 한다.
             code = rbti if is_valid_code(rbti) else None
@@ -514,7 +522,7 @@ async def run_agent_stream(
             # 이벤트 간격에 sse_timeout_s 상한을 건다. ADK 스트림은 하나의 고정 task가 소비해
             # 여러 yield에 걸친 OpenTelemetry context의 소유권을 보존한다.
             event_stream = runner.run_async(
-                user_id=_POC_USER_ID,
+                user_id=session_user_id,
                 session_id=resolved_session_id,
                 new_message=new_message,
                 run_config=run_config,
@@ -582,7 +590,7 @@ async def run_agent_stream(
                                 session_service=service,
                             )
                             event_stream = retry_runner.run_async(
-                                user_id=_POC_USER_ID,
+                                user_id=session_user_id,
                                 session_id=resolved_session_id,
                                 new_message=new_message,
                                 run_config=run_config,
@@ -678,7 +686,7 @@ async def run_agent_stream(
 
                 answer_text = _best_effort_text(raw_body, final_text)
                 sources = await _settle_turn_sources(
-                    service, resolved_session_id, observed_sources, prior_sources
+                    service, resolved_session_id, observed_sources, prior_sources, session_user_id
                 )
 
                 citation, done_payload = _finalize_answer(
@@ -757,7 +765,7 @@ async def run_agent_stream(
                 known_sources=known_sources,
                 final_text=final_text,
                 sources=await _settle_turn_sources(
-                    service, resolved_session_id, observed_sources, prior_sources
+                    service, resolved_session_id, observed_sources, prior_sources, session_user_id
                 ),
                 active_model=active_model,
                 session_id=resolved_session_id,
@@ -779,7 +787,7 @@ async def run_agent_stream(
                 known_sources=known_sources,
                 final_text=final_text,
                 sources=await _settle_turn_sources(
-                    service, resolved_session_id, observed_sources, prior_sources
+                    service, resolved_session_id, observed_sources, prior_sources, session_user_id
                 ),
                 active_model=active_model,
                 session_id=resolved_session_id,

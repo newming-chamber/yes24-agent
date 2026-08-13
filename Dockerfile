@@ -23,6 +23,10 @@ VOLUME ["/app/data"]
 # (하드코딩 금지 원칙: CLAUDE.md #6. 이전엔 8010이 세 곳에 박혀 settings.port가 무시됐다.)
 ENV PORT=8010
 
+# ADK append_event는 naive 로컬타임을 그대로 저장한다 — 컨테이너와 DB 서버의 TZ가 다르면
+# 세션 시각이 시간대만큼 어긋난다. 양쪽을 UTC로 맞춰 기준을 하나로 고정한다.
+ENV TZ=UTC
+
 EXPOSE ${PORT}
 
 # 셸 형식이라 ${PORT}가 확장된다.

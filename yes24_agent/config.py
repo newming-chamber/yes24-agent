@@ -231,6 +231,11 @@ class Settings(BaseSettings):
     # /chat/matrix 라우트를 등록하지 않아 404가 되고(채팅 경로는 무영향), 프론트 네비 링크는
     # 클라이언트가 /matrix 404를 감지해 숨긴다(서버 플래그가 단일 진실).
     matrix_enabled: bool = True
+    # 내장 프론트(UI 페이지·정적 파일·로그인월) 서빙 여부. False면 main.py가 UI 계열 라우트를
+    # 등록하지 않아 404가 되고 API(/chat/stream ·/health ·/models ·/toolsets)만 남는다.
+    # 백엔드 전용 배포는 env `SERVE_FRONTEND=false`(2026-08-12 사용자 결정 — 프론트는 코드를
+    # 두고 라우트만 끈다). 로컬 개발 기본은 True(내장 UI로 도그푸딩).
+    serve_frontend: bool = True
     # 공유 패스워드 로그인월. 빈 문자열이면 **비활성**(로컬 개발 기본 — 월 없음), 값이 있으면
     # 활성화돼 미들웨어가 보호 경로(/ ·/matrix ·/chat/*)를 쿠키로 가린다. env `ACCESS_PASSWORD`로
     # 주입한다(하드코딩 대신 env). 진짜 인증이 아니라 데모 접근을 막는 단일 공유 비밀번호 게이트다.
@@ -256,7 +261,34 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
 
     # 세션 영속
+    # sqlite 기본은 **로컬 개발용**이고, 배포는 env `SESSION_DB_URL`(MySQL)로 덮는다.
     session_db_url: str = "sqlite+aiosqlite:///./data/sessions.db"  # async 드라이버 접미사 필수
+    # 세션 서비스 생성 실패 시 InMemory 폴백을 허용할지. 파일 sqlite에선 폴백이 "그래도 기동"
+    # 이지만, 네트워크 DB에선 조용한 폴백이 **영속 중이라 믿는 비영속 서비스**를 만든다 —
+    # 대화가 재시작마다 증발하고 admin·집계는 위장 정상이 된다. 배포에선 env
+    # `SESSION_FALLBACK_ALLOWED=false`로 꺼서 기동 자체를 실패시킨다(fail-fast).
+    session_fallback_allowed: bool = True
+
+    # 인증(crema-ai 계약 이식). 프론트가 보내는 헤더 `x-api-key`의 값은 Yes24 service_cookie이며,
+    # 그 값으로 Yes24 회원 API를 조회해 userNo(= ADK 세션의 user_id)를 얻는다. 인증 DB(users·
+    # rate_limit_log)는 **세션 DB와 같은 계정·database**를 쓰므로 접속 정보를 따로 두지 않고
+    # session_db_url을 파싱한다(설정 단일 출처). 그래서 session_db_url이 mysql이 아니면
+    # (로컬 sqlite 개발) 인증 스택 전체가 자연히 꺼지고 모든 요청이 익명으로 흐른다.
+    yes24_user_info_url: str = "https://api.yes24.com/digital/user/info"
+    yes24_user_info_timeout_s: float = 10.0
+    # 회원 정보(userNo·userId) 재조회 주기(시간). users.user_cached_at이 이보다 오래되면
+    # 다음 인증 때 Yes24를 다시 물어 갱신한다.
+    yes24_user_cache_hours: int = 24
+    # api_key → 사용자 in-memory 캐시 TTL(초). 이 창 안의 재요청은 users 조회를 건너뛴다
+    # (rate limit 체크는 캐시와 무관하게 매 요청 DB에서 센다).
+    auth_cache_ttl_s: float = 300.0
+    # 인증 DB 커넥션 풀 상한. 세션 DB 풀(SQLAlchemy)과 별도로 잡히는 aiomysql 풀이라,
+    # 요청당 짧은 조회 몇 건이 전부인 용도에 맞춰 작게 둔다.
+    auth_pool_max: int = 5
+    # 신규 자동등록 사용자에게 부여하는 기본 rate limit(분당·일당). 기존 사용자는 users
+    # 행의 값이 우선한다 — 여기 값은 등록 시점의 초기값이자 행이 비었을 때의 폴백이다.
+    rate_limit_rpm: int = 20
+    rate_limit_rpd: int = 500
 
     # 운영자 데이터 조회(admin). 빈 문자열이면 **라우트 미등록**(404) — matrix_enabled와 같은
     # 패턴으로, 설정하지 않은 환경엔 admin이 존재조차 하지 않는다. 값은 env `ADMIN_PASSWORD`로
