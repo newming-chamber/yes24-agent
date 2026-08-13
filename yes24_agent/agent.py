@@ -10,7 +10,7 @@ from google.adk.agents import LlmAgent
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.genai import types
 
-from yes24_agent.config import get_settings
+from yes24_agent.config import ensure_openai_api_key_env, get_settings
 from yes24_agent.rbti.persona import axis_label, build_persona_block
 from yes24_agent.sources import time_kst, today_kst
 from yes24_agent.toolsets import (
@@ -82,21 +82,28 @@ def compose(fragments: tuple[_Frag, ...], active: frozenset[str]) -> str:
 # 얹힌 r3e 이월이 유지된다. 강점이 둘 이상이면 나열이 길어져 그 줄바꿈이 원문과 달라지므로,
 # 새 강점 toolset을 추가하는 구성은 골든 재검증 대상이다.
 _IDENTITY_TEMPLATE = """\
-당신은 유능하고 친근한 범용 AI 어시스턴트이며 {subjects}에 특히
+당신의 이름은 '{name}'입니다. 당신은 유능하고 친근한 범용 AI 어시스턴트이며 {subjects}에 특히
 밝습니다. {labels} 특화는 강점이지 답변 범위의 한계가 아닙니다. """
 
 # 강점 toolset이 하나도 없는 구성(예: web만) — 없는 전문성을 선언하지 않는다.
-_IDENTITY_GENERIC = "당신은 유능하고 친근한 범용 AI 어시스턴트입니다. "
+_IDENTITY_GENERIC = "당신의 이름은 '{name}'입니다. 당신은 유능하고 친근한 범용 AI 어시스턴트입니다. "
 
 
-def build_identity(active: frozenset[str]) -> str:
-    """활성 toolset의 강점을 합성해 정체성 문장을 만든다(나열 순서 = 레지스트리 선언 순서)."""
+def build_identity(active: frozenset[str], name: str) -> str:
+    """활성 toolset의 강점을 합성해 정체성 문장을 만든다(나열 순서 = 레지스트리 선언 순서).
+
+    이름은 persona 브랜딩 title(단일 출처)에서 온다 — 이름 없는 역할 서술만으로는 긴 대화
+    말미의 "이름이 뭐야?"에서 모델이 기반 벤더명으로 후퇴한다(2026-08-13 Luna 실측: 단발은
+    역할 서술로 답하지만 도구 대화가 쌓이면 "저는 ChatGPT" 3/3). 특정 벤더명 금지 같은
+    블랙리스트가 아니라 정체성에 고유명을 주는 일반 규칙이며, 모든 페르소나·모델에 공통이다.
+    """
     expertise = [
         TOOLSET_EXPERTISE[key] for key in TOOLSETS if key in active and key in TOOLSET_EXPERTISE
     ]
     if not expertise:
-        return _IDENTITY_GENERIC
+        return _IDENTITY_GENERIC.format(name=name)
     return _IDENTITY_TEMPLATE.format(
+        name=name,
         subjects=", ".join(item.subject for item in expertise),
         labels="·".join(item.label for item in expertise),
     )
@@ -312,7 +319,9 @@ def build_system_prompt(app, persona_directive: str = "") -> str:
     # RBTI 소개 단락은 2026-07-29 삭제 — RBTI/매트릭스는 개발자용 검증 뷰이지 사용자에게
     # 소개·영업할 앱 기능이 아니다(사용자 확인: "내가 보기 위한 뷰"). 페르소나 선택 시의
     # 어조 반영(persona_directive)은 유지하되, 모델이 먼저 RBTI를 입에 올리지 않는다.
-    template = build_identity(app.active) + compose(_BODY_FRAGMENTS, app.active)
+    template = build_identity(app.active, app.persona.branding.title) + compose(
+        _BODY_FRAGMENTS, app.active
+    )
     # str.format은 잉여 kwarg를 무시한다 — yes24 off 구성에서 {policy_seeds} 필드가
     # 조립에서 빠져도 같은 호출이 무분기로 성립한다.
     core = template.format(
@@ -385,8 +394,23 @@ def create_agent(model_name: str | None = None, app=None) -> LlmAgent:
     """
     settings = get_settings()
     app = app if app is not None else get_resolved_app()
+    model_id = model_name or settings.model_name
+    if "/" in model_id:
+        # "provider/model"은 LiteLLM 경로(config.selectable_models 주석 참조).
+        # 지연 import — litellm 로드 비용(수 초)은 실제 사용 시에만 지불한다.
+        from google.adk.models.lite_llm import LiteLlm
+
+        ensure_openai_api_key_env()
+        extra = (
+            {"reasoning_effort": settings.litellm_reasoning_effort}
+            if settings.litellm_reasoning_effort
+            else {}
+        )
+        model = LiteLlm(model=model_id, **extra)
+    else:
+        model = model_id
     return LlmAgent(
-        model=model_name or settings.model_name,
+        model=model,
         name="yes24_assistant",
         description="범용 질문에 답하고 Yes24 상품·정책과 웹 사실을 근거로 종합하는 어시스턴트.",
         instruction=_make_instruction_provider(app),

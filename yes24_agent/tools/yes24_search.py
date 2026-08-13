@@ -44,7 +44,7 @@ from yes24_agent.yes24.parsers import (
     parse_search,
     product_fields,
 )
-from yes24_agent.yes24.urls import SEARCH_SECTIONS, search_url
+from yes24_agent.yes24.urls import SEARCH_SECTIONS, WIDEST_SECTION, search_url
 
 logger = logging.getLogger(__name__)
 
@@ -137,16 +137,19 @@ async def _search_one(
     여기서 하고 등록은 호출부의 순차 루프에서 처리한다(레이스 0). 예상된 오류(조회·파싱)만
     잡아 구조화된 error dict로 반환하고, 예상 밖 예외는 삼키지 않고 그대로 올려보낸다.
 
-    반환: {"query", "status": "ok", "parsed": [item...]} 또는
-          {"query", "status": "error", "error_type": "fetch"|"parse", "message"}.
+    반환: {"query", "section", "status": "ok", "parsed": [item...]} 또는
+          {"query", "section", "status": "error", "error_type": "fetch"|"parse", "message"}.
+    `section`은 **실제로 검색한 범위**다 — 호출부가 요청 범위와 대조해 넓히기 여부를 판정하고
+    searches 요약에도 그대로 싣는다(별도 장부를 만들지 않는다).
     """
     url = search_url(settings.yes24_base_url, query, section)
     try:
         html = await client.get_text(url)
     except Yes24FetchError as exc:
-        logger.info("yes24_search query=%r status=error error_type=fetch results=0", query)
+        logger.info(f"yes24_search query={query!r} status=error error_type=fetch results=0")
         return {
             "query": query,
+            "section": section,
             "status": "error",
             "error_type": "fetch",
             "message": f"Yes24 조회에 실패했습니다: {exc}",
@@ -157,15 +160,16 @@ async def _search_one(
             html, base_url=settings.yes24_base_url, limit=settings.search_result_limit
         )
     except ParseError as exc:
-        logger.info("yes24_search query=%r status=error error_type=parse results=0", query)
+        logger.info(f"yes24_search query={query!r} status=error error_type=parse results=0")
         return {
             "query": query,
+            "section": section,
             "status": "error",
             "error_type": "parse",
             "message": f"검색 결과를 해석하지 못했습니다: {exc}",
         }
 
-    return {"query": query, "status": "ok", "parsed": parsed}
+    return {"query": query, "section": section, "status": "ok", "parsed": parsed}
 
 
 async def yes24_search(
@@ -198,7 +202,9 @@ async def yes24_search(
         상품 기준으로 병합·중복제거, 각 항목에 인용용 source_id와 어느 각도에서 나왔는지
         queries 포함), 각 각도의 성공/실패/결과 수를 담은 searches 요약, 검색 시각 checked_at,
         result_count를 담은 dict. 어느 각도에서도 상품을 찾지 못하면 results가 빈 목록이고
-        result_count=0이다(검색은 성공했으나 결과가 없는 상태). 상한을 넘겨 검색하지 않은
+        result_count=0이다(검색은 성공했으나 결과가 없는 상태). 섹션을 한정했는데 0건인
+        각도는 통합 검색으로 한 번 더 자동 재검색되며, 그 항목은 searches에 expanded_from으로
+        표시된다(원 각도의 0건 항목도 함께 남는다). 상한을 넘겨 검색하지 않은
         각도가 있으면 dropped_count·dropped_queries로 명시한다. 모든 각도가 실패했을 때만
         status="error"와 error_type("empty_query"|"fetch"|"parse"), message에 더해
         result_count=0을 담은 dict.
@@ -208,7 +214,7 @@ async def yes24_search(
     # 허용값은 urls의 섹션 표에서 파생한다(도구가 따로 열거하지 않는다 — 표가 늘면 자동 반영).
     # 모르는 값이 오면 search_url의 ValueError가 도구 밖으로 새지 않도록 통합검색으로 폴백한다.
     if section not in SEARCH_SECTIONS:
-        section = "all"
+        section = WIDEST_SECTION
 
     # 각도 계획(관용 변환·중복 제거·상한 cap)은 web_search와 공용 헬퍼를 쓴다.
     planned, dropped_queries = plan_queries(queries, settings.yes24_search_max_queries)
@@ -231,6 +237,25 @@ async def yes24_search(
         *(_search_one(q, section, client, settings) for q in planned)
     )
 
+    # 섹션 한정 검색의 0건은 "없다"가 아니라 **범위 밖**일 수 있다 — 국내도서 한정은 영어판·
+    # 수입서를 구조적으로 배제하므로, 정확한 질의여도 0건이 나오고 모델은 그대로 오부정한다
+    # (2026-08-12 실측: "한강 The Vegetarian 영어판" section=book 0건 → all 8건).
+    # 그 0건 각도만 최광역 범위로 한 번 더 검색해 병합한다. 조회·파싱 실패 각도는 대상이
+    # 아니고(범위 문제가 아니라 실패다), 이미 최광역이면 넓힐 곳이 없다 — 1단 한정이다.
+    if section != WIDEST_SECTION:
+        widen = [o["query"] for o in searched if o["status"] == "ok" and not o["parsed"]]
+        if widen:
+            logger.info(
+                f"yes24_search section={section} 0건 각도 {len(widen)}개를 "
+                f"section={WIDEST_SECTION}로 넓혀 재검색합니다: {widen}"
+            )
+            searched = [
+                *searched,
+                *await asyncio.gather(
+                    *(_search_one(q, WIDEST_SECTION, client, settings) for q in widen)
+                ),
+            ]
+
     checked_at = now_checked_at()
 
     results: list[dict] = []
@@ -238,8 +263,15 @@ async def yes24_search(
     searches: list[dict] = []  # 각도별 성공/실패/결과 수 요약(부분 실패·0건 fail-loud)
     for outcome in searched:
         query = outcome["query"]
+        # 넓혀 재검색한 각도는 원 각도의 0건 항목과 나란히 남기고, 어느 범위로 넓혔는지를
+        # 가법 필드로만 구분한다 — 넓히기가 없으면 요약 형태가 종전과 그대로 같다.
+        widened = (
+            {"section": outcome["section"], "expanded_from": section}
+            if outcome["section"] != section
+            else {}
+        )
         if outcome["status"] == "error":
-            searches.append(angle_error_summary(query, outcome["error_type"]))
+            searches.append({**angle_error_summary(query, outcome["error_type"]), **widened})
             continue
         matched = 0
         for item in outcome["parsed"]:
@@ -278,7 +310,7 @@ async def yes24_search(
                     **fields,
                 }
             )
-        searches.append({"query": query, "status": "ok", "result_count": matched})
+        searches.append({"query": query, "status": "ok", "result_count": matched, **widened})
 
     ok_count = sum(1 for s in searches if s["status"] == "ok")
     if ok_count == 0:
@@ -286,8 +318,8 @@ async def yes24_search(
         # 그대로 유지해, 에이전트가 "못 찾음"이 아니라 조회/파싱 오류로 처리하게 한다.
         first = searched[0]
         logger.info(
-            "yes24_search queries=%d status=error error_type=%s results=0",
-            len(planned), first["error_type"],
+            f"yes24_search queries={len(planned)} status=error "
+            f"error_type={first['error_type']} results=0"
         )
         return {
             "status": "error",
@@ -297,8 +329,8 @@ async def yes24_search(
         }
 
     logger.info(
-        "yes24_search queries=%d angles_ok=%d results=%d dropped=%d",
-        len(planned), ok_count, len(results), len(dropped_queries),
+        f"yes24_search queries={len(planned)} angles_ok={ok_count} "
+        f"results={len(results)} dropped={len(dropped_queries)}"
     )
     response = {
         "status": "ok",

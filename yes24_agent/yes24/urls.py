@@ -26,6 +26,10 @@ _SECTION_DOMAIN = {
 # yes24_search가 받는 section 허용값(별도 열거 금지 — 이 표가 단일 출처).
 SEARCH_SECTIONS = frozenset(_SECTION_DOMAIN)
 
+# 다른 모든 섹션을 포함하는 최광역 범위. 표에 섹션을 추가하는 사람이 "무엇의 상위집합인가"를
+# 여기서 함께 판단하도록 표 옆에 둔다 — 도구는 넓히기·폴백 대상을 이 이름에서 파생한다.
+WIDEST_SECTION = "all"
+
 
 def search_url(base_url: str, query: str, section: str = "all") -> str:
     """Yes24 검색 URL을 조립한다.

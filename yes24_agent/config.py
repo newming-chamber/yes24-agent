@@ -30,10 +30,16 @@ class Settings(BaseSettings):
     # 화이트리스트의 **값**만 허용하고(임의 모델 문자열 차단), 없거나 무효면 model_name으로
     # 폴백한다. 자동 라우팅이 아니라 명시 선택이라 단일 경로 원칙과 상충하지 않는다.
     # 벤치: pro 9/12·3.5-flash 10/12 동급, 단순질의 flash 2~3배 빠름(2026-07-24).
+    # 값에 "/"가 있으면 LiteLLM 경로("provider/model" — ADK·litellm 관례)로 해석돼
+    # create_agent가 LiteLlm 어댑터로 감싼다. 벤더 키워드 목록 없이 ID 형태가 신호다.
     selectable_models: dict[str, str] = {
         "Gemini 2.5 Pro": "gemini-2.5-pro",
         "Gemini 3.5 Flash": "gemini-3.5-flash",
         "Gemini 3.6 Flash": "gemini-3.6-flash",
+        # responses/ 접두는 litellm의 responses API 브리지 — chat/completions의
+        # "function tools + reasoning 병용 불가" 제약이 없어 reasoning을 켠 채 도구를 쓴다.
+        # 2026-08-12 도그푸딩 실측: reasoning 끈 chat 경로는 도구 회피(추천 3/3 무도구 창작).
+        "GPT 5.6 Luna": "openai/responses/gpt-5.6-luna",
     }
     # 활성 도구셋(toolsets.TOOLSETS 키 부분집합). 도구 등록·프롬프트 fragment 활성·프론트
     # 브랜딩이 여기서 파생된다. 순서는 레지스트리 선언 순서가 정본(이 리스트는 켜고 끄기만).
@@ -51,6 +57,12 @@ class Settings(BaseSettings):
     # 추천 질의는 동일(~20s, 지배 변수는 예산이 아니라 라운드 수·샘플링 변동). 고정 상한은
     # 근거 소멸로 삭제, .env `THINKING_BUDGET`으로 여전히 조정 가능.
     thinking_budget: int = -1
+    # LiteLLM 경로(openai/*) 전용 reasoning 강도. gpt-5.6 계열은 chat/completions에서
+    # function tools + reasoning_effort 병용을 400으로 거부하지만(2026-08-12 라이브 실측),
+    # responses API 브리지(모델ID의 responses/ 접두)에서는 병용이 된다. 재현 프로브
+    # (도구 미호출 추천 창작) 실측: 'none' 3/3 실패 → 'low' 1/3 → 'medium' 0/5, 지연은
+    # medium에서도 8~15s로 준수. 빈 문자열이면 미전달(벤더 기본).
+    litellm_reasoning_effort: str = "medium"
     # 사고 요약 스트리밍(Gemini include_thoughts). 벤더 사고 구간(첫 3~5초)은 본문 파트가
     # 없어 화면이 비는데, 사고 요약 파트는 그 구간에 먼저 도착한다 — runner가 이를 진행
     # 타임라인(stage=thinking)으로 흘려 첫 응답 체감 침묵을 줄인다(LLM 실생성 텍스트,
@@ -68,6 +80,18 @@ class Settings(BaseSettings):
     # 못하면 같은 pro로 딱 1회 조용히 재시도한다. off면 곧장 정직 안내(error+done).
     error_fallback: bool = True
     max_llm_calls: int = 50  # ADK RunConfig 상한
+
+    # 출처·인용
+    # 세션 source_id의 시작 번호. 값 자체엔 의미가 없고, **자릿수가 모델 행동을 바꾼다** —
+    # 1부터 매기면 `[n]` 마커가 각주 카운터로 재해석돼 언급 순서대로 번호가 붙지만, 3자리는
+    # 식별자로 취급된다. 2026-08-13 오프셋 A/B(48런, Luna 다중검색 종합): 순번 인용 7/24 →
+    # 0/24(p=0.0094), 인용 소실 0, flash 중립 12/12. 비용·지연 변화 없음. 상세는
+    # docs/known-limitations.md 2026-08-13 절.
+    # **"인용 소실 0"의 모집단은 다중검색 종합 턴뿐이다** — 짧은 단일 추천 턴에선 각주
+    # 습관이 잔존해 무효 마커 제거로 인용이 소실된다(R5 재현 프로브 2/10, 오지정 승격은 0).
+    # 오프셋의 비용은 유형 의존이며, 그 결함의 처방은 이 값이 아니라 검증·재작성 층이다.
+    # 1이면 종전 동작(1부터 발급) — 이 필드가 롤백 레버다.
+    source_id_base: int = 101
 
     # Yes24 크롤링
     yes24_base_url: str = "https://www.yes24.com"
@@ -336,6 +360,7 @@ class Settings(BaseSettings):
 
     # 시크릿 (.env에서만 로드)
     gemini_api_key: str = ""
+    openai_api_key: str = ""  # LiteLLM 경로(openai/*) 모델용
     perplexity_api_key: str = ""  # web_search(퍼플렉시티 /search)용 — Bearer 토큰
     tavily_api_key: str = ""  # web_fetch(Tavily /extract)용
 
@@ -367,6 +392,19 @@ def ensure_google_api_key_env() -> str:
         os.environ["GOOGLE_API_KEY"] = gemini_key
     os.environ.pop("GEMINI_API_KEY", None)
     return gemini_key
+
+
+def ensure_openai_api_key_env() -> str:
+    """litellm이 기대하는 `OPENAI_API_KEY` 환경변수를 설정하고 사용된 키를 반환한다.
+
+    pydantic-settings는 .env를 os.environ으로 내보내지 않으므로, LiteLLM 경로
+    (selectable_models의 "openai/*" 모델) 사용 시 여기서 매핑한다. 키가 없어도
+    예외를 던지지 않는다 — Gemini 전용 운용에선 이 키가 필요 없다.
+    """
+    key = os.environ.get("OPENAI_API_KEY") or get_settings().openai_api_key
+    if key:
+        os.environ["OPENAI_API_KEY"] = key
+    return key
 
 
 # 공유 google.genai 클라이언트 싱글턴.

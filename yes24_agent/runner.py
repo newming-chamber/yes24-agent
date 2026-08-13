@@ -217,6 +217,10 @@ def _finalize_answer(
     본문을 정형 문구로 갈아끼웠는데, 2026-07-22 실측에서 캐치 0 · 오탐 14/14였다(40턴 중
     14턴에서 접지된 정답이 죽었고 창작은 0건). 정상 경로에서 그 근거로 삭제했으면서
     에러·타임아웃 경로에만 남겨두면 같은 결함이 드문 경로에서 계속 재발한다.
+
+    순번 인용(마커를 언급 순서로 매김) 계측은 source_id_base=101 도입으로 **구조적으로
+    발화 불가**가 되어 삭제했다 — 순번 마커는 무효 id가 되어 validate_citations가 이미
+    "존재하지 않는 source_id 마커 제거" 경고를 내므로, 그 제거율이 살아 있는 지표다.
     """
     citation = validate_citations(text or "", sources)
     # 검증이 끝난 **뒤에만** 공개 번호를 1..n으로 다시 매긴다(renumber_for_display docstring).
@@ -510,7 +514,9 @@ async def run_agent_stream(
             # 아니라 명시 선택이라 단일 루프 원칙은 유지된다 — 프롬프트·도구·thinking 구성은
             # 모델과 무관하게 동일하고, done.model이 실제 사용 모델을 싣는다.
             agent = get_agent(model, app)
-            active_model = str(agent.model)
+            # LiteLLM 경로에선 agent.model이 BaseLlm 객체라 str()이 pydantic repr을
+            # 뱉는다 — 모델ID 문자열(.model 속성)을 우선한다.
+            active_model = getattr(agent.model, "model", None) or str(agent.model)
 
             runner = Runner(
                 agent=agent,

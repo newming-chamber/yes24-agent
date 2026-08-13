@@ -14,6 +14,8 @@ from collections.abc import MutableMapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from yes24_agent.config import get_settings
+
 # 세션 스코프 키 (temp: 접두사 금지 — 멀티턴에서 이전 턴 출처도 유지되어야 함)
 SOURCES_STATE_KEY = "sources"
 # 관측 충실도. **등록하는 도구가 선언하고 코어는 크기만 비교한다** — 코어가 "book_detail이면
@@ -56,8 +58,18 @@ _WATERMARK_MAX_INVOCATIONS = 64
 
 
 def _next_source_id(existing: list, invocation_id: str | None) -> int:
-    """다음 source_id를 발급한다. invocation_id가 있으면 그 턴 안에서 단조·유일을 보장한다."""
+    """다음 source_id를 발급한다. invocation_id가 있으면 그 턴 안에서 단조·유일을 보장한다.
+
+    `source_id_base`는 발급 **바닥값**으로 들어간다(`base - 1`을 이미 쓴 번호처럼 취급).
+    반환값에 오프셋을 더하는 방식은 금지다 — 저장된 id에서 다시 계산할 때 오프셋이 **거듭
+    더해져** 발급이 턴마다 튀고(101 → 202 → 303), state 기준과 워터마크 기준이 서로 다른
+    축이 된다. 바닥값은 아래 max 체인에 흡수되므로 기존 단조·유일 보장을 손대지 않는다.
+    기존 세션(id 1..n)의 다음 발급이 base로 점프하는 것은 의도 동작이다 — 이미 쓴 번호를
+    재사용하지 않으면서 새 출처만 3자리를 받는다.
+    """
     state_max = max((source.get("id", 0) for source in existing), default=0)
+    # 왜 3자리부터 시작하는지는 config의 source_id_base 주석이 정본이다.
+    state_max = max(state_max, get_settings().source_id_base - 1)
     if invocation_id is None:
         return state_max + 1
     with _WATERMARK_LOCK:
