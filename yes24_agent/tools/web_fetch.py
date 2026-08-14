@@ -16,7 +16,7 @@ import httpx
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
-from yes24_agent.sources import now_checked_at, register_source
+from yes24_agent.sources import cite_marker, now_checked_at, register_source
 from yes24_agent.tools.web_search import _get_client
 from yes24_agent.tools.yes24_fetch import window_around_find
 
@@ -165,6 +165,7 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
     result = {
         "status": "ok",
         "source_id": source_id,
+        "cite_as": cite_marker(source_id),
         "type": "web",
         "title": title,
         "url": url,

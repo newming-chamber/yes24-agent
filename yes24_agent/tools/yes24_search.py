@@ -32,7 +32,7 @@ import logging
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import Settings, get_settings
-from yes24_agent.sources import now_checked_at, register_source
+from yes24_agent.sources import cite_marker, now_checked_at, register_source
 from yes24_agent.tools._planning import (
     angle_error_summary,
     dropped_queries_message,
@@ -302,6 +302,7 @@ async def yes24_search(
             results.append(
                 {
                     "source_id": source_id,
+                    "cite_as": cite_marker(source_id),
                     "type": "search_result",
                     "title": item["title"],
                     "url": item["url"],

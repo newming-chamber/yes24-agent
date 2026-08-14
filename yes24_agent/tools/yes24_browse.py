@@ -13,7 +13,7 @@ import logging
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
-from yes24_agent.sources import now_checked_at, register_source
+from yes24_agent.sources import cite_marker, now_checked_at, register_source
 from yes24_agent.tools.yes24_search import _get_client
 from yes24_agent.yes24.client import Yes24FetchError
 from yes24_agent.yes24.parsers import (
@@ -247,6 +247,7 @@ async def yes24_browse(
         results.append(
             {
                 "source_id": source_id,
+                "cite_as": cite_marker(source_id),
                 "type": "browse",
                 "rank": item.get("rank"),
                 "title": item["title"],

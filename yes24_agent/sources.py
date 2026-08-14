@@ -83,6 +83,16 @@ def _next_source_id(existing: list, invocation_id: str | None) -> int:
     return new_id
 
 
+def cite_marker(source_id: int) -> str:
+    """이 출처를 인용할 때 본문에 그대로 복사할 마커 표면형의 **단일 정의처**.
+
+    postprocess.MARKER_PATTERN(`[숫자]`)이 소비하는 마커 어휘와 같은 표면형이다 — 여기와
+    그 정규식이 어긋나면 도구가 준 cite_as가 출구 검증에서 마커로 안 잡히므로, 표면형을
+    바꿀 땐 반드시 둘을 함께 바꾼다.
+    """
+    return f"[{source_id}]"
+
+
 # KST(UTC+9). 도구·매트릭스가 "오늘"·검색시각(checked_at)을 계산하는 단일 기준.
 # 값 자체는 외부 사실이지만, 10개 파일에 재정의돼 있던 것을 여기 한 곳으로 모은다.
 KST = timezone(timedelta(hours=9))

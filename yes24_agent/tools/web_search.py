@@ -46,7 +46,7 @@ from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
 from yes24_agent.config import Settings, get_settings
-from yes24_agent.sources import now_checked_at, register_source
+from yes24_agent.sources import cite_marker, now_checked_at, register_source
 from yes24_agent.tools._planning import (
     angle_error_summary,
     dropped_queries_message,
@@ -528,6 +528,7 @@ async def _grounded_search(
         results.append(
             {
                 "source_id": source_id,
+                "cite_as": cite_marker(source_id),
                 "type": "web",
                 "title": item["title"],
                 "url": item["url"],
@@ -797,6 +798,9 @@ async def web_search(
             results.append(
                 {
                     "source_id": source_id,
+                    # 퍼플렉시티 원시 경로도 복사용 마커 동봉 — 그라운딩 경로와 같은 계약
+                    # (인용 가능한 결과는 모두 자기 마커를 들고 온다). 감사 지적 갭 봉합.
+                    "cite_as": cite_marker(source_id),
                     "type": "web",
                     "title": title,
                     "url": url,

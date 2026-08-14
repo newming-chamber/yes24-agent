@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
-from yes24_agent.sources import DETAIL_FIDELITY, now_checked_at, register_source
+from yes24_agent.sources import DETAIL_FIDELITY, cite_marker, now_checked_at, register_source
 from yes24_agent.tools.yes24_search import _get_client
 from yes24_agent.yes24.client import Yes24FetchError
 from yes24_agent.yes24.parsers import (
@@ -309,6 +309,7 @@ def _fetch_product(
     detail = {
         "status": "ok",
         "source_id": source_id,
+        "cite_as": cite_marker(source_id),
         "title": title,
         "url": url,
         "type": "book_detail",
@@ -388,6 +389,7 @@ def _register_other_formats(
             {
                 **record,
                 "source_id": source_id,
+                "cite_as": cite_marker(source_id),
                 "type": "other_format",
                 "title": format_title,
                 "checked_at": checked_at,
@@ -478,6 +480,7 @@ def _fetch_generic(
     result = {
         "status": "ok",
         "source_id": source_id,
+        "cite_as": cite_marker(source_id),
         "title": title,
         "url": url,
         "type": "notice",
