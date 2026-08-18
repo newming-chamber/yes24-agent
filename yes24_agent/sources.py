@@ -33,32 +33,43 @@ DETAIL_FIDELITY = 1
 # 관측 시점의 값**(최신 관측이 이긴다) — `merge_source_records`가 그 판정의 유일한 구현이다.
 REGISTRY_RECORD_FIELDS = ("id", "title", "url", "type", "snippet", "checked_at", "meta", "fidelity")
 
-# 인보케이션 스코프 id 워터마크. id 발급은 `max(state의 기존 id)+1`이라 read-modify-write이고,
-# 한 턴의 병렬 function call이 상대의 write를 보기 전에 자기 스냅샷을 읽으면 **둘 다 같은
-# 번호**를 딴다. 그러면 `settle_sources`가 id 기준 병합으로 서로 다른 출처를 한 레코드에
-# 합쳐(서로 다른 타입의 키메라) 공개 DTO를 오염시키고, 모델도 "id n"이 둘인 결과를 받아
-# 인용이 중의적이 된다. **역할 분담**: 턴 내 충돌은 이 워터마크가 막고, 턴 간 id 재사용은
-# 애초에 일어나지 않게 러너가 턴 마감에 유실분을 레지스트리로 복구하며
-# (`runner._settle_turn_sources`), 그래도 같은 id로 다른 문서가 만나면 merge_source_records의
-# 정체성 가드가 키메라를 막는다 — 관측된 증상(2026-08-06 도그푸딩: search_result 카드에 다른
-# 타입의 메타 필드 동거)의 원인 경로는 라이브 재현으로 확정된 바 없다(같은 턴의 상세→목록
-# 관측 격하로도 같은 모양이 나온다). 이 픽스들이 그 증상을 막았다고 단정하지 말 것.
+# 인보케이션 스코프 발급 장부. id 발급은 `max(state의 기존 id)+1`이라 read-modify-write이고,
+# 한 턴의 병렬 function call은 서로의 write를 못 보는 state 스냅샷에서 출발한다. 그 격리가
+# 만드는 결함이 두 축이다 — 장부가 인보케이션당 한 레코드로 둘 다 막는다:
+# - **watermark**(id 단조): 두 콜이 같은 스냅샷 최대값을 읽으면 **둘 다 같은 번호**를 딴다.
+#   그러면 `settle_sources`가 id 기준 병합으로 서로 다른 출처를 한 레코드에 합쳐(서로 다른
+#   타입의 키메라) 공개 DTO를 오염시키고, 모델도 "id n"이 둘인 결과를 받아 인용이 중의적이
+#   된다. 워터마크가 스냅샷과 무관하게 번호를 단조 증가시킨다.
+# - **url_ids**(URL 멱등): 한 콜의 등록이 delta last-wins로 state에서 유실되면, 같은 턴의
+#   뒤 콜이 같은 URL을 못 보고 **새 id로 재발급**한다. 턴 마감 복구가 양쪽 관측을 모두
+#   살리므로 같은 URL이 다른 id 두 개로 영속된다(2026-08-13 실측: 세션 ceb47cc4에서 8쌍,
+#   덤프 qa/h7-dup-registration). "같은 URL은 id를 유지"(결정 4) 위반이고, 뒤 id 레코드는
+#   이후 관측 병합에서 소외돼 낡는다. 이 인보케이션이 이미 그 URL에 발급한 id를 재사용해
+#   발급을 URL에 대해 멱등으로 만든다 — 마감에서 중복을 지우는 방식은 모델이 이미 받은
+#   cite_as 마커를 무효화해 무인용을 만들므로(위계: 무인용 > 오인용) 발급 시점이 정답이다.
+# **역할 분담**: 턴 내 충돌·중복은 이 장부가 막고, 턴 간 id 재사용은 애초에 일어나지 않게
+# 러너가 턴 마감에 유실분을 레지스트리로 복구하며(`runner._settle_turn_sources`), 그래도
+# 같은 id로 다른 문서가 만나면 merge_source_records의 정체성 가드가 키메라를 막는다 —
+# 관측된 증상(2026-08-06 도그푸딩: search_result 카드에 다른 타입의 메타 필드 동거)의 원인
+# 경로는 라이브 재현으로 확정된 바 없다(같은 턴의 상세→목록 관측 격하로도 같은 모양이 나온다).
+# 이 픽스들이 그 증상을 막았다고 단정하지 말 것.
 # 정상 경로(ADK State write-through)에서는 스냅샷이 공유돼 충돌이 안 나지만, 그 보호는 ADK 내부
 # 구현에 딸린 것이라(`State.__setitem__`에 "delta에만 쓰도록 바꾸자"는 TODO가 달려 있다) 발급
-# 자체를 스냅샷과 무관하게 단조로 만든다. 같은 턴의 도구는 invocation_id를 공유하므로 번호가
-# 겹칠 수 없다.
-_ID_WATERMARK: dict[str, int] = {}
+# 자체를 스냅샷과 무관하게 만든다. 같은 턴의 도구는 invocation_id를 공유한다.
+_INVOCATION_LEDGER: dict[str, dict] = {}  # {inv: {"watermark": int, "url_ids": {url: id}}}
 # 발급 구간(읽기→갱신)은 await가 없지만 ADK가 도구를 별도 스레드에서 돌릴 수 있어(sync 도구
 # 경로) 락으로 원자성을 보장한다. 구간이 짧아 경합 비용은 무시할 수준이다.
-_WATERMARK_LOCK = threading.Lock()
-# 워터마크 보관 상한(동시 진행 인보케이션 수의 여유 상한). agent._invocation_instruction의
+_LEDGER_LOCK = threading.Lock()
+# 장부 보관 상한(동시 진행 인보케이션 수의 여유 상한). agent._invocation_instruction의
 # lru_cache(64)와 같은 논리이며, 조정 대상 설정값이 아니라 자료구조 상한이라 코드 상수로 둔다.
 # 초과 시 가장 오래 전에 시작된 인보케이션부터 버린다(dict는 삽입 순서를 보존한다).
-_WATERMARK_MAX_INVOCATIONS = 64
+_LEDGER_MAX_INVOCATIONS = 64
 
 
-def _next_source_id(existing: list, invocation_id: str | None) -> int:
-    """다음 source_id를 발급한다. invocation_id가 있으면 그 턴 안에서 단조·유일을 보장한다.
+def _next_source_id(existing: list, invocation_id: str | None, url: str) -> int:
+    """다음 source_id를 발급한다. invocation_id가 있으면 그 턴 안에서 단조·유일을 보장하고,
+    같은 턴이 이미 같은 url에 발급한 id는 새 번호 대신 그대로 재사용한다(발급 멱등 — 장부
+    주석의 url_ids 축).
 
     `source_id_base`는 발급 **바닥값**으로 들어간다(`base - 1`을 이미 쓴 번호처럼 취급).
     반환값에 오프셋을 더하는 방식은 금지다 — 저장된 id에서 다시 계산할 때 오프셋이 **거듭
@@ -72,14 +83,19 @@ def _next_source_id(existing: list, invocation_id: str | None) -> int:
     state_max = max(state_max, get_settings().source_id_base - 1)
     if invocation_id is None:
         return state_max + 1
-    with _WATERMARK_LOCK:
+    with _LEDGER_LOCK:
         # 재대입은 삽입 순서를 바꾸지 않는다 — pop 후 재삽입으로 "최근 발급 = 최신"을 만든다.
         # 그래야 축출이 오래 쉰 인보케이션부터 버리고, 긴 도구 루프로 아직 진행 중인
-        # 인보케이션의 워터마크를 떨어뜨려 id를 되감지 않는다.
-        new_id = max(state_max, _ID_WATERMARK.pop(invocation_id, 0)) + 1
-        _ID_WATERMARK[invocation_id] = new_id
-        while len(_ID_WATERMARK) > _WATERMARK_MAX_INVOCATIONS:
-            _ID_WATERMARK.pop(next(iter(_ID_WATERMARK)))
+        # 인보케이션의 장부를 떨어뜨려 id를 되감거나 URL을 재발급하지 않는다.
+        ledger = _INVOCATION_LEDGER.pop(invocation_id, None) or {"watermark": 0, "url_ids": {}}
+        new_id = ledger["url_ids"].get(url)
+        if new_id is None:
+            new_id = max(state_max, ledger["watermark"]) + 1
+            ledger["watermark"] = new_id
+            ledger["url_ids"][url] = new_id
+        _INVOCATION_LEDGER[invocation_id] = ledger
+        while len(_INVOCATION_LEDGER) > _LEDGER_MAX_INVOCATIONS:
+            _INVOCATION_LEDGER.pop(next(iter(_INVOCATION_LEDGER)))
     return new_id
 
 
@@ -255,7 +271,7 @@ def register_source(
                 state[SOURCES_STATE_KEY] = refreshed
             return source["id"]
 
-    new_id = _next_source_id(existing, invocation_id)
+    new_id = _next_source_id(existing, invocation_id, url)
     new_source = {
         "id": new_id,
         "title": title,
