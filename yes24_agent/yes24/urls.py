@@ -30,17 +30,36 @@ SEARCH_SECTIONS = frozenset(_SECTION_DOMAIN)
 # 여기서 함께 판단하도록 표 옆에 둔다 — 도구는 넓히기·폴백 대상을 이 이름에서 파생한다.
 WIDEST_SECTION = "all"
 
+# 정렬 이름 → Yes24 검색 order 쿼리값 매핑(2026-08-14 라이브 관측: 검색 페이지 sort_gb
+# 셀렉트의 value들 — SINDEX_ONLY(인기도)·RELATION(정확도)·RECENT(신상품)·REG_DTS 등 8종).
+# 도구가 노출하는 정렬만 담는다: 기본(빈 값)은 파라미터를 붙이지 않아 사이트 기본
+# 정렬(인기도순)을 따르고, "recent"는 최신작·신간 질문의 근거 정렬이다 — 인기도순 상위
+# N건 밖의 최신작은 모델이 볼 수 없어 낡은 책을 최신작으로 단정하는 실측 원인이었다.
+# yes24_search의 허용값도 이 표에서 파생한다(별도 열거 금지).
+_ORDER_PARAM = {
+    "recent": "RECENT",
+}
+SEARCH_ORDERS = frozenset(_ORDER_PARAM)
 
-def search_url(base_url: str, query: str, section: str = "all") -> str:
+
+def search_url(
+    base_url: str, query: str, section: str = "all", order: str = "", author_no: str = ""
+) -> str:
     """Yes24 검색 URL을 조립한다.
 
     Args:
         base_url: Yes24 오리진 (예: "https://www.yes24.com"). 끝에 "/"가 있어도 없어도 된다.
         query: 검색어. URL 인코딩은 이 함수가 처리한다.
         section: "all"(전체) 또는 "book"(도서). 그 외 값은 ValueError.
+        order: ""(사이트 기본 정렬) 또는 SEARCH_ORDERS의 정렬 이름(예: "recent"=신상품순).
+            그 외 값은 ValueError.
+        author_no: 저자 동일성 키(검색 결과 행의 저자 링크가 싣는 authorNo). 지정하면
+            그 저자의 책만 나온다. 2026-08-18 라이브 실측: authorNo가 있으면 사이트가
+            **query를 무시하고** 저자 스코프로 대체한다(엉뚱한 query+authorNo도 저자
+            전집이 나옴) — AND 필터가 아니므로 키워드 오염으로 0건이 되는 함정은 없다.
 
     Returns:
-        `/product/search?domain=...&query=...` 형태의 완전한 검색 URL.
+        `/product/search?domain=...&query=...[&order=...][&authorNo=...]` 형태의 완전한 검색 URL.
     """
     try:
         domain = _SECTION_DOMAIN[section]
@@ -50,7 +69,16 @@ def search_url(base_url: str, query: str, section: str = "all") -> str:
 
     encoded_query = quote(query, safe="")
     base = base_url.rstrip("/")
-    return f"{base}/product/search?domain={domain}&query={encoded_query}"
+    url = f"{base}/product/search?domain={domain}&query={encoded_query}"
+    if order:
+        try:
+            url += f"&order={_ORDER_PARAM[order]}"
+        except KeyError as exc:
+            allowed = ", ".join(sorted(_ORDER_PARAM))
+            raise ValueError(f"지원하지 않는 order: {order!r} (허용값: {allowed})") from exc
+    if author_no:
+        url += f"&authorNo={quote(author_no, safe='')}"
+    return url
 
 
 def product_url(base_url: str, goods_no: str) -> str:

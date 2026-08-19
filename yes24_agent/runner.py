@@ -1,6 +1,6 @@
 """ADK Runner 실행 → SSE 이벤트 변환.
 
-`/chat/stream` 엔드포인트의 심장. `root_agent`를 ADK Runner로 돌리며 흘러나오는
+`/chat/stream` 엔드포인트의 심장. 선택된 모델·구성의 에이전트를 ADK Runner로 돌리며 흘러나오는
 이벤트(function call/response, partial/final text)를 프론트 계약(status/source/
 delta/done/error)의 SSE 프레임으로 번역해 yield한다.
 

@@ -27,6 +27,9 @@ ITEM_TITLE_LINK = "a.gd_name"
 # 마크업(크레마클럽)에서는 관측 불가다 — 그 구분은 _item_fields의 키 생략이 표현한다.
 ITEM_FORMAT_LABEL = "span.gd_res"
 ITEM_EBOOK_LABEL = "[eBook]"
+# 라벨의 대괄호는 마크업 장식이다 — kind(라벨 원형) 관측은 이 장식을 벗긴 값을 쓰며,
+# 그 표기 규약은 ITEM_EBOOK_LABEL(대괄호 포함 원문 비교용)과 함께 이 파일이 소유한다.
+ITEM_FORMAT_LABEL_DECORATION = "[]"
 
 # 표지 이미지. lazy-load라 실제 커버 URL은 `src`(Noimg 플레이스홀더)가 아니라 `data-original`
 # 속성에 든다(실측: 24개 상품 전부 data-original에 image 서브도메인의 goods 커버 경로, src는
@@ -40,15 +43,27 @@ ITEM_AUTHOR = "span.authPub.info_auth"
 # 노드를 제거하지 않으면 "홍창숙 , 김경은 … 저 외 1명 정보 더 보기/감추기 홍창숙 김경은 …"
 # 처럼 토글 라벨과 중복 이름이 섞인다.
 ITEM_AUTHOR_TOGGLE = ".moreAuthArea"
+# 저자 앵커 — href의 authorNo 쿼리가 **저자 동일성 키**다(goods_no와 같은 정체성 축,
+# 2026-08-18 실측: 검색 결과 행의 저자 링크가 `?query=..&authorNo=673&author=김영하` 형태).
+# 동명이인 저자 구분은 이 키로만 가능하다: 이름 텍스트는 흔한 이름에서 겹치고, 신상품순
+# 정렬은 무관 저자의 신간을 상위로 끌어올린다. 공저·번역 행은 앵커가 여럿이므로 첫
+# 앵커(주 저자)를 읽는다.
+ITEM_AUTHOR_LINK = "span.authPub.info_auth a[href*='authorNo=']"
 ITEM_PUBLISHER = "span.authPub.info_pub"
 ITEM_PUB_DATE = "span.authPub.info_date"
 
 # 가격과 평점이 둘 다 `em.yes_b`를 재사용하므로 컨테이너로 구분해야 한다.
 # `.info_price` 안에는 쿠폰 적용가(`.yCoupon` 안의 `strong.txt_num`)가 추가로 나올 수
 # 있어, '>' 자식 결합자로 최상위 판매가(strong.txt_num)만 선택해 쿠폰가 오염을 막는다.
-# 뽑히는 값은 **할인 적용 판매가**다(같은 블록의 취소선 `span.txt_num.dash em.yes_m`가
-# 정가이며 뽑지 않는다) — 상세페이지 g_GoodsSalePrice와 같은 의미라 필드명도 sale_price다.
+# 뽑히는 값은 **할인 적용 판매가**다 — 상세페이지 g_GoodsSalePrice와 같은 의미라
+# 필드명도 sale_price다.
 ITEM_SALE_PRICE = ".info_price > strong.txt_num em.yes_b"
+# 정가는 같은 블록의 취소선 표기(`span.txt_num.dash` 안 `em.yes_m`)다. 판매가와 클래스가
+# 다르지만 여기서도 '>' 자식 결합자를 써서 쿠폰 블록 안쪽을 배제한다(형제 셀렉터와 같은 규약).
+# 두 원시값을 함께 뽑는 이유: 정가가 없으면 모델이 판매가와 할인 표기로 정가를 역산해
+# 지어낸다(실측 2026-08-12: "정가 16,800원에서 10% 할인" — 그 값을 관측한 출처가 없다).
+# 할인율(`span.txt_sale`)은 두 값의 파생이라 뽑지 않는다 — 저장하면 진실이 둘이 된다.
+ITEM_LIST_PRICE = ".info_price > span.txt_num.dash em.yes_m"
 ITEM_RATING = ".rating_grade em.yes_b"
 
 # 대중성/매력 신호(매트릭스 풀 재순위화용). 둘 다 검색 결과 HTML에 SSR로 박혀 있다.
@@ -86,6 +101,25 @@ PRODUCT_RATING = ".gd_lnkRate em.yes_b"
 PRODUCT_SPECIFICATION_ROWS = "#infoset_specific table.tb_vertical tr"
 PRODUCT_SPECIFICATION_LABEL = "th[scope=row]"
 PRODUCT_SPECIFICATION_VALUE = "td"
+
+# 상세 정보 테이블(캡션 있는 라벨→값 표). 두 앵커만 읽는다 — 상단 `.gd_infoTb`는 상품
+# 유형별 핵심 표(클래스 상품의 "강연 정보": 모집기간+모집마감/모집중 배지·일정·장소,
+# 도서의 "상품 가격정보" 등)를 싣고, `#infoset_deli`("배송 안내")는 **상품별 배송비**
+# ("배송 구분 = 예스24 배송 배송비 : 무료배송")를 싣는다. 2026-08-18 도그푸딩 실측:
+# 이 표들을 안 읽어서 모델이 상세를 열고도 모집마감된 행사를 안내했고, 배송비를 FAQ
+# 일반 규칙에서 산술로 유도하다 틀렸다. 캡션·라벨은 열거하지 않는다(사이트 어휘 통과).
+# 반품/교환 등 다른 하단 표는 정책 상용구라 앵커에 넣지 않는다(관측된 실패와 무관).
+PRODUCT_INFO_TABLES = ".gd_infoTb table, #infoset_deli table"
+# 정보 테이블의 행 구조. 스펙 표(PRODUCT_SPECIFICATION_*)와 달리 th에 scope 속성이 없는
+# 표도 있어 th/td 원형으로 잡는다 — 표의 행·라벨·값 셀렉터는 이 파일이 소유한다는 규약은
+# 동일하다(파서에 직접 박지 않는다).
+PRODUCT_INFO_TABLE_CAPTION = "caption"
+PRODUCT_INFO_TABLE_ROW = "tr"
+PRODUCT_INFO_TABLE_LABEL = "th"
+PRODUCT_INFO_TABLE_VALUE = "td"
+
+# 쪽수는 스펙 표(PRODUCT_SPECIFICATION_*)의 라벨 이름이다 — 위 정보 테이블 블록이 아니라
+# 스펙 표 소유다.
 PRODUCT_PAGE_COUNT_FIELD = "쪽수"
 
 # 가격·goods_no·eBook 여부는 상세페이지 인라인 <script> 전역변수를 정규식으로 추출한다.
@@ -100,6 +134,10 @@ PRODUCT_GOODS_NO_JS_RE = r"g_GoodsNo\s*=\s*'(\d+)'"
 PRODUCT_GOODS_NAME_JS_RE = r"g_GoodsName\s*=\s*'([^']+)'"
 PRODUCT_IS_EBOOK_JS_RE = r"g_isEbook\s*=\s*'([YN])'"
 PRODUCT_SALE_PRICE_JS_RE = r"g_GoodsSalePrice\s*=\s*([\d.]+)"
+# 정가(할인 전 가격). 목록의 취소선 표기(ITEM_LIST_PRICE)와 같은 값이며, 같은 이유로 뽑는다.
+# 할인 폭 전역(g_GoodsDiscountShopPrice)은 두 값의 차라 뽑지 않는다 — 변수명이 이 패턴의
+# 부분문자열이 아니라(g_Goods**Discount**ShopPrice) 정규식에 걸리지도 않는다.
+PRODUCT_LIST_PRICE_JS_RE = r"g_GoodsShopPrice\s*=\s*([\d.]+)"
 
 # 다른 판형 안내 위젯("eBook 12,000원 이동", "중고상품"). 같은 작품의 **다른 판형과 그
 # 판매가**를 담으며, 값의 임자는 이 페이지의 상품이 아니라 링크가 가리키는 다른 상품이다.

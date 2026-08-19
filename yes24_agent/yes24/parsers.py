@@ -7,7 +7,7 @@
 import re
 from collections.abc import Mapping
 from datetime import datetime
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse, urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -26,12 +26,15 @@ from yes24_agent.yes24.selectors import (
     FAQ_QUESTION,
     FAQ_QUESTION_DECORATION,
     ITEM_AUTHOR,
+    ITEM_AUTHOR_LINK,
     ITEM_AUTHOR_TOGGLE,
     ITEM_EBOOK_LABEL,
     ITEM_FORMAT_LABEL,
+    ITEM_FORMAT_LABEL_DECORATION,
     ITEM_GOODS_NO_ATTR,
     ITEM_IMAGE,
     ITEM_IMAGE_ATTR,
+    ITEM_LIST_PRICE,
     ITEM_PUB_DATE,
     ITEM_PUBLISHER,
     ITEM_RANK,
@@ -50,8 +53,14 @@ from yes24_agent.yes24.selectors import (
     PRODUCT_FORMAT_PRICE,
     PRODUCT_GOODS_NAME_JS_RE,
     PRODUCT_GOODS_NO_JS_RE,
+    PRODUCT_INFO_TABLE_CAPTION,
+    PRODUCT_INFO_TABLE_LABEL,
+    PRODUCT_INFO_TABLE_ROW,
+    PRODUCT_INFO_TABLE_VALUE,
+    PRODUCT_INFO_TABLES,
     PRODUCT_INTRO,
     PRODUCT_IS_EBOOK_JS_RE,
+    PRODUCT_LIST_PRICE_JS_RE,
     PRODUCT_PAGE_COUNT_FIELD,
     PRODUCT_PUB_DATE,
     PRODUCT_PUB_REVIEW,
@@ -86,8 +95,10 @@ _ITEM_FIELDS = (
     "title",
     "url",
     "author",
+    "author_no",
     "publisher",
     "pub_date",
+    "list_price",
     "sale_price",
     "rating",
     "page_count",
@@ -95,6 +106,7 @@ _ITEM_FIELDS = (
     "review_count",
     "image_url",
     "is_ebook",
+    "kind",
     "other_formats",
 )
 
@@ -111,7 +123,8 @@ class ParseError(Exception):
 def parse_search(html: str, *, base_url: str, limit: int = 10) -> list[dict]:
     """Yes24 검색 결과 HTML을 파싱해 상품 목록을 반환한다.
 
-    각 아이템 dict 키는 `_ITEM_FIELDS`와 같다(페이지에 없는 필드는 None). 손으로 다시
+    각 아이템 dict 키는 `_ITEM_FIELDS`와 같다(페이지에 없는 필드는 None이거나 키가
+    생략된다 — _item_fields 규약). 손으로 다시
     열거하지 않는다 — 목록이 갈라지면 계약이 조용히 어긋난다.
     제목 또는 URL이 없는 아이템은 건너뛴다.
 
@@ -195,8 +208,19 @@ def _parse_item(item, base_url: str) -> dict | None:
 
     # 판형은 제목이 아니라 옆 라벨이 말한다(ITEM_FORMAT_LABEL 주석). 라벨이 없는 마크업에선
     # 키를 생략해 "관측 불가"로 남긴다 — False로 되채우면 전자책을 종이책으로 단정하게 된다.
+    # 라벨 원형은 kind로 함께 관측한다: 도서·eBook 외에도 클래스24(북토크·강연 묶음) 같은
+    # 비도서 상품 라벨이 있는데(2026-08-18 실측), 불리언으로 접으면 묶음 상품이 종이책과
+    # 구별 불능이 되어 모델이 이벤트 상품 카드를 도서 사실의 근거로 인용한다(3팔 중 2팔
+    # 관측). 값은 사이트 어휘 그대로 통과시킨다 — 라벨 종류를 여기서 열거하지 않는다.
     format_label = _text_or_none(item.select_one(ITEM_FORMAT_LABEL))
-    observed_format = {"is_ebook": format_label == ITEM_EBOOK_LABEL} if format_label else {}
+    observed_format = (
+        {
+            "is_ebook": format_label == ITEM_EBOOK_LABEL,
+            "kind": format_label.strip(ITEM_FORMAT_LABEL_DECORATION),
+        }
+        if format_label
+        else {}
+    )
 
     return _item_fields(
         **observed_format,
@@ -204,8 +228,10 @@ def _parse_item(item, base_url: str) -> dict | None:
         title=title,
         url=urljoin(base_url, href),
         author=_author_or_none(item),
+        author_no=_author_no_or_none(item),
         publisher=_text_or_none(item.select_one(ITEM_PUBLISHER)),
         pub_date=_text_or_none(item.select_one(ITEM_PUB_DATE)),
+        list_price=_parse_grouped_int(item.select_one(ITEM_LIST_PRICE)),
         sale_price=_parse_grouped_int(item.select_one(ITEM_SALE_PRICE)),
         rating=_parse_rating(item.select_one(ITEM_RATING)),
         sale_index=_parse_grouped_int(item.select_one(ITEM_SALE_INDEX)),
@@ -231,18 +257,20 @@ def _item_fields(**values) -> dict:
 def parse_product(html: str, *, base_url: str) -> dict:
     """Yes24 상품 상세 페이지 HTML을 파싱해 상세 정보를 반환한다.
 
-    반환 dict 키: goods_no, title, url, author, publisher, pub_date, sale_price(int|None),
-    rating(float|None), is_ebook(bool), other_formats(list[dict]), intro, toc, pub_review,
-    weekly_reviews(list[str]).
+    반환 dict 키: goods_no, title, url, author, publisher, pub_date, list_price(int|None),
+    sale_price(int|None), rating(float|None), page_count(int|None), is_ebook(bool),
+    other_formats(list[dict]), intro, toc, pub_review, weekly_reviews(list[str]),
+    info_tables(dict — 캡션→{라벨: 값}, 표가 없으면 빈 dict).
     텍스트 블록(intro/toc/pub_review)은 없으면 None, weekly_reviews는 없으면 빈 리스트.
     other_formats는 다른 판형이 없는 상품이면 빈 리스트다(관측했으나 없음).
 
     가격·goods_no·eBook 여부는 CSS가 아니라 페이지 인라인 <script>의 전역변수를
     정규식으로 추출한다 — 상세페이지 CSS 가격(em.yes_b)은 번들가·중고가까지 섞여
-    나와 오염 위험이 크다(docs/m2-scout-report.md 참조). 뽑는 값은 `g_GoodsSalePrice`,
-    즉 **할인 적용 판매가**이므로 키도 sale_price다 — 중립적인 `price`로 내보내면
-    소비자(모델·카드)가 정가인지 판매가인지 추측하게 되고, 실제로 "정가 16,200원"처럼
-    틀린 라벨을 붙였다(정가는 별도 변수 g_GoodsShopPrice이며 여기서 뽑지 않는다).
+    나와 오염 위험이 크다(docs/m2-scout-report.md 참조). 가격은 정가·판매가 두 원시값을
+    각자의 이름으로 싣는다 — `g_GoodsShopPrice`(정가)는 list_price, `g_GoodsSalePrice`
+    (할인 적용 판매가)는 sale_price다. 중립적인 `price` 하나로 내보내면 소비자(모델·카드)가
+    정가인지 판매가인지 추측하게 되고, 정가 자체를 안 실으면 모델이 판매가에서 역산해
+    지어낸다(둘 다 실측된 실패 — 선언된 이름으로 두 값을 다 주는 것이 처방이다).
 
     제목(CSS)도 없고 goods_no(JS 변수)도 없으면 상품 상세 페이지가 아니거나 구조가
     변경된 것으로 보고 ParseError를 발생시킨다.
@@ -266,9 +294,6 @@ def parse_product(html: str, *, base_url: str) -> dict:
     is_ebook_match = re.search(PRODUCT_IS_EBOOK_JS_RE, html)
     is_ebook = is_ebook_match.group(1) == "Y" if is_ebook_match else False
 
-    sale_price_match = re.search(PRODUCT_SALE_PRICE_JS_RE, html)
-    sale_price = _parse_js_price(sale_price_match.group(1)) if sale_price_match else None
-
     return {
         "goods_no": goods_no,
         "title": title,
@@ -276,7 +301,8 @@ def parse_product(html: str, *, base_url: str) -> dict:
         "author": _author_text_or_none(soup.select_one(PRODUCT_AUTHOR)),
         "publisher": _text_or_none(soup.select_one(PRODUCT_PUBLISHER)),
         "pub_date": _text_or_none(soup.select_one(PRODUCT_PUB_DATE)),
-        "sale_price": sale_price,
+        "list_price": _js_price(html, PRODUCT_LIST_PRICE_JS_RE),
+        "sale_price": _js_price(html, PRODUCT_SALE_PRICE_JS_RE),
         "rating": _parse_rating(soup.select_one(PRODUCT_RATING)),
         "page_count": _parse_page_count(soup),
         "is_ebook": is_ebook,
@@ -285,7 +311,32 @@ def parse_product(html: str, *, base_url: str) -> dict:
         "toc": _extract_infoset_text(soup, PRODUCT_TOC),
         "pub_review": _extract_infoset_text(soup, PRODUCT_PUB_REVIEW),
         "weekly_reviews": _extract_weekly_reviews(soup),
+        "info_tables": _extract_info_tables(soup),
     }
+
+
+def _extract_info_tables(soup: BeautifulSoup) -> dict[str, dict[str, str]]:
+    """상세 정보 테이블들을 {캡션: {라벨: 값}}으로 범용 관측한다(PRODUCT_INFO_TABLES 주석).
+
+    캡션 없는 표(이름이 없어 소비자가 정체를 알 수 없다)와 값 없는 행(SSR 빈 껍데기 —
+    상단 "배송안내 바로가기" 류)은 건너뛴다. 행이 하나도 없는 표는 싣지 않는다. 라벨·값
+    텍스트는 그대로 통과시킨다 — 클래스 상품의 모집 상태 배지("모집마감")도 셀 텍스트의
+    일부로 함께 남는다.
+    """
+    tables: dict[str, dict[str, str]] = {}
+    for table in soup.select(PRODUCT_INFO_TABLES):
+        caption = _text_or_none(table.select_one(PRODUCT_INFO_TABLE_CAPTION))
+        if not caption:
+            continue
+        rows: dict[str, str] = {}
+        for row in table.select(PRODUCT_INFO_TABLE_ROW):
+            label = _text_or_none(row.select_one(PRODUCT_INFO_TABLE_LABEL))
+            value = _text_or_none(row.select_one(PRODUCT_INFO_TABLE_VALUE))
+            if label and value:
+                rows[label] = value
+        if rows:
+            tables[caption] = rows
+    return tables
 
 
 def _extract_other_formats(soup: BeautifulSoup, *, base_url: str) -> list[dict]:
@@ -344,9 +395,9 @@ def _parse_page_count(soup: BeautifulSoup) -> int | None:
 def parse_browse_list(html: str, *, base_url: str, section: str, limit: int = 24) -> list[dict]:
     """Yes24 섹션 목록(베스트셀러/신간/크레마클럽 인기) HTML을 파싱한다.
 
-    반환 dict 키: rank(int|None) + parse_search와 **동일한 상품 필드 집합**(_ITEM_FIELDS:
-    goods_no, title, url(절대), author, publisher, pub_date, sale_price, rating, sale_index,
-    review_count, image_url). 페이지에 필드가 없으면 None이다. 아이템 단위로 제목 또는
+    반환 dict 키: rank(int|None) + parse_search와 **동일한 상품 필드 집합**(_ITEM_FIELDS —
+    목록을 여기 다시 열거하지 않는다. 정본은 _ITEM_FIELDS 선언이며, 페이지에 필드가 없으면
+    None이거나 키가 생략된다: _item_fields 규약). 아이템 단위로 제목 또는
     링크(크레마클럽은 goods_no)가 없으면 건너뛴다.
 
     파싱 스펙(마크업 종류·셀렉터·순위 마커 유무)은 **urls.BROWSE_SEED_URLS 레코드에서 읽는다**
@@ -699,6 +750,22 @@ def _author_or_none(item) -> str | None:
     return _author_text_or_none(item.select_one(ITEM_AUTHOR))
 
 
+def _author_no_or_none(item) -> str | None:
+    """저자 앵커 href의 authorNo(저자 동일성 키)를 뽑는다. 앵커·파라미터가 없으면 None.
+
+    이름 텍스트는 동명이인을 구분하지 못한다 — 이 키가 검색의 authorNo 파라미터로
+    되들어가 저자 스코프 검색(yes24_search author_no)의 입력이 된다. 공저·번역 행은
+    앵커가 여럿이므로 첫 앵커(주 저자)의 것만 읽는다(ITEM_AUTHOR_LINK 주석).
+    """
+    anchor = item.select_one(ITEM_AUTHOR_LINK)
+    if anchor is None:
+        return None
+    for key, value in parse_qsl(urlsplit(anchor.get("href", "")).query):
+        if key == "authorNo" and value:
+            return value
+    return None
+
+
 def _author_text_or_none(el) -> str | None:
     """저자 요소에서 펼침 UI를 제거하고 이름 목록만 반환한다."""
     if el is None:
@@ -723,15 +790,18 @@ def _image_url_or_none(item) -> str | None:
     return url or None
 
 
-def _parse_js_price(raw: str) -> int | None:
-    """PRODUCT_SALE_PRICE_JS_RE가 캡처한 문자열("15300.00" 등)을 정수로 변환한다.
+def _js_price(html: str, pattern: str) -> int | None:
+    """상세 페이지 인라인 JS 가격 전역(정가·판매가)을 정수로 뽑는다(없거나 파싱 불가면 None).
 
-    캡처 그룹 자체가 `[\\d.]+`라 점이 여러 개인 값("1.2.3")도 매칭될 수 있어
-    `float()`가 ValueError를 던질 수 있다 — 형제 파서(_parse_grouped_int/_parse_rating)와
-    동일하게 가드해 파싱 불가 시 예외 대신 None으로 degrade한다.
+    캡처 그룹이 `[\\d.]+`라 점이 여러 개인 값("1.2.3")도 매칭될 수 있어 `float()`가
+    ValueError를 던질 수 있다 — 형제 파서(_parse_grouped_int/_parse_rating)와 동일하게
+    가드해 예외 대신 None으로 degrade한다(빈 성공 위장 금지).
     """
+    match = re.search(pattern, html)
+    if match is None:
+        return None
     try:
-        return int(float(raw))
+        return int(float(match.group(1)))
     except ValueError:
         return None
 

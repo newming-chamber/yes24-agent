@@ -44,7 +44,7 @@ from yes24_agent.yes24.parsers import (
     parse_search,
     product_fields,
 )
-from yes24_agent.yes24.urls import SEARCH_SECTIONS, WIDEST_SECTION, search_url
+from yes24_agent.yes24.urls import SEARCH_ORDERS, SEARCH_SECTIONS, WIDEST_SECTION, search_url
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,7 @@ async def aclose_shared_client() -> None:
 
 
 async def _search_one(
-    query: str, section: str, client: Yes24Client, settings: Settings
+    query: str, section: str, order: str, author_no: str, client: Yes24Client, settings: Settings
 ) -> dict:
     """한 검색 각도로 Yes24 검색 HTML을 받아 **파싱 결과만** 돌려준다(등록 없음).
 
@@ -142,7 +142,7 @@ async def _search_one(
     `section`은 **실제로 검색한 범위**다 — 호출부가 요청 범위와 대조해 넓히기 여부를 판정하고
     searches 요약에도 그대로 싣는다(별도 장부를 만들지 않는다).
     """
-    url = search_url(settings.yes24_base_url, query, section)
+    url = search_url(settings.yes24_base_url, query, section, order, author_no)
     try:
         html = await client.get_text(url)
     except Yes24FetchError as exc:
@@ -173,7 +173,11 @@ async def _search_one(
 
 
 async def yes24_search(
-    queries: list[str], section: str, tool_context: ToolContext
+    queries: list[str],
+    section: str,
+    tool_context: ToolContext,
+    order: str = "",
+    author_no: str = "",
 ) -> dict:
     """Yes24에서 도서·상품을 검색해 현재 가격·평점·저자·출판사 등 실제 데이터를 얻는다.
 
@@ -196,6 +200,26 @@ async def yes24_search(
             상한을 넘는 각도는 dropped_queries로 알리고 검색하지 않는다.
         section: 검색 범위(모든 각도에 공통 적용). "all"은 통합 검색(도서·음반·DVD 등 전체),
             "book"은 국내도서로 한정. 확실치 않으면 "all".
+        order: 정렬(모든 각도에 공통 적용). 기본 ""는 인기도순 — 잘 팔리는 책이 앞이라
+            **최신작이 목록 밖에 밀려날 수 있다**. 출간 시점이 답의 근거가 되는 질문은
+            "recent"(신상품순)로 검색해야 출간일 내림차순의 실제 최신 목록이 근거가 된다.
+            단 신상품순은 관련도 필터가 풀려 검색어만 겹치는 무관 상품(동명이인의 신간
+            포함)이 섞이므로, 결과의 author·author_no·pub_date·kind로 대상을 확인하고
+            무관한 행은 무시한다. kind는 그 행이 어떤 종류의 상품인지 말하는 사이트
+            라벨이다 — 책에 대한 사실은 kind가 책인 행에만 근거한다. 연도를 검색어에
+            넣는 방식("작가명 2026")은 키워드 색인이라 0건이 되기 쉽다 — 대신 이 정렬을 쓴다.
+        author_no: 저자 스코프(모든 각도에 공통 적용). 검색 결과 행의 author_no 필드가
+            그 저자의 동일성 키다 — 지정하면 검색어와 무관하게 **그 저자의 책만** 나온다.
+            같은 이름의 다른 저자 책이 결과에 섞이거나(결과의 author_no 값이 여러 개로
+            갈리면 동명이인이다), 신상품순 목록이 무관 저자의 신간으로 덮일 때, 관측한
+            author_no로 다시 검색해 확정한다. **키의 채집처가 중요하다**: author_no는
+            그 저자임이 이미 확인되는 행(대표작·아는 작품이 보이는 기본 인기도순 결과)에서
+            관측한다 — 신상품순 목록은 그 저자의 행이 통째로 밀려나고 동명이인 행만 남을
+            수 있어, 이름만 보고 거기서 집은 author_no는 다른 사람의 번호일 수 있다.
+            같은 이유로 **신상품순 목록에 그 저자의 책이 안 보인다고 "신간 없음"으로
+            단정하지 말 것** — 인기도순에서 확보한 author_no로 좁혀 재확인한다. 관측된
+            값만 쓰고 지어내지 않는다. author_no를 쓸 때 검색어는 사이트가 무시하므로
+            각도는 하나만 담는다.
 
     Returns:
         각도 중 하나라도 검색에 성공하면 status="ok"와 results 목록(모든 각도의 결과를
@@ -211,10 +235,13 @@ async def yes24_search(
     """
     settings = get_settings()
 
-    # 허용값은 urls의 섹션 표에서 파생한다(도구가 따로 열거하지 않는다 — 표가 늘면 자동 반영).
-    # 모르는 값이 오면 search_url의 ValueError가 도구 밖으로 새지 않도록 통합검색으로 폴백한다.
+    # 허용값은 urls의 섹션·정렬 표에서 파생한다(도구가 따로 열거하지 않는다 — 표가 늘면 자동
+    # 반영). 모르는 값이 오면 search_url의 ValueError가 도구 밖으로 새지 않도록 각각 최광역
+    # 범위·기본 정렬로 폴백한다.
     if section not in SEARCH_SECTIONS:
         section = WIDEST_SECTION
+    if order not in SEARCH_ORDERS:
+        order = ""
 
     # 각도 계획(관용 변환·중복 제거·상한 cap)은 web_search와 공용 헬퍼를 쓴다.
     planned, dropped_queries = plan_queries(queries, settings.yes24_search_max_queries)
@@ -234,7 +261,7 @@ async def yes24_search(
     # 네트워크·파싱만 동시 실행한다(각도별 병렬). 등록은 아래 순차 루프에서 — 레이스 0.
     # _search_one이 예상 오류를 이미 error dict로 삼키므로 예상 밖 예외만 gather 밖으로 올라온다.
     searched = await asyncio.gather(
-        *(_search_one(q, section, client, settings) for q in planned)
+        *(_search_one(q, section, order, author_no, client, settings) for q in planned)
     )
 
     # 섹션 한정 검색의 0건은 "없다"가 아니라 **범위 밖**일 수 있다 — 국내도서 한정은 영어판·
@@ -252,7 +279,10 @@ async def yes24_search(
             searched = [
                 *searched,
                 *await asyncio.gather(
-                    *(_search_one(q, WIDEST_SECTION, client, settings) for q in widen)
+                    *(
+                        _search_one(q, WIDEST_SECTION, order, author_no, client, settings)
+                        for q in widen
+                    )
                 ),
             ]
 
@@ -341,6 +371,14 @@ async def yes24_search(
         "checked_at": checked_at,
         "result_count": len(results),
     }
+    if order:
+        # 가법 필드: 기본 정렬이면 반환 형태는 종전과 같다. 모든 각도 공통이라 한 번만 싣는다
+        # — 모델이 "이 결과 순서 = 출간일 내림차순"임을 알고 최신작 판정의 근거로 삼는다.
+        response["order"] = order
+    if author_no:
+        # 가법 필드: 이 결과 집합이 저자 스코프임을 명시한다 — 모델이 "이 목록 = 그 저자의
+        # 전작"을 전제로 최신작·전작 여부를 판정할 수 있다.
+        response["author_no"] = author_no
     if not results:
         # 검색은 됐으나 어느 각도에서도 상품이 없다 — 0건임을 본문으로도 명시한다.
         response["message"] = "검색 결과 없음"

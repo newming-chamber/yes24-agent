@@ -36,6 +36,7 @@ class Settings(BaseSettings):
         "Gemini 2.5 Pro": "gemini-2.5-pro",
         "Gemini 3.5 Flash": "gemini-3.5-flash",
         "Gemini 3.6 Flash": "gemini-3.6-flash",
+        "Gemini 3.7 Flash": "gemini-3.7-flash",
         # responses/ 접두는 litellm의 responses API 브리지 — chat/completions의
         # "function tools + reasoning 병용 불가" 제약이 없어 reasoning을 켠 채 도구를 쓴다.
         # 2026-08-12 도그푸딩 실측: reasoning 끈 chat 경로는 도구 회피(추천 3/3 무도구 창작).

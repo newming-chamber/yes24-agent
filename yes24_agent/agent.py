@@ -21,9 +21,6 @@ from yes24_agent.toolsets import (
 )
 from yes24_agent.yes24.urls import POLICY_SEEDS
 
-# config(enabled_toolsets)에서 파생된 도구 튜플 — 등록 순서·구성의 정본은
-# toolsets.TOOLSETS 레지스트리이며, 이 상수는 기존 소비자(create_agent) 호환용이다.
-AGENT_TOOLS = get_resolved_app().tools
 _PERSONA_TOOL_DIRECTIVE = """
 ## 독자 맞춤 반영
 독서 성향을 후보의 검색·선택과 답변의 어조·강조·구성에 반영하되, 사용자 조건과 증거 계약보다
@@ -380,8 +377,9 @@ def _make_instruction_provider(app):
     return _instruction_provider
 
 
-# 기본 구성(config)의 instruction provider — 모듈 레벨 AGENT_TOOLS와 같은 전제로 기동 시
-# 한 번 고정한다. 요청별 구성은 create_agent가 자기 조합으로 provider를 새로 만든다.
+# 기본 구성(config)의 instruction provider — 기동 시 한 번 고정한다. 요청별 구성은
+# create_agent가 자기 조합으로 provider를 새로 만들며, 현재 이 모듈 레벨 객체의 소비자는
+# tests/test_agent.py뿐이다(테스트 픽스처 이전 백로그 — 구조 감사 D4).
 _instruction_provider = _make_instruction_provider(get_resolved_app())
 
 
@@ -424,7 +422,9 @@ def create_agent(model_name: str | None = None, app=None) -> LlmAgent:
     )
 
 
-root_agent = create_agent()
+# (AGENT_TOOLS·root_agent는 2026-08-19 삭제 — 소비자 0의 죽은 심볼이었고 import 시점에
+#  ResolvedApp/LlmAgent를 불필요하게 조립했다. adk CLI(root_agent 규약)는 이 프로젝트
+#  진입점(python -m yes24_agent.main)에서 쓰지 않는다. 구조 감사 D1·D2.)
 
 # (모델, 구성) 조합별 에이전트 캐시. 요청마다 재생성하면 LlmAgent 조립 비용이 매 턴 붙는다.
 # 모델은 API 화이트리스트를, 구성은 resolve_app_for의 fail-loud 검증을 이미 통과한 값만

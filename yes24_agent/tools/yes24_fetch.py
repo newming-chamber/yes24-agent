@@ -332,6 +332,11 @@ def _fetch_product(
         "links": links,
         "checked_at": checked_at,
     }
+    if product.get("info_tables"):
+        # 가법 필드: 페이지의 정보 테이블(강연 정보의 모집기간·모집마감 상태, 상품별 배송비
+        # 등 — selectors.PRODUCT_INFO_TABLES 주석)을 {캡션: {라벨: 값}} 그대로 싣는다.
+        # 표가 없는 상품은 키 자체가 없다(관측 불가 표시 규약).
+        detail["info_tables"] = product["info_tables"]
     if content is None:
         # 페이지는 열렸고 가격·평점 등 구조 필드는 실제로 관측됐으므로 status=error로 버리지
         # 않는다(그러면 정당한 가격 인용까지 사라진다). 대신 없는 것을 없다고 명시한다 —
