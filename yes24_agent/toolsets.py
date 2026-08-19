@@ -81,7 +81,8 @@ TOOLSET_SOURCE_TYPES: dict[str, dict[str, tuple[str, ...]]] = {
     "yes24": {
         "search_result": GROUNDING_FIELDS,
         "book_detail": GROUNDING_FIELDS,
-        "browse": GROUNDING_FIELDS,
+        # browse만 목록 순위(rank)를 관측한다 — 코너 랭킹이 그 출처의 본질 필드다.
+        "browse": (*GROUNDING_FIELDS, "rank"),
         # 상세가 함께 관측한 다른 판형(eBook·중고 등). 그 페이지를 연 것이 아니라 판형
         # 위젯이 렌더한 값이라, 관측된 것은 판매가 하나뿐이다.
         "other_format": ("sale_price",),

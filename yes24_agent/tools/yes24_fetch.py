@@ -17,7 +17,10 @@ from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
 from yes24_agent.sources import DETAIL_FIDELITY, cite_marker, now_checked_at, register_source
-from yes24_agent.tools.yes24_search import _get_client
+from yes24_agent.tools._text import (
+    window_around_find,
+)
+from yes24_agent.tools.yes24_search import get_client
 from yes24_agent.yes24.client import Yes24FetchError
 from yes24_agent.yes24.parsers import (
     ParseError,
@@ -34,49 +37,6 @@ logger = logging.getLogger(__name__)
 _NOISE_TAGS = ("script", "style", "noscript", "template")
 
 # 실질 본문 판정 임계값은 config(fetch_min_meaningful_chars)에서 주입한다.
-
-# 절단 표시 접미사·중간 시작 표시 접두사.
-TRUNCATION_SUFFIX = "…(이하 생략)"
-OMITTED_PREFIX = "(앞부분 생략)… "
-
-
-def truncate(text: str, max_chars: int) -> str:
-    """text를 max_chars로 절단하고 절단 표시를 붙인다. 이미 짧으면 그대로 반환."""
-    if len(text) <= max_chars:
-        return text
-    content_budget = max_chars - len(TRUNCATION_SUFFIX)
-    if content_budget <= 0:
-        return TRUNCATION_SUFFIX[:max_chars]
-    return text[:content_budget].rstrip() + TRUNCATION_SUFFIX
-
-
-def window_around_find(
-    text: str, max_chars: int, find: str | None, lead_chars: int
-) -> tuple[str, bool]:
-    """본문에서 반환할 창을 고른다. 반환: (창 텍스트, find 발견 여부).
-
-    find가 없거나 본문이 상한 이내면 앞에서부터 자른다. find가 있고 상한 밖 위치에서
-    발견되면 그 위치 lead_chars 앞에서 시작하는 창을 잘라 키워드 앞 맥락(소제목·조건
-    문장)이 함께 담기게 한다. 못 찾으면 앞부분 창으로 폴백한다.
-    """
-    if not find or len(text) <= max_chars:
-        return truncate(text, max_chars), bool(find) and find.lower() in text.lower()
-
-    pos = text.lower().find(find.lower())
-    if pos < 0:
-        return truncate(text, max_chars), False
-    if pos < max_chars:
-        return truncate(text, max_chars), True
-
-    start = max(0, pos - lead_chars)
-    prefix = OMITTED_PREFIX if start > 0 else ""
-    suffix = TRUNCATION_SUFFIX if start + max_chars < len(text) else ""
-    content_budget = max_chars - len(prefix) - len(suffix)
-    if content_budget <= 0:
-        return (prefix + suffix)[:max_chars], True
-    window = text[start : start + content_budget].strip()
-    return f"{prefix}{window}{suffix}", True
-
 
 def _render_faq_entries(entries: list[dict[str, str]]) -> str:
     return "\n\n".join(
@@ -112,10 +72,6 @@ def _select_complete_faq_entries(
         selected.append(entry)
         selected_chars += added_chars
     return selected, _render_faq_entries(selected), find_found
-
-
-# 외부 페이지 열람(web_fetch)도 이 두 함수를 그대로 import해 **같은 절단 계약**을 갖는다
-# (도구마다 다른 절단 규칙을 배우게 하지 않는다). 주 소비자가 여기라 여기 둔다.
 
 
 async def yes24_fetch(
@@ -163,12 +119,12 @@ async def yes24_fetch(
     del title
 
     settings = get_settings()
-    client = _get_client(settings)
+    client = get_client(settings)
 
     try:
         html = await client.get_text(url)
     except Yes24FetchError as exc:
-        logger.info("yes24_fetch url=%r status=error error_type=fetch", url)
+        logger.info(f"yes24_fetch url={url!r} status=error error_type=fetch")
         return {
             "status": "error",
             "error_type": "fetch",
@@ -247,7 +203,7 @@ def _fetch_product(
     try:
         product = parse_product(html, base_url=get_settings().yes24_base_url)
     except ParseError as exc:
-        logger.info("yes24_fetch url=%r status=error error_type=parse", url)
+        logger.info(f"yes24_fetch url={url!r} status=error error_type=parse")
         return {
             "status": "error",
             "error_type": "parse",
@@ -436,7 +392,7 @@ def _fetch_generic(
     )
 
     if len(text) < min_meaningful_chars:
-        logger.info("yes24_fetch url=%r status=error error_type=empty chars=%d", url, len(text))
+        logger.info(f"yes24_fetch url={url!r} status=error error_type=empty chars={len(text)}")
         return {
             "status": "error",
             "error_type": "empty",
@@ -453,9 +409,8 @@ def _fetch_generic(
         )
         if not selected_entries:
             logger.info(
-                "yes24_fetch url=%r status=error error_type=content_too_large total=%d",
-                url,
-                total_chars,
+                f"yes24_fetch url={url!r} status=error error_type=content_too_large "
+                f"total={total_chars}"
             )
             return {
                 "status": "error",
@@ -476,11 +431,8 @@ def _fetch_generic(
     )
 
     logger.info(
-        "yes24_fetch url=%r status=ok type=notice chars=%d total=%d find=%r",
-        url,
-        len(window),
-        total_chars,
-        find,
+        f"yes24_fetch url={url!r} status=ok type=notice chars={len(window)} "
+        f"total={total_chars} find={find!r}"
     )
     result = {
         "status": "ok",

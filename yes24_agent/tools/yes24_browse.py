@@ -14,7 +14,7 @@ from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
 from yes24_agent.sources import cite_marker, now_checked_at, register_source
-from yes24_agent.tools.yes24_search import _get_client
+from yes24_agent.tools.yes24_search import get_client
 from yes24_agent.yes24.client import Yes24FetchError
 from yes24_agent.yes24.parsers import (
     ParseError,
@@ -81,9 +81,8 @@ async def yes24_browse(
     호출한다. 분야 번호를 추측으로 만들지 말고 결과에서 본 번호만 사용한다.
 
     Args:
-        section: 열람할 코너 코드. 셋 중 하나:
-            "bestseller"(국내도서 베스트셀러 랭킹), "new"(새로 나온 국내도서),
-            "cremaclub"(크레마클럽 eBook 구독 인기).
+        section: 열람할 코너 코드. 허용값과 설명:
+            __BROWSE_SECTIONS__.
         category_number: 분야 번호(선택, 숫자 문자열). 이전 결과의 categories에서 얻은
             번호로 코너를 그 분야로 좁힌다. category_name보다 우선한다.
         category_name: 분야 이름(선택). "소설"·"에세이"처럼 원하는 분야명을 주면 코너
@@ -126,7 +125,7 @@ async def yes24_browse(
             "message": "category_number는 categories에서 본 숫자 번호여야 합니다.",
             "result_count": 0,
         }
-    client = _get_client(settings)
+    client = get_client(settings)
 
     # 분야 이름 → 번호 동적 해석(번호 미지정 시). 시드 페이지 내비가 단일 소스이며,
     # 유일 해석이 안 되면 임의로 고르지 않고 목록/후보와 함께 fail-loud한다 — 이 한
@@ -275,3 +274,12 @@ async def yes24_browse(
         "checked_at": checked_at,
         "result_count": len(results),
     }
+
+
+# 도구 docstring은 모델이 보는 계약이다 — 섹션 코드·라벨을 손으로 열거하면 시드를 추가할 때
+# 계약만 조용히 썩으므로(2026-08-19 감사), 정본 표(BROWSE_SEED_URLS)에서 조립해 치환한다.
+# 모듈 임포트 시점에 실행되므로 toolsets가 FunctionTool을 만들기 전에 반영된다.
+yes24_browse.__doc__ = yes24_browse.__doc__.replace(
+    "__BROWSE_SECTIONS__",
+    ", ".join(f'"{key}"({seed["label"]})' for key, seed in BROWSE_SEED_URLS.items()),
+)

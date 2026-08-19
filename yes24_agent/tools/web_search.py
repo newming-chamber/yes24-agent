@@ -52,7 +52,7 @@ from yes24_agent.tools._planning import (
     dropped_queries_message,
     plan_queries,
 )
-from yes24_agent.tools.yes24_fetch import truncate
+from yes24_agent.tools._text import truncate
 
 logger = logging.getLogger(__name__)
 
@@ -339,7 +339,7 @@ async def _fetch_page_meta(url: str, settings: Settings) -> tuple[str | None, st
     유지한다. 인용 근거가 아니라 순수 표시 메타다.
     """
     try:
-        client = _get_client(settings)
+        client = get_client(settings)
         buf = b""
         async with client.stream(
             "GET", url, follow_redirects=True,
@@ -350,7 +350,7 @@ async def _fetch_page_meta(url: str, settings: Settings) -> tuple[str | None, st
             final_url = str(response.url)
             async for chunk in response.aiter_bytes():
                 buf += chunk
-                if b"</title>" in buf.lower() or len(buf) > 65536:
+                if b"</title>" in buf.lower() or len(buf) > settings.web_title_fetch_max_bytes:
                     break
         match = re.search(rb"<title[^>]*>(.*?)</title>", buf, re.S | re.I)
         if not match:
@@ -365,7 +365,7 @@ async def _fetch_page_meta(url: str, settings: Settings) -> tuple[str | None, st
         else:
             return final_url, None
         title = html.unescape(" ".join(text.split()))
-        return final_url, title[:120] or None
+        return final_url, title[: settings.web_title_max_chars] or None
     except Exception:  # noqa: BLE001 — 표시 보강 전용: 어떤 실패도 원래 값 유지
         return None, None
 
@@ -373,14 +373,15 @@ async def _fetch_page_meta(url: str, settings: Settings) -> tuple[str | None, st
 async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
     """그라운딩 서브콜을 실행해 출처별 원시 재료를 돌려준다(빈 목록 가능, 종단 실패는 raise).
 
-    일시 실패 2종을 1회 재시도로 흡수한다(Yes24Client의 전송 오류 재시도와 동일 철학):
+    일시 실패 2종을 재시도로 흡수한다(시도 횟수는 config web_grounding_max_attempts,
+    Yes24Client의 전송 오류 재시도와 동일 철학):
     ① 벤더 5xx·타임아웃(ServerError — 504가 재시도에서 정상, 라이브 실측) ② **빈 근거**
     — 그라운딩 종합은 확률적이라 같은 질의가 다음 시도에서 출처를 붙인다(영화 질의 실측:
     E2E 1회 empty → 직호출 3/3 성공). 4xx(ClientError)는 반복해도 같으므로 즉시 실패.
     """
     last_error: Exception | None = None
     raw_results: list[dict] = []
-    for _ in range(2):
+    for _ in range(settings.web_grounding_max_attempts):
         try:
             response = await asyncio.to_thread(
                 _grounding_client(int(settings.web_grounding_timeout_s * 1000))
@@ -558,7 +559,7 @@ async def _grounded_search(
     }
 
 
-def _get_client(settings: Settings) -> httpx.AsyncClient:
+def get_client(settings: Settings) -> httpx.AsyncClient:
     """외부 API 호출용 공유 httpx 클라이언트 싱글턴을 반환한다(최초 호출 시 생성)."""
     global _shared_client
     if _shared_client is None:
@@ -632,7 +633,7 @@ async def _search_one(
     except (httpx.HTTPError, ValueError) as exc:
         # httpx.HTTPError: 타임아웃·전송 오류·raise_for_status의 HTTPStatusError 포함.
         # ValueError: 응답이 JSON이 아니거나(response.json()) JSON 객체가 아닐 때.
-        logger.info("web_search query=%r status=error error_type=fetch", query)
+        logger.info(f"web_search query={query!r} status=error error_type=fetch")
         return {
             "query": query,
             "status": "error",
@@ -732,7 +733,7 @@ async def web_search(
             "result_count": 0,
         }
 
-    client = _get_client(settings)
+    client = get_client(settings)
     # 퍼플렉시티는 Bearer 헤더 인증(바디 api_key 아님). 헤더는 요청마다 넘겨 공유 클라이언트를
     # 인증 중립으로 유지한다. snippet 콘텐츠 분량은 토큰 예산으로 조절(snippet이 종합 재료).
     headers = {"Authorization": f"Bearer {settings.perplexity_api_key}"}
@@ -769,7 +770,7 @@ async def web_search(
             if content is None:
                 continue
             # 절단(상한에서 자르고 끝 공백 정리 후 표식)은 세 도구가 같아야 하므로
-            # yes24_fetch의 truncate를 공유한다.
+            # 공용 텍스트 유틸(tools/_text.truncate)을 공유한다.
             snippet = truncate(content, settings.web_search_snippet_max_chars)
             matched += 1
             existing = url_to_index.get(url)
@@ -824,7 +825,7 @@ async def web_search(
     if ok_count == 0:
         # 모든 각도가 실패 — 단일 각도 실패의 기존 계약(status=error·error_type=fetch·
         # result_count=0)을 그대로 유지해, 에이전트가 "못 찾음"이 아니라 일시 오류로 처리하게 한다.
-        logger.info("web_search queries=%d status=error error_type=fetch", len(planned))
+        logger.info(f"web_search queries={len(planned)} status=error error_type=fetch")
         return {
             "status": "error",
             "error_type": "fetch",
@@ -833,8 +834,8 @@ async def web_search(
         }
 
     logger.info(
-        "web_search queries=%d angles_ok=%d results=%d dropped=%d",
-        len(planned), ok_count, len(results), len(dropped_queries),
+        f"web_search queries={len(planned)} angles_ok={ok_count} results={len(results)} "
+        f"dropped={len(dropped_queries)}"
     )
     response = {
         "status": "ok",

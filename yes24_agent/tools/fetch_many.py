@@ -30,7 +30,7 @@ from google.adk.tools import ToolContext
 from yes24_agent.config import get_settings
 from yes24_agent.sources import now_checked_at
 from yes24_agent.tools.yes24_fetch import build_result_from_html
-from yes24_agent.tools.yes24_search import _get_client
+from yes24_agent.tools.yes24_search import get_client
 from yes24_agent.yes24.client import Yes24FetchError
 
 logger = logging.getLogger(__name__)
@@ -81,7 +81,7 @@ async def fetch_many(items: list[dict], tool_context: ToolContext) -> dict:
         }
 
     settings = get_settings()
-    client = _get_client(settings)
+    client = get_client(settings)
     max_items = settings.fetch_many_max_items
     requested = list(items)
 
@@ -126,7 +126,7 @@ async def fetch_many(items: list[dict], tool_context: ToolContext) -> dict:
             continue
         outcome = next(gathered_iter)
         if isinstance(outcome, Yes24FetchError):
-            logger.info("fetch_many url=%r status=error error_type=fetch", url)
+            logger.info(f"fetch_many url={url!r} status=error error_type=fetch")
             results.append({
                 "status": "error",
                 "error_type": "fetch",
@@ -143,8 +143,8 @@ async def fetch_many(items: list[dict], tool_context: ToolContext) -> dict:
     checked_at = now_checked_at()
     ok = sum(1 for r in results if r.get("status") != "error")
     logger.info(
-        "fetch_many requested=%d opened=%d ok=%d dropped=%d duplicate=%d",
-        len(requested), len(results), ok, len(dropped_urls), duplicate_count,
+        f"fetch_many requested={len(requested)} opened={len(results)} ok={ok} "
+        f"dropped={len(dropped_urls)} duplicate={duplicate_count}"
     )
 
     response = {

@@ -12,7 +12,7 @@ from google.genai import types
 
 from yes24_agent.config import ensure_openai_api_key_env, get_settings
 from yes24_agent.rbti.persona import axis_label, build_persona_block
-from yes24_agent.sources import time_kst, today_kst
+from yes24_agent.sources import LEDGER_MAX_INVOCATIONS, time_kst, today_kst
 from yes24_agent.toolsets import (
     TOOLSET_EXPERTISE,
     TOOLSETS,
@@ -329,7 +329,9 @@ def build_system_prompt(app, persona_directive: str = "") -> str:
     return f"{core}{tail}"
 
 
-@lru_cache(maxsize=64)
+# 캐시 상한 = 동시 진행 인보케이션 수의 여유 상한. 근거가 sources의 발급 장부와 같으므로
+# 상수도 하나만 둔다(2026-08-19 감사 — 같은 근거의 리터럴 2벌 통합).
+@lru_cache(maxsize=LEDGER_MAX_INVOCATIONS)
 def _invocation_instruction(
     invocation_id: str, code: str, persona_key: str, active: frozenset[str]
 ) -> str:
@@ -377,10 +379,8 @@ def _make_instruction_provider(app):
     return _instruction_provider
 
 
-# 기본 구성(config)의 instruction provider — 기동 시 한 번 고정한다. 요청별 구성은
-# create_agent가 자기 조합으로 provider를 새로 만들며, 현재 이 모듈 레벨 객체의 소비자는
-# tests/test_agent.py뿐이다(테스트 픽스처 이전 백로그 — 구조 감사 D4).
-_instruction_provider = _make_instruction_provider(get_resolved_app())
+# (모듈 레벨 _instruction_provider는 2026-08-19 삭제 — 소비자가 테스트뿐인 픽스처였다.
+#  테스트는 _make_instruction_provider(get_resolved_app())를 직접 조립한다. 구조 감사 D4.)
 
 
 def create_agent(model_name: str | None = None, app=None) -> LlmAgent:

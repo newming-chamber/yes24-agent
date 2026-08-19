@@ -60,10 +60,11 @@ _INVOCATION_LEDGER: dict[str, dict] = {}  # {inv: {"watermark": int, "url_ids": 
 # 발급 구간(읽기→갱신)은 await가 없지만 ADK가 도구를 별도 스레드에서 돌릴 수 있어(sync 도구
 # 경로) 락으로 원자성을 보장한다. 구간이 짧아 경합 비용은 무시할 수준이다.
 _LEDGER_LOCK = threading.Lock()
-# 장부 보관 상한(동시 진행 인보케이션 수의 여유 상한). agent._invocation_instruction의
-# lru_cache(64)와 같은 논리이며, 조정 대상 설정값이 아니라 자료구조 상한이라 코드 상수로 둔다.
-# 초과 시 가장 오래 전에 시작된 인보케이션부터 버린다(dict는 삽입 순서를 보존한다).
-_LEDGER_MAX_INVOCATIONS = 64
+# 장부 보관 상한(동시 진행 인보케이션 수의 여유 상한). 조정 대상 설정값이 아니라 자료구조
+# 상한이라 코드 상수로 두며, 같은 근거를 쓰는 agent._invocation_instruction의 lru_cache가
+# 이 상수를 import한다(리터럴 2벌 금지). 초과 시 가장 오래 전에 시작된 인보케이션부터
+# 버린다(dict는 삽입 순서를 보존한다).
+LEDGER_MAX_INVOCATIONS = 64
 
 
 def _next_source_id(existing: list, invocation_id: str | None, url: str) -> int:
@@ -94,7 +95,7 @@ def _next_source_id(existing: list, invocation_id: str | None, url: str) -> int:
             ledger["watermark"] = new_id
             ledger["url_ids"][url] = new_id
         _INVOCATION_LEDGER[invocation_id] = ledger
-        while len(_INVOCATION_LEDGER) > _LEDGER_MAX_INVOCATIONS:
+        while len(_INVOCATION_LEDGER) > LEDGER_MAX_INVOCATIONS:
             _INVOCATION_LEDGER.pop(next(iter(_INVOCATION_LEDGER)))
     return new_id
 
@@ -104,7 +105,9 @@ def cite_marker(source_id: int) -> str:
 
     postprocess.MARKER_PATTERN(`[숫자]`)이 소비하는 마커 어휘와 같은 표면형이다 — 여기와
     그 정규식이 어긋나면 도구가 준 cite_as가 출구 검증에서 마커로 안 잡히므로, 표면형을
-    바꿀 땐 반드시 둘을 함께 바꾼다.
+    바꿀 땐 반드시 둘을 함께 바꾼다. 파이썬 쪽 패턴은 MARKER_PATTERN 하나뿐이고
+    (matrix 사본은 2026-08-19 통합), **JS 사본이 하나 더 있다**(static/lib/md.js
+    MARKER_RE — 런타임이 달라 파생 불가) — 표면형 변경 시 그 셋을 함께 바꾼다.
     """
     return f"[{source_id}]"
 

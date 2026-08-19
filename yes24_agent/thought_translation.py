@@ -73,5 +73,5 @@ async def translate_thought_label(label: str) -> str:
         translated = " ".join((response.text or "").split())
         return translated or label
     except Exception as exc:  # noqa: BLE001 — 표시용 부가 경로: 어떤 실패도 원문 폴백
-        logger.warning("사고 라벨 번역 실패(원문 폴백): %s", exc)
+        logger.warning(f"사고 라벨 번역 실패(원문 폴백): {exc}")
         return label

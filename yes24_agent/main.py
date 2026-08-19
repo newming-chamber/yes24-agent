@@ -6,11 +6,9 @@
 """
 
 import asyncio
-import hmac
 import json
 import logging
 from contextlib import asynccontextmanager
-from hashlib import sha256
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from secrets import compare_digest
@@ -30,7 +28,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, StringConstraints
 
 from yes24_agent.admin import client_ip, register_admin
-from yes24_agent.auth import AuthenticatedUser, close_auth_service, get_authenticated_user
+from yes24_agent.auth import (
+    AuthenticatedUser,
+    close_auth_service,
+    get_authenticated_user,
+    signed_access_token,
+    token_matches,
+)
 from yes24_agent.config import Settings, ensure_google_api_key_env, get_settings
 from yes24_agent.matrix.matrix_runner import run_matrix_stream
 from yes24_agent.runner import run_agent_stream
@@ -42,7 +46,9 @@ logger = logging.getLogger(__name__)
 
 # 웹 채팅 UI(단일 self-contained HTML).
 _INDEX_HTML = Path(__file__).parent / "static" / "index.html"
-# 16뷰 RBTI 매트릭스 시뮬레이터 UI(C4/matrix-ux 소유). 인증 없음 — 개발/데모 용도.
+# 16뷰 RBTI 매트릭스 시뮬레이터 UI(C4/matrix-ux 소유). 로그인월이 켜져 있으면 다른 보호
+# 경로와 동일하게 월 뒤에 있다(_ACCESS_EXEMPT_PATHS에 없음 — "인증 없음"이던 옛 주석은
+# 2026-08-19 감사에서 부패 판정).
 _MATRIX_HTML = Path(__file__).parent / "static" / "matrix.html"
 # 공유 패스워드 로그인월 페이지(access_password 설정 시 노출).
 _LOGIN_HTML = Path(__file__).parent / "static" / "login.html"
@@ -105,18 +111,13 @@ _TOKEN_MESSAGE = b"yes24-agent-access-v1"
 
 
 def expected_token(password: str) -> str:
-    """비밀번호로부터 결정론적 접근 토큰(HMAC-SHA256 hex)을 만든다.
-
-    같은 비밀번호는 항상 같은 토큰을 낸다 → 세션 저장 없이 쿠키만으로 검증한다.
-    """
-    return hmac.new(password.encode("utf-8"), _TOKEN_MESSAGE, sha256).hexdigest()
+    """로그인월 토큰(auth.signed_access_token의 로그인월 message 바인딩)."""
+    return signed_access_token(password, _TOKEN_MESSAGE)
 
 
 def token_valid(cookie_value: str | None, password: str) -> bool:
-    """쿠키 토큰이 현재 비밀번호에서 파생된 값과 일치하는지 상수시간 비교로 판정한다."""
-    if not cookie_value:
-        return False
-    return compare_digest(cookie_value, expected_token(password))
+    """쿠키 토큰 검증(auth.token_matches의 로그인월 message 바인딩)."""
+    return token_matches(cookie_value, password, _TOKEN_MESSAGE)
 
 
 def password_matches(candidate: str, password: str) -> bool:

@@ -32,6 +32,7 @@ from collections.abc import AsyncIterator
 
 from google.adk.sessions import InMemorySessionService
 
+from yes24_agent.postprocess import MARKER_PATTERN, code_span_ranges, renumber_markers
 from yes24_agent.rbti.persona import axis_label, get_archetype_name, matrix_codes
 from yes24_agent.runner import run_agent_stream
 from yes24_agent.sse import (
@@ -43,12 +44,15 @@ from yes24_agent.sse import (
     sse_status,
 )
 from yes24_agent.tools.yes24_search import high_throughput_client
+from yes24_agent.toolsets import TOOLSET_SOURCE_TYPES
 
 logger = logging.getLogger(__name__)
 
-# 대표책 줄에서 제외할 출처 타입(프론트 WEB_TYPES와 동일 단일 진실). 웹 출처는 책이 아니라
-# 하단 인용 칩으로만 표시되므로 picks(고른 책)에서 뺀다.
-_WEB_TYPES = frozenset({"web"})
+# 대표책 줄에서 제외할 출처 타입 — 도구 레지스트리(toolsets.TOOLSET_SOURCE_TYPES)의 web
+# toolset 선언에서 파생한다(손 사본 금지). 프론트 static/lib/sources.js WEB_TYPES는 런타임이
+# 달라 불가피한 JS 사본이다. 웹 출처는 책이 아니라 하단 인용 칩으로만 표시되므로
+# picks(고른 책)에서 뺀다.
+_WEB_TYPES = frozenset(TOOLSET_SOURCE_TYPES["web"])
 
 # 셀 로컬 id → 매트릭스 전역 유일 id의 네임스페이스 폭. 각 셀은 독립 세션이라 로컬 id가
 # 1,2,3…으로 재시작(sources.py register_source)해, 전역 디둡·프론트 레지스트리(String(id))에서
@@ -56,32 +60,15 @@ _WEB_TYPES = frozenset({"web"})
 # 셀마다 유일화한다(셀당 인용 출처 < STRIDE 가정 안전 — 실사용 채팅 한 턴 인용은 한 자릿수).
 _CELL_ID_STRIDE = 1000
 
-# 본문 [n]·[n, m] 인용 마커(md.js MARKER_RE와 동일 형태). 대괄호 안 숫자만 전역 id로 치환한다.
-_MARKER_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
-
-
-def _remap_marker_text(text: str, id_map: dict[int, int]) -> str:
-    """본문의 [n]·[n, m] 마커 안 로컬 id를 셀 전역 id로 치환한다(구분자·공백 보존).
-
-    id_map에 없는 마커 숫자는 이번 턴 인용 출처가 아니므로(프론트 풀에도 없어 평문으로
-    남는다) 그대로 둔다.
-    """
-
-    def _sub_group(match: re.Match) -> str:
-        inner = re.sub(
-            r"\d+",
-            lambda m: str(id_map.get(int(m.group()), int(m.group()))),
-            match.group(1),
-        )
-        return f"[{inner}]"
-
-    return _MARKER_RE.sub(_sub_group, text)
-
+# 마커 치환·패턴은 postprocess가 단일 정의처다(renumber_markers·MARKER_PATTERN) — 셀 로컬
+# id → 전역 id 치환도 채팅 경로와 같은 함수로 한다(이스케이프 가드·코드 스팬 제외까지 동일).
+# 사본이던 _MARKER_RE·_remap_marker_text는 2026-08-19 삭제(구조 감사 C1 — matrix 사본에만
+# 이스케이프 가드·코드 스팬 제외가 없어 채팅과 동작이 갈렸다).
 
 # 정렬 비교에서 건너뛸 것: 마커 토큰과 가로 공백. 인용 검증이 정본에서 바꾸는 것은 마커
 # 표기뿐인데, 무효 마커를 지울 때 seam의 공백까지 흡수하므로(postprocess) 마커만 눈감으면
 # 공백 한 칸에 대조가 깨진다. 줄바꿈은 남긴다(검증이 건드리지 않는다).
-_ALIGN_SKIP_RE = re.compile(_MARKER_RE.pattern + r"|[ \t]+")
+_ALIGN_SKIP_RE = re.compile(MARKER_PATTERN.pattern + r"|[ \t]+")
 
 
 def _normalize_for_align(text: str) -> tuple[str, list[int]]:
@@ -109,6 +96,8 @@ def _aligned_offset(text: str, streamed: str) -> int:
     (4a의 실제 방어선) 이 대조도 남긴다 — 마커 차이에 눈감지 않으면 그 셀은 접힘을 포기해
     답이 조사 로그로 시작한다. 프론트의 같은 판정(md.js redistributeCanonical)과 한 쌍이라
     한쪽만 지우면 채팅과 매트릭스가 갈린다(런타임이 달라 사본이 둘일 뿐, 규칙은 하나다).
+    단 이스케이프 가드(`(?<!\\)`)는 서버 쪽에만 있다 — md.js 사본에는 없어 본문에 `\\[숫자]`
+    리터럴이 있을 때만 미세 분기한다(2026-08-19 동등성 검증 관측, 서버 쪽이 더 정확한 방향).
     """
     norm_text, index_map = _normalize_for_align(text)
     norm_streamed, _ = _normalize_for_align(streamed)
@@ -116,6 +105,22 @@ def _aligned_offset(text: str, streamed: str) -> int:
         return -1
     position = len(norm_streamed)
     return index_map[position] if position < len(index_map) else len(text)
+
+
+def _display_cell_fields(text: str, cut: int, id_map: dict[int, int]) -> tuple[str, int]:
+    """셀 본문을 전역 id로 치환하고, 접힘 오프셋(process_chars)을 치환 후 기준으로 센다.
+
+    슬라이스 치환에도 **정본 전체의 코드스팬 눈**(code_ranges)을 넘긴다 — 슬라이스 위에서
+    새로 계산하면 슬라이스 밖에서 닫히는 인라인 코드스팬이 코드스팬으로 안 보여 접두
+    치환이 전체 치환의 접두가 아니게 되고(remap(prefix) ⊄ remap(full)), 그 오버슛만큼
+    셀 답변 앞부분이 접힘에 삼켜진다(2026-08-19 동등성 적대 검증 실결함 — 가드:
+    test_process_chars_remap_keeps_the_prefix_invariant).
+    """
+    ranges = code_span_ranges(text)
+    return (
+        renumber_markers(text, id_map, code_ranges=ranges),
+        len(renumber_markers(text[:cut], id_map, code_ranges=ranges)),
+    )
 
 
 def _parse_frame(frame: str) -> tuple[str, dict]:
@@ -263,6 +268,9 @@ async def run_matrix_stream(
                 all_visible.append(remapped)
                 yield sse_source(remapped)
 
+            display_text, display_cut = _display_cell_fields(
+                cell["text"], cell["process_chars"], id_map
+            )
             identity = {
                 "code": cell["code"],
                 "name": get_archetype_name(cell["code"]),
@@ -270,11 +278,9 @@ async def run_matrix_stream(
                 # 마커 전역화가 [2]→[2002]로 길이를 바꾸므로 오프셋도 **치환 후 기준**으로 센다.
                 # 경계가 마커 안에 걸리면 그 마커만 치환에서 빠져 몇 글자 짧게 잡히는데, 과정
                 # 꼬리가 조금 더 보이는 방향이라 무해하다(경계는 신호가 정본 — 문구 보정 없음).
-                "process_chars": len(
-                    _remap_marker_text(cell["text"][: cell["process_chars"]], id_map)
-                ),
+                "process_chars": display_cut,
             }
-            yield sse_delta(_remap_marker_text(cell["text"], id_map), col=col, extra=identity)
+            yield sse_delta(display_text, col=col, extra=identity)
 
             # picks = 인용한 **책**(비-web) 출처, 등장 순서 보존(대표책=picks[0]). 인용 유무는
             # 대표책 줄 표시에만 쓰이고 폴백 판정과는 분리한다 — 프론트는 이 명시 필드만 보고
@@ -308,7 +314,7 @@ async def run_matrix_stream(
         yield _terminal_done()
 
     except Exception as exc:  # noqa: BLE001 — SSE 스트림 최상위 방어선(글로벌 done 1회 불변식)
-        logger.exception("매트릭스 스트림 처리 중 예외: %s", exc)
+        logger.exception(f"매트릭스 스트림 처리 중 예외: {exc}")
         yield sse_error(STREAM_ERROR_MESSAGE)
         yield _terminal_done()
     finally:

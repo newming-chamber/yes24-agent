@@ -18,10 +18,13 @@ ADK 세션 키 `(app_name, user_id, session_id)`의 user_id가 되어 대화 기
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import time
 from dataclasses import dataclass
+from hashlib import sha256
+from secrets import compare_digest
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -336,3 +339,20 @@ async def get_authenticated_user(
     await service.check_rate_limit(user)
     await service.record_request(x_api_key, request.url.path)
     return user
+
+def signed_access_token(password: str, message: bytes) -> str:
+    """비밀번호에서 결정론적 접근 토큰(HMAC-SHA256 hex)을 만든다.
+
+    같은 비밀번호는 항상 같은 토큰 → 세션 저장 없이 쿠키만으로 검증한다. message는
+    용도·버전 구분자(비밀 아님)다. 채팅 로그인월(main)과 admin 게이트(admin)가 이 한
+    구현을 공유하되, 쿠키명·비밀번호·message는 각자 유지한다(권한 분리는 값으로,
+    구현은 한 벌로 — 2026-08-19 구조 감사 C3 통합).
+    """
+    return hmac.new(password.encode("utf-8"), message, sha256).hexdigest()
+
+
+def token_matches(cookie_value: str | None, password: str, message: bytes) -> bool:
+    """쿠키 토큰이 현재 비밀번호 파생값과 일치하는지 상수시간 비교로 판정한다."""
+    return bool(cookie_value) and compare_digest(
+        cookie_value, signed_access_token(password, message)
+    )

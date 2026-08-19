@@ -94,7 +94,7 @@ def high_throughput_client():
         _high_throughput.reset(token)
 
 
-def _get_client(settings: Settings) -> Yes24Client:
+def get_client(settings: Settings) -> Yes24Client:
     """이 태스크 컨텍스트에 맞는 Yes24Client 싱글턴을 반환한다(최초 호출 시 생성).
 
     고처리량 컨텍스트(매트릭스 셀)면 matrix_http_* 예산의 전용 클라이언트를, 아니면 채팅
@@ -256,7 +256,7 @@ async def yes24_search(
             "result_count": 0,
         }
 
-    client = _get_client(settings)
+    client = get_client(settings)
 
     # 네트워크·파싱만 동시 실행한다(각도별 병렬). 등록은 아래 순차 루프에서 — 레이스 0.
     # _search_one이 예상 오류를 이미 error dict로 삼키므로 예상 밖 예외만 gather 밖으로 올라온다.

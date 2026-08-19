@@ -208,6 +208,15 @@ class Settings(BaseSettings):
     # 요청 하나의 상한이자 **보강 전체의 wall-clock 예산**이다(노브 하나로 표시 메타에 쓸
     # 시간을 정한다). 요청별 상한만으로는 청크가 느리게 계속 흘러오는 서버를 못 막는다.
     web_title_fetch_timeout_s: float = 3.0
+    # 제목 보강 스트림 읽기 바이트 상한 — </title>이 안 나와도 이만큼 받으면 끊는다(표시
+    # 보강 전용 요청이 본문 전체를 내려받지 않게). 64KiB면 head 블록은 넉넉히 덮는다.
+    web_title_fetch_max_bytes: int = 65536
+    # 표시용 출처 제목 길이 상한(문자). status_detail_max_chars(진행 라벨)와는 다른 축이다 —
+    # 우연히 같은 값이어도 서로를 따라가면 안 된다.
+    web_title_max_chars: int = 120
+    # 그라운딩 서브콜 시도 횟수 상한(재시도 = attempts-1). 일시 5xx·빈 근거를 흡수하는
+    # 값으로, Yes24 재시도(http_max_retries)와 같은 성격의 상한이라 config에 둔다.
+    web_grounding_max_attempts: int = 2
     # 웹 선제 실행(prefetch) — TTFT 실측(2026-07-28: 첫 본문 11.8s = 사고1 3.8 + 도구 2.8 +
     # 사고2 5.2 직렬)에서 도구 구간을 사고1과 병렬화하는 순수 지연 최적화. 턴 시작 시 경량
     # 모델이 "웹 최신 정보가 필요한가"만 판단(모델 판단 — 키워드 분류 아님)해 그라운딩

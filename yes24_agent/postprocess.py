@@ -15,7 +15,7 @@ from yes24_agent.event_translate import project_public_source
 logger = logging.getLogger(__name__)
 
 # 서버가 붙인 ASCII 대괄호+숫자만 마커로 간주한다. 도구 데이터 안의 리터럴 `[1]`은
-# 이 패턴과 구분되지 않는다 — 프로즈/코드 스팬 분할(`_code_span_ranges`) 외에 이스케이프
+# 이 패턴과 구분되지 않는다 — 프로즈/코드 스팬 분할(`code_span_ranges`) 외에 이스케이프
 # 계층은 없다(docs/known-limitations.md).
 MARKER_PATTERN = re.compile(r"(?<!\\)\[(\d+(?:\s*,\s*\d+)*)\]")
 
@@ -30,7 +30,7 @@ _FENCE_PATTERN = re.compile(
 _INLINE_CODE_PATTERN = re.compile(r"(`+)[^\n]*?\1")
 
 
-def _code_span_ranges(text: str) -> list[tuple[int, int]]:
+def code_span_ranges(text: str) -> list[tuple[int, int]]:
     """본문에서 코드 스팬(펜스 블록·인라인 코드)의 문자 구간 `[start, end)`를 찾는다.
 
     펜스 블록을 먼저 찾아 같은 길이 공백으로 가린 뒤 인라인 코드를 찾는다. 그래야 인라인 백틱
@@ -60,7 +60,7 @@ def prose_citation_ids(text: str) -> list[int]:
     쓴다 — 판정을 두 벌 두면 한 벌만 고쳐진다(하네스가 자체 정규식을 들었을 때 코드블록 안
     `[1]`을 인용으로 세어 정상 턴을 실패로 몰았다).
     """
-    code_ranges = _code_span_ranges(text)
+    code_ranges = code_span_ranges(text)
     return [
         int(part)
         for match in MARKER_PATTERN.finditer(text)
@@ -122,12 +122,12 @@ def normalize_marker_dialects(text: str) -> str:
 
     정규화는 인용을 **인정**하지 않는다 — 형태만 맞춰 줄 뿐이라, 존재하지 않는 id를 가리키는
     방언은 이어지는 `validate_citations`가 평소처럼 지운다. 코드 스팬 안의 방언은 리터럴이므로
-    마커 검증과 **같은 눈**(`_code_span_ranges`)으로 건너뛴다 — 판정을 두 벌 두면 한 벌만
+    마커 검증과 **같은 눈**(`code_span_ranges`)으로 건너뛴다 — 판정을 두 벌 두면 한 벌만
     고치는 실수가 반복된다.
 
     라벨도 링크도 없는 마커는 이미 canonical이므로 손대지 않는다(모델이 쓴 공백 표기 보존).
     """
-    code_ranges = _code_span_ranges(text)
+    code_ranges = code_span_ranges(text)
 
     def _replace(match: re.Match) -> str:
         if _within_code_span(match.start(), code_ranges):
@@ -220,14 +220,14 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
     반환되는 `supports`의 인덱스는 (재작성·제거 반영 후) 최종 본문 기준이다.
 
     코드 스팬(펜스 블록·인라인 코드) 안의 `[n]`은 배열 인덱스·수식이므로 마커 검증에서
-    제외하고 원문 그대로 보존한다(`_code_span_ranges`).
+    제외하고 원문 그대로 보존한다(`code_span_ranges`).
 
     검증 전에 마커 방언(`[source:6]` 등)을 canonical 형태로 정규화한다
     (`normalize_marker_dialects`) — 표기가 무엇이든 검증·제거 규칙은 하나다.
     """
     text = normalize_marker_dialects(text)
     valid_ids = {source["id"] for source in sources}
-    code_ranges = _code_span_ranges(text)
+    code_ranges = code_span_ranges(text)
 
     cleaned_parts: list[str] = []
     # (최종 본문 기준 마커 시작/끝 인덱스, 마커에 담긴 유효 source_id 목록)
@@ -268,9 +268,8 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
             # 전부 무효 → 마커 전체 제거 (기존 단일 무효 마커와 동일 처리)
             removed_markers.append(match.group(0))
             logger.warning(
-                "존재하지 않는 source_id(%s)를 인용한 마커 %s를 본문에서 제거합니다.",
-                ", ".join(str(i) for i in invalid_in_marker),
-                match.group(0),
+                f"존재하지 않는 source_id({', '.join(str(i) for i in invalid_in_marker)})를 "
+                f"인용한 마커 {match.group(0)}를 본문에서 제거합니다."
             )
             rest = text[cursor:]
             prefix = cleaned_parts[-1] if cleaned_parts else ""
@@ -286,10 +285,9 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
             for source_id in invalid_in_marker:
                 removed_markers.append(f"[{source_id}]")
             logger.warning(
-                "마커 %s에서 존재하지 않는 source_id(%s)를 제거하고 %s로 재작성합니다.",
-                match.group(0),
-                ", ".join(str(i) for i in invalid_in_marker),
-                marker_text,
+                f"마커 {match.group(0)}에서 존재하지 않는 "
+                f"source_id({', '.join(str(i) for i in invalid_in_marker)})를 제거하고 "
+                f"{marker_text}로 재작성합니다."
             )
         else:
             # 전부 유효 → 원문(공백 스타일 포함) 그대로 유지
@@ -330,7 +328,7 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
     )
 
 
-def _renumber_markers(
+def renumber_markers(
     text: str,
     mapping: dict[int, int],
     *,
@@ -340,13 +338,13 @@ def _renumber_markers(
     """프로즈 마커 안의 id만 표시 번호로 갈아끼운다(구분자·공백 표기 그대로).
 
     코드 스팬 안의 `[n]`은 배열 인덱스·수식이므로 검증과 **같은 눈**으로 건너뛴다
-    (`_code_span_ranges`) — 판정을 두 벌 두면 한 벌만 고치는 실수가 반복된다.
+    (`code_span_ranges`) — 판정을 두 벌 두면 한 벌만 고치는 실수가 반복된다.
 
     `text`가 더 긴 본문의 **조각**일 때는 그 본문 전체의 `code_ranges`와 조각의 시작
     위치 `offset`을 넘긴다(스트리밍 증분 치환). 조각만 보면 앞서 열린 펜스를 못 본다.
     """
     if code_ranges is None:
-        code_ranges = _code_span_ranges(text)
+        code_ranges = code_span_ranges(text)
 
     def _replace(match: re.Match) -> str:
         if _within_code_span(match.start() + offset, code_ranges):
@@ -380,7 +378,7 @@ def assign_display_numbers(
     뒤 번호가 통째로 밀린다.
     """
     if code_ranges is None:
-        code_ranges = _code_span_ranges(text)
+        code_ranges = code_span_ranges(text)
     if mapping is None:
         mapping = {}
     for match in MARKER_PATTERN.finditer(text):
@@ -423,7 +421,7 @@ def _stable_prefix(text: str) -> str:
     ① 형태가 아직 확정되지 않은 마커 꼬리(`_OPEN_MARKER_TAIL` — 미완성 마커·미완성 방언
        라벨·링크가 붙을 수 있는 닫힌 마커).
     ② 마지막 줄의 **열린 인라인 코드 백틱** — 닫히는 순간 그 구간의 `[n]`은 마커가 아니라
-       리터럴로 재분류된다(`_code_span_ranges`와 같은 눈). 백틱 앞에서 끊어 두면 재분류
+       리터럴로 재분류된다(`code_span_ranges`와 같은 눈). 백틱 앞에서 끊어 두면 재분류
        대상이 이미 흘러간 본문에 들어갈 수 없다.
     펜스 블록은 닫히지 않아도 `_FENCE_PATTERN`이 본문 끝까지 코드 스팬으로 잡으므로
     분류가 흔들리지 않는다(그래서 여기서 따로 붙잡지 않는다).
@@ -433,7 +431,7 @@ def _stable_prefix(text: str) -> str:
     if open_marker:
         cut = open_marker.start()
     tick = text.rfind("`", text.rfind("\n") + 1)
-    if tick >= 0 and not _within_code_span(tick, _code_span_ranges(text)):
+    if tick >= 0 and not _within_code_span(tick, code_span_ranges(text)):
         cut = min(cut, tick)
     return text[:cut]
 
@@ -476,13 +474,13 @@ class StreamRenumberer:
         stable = normalize_marker_dialects(raw_text if final else _stable_prefix(raw_text))
         if len(stable) <= self._consumed:
             return "", {}
-        code_ranges = _code_span_ranges(stable)
+        code_ranges = code_span_ranges(stable)
         segment = stable[self._consumed :]
         assigned_before = set(self._mapping)
         assign_display_numbers(
             segment, valid_ids, self._mapping, code_ranges=code_ranges, offset=self._consumed
         )
-        rendered = _renumber_markers(
+        rendered = renumber_markers(
             segment, self._mapping, code_ranges=code_ranges, offset=self._consumed
         )
         self._consumed = len(stable)
@@ -520,7 +518,7 @@ def renumber_for_display(
     public_sources = [
         {**by_id[old], "id": new} for old, new in mapping.items() if old in by_id
     ]
-    renumbered = validate_citations(_renumber_markers(citation.text, mapping), public_sources)
+    renumbered = validate_citations(renumber_markers(citation.text, mapping), public_sources)
     renumbered.removed_markers = [*citation.removed_markers, *renumbered.removed_markers]
     return renumbered, public_sources
 

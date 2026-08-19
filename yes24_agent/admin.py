@@ -12,12 +12,10 @@
 
 from __future__ import annotations
 
-import hmac
 import json
 import logging
 import sqlite3
 from contextlib import closing
-from hashlib import sha256
 from pathlib import Path
 from secrets import compare_digest
 from typing import Any
@@ -25,6 +23,7 @@ from typing import Any
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 
+from yes24_agent.auth import signed_access_token, token_matches
 from yes24_agent.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -39,8 +38,8 @@ _TOKEN_MESSAGE = b"yes24-agent-admin-v1"
 
 
 def _expected_token(password: str) -> str:
-    """비밀번호에서 결정론적 admin 토큰(HMAC-SHA256 hex)을 만든다(세션 저장소 불필요)."""
-    return hmac.new(password.encode("utf-8"), _TOKEN_MESSAGE, sha256).hexdigest()
+    """admin 토큰(auth.signed_access_token의 admin message 바인딩)."""
+    return signed_access_token(password, _TOKEN_MESSAGE)
 
 
 def client_ip(request: Request) -> str:
@@ -56,7 +55,7 @@ def client_ip(request: Request) -> str:
 def _authorized(request: Request, password: str) -> bool:
     """요청 쿠키가 현재 admin 비밀번호에서 파생된 토큰인지 상수시간 비교로 판정한다."""
     cookie = request.cookies.get(ADMIN_COOKIE)
-    return bool(cookie) and compare_digest(cookie, _expected_token(password))
+    return token_matches(cookie, password, _TOKEN_MESSAGE)
 
 
 def db_path_from_url(session_db_url: str) -> Path:

@@ -128,8 +128,6 @@ _REGISTERED_SOURCE_FIELDS = tuple(
 )
 _PUBLIC_SOURCE_FIELDS = (
     *_REGISTERED_SOURCE_FIELDS,
-    "rank",
-    "is_ebook",
     "snippet",
     "published_at",
     "last_updated",

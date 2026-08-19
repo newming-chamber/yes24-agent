@@ -380,7 +380,7 @@ def _closeout_error_frames(
     error_done["model"] = active_model
     if _ensure_substantive_text(error_done):
         logger.warning(
-            "실패 경로의 본문이 비어 최후 방어 안내로 대체합니다(session_id=%s).", session_id
+            f"실패 경로의 본문이 비어 최후 방어 안내로 대체합니다(session_id={session_id})."
         )
     for source in error_done.get("sources", []):
         frames.append(sse_source(source))
@@ -444,7 +444,7 @@ async def run_agent_stream(
                     Event(author="system", actions=EventActions(state_delta={"rbti": code})),
                 )
         except Exception as exc:  # noqa: BLE001 — 스트림 시작 전 방어선(done 1회 불변식 보장)
-            logger.exception("세션 준비 실패: %s", exc)
+            logger.exception(f"세션 준비 실패: {exc}")
             error_text = "대화 세션을 준비하지 못했어요. 잠시 후 다시 시도해 주세요."
             yield sse_error(error_text)
             _, error_done = _finalize_answer(
@@ -569,10 +569,8 @@ async def run_agent_stream(
                             and _is_overloaded_error(exc)
                         ):
                             logger.warning(
-                                "Gemini 과부하/일시장애(code=%s) 감지 → 같은 메시지로 재시도"
-                                "(session_id=%s).",
-                                getattr(exc, "code", "?"),
-                                resolved_session_id,
+                                f"Gemini 과부하/일시장애(code={getattr(exc, 'code', '?')}) "
+                                f"감지 → 같은 메시지로 재시도(session_id={resolved_session_id})."
                             )
                             await timed_event_stream.aclose()
                             await event_stream.aclose()
@@ -724,31 +722,25 @@ async def run_agent_stream(
                     citation.removed_markers or observed_sources
                 ):
                     logger.warning(
-                        "유효 인용 0건(removed=%s sources=%d) — 본문은 유지하고 기록만 남긴다"
-                        "(session_id=%s).",
-                        bool(citation.removed_markers),
-                        len(observed_sources),
-                        resolved_session_id,
+                        f"유효 인용 0건(removed={bool(citation.removed_markers)} "
+                        f"sources={len(observed_sources)}) — 본문은 유지하고 기록만 남긴다"
+                        f"(session_id={resolved_session_id})."
                     )
 
                 done_payload["model"] = active_model
                 if citation.removed_markers:
                     logger.warning(
-                        "무효 인용 마커 %d개를 본문에서 제거했습니다: %s (유효 출처 id=%s)",
-                        len(citation.removed_markers),
-                        citation.removed_markers,
-                        sorted(s["id"] for s in sources),
+                        f"무효 인용 마커 {len(citation.removed_markers)}개를 본문에서 "
+                        f"제거했습니다: {citation.removed_markers} "
+                        f"(유효 출처 id={sorted(s['id'] for s in sources)})"
                     )
 
                 final_done = done_payload
                 if _ensure_substantive_text(final_done):
                     logger.warning(
-                        "본문이 비어 최후 방어 안내로 대체합니다"
-                        "(session_id=%s tools=%d sources=%d rbti=%s).",
-                        resolved_session_id,
-                        tool_call_count,
-                        len(sources),
-                        bool(rbti),
+                        f"본문이 비어 최후 방어 안내로 대체합니다"
+                        f"(session_id={resolved_session_id} tools={tool_call_count} "
+                        f"sources={len(sources)} rbti={bool(rbti)})."
                     )
                 for source in final_done.get("sources", []):
                     yield sse_source(source)
@@ -759,9 +751,8 @@ async def run_agent_stream(
 
         except asyncio.TimeoutError:
             logger.error(
-                "LLM 응답이 %s초 내 오지 않아 스트림을 종료합니다(session_id=%s).",
-                settings.sse_timeout_s,
-                resolved_session_id,
+                f"LLM 응답이 {settings.sse_timeout_s}초 내 오지 않아 스트림을 "
+                f"종료합니다(session_id={resolved_session_id})."
             )
             frames = _closeout_error_frames(
                 "응답이 너무 지연되고 있어요. 잠시 후 다시 시도해 주세요.",
@@ -784,7 +775,7 @@ async def run_agent_stream(
             # 재조립·인용 검증 구간에서 예외가 나면 이미 만들어 둔 답이 통째로 사라진다(실측:
             # 사용자에게 나간 본문 0자). 비파괴 원칙을 파이프라인 전체로 올려,
             # 그 시점까지 확보한 최선의 본문·출처로 마감한다. 스택트레이스는 반드시 로그에 남긴다.
-            logger.exception("스트림 처리 중 예외 발생: %s", exc)
+            logger.exception(f"스트림 처리 중 예외 발생: {exc}")
             frames = _closeout_error_frames(
                 STREAM_ERROR_MESSAGE,
                 renumberer=renumberer,

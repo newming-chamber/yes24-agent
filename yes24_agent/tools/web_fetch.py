@@ -17,8 +17,8 @@ from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
 from yes24_agent.sources import cite_marker, now_checked_at, register_source
-from yes24_agent.tools.web_search import _get_client
-from yes24_agent.tools.yes24_fetch import window_around_find
+from yes24_agent.tools._text import window_around_find
+from yes24_agent.tools.web_search import get_client
 
 logger = logging.getLogger(__name__)
 
@@ -52,14 +52,14 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
     settings = get_settings()
 
     if not isinstance(url, str) or not url.strip():
-        logger.info("web_fetch url=%r status=error error_type=invalid_url", url)
+        logger.info(f"web_fetch url={url!r} status=error error_type=invalid_url")
         return {
             "status": "error",
             "error_type": "invalid_url",
             "message": "url은 빈 문자열이 아닌 http/https URL이어야 합니다",
         }
     if find is not None and not isinstance(find, str):
-        logger.info("web_fetch url=%r status=error error_type=invalid_find", url)
+        logger.info(f"web_fetch url={url!r} status=error error_type=invalid_find")
         return {
             "status": "error",
             "error_type": "invalid_find",
@@ -72,7 +72,7 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
     except ValueError:
         scheme = ""
     if scheme not in ("http", "https"):
-        logger.info("web_fetch url=%r status=error error_type=invalid_url", url)
+        logger.info(f"web_fetch url={url!r} status=error error_type=invalid_url")
         return {
             "status": "error",
             "error_type": "invalid_url",
@@ -81,7 +81,7 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
         }
 
     if not settings.tavily_api_key:
-        logger.info("web_fetch url=%r status=error error_type=not_configured", url)
+        logger.info(f"web_fetch url={url!r} status=error error_type=not_configured")
         return {
             "status": "error",
             "error_type": "not_configured",
@@ -89,7 +89,7 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
             "message": "웹 열람이 설정되지 않았습니다",
         }
 
-    client = _get_client(settings)
+    client = get_client(settings)
     payload = {"api_key": settings.tavily_api_key, "urls": [url]}
 
     try:
@@ -121,7 +121,7 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
                 f"{type(extracted_title).__name__}"
             )
     except (httpx.HTTPError, ValueError) as exc:
-        logger.info("web_fetch url=%r status=error error_type=fetch", url)
+        logger.info(f"web_fetch url={url!r} status=error error_type=fetch")
         return {
             "status": "error",
             "error_type": "fetch",
@@ -131,7 +131,7 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
 
     if not raw_content:
         # 추출 실패(failed_results)거나 본문이 비어 있음 — 빈 성공 위장 금지.
-        logger.info("web_fetch url=%r status=error error_type=empty", url)
+        logger.info(f"web_fetch url={url!r} status=error error_type=empty")
         return {
             "status": "error",
             "error_type": "empty",
@@ -159,8 +159,7 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
     )
 
     logger.info(
-        "web_fetch url=%r status=ok chars=%d total=%d find=%r",
-        url, len(text), total_chars, find,
+        f"web_fetch url={url!r} status=ok chars={len(text)} total={total_chars} find={find!r}"
     )
     result = {
         "status": "ok",
