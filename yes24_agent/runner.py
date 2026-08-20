@@ -26,6 +26,7 @@ from yes24_agent.agent import (
     get_agent,
 )
 from yes24_agent.config import get_settings
+from yes24_agent.enrichment import SESSION_TITLE_STATE_KEY, extract_turn_meta
 from yes24_agent.event_translate import (
     _sources_from_response,
     _status_for_call,
@@ -56,6 +57,7 @@ from yes24_agent.sse import (
     sse_delta,
     sse_done,
     sse_error,
+    sse_meta,
     sse_reset,
     sse_source,
     sse_status,
@@ -397,11 +399,12 @@ async def run_agent_stream(
     session_service: BaseSessionService | None = None,
     app=None,
     user_id: str | None = None,
+    enrich: bool = True,
 ) -> AsyncIterator[str]:
     """사용자 메시지 1건을 처리하며 SSE 프레임 문자열을 순서대로 yield한다.
 
     이벤트 순서 계약: status·delta가 도착 순서대로 섞여 흐르고, 마지막에
-    source → (reset →) delta → done으로 마감한다. 도구 응답 시점의 status는
+    source → (reset →) delta → (meta →) done으로 마감한다. 도구 응답 시점의 status는
     `refs`(마커 렌더용 id·url 힌트)를 실어 본문 [n]보다 먼저 도착하고, 검증을 통과한
     **최종 인용 출처만** source·done.sources로 나간다(원칙 4). 어떤 예외가 나도
     제너레이터가 예외로 죽지 않고 error+done을 흘려보낸 뒤 정상 종료한다.
@@ -412,6 +415,10 @@ async def run_agent_stream(
 
     user_id는 인증된 요청의 Yes24 userNo다(auth.py). None이면 인증 없는 단일 사용자
     (_POC_USER_ID)로 돌아 로컬·익명·매트릭스 동작이 그대로다.
+
+    enrich=False면 done 직전의 meta 부가 파이프라인(추천 이유·세션 제목)을 끈다 —
+    매트릭스가 16셀에서 서브콜을 16번 쏘는 낭비를 막는 경로다(셀 세션은 1회성이라
+    제목·추천 구조화의 소비자도 없다).
     """
     settings = get_settings()
     # 세션 조회·생성·실행이 전부 같은 user_id를 봐야 한다 — 한 곳이라도 다르면 같은
@@ -423,8 +430,11 @@ async def run_agent_stream(
     app = app if app is not None else get_resolved_app()
     for prefetch in app.prefetch_hooks:
         prefetch(message, app.active)
-    # 같은 session_id 동시 요청을 순차화한다(입력 id 기준). 신규 세션(None)은 create_session이
-    # 고유 id를 부여하므로 충돌하지 않아 락이 불필요하다.
+    # 같은 session_id 동시 요청을 순차화한다(입력 id 기준). 신규 세션(None)은 create가
+    # 고유 id를 부여하고 세션 쓰기(제목 영속 포함)가 전부 done 앞에서 끝나므로 락이
+    # 불필요하다 — 후속 턴은 done의 session_id를 봐야 시작할 수 있다(다른 프레임에는
+    # session_id가 없다). meta가 done 뒤에 있던 동안엔 이 전제가 깨져 신규 세션도 락을
+    # 잡았었다(2026-08-20 레이스 실측) — done 앞 이동으로 근거가 소멸해 삭제했다.
     lock = _get_session_lock(session_id) if session_id else None
     if lock is not None:
         await lock.acquire()
@@ -443,6 +453,9 @@ async def run_agent_stream(
                     session,
                     Event(author="system", actions=EventActions(state_delta={"rbti": code})),
                 )
+            # 이 세션에 제목이 아직 없는가 — meta 파이프라인의 제목 생성 여부(구조 판정).
+            # 턴 시작에 잡아 두어, 이번 턴이 직접 영속한 제목을 같은 턴이 다시 만들지 않는다.
+            want_title = enrich and not session.state.get(SESSION_TITLE_STATE_KEY)
         except Exception as exc:  # noqa: BLE001 — 스트림 시작 전 방어선(done 1회 불변식 보장)
             logger.exception(f"세션 준비 실패: {exc}")
             error_text = "대화 세션을 준비하지 못했어요. 잠시 후 다시 시도해 주세요."
@@ -746,6 +759,48 @@ async def run_agent_stream(
                     yield sse_source(source)
                 for frame in _emit_final_body("".join(streamed), final_done):
                     yield frame
+
+                # 턴 부가 정보(meta) — done **직전** 채널, crema-ai와 같은 배치(2026-08-20
+                # 사용자 결정): 스트림은 항상 done으로 끝나므로 done에서 닫는 소비자도
+                # meta를 받는다. 비용은 추천 턴의 done이 추출 시간(~1.4s, 상한
+                # enrichment_timeout_s)만큼 늦어지는 것 — 본문은 이미 전량 흘렀다.
+                # 게이트는 구조 판정뿐이다: 인용 출처도 없고 만들 제목도 없으면 추출할 재료가
+                # 없다(의미 분류 아님). 실패 경로(타임아웃·예외 closeout)에서는 돌리지 않는다.
+                # extract_turn_meta가 예외를 삼키지만, 프레임 방출·제목 영속까지 한 번 더
+                # 감싼다 — 부가 채널 실패가 정상 답변의 done 마감을 오염시키면 안 된다.
+                if enrich and (final_done.get("sources") or want_title):
+                    try:
+                        meta = await extract_turn_meta(
+                            message,
+                            final_done.get("text", ""),
+                            final_done.get("sources", []),
+                            want_title=want_title,
+                        )
+                        if meta:
+                            yield sse_meta({**meta, "session_id": resolved_session_id})
+                            title = meta.get("session_title")
+                            if title:
+                                # append는 **재조회한 최신 세션**으로 한다 — 턴 시작 스냅샷
+                                # `session`은 Runner가 턴 동안 이벤트를 영속한 순간 stale이
+                                # 되어 DatabaseSessionService 낙관적 락이 매 턴 거부한다
+                                # ("modified in storage", 2026-08-19 라이브 QA 실측 — 제목이
+                                # 영영 저장되지 않아 잡담 턴에도 재생성됐다). rbti 저장이
+                                # 스냅샷으로 되는 이유는 그 시점 세션이 방금 로드된 것이기
+                                # 때문. _settle_turn_sources의 재조회와 같은 패턴이다.
+                                fresh = await _resolve_session(
+                                    service, resolved_session_id, session_user_id
+                                )
+                                await service.append_event(
+                                    fresh,
+                                    Event(
+                                        author="system",
+                                        actions=EventActions(
+                                            state_delta={SESSION_TITLE_STATE_KEY: title}
+                                        ),
+                                    ),
+                                )
+                    except Exception as exc:  # noqa: BLE001 — 부가 채널(정상 done 마감 보호)
+                        logger.warning(f"meta 파이프라인 마감 실패(생략): {exc}")
                 yield sse_done(final_done)
                 break
 

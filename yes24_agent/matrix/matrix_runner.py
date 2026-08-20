@@ -160,8 +160,15 @@ async def _run_cell(
     # 셀의 Yes24 요청을 0.667초 간격으로 직렬화하던 병목을 없앤다(2026-07-24 실측: 89→~52초).
     # 채팅 단일 경로는 이 컨텍스트가 꺼져 있어 rps=1.5 그대로 — 매트릭스만 빨라진다.
     with high_throughput_client():
+        # enrich=False: 셀 세션은 1회성이라 제목·추천 구조화의 소비자가 없다 — 16셀이
+        # meta 서브콜을 16번 쏘는 낭비를 끈다.
         async for frame in run_agent_stream(
-            question, session_id=None, rbti=code, model=model, session_service=session_service
+            question,
+            session_id=None,
+            rbti=code,
+            model=model,
+            session_service=session_service,
+            enrich=False,
         ):
             event, data = _parse_frame(frame)
             if event == "delta" and not settled:

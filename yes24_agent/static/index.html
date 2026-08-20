@@ -214,6 +214,13 @@
        안 보인다(도그푸딩 2026-07-28 실측: 7·6개 턴에서 마지막 칩 유실 체감). */
     .sources { display: flex; flex-wrap: wrap; gap: 8px; padding-bottom: 4px; }
     .sources:empty { display: none; }
+    /* meta 이벤트의 추천 이유(done 뒤 도착) — 해당 출처 카드 **안**에 몇 줄로 얹는다.
+       .info의 한 줄 말줄임을 풀고 3줄 클램프로 제한, 전체 문장은 카드 tooltip이 담당한다. */
+    .card.rec { max-width: 250px; }
+    .card .info.reason {
+      color: var(--muted); white-space: normal; display: -webkit-box;
+      -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    }
     .card {
       flex: 0 0 auto; max-width: 210px; background: var(--card-bg); border: 1px solid var(--border);
       border-radius: 10px; padding: 8px 10px; cursor: pointer; display: flex; flex-direction: row; gap: 8px;
@@ -902,6 +909,9 @@
     }
 
     // 어시스턴트 메시지 컨테이너를 만들고, 조작용 핸들 객체를 반환한다.
+    // 기동 시점 문서 제목(브랜딩) — meta의 세션 제목이 접두로 붙고, 새 대화에서 복원된다.
+    const baseDocTitle = document.title;
+
     function createAssistantMessage() {
       const msg = document.createElement("div");
       msg.className = "msg assistant";
@@ -951,6 +961,7 @@
       // 이 턴이 본 출처의 원본 페이로드(id → src). 대화 스냅샷 저장·복원의 재료다.
       const srcById = new Map();
       let citedList = [];      // finalize에서 확정된 인용 id(스냅샷용)
+      let metaSaved = null;    // meta 이벤트 페이로드(추천 이유·세션 제목 — 스냅샷용)
       let elapsedSaved = 0;    // 응답 소요(초) — 스냅샷 복원 시 요약에 재사용
       let modelSaved = "";      // 최종 public model — 스냅샷 복원 시 같은 메타를 표시
       let errorText = "";      // 오류로 끝난 턴의 안내 문구(스냅샷용)
@@ -1381,6 +1392,33 @@
           }
           scrollToBottom();
         },
+        // meta 이벤트(done 뒤 가법 채널): 추천 이유를 **해당 출처 카드 안에** 몇 줄로 얹고,
+        // 세션 제목을 브라우저 탭 제목으로 표시한다(내장 UI엔 대화 목록이 없어 탭이 유일한
+        // 노출면). 항목의 id는 done.sources와 같은 공개 번호 공간이라 cardMap이 바로 잡힌다.
+        // 카드가 이미 화면에 있으므로 재호출(복원 경로)에도 안전하게 기존 이유를 교체한다.
+        showMeta(data) {
+          if (!data) return;
+          metaSaved = data;
+          if (data.session_title) {
+            document.title = `${data.session_title} · ${baseDocTitle}`;
+          }
+          for (const r of Array.isArray(data.recommendations) ? data.recommendations : []) {
+            const card = cardMap.get(String(r.id));
+            const reason = (r.reason || "").trim();
+            if (!card || !reason) continue;
+            card.classList.add("rec");
+            card.title = reason; // 3줄 클램프 밖 전체 문장은 tooltip으로
+            const main = card.querySelector(".card-main") || card;
+            let el = main.querySelector(".info.reason");
+            if (!el) {
+              el = document.createElement("div");
+              el.className = "info reason";
+              main.appendChild(el);
+            }
+            el.textContent = reason;
+          }
+          scrollToBottom();
+        },
         showError(message) {
           errored = true;
           errorText = message || "오류가 발생했어요.";
@@ -1428,6 +1466,7 @@
             cited_ids: citedList,
             elapsed: elapsedSaved,
             model: modelSaved,
+            ...(metaSaved ? { meta: metaSaved } : {}),
           };
         },
       };
@@ -1474,6 +1513,7 @@
             },
             turn.elapsed || 0
           );
+          if (turn.meta) asst.showMeta(turn.meta); // 라이브와 같은 경로로 부가 줄 복원
         }
       }
     }
@@ -1548,6 +1588,8 @@
               try { sessionStorage.setItem(CHAT_SESSION_KEY, sessionId); } catch (e) {}
             }
             asst.finalize(data, (performance.now() - started) / 1000);
+          } else if (event === "meta") {
+            asst.showMeta(data); // done 뒤 가법 채널(추천 이유·세션 제목)
           } else if (event === "error") {
             asst.showError(data.message);
           }
@@ -1574,6 +1616,7 @@
     newChatBtn.addEventListener("click", () => {
       if (sending && controller) controller.abort();
       sessionId = null;
+      document.title = baseDocTitle; // 이전 세션 제목이 새 대화 탭에 남지 않게
       try { sessionStorage.removeItem(CHAT_SESSION_KEY); } catch (e) {}
       clearTranscript(); // 세션과 기록은 함께 산다·함께 죽는다(화면=세션 불변식)
       conversation.textContent = "";

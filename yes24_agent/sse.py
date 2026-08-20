@@ -87,6 +87,17 @@ def sse_done(payload: dict, col: int | None = None) -> str:
     return format_sse("done", _with_col(payload, col))
 
 
+def sse_meta(payload: dict) -> str:
+    """턴 부가 정보(추천 이유·세션 제목) 이벤트 — `done` **직전**에 나가는 가법 채널.
+
+    스트림은 항상 done으로 끝난다(crema-ai 계약과 동일 배치 — 2026-08-20 사용자 결정).
+    done에서 스트림을 닫는 소비자도 meta를 받고, 모르는 이벤트를 무시하는 소비자에겐
+    가법이라 하위 호환이다. 추천의 `id`는 done.sources·본문 마커와 **같은 공개 표시
+    번호 공간**을 쓴다 — 프론트가 출처 카드에 이유를 붙일 때 재매핑이 필요 없다.
+    """
+    return format_sse("meta", payload)
+
+
 # 범용 일시 오류 안내 문구 — 채팅(runner)·매트릭스(matrix_runner)가 같은 문구를 쓴다.
 # 각자 리터럴로 두면 한쪽만 고쳐 채팅/매트릭스 안내가 갈라진다(단일 진실).
 STREAM_ERROR_MESSAGE = "일시적인 오류가 발생했어요. 잠시 후 다시 시도해 주세요."

@@ -37,6 +37,7 @@ from yes24_agent.auth import (
 )
 from yes24_agent.config import Settings, ensure_google_api_key_env, get_settings
 from yes24_agent.matrix.matrix_runner import run_matrix_stream
+from yes24_agent.rbti.profile import fetch_user_rbti
 from yes24_agent.runner import run_agent_stream
 from yes24_agent.session_service import SQLITE_DIALECT, db_dialect, persistence_mode
 from yes24_agent.thought_translation import warmup_translation
@@ -467,13 +468,17 @@ def create_app() -> FastAPI:
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # 요청이 rbti를 명시하지 않으면 유저 프로필의 저장 코드로 폴백한다(현재 껍데기 —
+        # 항상 None이라 기존 동작과 동일. 데이터 소스가 정해지면 profile.py만 채운다).
+        user_no = str(user.user_no) if user and user.user_no else None
+        rbti = request.rbti or await fetch_user_rbti(user_no)
         stream = run_agent_stream(
             request.message,
             request.session_id,
-            rbti=request.rbti,
+            rbti=rbti,
             model=model,
             app=app_config,
-            user_id=str(user.user_no) if user and user.user_no else None,
+            user_id=user_no,
         )
         return StreamingResponse(
             stream if unlocked else _hide_model_frames(stream),

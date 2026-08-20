@@ -76,6 +76,20 @@ class Settings(BaseSettings):
     thought_translation_model: str = "gemini-3.1-flash-lite"
     thought_translation_timeout_s: float = 5.0
     thought_translation_max_tokens: int = 80
+    # 턴 부가 정보(meta) 추출 — 추천 이유·세션 제목(enrichment.py). 본문 생성과 무관한
+    # "이미 쓰인 답변의 구조화"라 깊은 추론이 불필요하다 — thought_translation과 같은 경량
+    # 유틸 모델 관례. 빈 문자열이면 파이프라인 전체 비활성(구조적 off 스위치).
+    enrichment_model: str = "gemini-3.1-flash-lite"
+    # done 이후 부가 채널의 상한 — 이 시간을 넘기면 meta 없이 스트림을 닫는다(비파괴).
+    enrichment_timeout_s: float = 10.0
+    # 추천 이유 여러 건 + 제목의 JSON 출력 예산. 이유는 한 줄 요약이라 넉넉한 천장이다.
+    enrichment_max_output_tokens: int = 1024
+    # meta 추천 항목 수 상한(출구에서 초과 꼬리 제거). crema-ai의 카드 5권 계약 이식 —
+    # 프론트 카드 줄과 1:1이 보장되는 폭이다. 정렬은 본문 인용 등장 순서(출구 검증이 소유).
+    enrichment_max_recommendations: int = 5
+    # 세션 제목 표시 상한(문자). 목록 한 줄에 담기는 길이 — status_detail_max_chars와는
+    # 다른 축이라 따로 둔다(우연히 비슷해도 서로 따라가면 안 된다).
+    session_title_max_chars: int = 60
 
     # 에러 구동 반응형 재시도: pro 경로가 Gemini 과부하/일시장애(429/5xx)로 첫 응답조차 내지
     # 못하면 같은 pro로 딱 1회 조용히 재시도한다. off면 곧장 정직 안내(error+done).
