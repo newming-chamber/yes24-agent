@@ -169,6 +169,7 @@ async def _run_cell(
             model=model,
             session_service=session_service,
             enrich=False,
+            endpoint="matrix",
         ):
             event, data = _parse_frame(frame)
             if event == "delta" and not settled:

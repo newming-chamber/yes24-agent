@@ -9,6 +9,7 @@ InMemorySessionService로 폴백해 서버 기동을 항상 보장하고(폴백�
 import asyncio
 import logging
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 from weakref import WeakValueDictionary
 
 from google.adk.sessions import (
@@ -30,6 +31,11 @@ _POC_USER_ID = "poc-user"
 # 파일 기반 DB dialect. "파일이 있어야 성립하는 기능"(sqlite 디렉토리 보장, admin의 파일
 # 직접 열람)의 판정을 여기 한 곳에서 낸다 — 각자 URL 문자열을 훑으면 판정이 갈라진다.
 SQLITE_DIALECT = "sqlite"
+
+# 네트워크 DB dialect. "MySQL이라야 성립하는 기능"(인증 스택 auth.py, 사용량 기록
+# usage.py)의 활성 판정이 이 값 하나를 공유한다 — 키워드 분기가 아니라 접속 가능성에서
+# 나오는 구조 분기다.
+MYSQL_DIALECT = "mysql"
 
 # 세션 서비스 싱글턴(lazy). 프로세스 전체가 하나의 DB 연결 풀을 공유한다.
 _session_service: BaseSessionService | None = None
@@ -62,6 +68,38 @@ def db_dialect(db_url: str) -> str:
     """
     scheme, _, _ = db_url.partition("://")
     return scheme.partition("+")[0].lower()
+
+
+def mysql_pool_kwargs(db_url: str, *, maxsize: int) -> dict | None:
+    """세션 DB URL에서 aiomysql 접속 kwargs를 뽑는다 — mysql이 아니면 None(기능 비활성).
+
+    인증(auth.py)·사용량 기록(usage.py)이 세션 DB와 **같은 계정·database**를 쓰므로
+    접속 정보를 따로 두지 않고 여기 한 곳에서 파싱한다(설정 단일 출처). 포트가 URL에
+    없으면 키를 아예 넣지 않아 드라이버 기본값을 쓴다(우리가 포트 상수를 새로 만들지
+    않는다). 사용자·비밀번호는 URL 인코딩돼 있을 수 있어 디코드한다. maxsize는 용도별
+    config 필드를 호출부가 넘긴다 — 풀 크기는 기능마다 다른 결정이다.
+    """
+    if db_dialect(db_url) != MYSQL_DIALECT:
+        return None
+    parsed = urlparse(db_url)
+    kwargs: dict = {
+        "host": parsed.hostname,
+        "user": unquote(parsed.username or ""),
+        "password": unquote(parsed.password or ""),
+        "db": parsed.path.lstrip("/"),
+        "charset": "utf8mb4",
+        "autocommit": True,
+        "minsize": 1,
+        "maxsize": maxsize,
+        # 접속 수립 상한. aiomysql 기본은 None = OS TCP 타임아웃(~75s+)이라, RDS가
+        # TCP 블랙홀(SG 오설정 등)이면 실패 **판정 자체**가 분 단위로 늘어진다 —
+        # auth의 503도 usage의 무시 판정·종료 배수도 전부 이 값에 물리므로, 장애를
+        # 초 단위로 끊어 정직하게 노출한다(포트와 달리 드라이버 기본값이 쓸 수 없는 값).
+        "connect_timeout": get_settings().mysql_connect_timeout_s,
+    }
+    if parsed.port:
+        kwargs["port"] = parsed.port
+    return kwargs
 
 
 def _sqlite_dir(db_url: str) -> Path | None:

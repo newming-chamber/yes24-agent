@@ -18,6 +18,7 @@ ADK 세션 키 `(app_name, user_id, session_id)`의 user_id가 되어 대화 기
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
@@ -26,19 +27,15 @@ from dataclasses import dataclass
 from hashlib import sha256
 from secrets import compare_digest
 from typing import Any
-from urllib.parse import unquote, urlparse
 
 import aiomysql
 import httpx
 from fastapi import Header, HTTPException, Request
 
 from yes24_agent.config import get_settings
-from yes24_agent.session_service import db_dialect
+from yes24_agent.session_service import mysql_pool_kwargs
 
 logger = logging.getLogger(__name__)
-
-# 인증 스택이 성립하는 세션 DB dialect. 이 값이 아니면 AuthService는 비활성이다.
-MYSQL_DIALECT = "mysql"
 
 
 @dataclass(frozen=True)
@@ -83,27 +80,11 @@ async def fetch_yes24_user_info(service_cookie: str) -> dict[str, Any] | None:
 
 
 def _pool_kwargs(db_url: str) -> dict[str, Any] | None:
-    """세션 DB URL에서 aiomysql 접속 kwargs를 뽑는다 — mysql이 아니면 None(인증 비활성).
+    """인증 풀 접속 kwargs — 파싱은 session_service.mysql_pool_kwargs 단일 출처.
 
-    포트가 URL에 없으면 키를 아예 넣지 않아 드라이버 기본값을 쓴다(우리가 포트 상수를
-    새로 만들지 않는다). 사용자·비밀번호는 URL 인코딩돼 있을 수 있어 디코드한다.
+    mysql이 아니면 None(인증 비활성). 풀 크기만 인증 용도의 config 필드를 쓴다.
     """
-    if db_dialect(db_url) != MYSQL_DIALECT:
-        return None
-    parsed = urlparse(db_url)
-    kwargs: dict[str, Any] = {
-        "host": parsed.hostname,
-        "user": unquote(parsed.username or ""),
-        "password": unquote(parsed.password or ""),
-        "db": parsed.path.lstrip("/"),
-        "charset": "utf8mb4",
-        "autocommit": True,
-        "minsize": 1,
-        "maxsize": get_settings().auth_pool_max,
-    }
-    if parsed.port:
-        kwargs["port"] = parsed.port
-    return kwargs
+    return mysql_pool_kwargs(db_url, maxsize=get_settings().auth_pool_max)
 
 
 def _user_fields(data: dict[str, Any]) -> tuple[str | None, str | None, bool]:
@@ -134,6 +115,10 @@ class AuthService:
         self._pool_factory = pool_factory
         self._fetch_user_info = fetch_user_info
         self._pool: Any = None
+        # 풀 생성 태스크(공유) — 동시 첫 요청들이 check-then-act로 각자 풀을 만들면
+        # close()가 마지막 대입만 닫아 고아 연결이 남는다. 잠금이 아니라 태스크 공유인
+        # 이유는 _get_pool 주석 참조(usage.UsageLogger와 같은 구조).
+        self._pool_task: asyncio.Task | None = None
         # api_key → (사용자, 캐시 시각). TTL 안에서는 users 조회를 건너뛴다.
         # is_active 회수도 최대 TTL만큼 늦게 반영된다(rate limit은 캐시와 무관하게 매번 DB).
         self._cache: dict[str, tuple[AuthenticatedUser, float]] = {}
@@ -150,7 +135,15 @@ class AuthService:
         return self._pool_kwargs is not None
 
     async def close(self) -> None:
-        """커넥션 풀을 정리한다(앱 종료 훅)."""
+        """커넥션 풀을 정리한다(앱 종료 훅).
+
+        진행 중인 생성 태스크도 직접 취소한다 — _get_pool의 shield가 대기자(요청) 취소
+        전파를 막으므로 태스크의 마감 책임은 여기에 있다(완료된 태스크면 no-op).
+        """
+        if self._pool_task is not None:
+            self._pool_task.cancel()
+            await asyncio.gather(self._pool_task, return_exceptions=True)
+            self._pool_task = None
         if self._pool is not None:
             self._pool.close()
             await self._pool.wait_closed()
@@ -158,15 +151,36 @@ class AuthService:
 
     # ----- DB -----
 
+    async def _create_pool(self) -> Any:
+        """생성 본체. 성공 대입을 태스크 **안**에서 한다 — 대기자가 전부 취소돼도
+        만들어진 풀이 self._pool에 남아 close()가 닫을 수 있다(고아 풀 방지)."""
+        self._pool = await self._pool_factory(**self._pool_kwargs)
+        return self._pool
+
     async def _get_pool(self):
+        """풀 지연 생성 — 생성 시도를 태스크 하나로 공유한다(성공 뒤 빠른 경로는 무대기).
+
+        잠금 직렬화가 아니라 태스크 공유인 이유: 잠금은 생성 1회 보장은 되지만, DB가
+        TCP 블랙홀인 채 (재)기동해 첫 풀 생성 전에 인증 요청 k건이 동시 유입되면
+        대기자들이 잠금 **안에서 각자** connect 실패를 순차 대기해 k번째 503이
+        k×connect_timeout 뒤에 나온다(실패 지연이 병렬→직렬로 퇴행, 그동안 워커 점유).
+        한 태스크를 함께 await하면 동시 대기자 전원이 한 시도의 성공·실패를 동반
+        수신한다. 실패한 태스크는 버려 다음 요청이 새로 시도한다(장애 복구). shield는
+        한 요청의 취소(클라이언트 이탈)가 공유 태스크를 함께 취소해 무고한 동시
+        대기자들을 실패시키는 전파를 막는다 — 태스크 자체의 마감은 close()가 직접 한다.
+        check-then-create 사이에 await가 없어 asyncio 단일 스레드에서 원자적이다.
+        """
         if self._pool is not None:
             return self._pool
+        task = self._pool_task
+        if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
+            task = asyncio.get_running_loop().create_task(self._create_pool())
+            self._pool_task = task
         try:
-            self._pool = await self._pool_factory(**self._pool_kwargs)
+            return await asyncio.shield(task)
         except Exception as exc:  # noqa: BLE001 — 어떤 드라이버 오류든 503으로 정직하게
             logger.error(f"인증 DB 풀 생성 실패: {exc}")
             raise HTTPException(status_code=503, detail="인증 DB에 연결할 수 없습니다.") from exc
-        return self._pool
 
     async def _run(self, sql: str, params: tuple, *, fetch: bool = False):
         """질의 1건 실행(필요하면 1행 반환). DB 오류는 삼키지 않고 503으로 올린다."""

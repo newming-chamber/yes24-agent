@@ -333,10 +333,24 @@ class Settings(BaseSettings):
     # 인증 DB 커넥션 풀 상한. 세션 DB 풀(SQLAlchemy)과 별도로 잡히는 aiomysql 풀이라,
     # 요청당 짧은 조회 몇 건이 전부인 용도에 맞춰 작게 둔다.
     auth_pool_max: int = 5
+    # aiomysql 풀(인증·사용량 공통) 접속 수립 상한(초). 드라이버 기본은 None = OS TCP
+    # 타임아웃(~75s+)이라, RDS가 TCP 블랙홀(SG 오설정 등)이면 인증 503과 종료 배수가
+    # 분 단위로 매달린다 — 같은 AZ/VPC의 정상 접속은 밀리초 단위라 초 단위면 넉넉하다.
+    mysql_connect_timeout_s: float = 5.0
     # 신규 자동등록 사용자에게 부여하는 기본 rate limit(분당·일당). 기존 사용자는 users
     # 행의 값이 우선한다 — 여기 값은 등록 시점의 초기값이자 행이 비었을 때의 폴백이다.
     rate_limit_rpm: int = 20
     rate_limit_rpd: int = 500
+
+    # 토큰 사용량 기록(usage.py → usage_log 테이블) 커넥션 풀 상한. 접속 정보는 인증과
+    # 같이 session_db_url을 파싱하므로(단일 출처) mysql이 아니면 스택 전체가 비활성이다 —
+    # 별도 on/off 스위치는 두지 않는다(죽은 레버 금지, 구조 분기: mysql=on). 쓰기는
+    # fire-and-forget 단건 INSERT뿐이라 auth 풀(5)보다도 작게 둔다.
+    usage_pool_max: int = 2
+    # 앱 종료 시 usage 기록 배수(drain) 상한(초). DB 장애 중 쌓인 INSERT task를 상한
+    # 없이 기다리면 SIGTERM 후 lifespan 종료가 매달려 오케스트레이터 SIGKILL(배포 지연)
+    # 로만 끝난다. 상한 초과분은 취소한다 — 부가 채널이라 기록 유실이 종료 지연보다 싸다.
+    usage_close_timeout_s: float = 5.0
 
     # 운영자 데이터 조회(admin). 빈 문자열이면 **라우트 미등록**(404) — matrix_enabled와 같은
     # 패턴으로, 설정하지 않은 환경엔 admin이 존재조차 하지 않는다. 값은 env `ADMIN_PASSWORD`로

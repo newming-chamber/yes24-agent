@@ -53,6 +53,7 @@ from yes24_agent.tools._planning import (
     plan_queries,
 )
 from yes24_agent.tools._text import truncate
+from yes24_agent.usage import record_usage
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +199,8 @@ async def _prefetch_hint_needs_web(message: str, settings: Settings) -> bool:
         ),
         timeout=settings.web_prefetch_hint_timeout_s,
     )
+    # 힌트도 과금되는 LLM 콜이다 — 콜당 1행(부가 채널·무실패, session 문맥 없음).
+    record_usage("web_prefetch_hint", response.usage_metadata, model=settings.web_grounding_model)
     return json.loads(response.text or "{}").get("needs_web") is True
 
 
@@ -391,6 +394,11 @@ async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
                 config=genai_types.GenerateContentConfig(
                     tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())]
                 ),
+            )
+            # 재시도 루프 **안**에서 기록한다 — 실패·빈 결과로 버려진 시도도 각각 과금
+            # 콜이라 시도별 1행이 정직하다(부가 채널·무실패).
+            record_usage(
+                "web_grounding", response.usage_metadata, model=settings.web_grounding_model
             )
             raw_results = _grounding_response_to_results(response)
             last_error = None

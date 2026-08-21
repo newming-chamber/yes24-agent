@@ -11,6 +11,7 @@ delta/done/error)의 SSE 프레임으로 번역해 yield한다.
 
 import asyncio
 import logging
+import time
 from collections import deque
 from collections.abc import AsyncIterator
 
@@ -64,6 +65,7 @@ from yes24_agent.sse import (
 )
 from yes24_agent.thought_translation import translate_thought_label
 from yes24_agent.toolsets import get_resolved_app
+from yes24_agent.usage import record_usage
 
 logger = logging.getLogger(__name__)
 
@@ -400,6 +402,7 @@ async def run_agent_stream(
     app=None,
     user_id: str | None = None,
     enrich: bool = True,
+    endpoint: str = "chat",
 ) -> AsyncIterator[str]:
     """사용자 메시지 1건을 처리하며 SSE 프레임 문자열을 순서대로 yield한다.
 
@@ -419,8 +422,14 @@ async def run_agent_stream(
     enrich=False면 done 직전의 meta 부가 파이프라인(추천 이유·세션 제목)을 끈다 —
     매트릭스가 16셀에서 서브콜을 16번 쏘는 낭비를 막는 경로다(셀 세션은 1회성이라
     제목·추천 구조화의 소비자도 없다).
+
+    endpoint는 usage_log 기록용 호출 경로 라벨이다("chat" | 매트릭스 "matrix") —
+    호출부가 넘기는 파라미터일 뿐 이 함수 안에 어떤 분기도 만들지 않는다.
     """
     settings = get_settings()
+    # usage_log latency_ms의 기준점(락 대기 포함 요청 처리 전체 벽시계). 토큰 누적과
+    # 함께 턴 마감(아래 inner finally)에서 1행으로 기록된다.
+    turn_started = time.monotonic()
     # 세션 조회·생성·실행이 전부 같은 user_id를 봐야 한다 — 한 곳이라도 다르면 같은
     # session_id가 두 사용자 밑에 갈라져 히스토리가 끊긴다.
     session_user_id = user_id or _POC_USER_ID
@@ -485,6 +494,14 @@ async def run_agent_stream(
         observed_sources: list[dict] = []
         # 이번 턴에 도구가 돈 횟수. 최후 방어 실패 로그(tools=%d)의 진단값으로만 쓴다.
         tool_call_count = 0
+        # 이번 턴 LLM 콜들의 토큰 합계(usage_log 재료). **non-partial 이벤트의 usage만**
+        # 더한다 — LLM 콜 1회당 non-partial 모델 이벤트가 정확히 1개이고 그 usage는 콜
+        # 단독분이라(Gemini·LiteLLM 양 경로 공통), 이 합이 콜마다 프롬프트를 다시 세는
+        # 실제 과금 기준과 일치한다. partial 청크의 usage는 그 콜의 누적 스냅샷이라
+        # 합산하면 대폭 중복 계상된다(ADK 2.3.0 실측). 과부하 재시도에서도 리셋하지
+        # 않는다 — 버려진 첫 시도의 콜도 실제 과금된 호출이다(관찰만, 본류 무간섭).
+        usage_calls = 0
+        usage_prompt = usage_response = usage_total = 0
         # 모델이 쓴 **원시** 본문 조각(세션 누적 id 그대로). 인용 검증의 입력이다.
         raw_body: list[str] = []
         # 화면에 흘린 **표시 번호** 본문 조각. 마감의 4b 대조(_emit_final_body)가 이 값 위에
@@ -617,6 +634,14 @@ async def run_agent_stream(
                             )
                             continue
                         raise
+
+                    # 토큰 사용량 누적 — 분기 앞 단일 지점이라 함수콜·최종 텍스트·미래
+                    # 분기를 전부 덮는다(합산 규칙은 위 usage_calls 선언 주석 참조).
+                    if not event.partial and event.usage_metadata is not None:
+                        usage_calls += 1
+                        usage_prompt += event.usage_metadata.prompt_token_count or 0
+                        usage_response += event.usage_metadata.candidates_token_count or 0
+                        usage_total += event.usage_metadata.total_token_count or 0
 
                     if not event.partial and event.get_function_calls():
                         # 도구 직전 예고·경과 서술은 이미 본문 delta로 흘렀다(내레이션 전환).
@@ -847,6 +872,25 @@ async def run_agent_stream(
             for frame in frames:
                 yield frame
         finally:
+            # 턴 마감 usage_log 1행 — 정상 done·타임아웃·예외·클라이언트 중단 전부 이
+            # finally를 지나므로 여기가 공통 기록 지점이다. LLM 콜이 하나도 관측되지
+            # 않은 턴(스트림 시작 전 실패 등)은 잴 것이 없어 기록하지 않는다 — 계측
+            # 채널이라 0행이 빈 성공 위장이 아니다. record_usage는 fire-and-forget이며
+            # 어떤 실패도 던지지 않는다(부가 채널 계약 — usage.py).
+            if usage_calls:
+                record_usage(
+                    "main",
+                    types.GenerateContentResponseUsageMetadata(
+                        prompt_token_count=usage_prompt,
+                        candidates_token_count=usage_response,
+                        total_token_count=usage_total,
+                    ),
+                    model=active_model or None,
+                    session_id=resolved_session_id,
+                    user_id=session_user_id,
+                    endpoint=endpoint,
+                    latency_ms=int((time.monotonic() - turn_started) * 1000),
+                )
             # 타임아웃·클라이언트 중단 시 미소진 제너레이터의 자원을 정리한다.
             # 미완 번역·병합 대기 task도 함께 취소한다(부가 채널이라 유실이 아니다).
             for task in thought_tasks:

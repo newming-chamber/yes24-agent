@@ -19,6 +19,7 @@ from google import genai
 from google.genai import types
 
 from yes24_agent.config import get_settings
+from yes24_agent.usage import record_usage
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,12 @@ async def translate_thought_label(label: str) -> str:
                 ),
             ),
             timeout=settings.thought_translation_timeout_s,
+        )
+        # 서브콜 토큰 사용량 기록(부가 채널·무실패). 라벨당 1콜이라 턴당 여러 행이 남는다.
+        record_usage(
+            "thought_translation",
+            response.usage_metadata,
+            model=settings.thought_translation_model,
         )
         translated = " ".join((response.text or "").split())
         return translated or label

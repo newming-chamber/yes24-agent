@@ -24,6 +24,7 @@ import time
 from google.genai import types
 
 from yes24_agent.config import get_genai_client, get_settings
+from yes24_agent.usage import record_usage
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +178,9 @@ async def extract_turn_meta(
             ),
             timeout=settings.enrichment_timeout_s,
         )
+        # 서브콜 토큰 사용량 기록(부가 채널·무실패). 이 함수는 세션 문맥을 모른다 —
+        # session_id 없는 행으로 남긴다(usage_log NULL 허용).
+        record_usage("enrichment", response.usage_metadata, model=settings.enrichment_model)
         raw = json.loads(response.text or "{}")
         # done.sources 순서 = 본문 인용 등장 순서 — 출구 정렬의 기준이 된다.
         cited_ids = [s.get("id") for s in cited_sources if s.get("id") is not None]

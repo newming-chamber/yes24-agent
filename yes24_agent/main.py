@@ -42,6 +42,7 @@ from yes24_agent.runner import run_agent_stream
 from yes24_agent.session_service import SQLITE_DIALECT, db_dialect, persistence_mode
 from yes24_agent.thought_translation import warmup_translation
 from yes24_agent.toolsets import TOOLSETS, get_resolved_app, resolve_app_for
+from yes24_agent.usage import close_usage_logger
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +267,9 @@ async def lifespan(app: FastAPI):
         await hook()
     # 인증 DB 커넥션 풀도 함께 닫는다(만들어진 적 없으면 no-op).
     await close_auth_service()
+    # 토큰 사용량 기록 풀도 나란히 정리한다 — 진행 중인 fire-and-forget INSERT를
+    # 배수한 뒤 닫는다(만들어진 적 없으면 no-op).
+    await close_usage_logger()
 
 
 def _register_frontend(app: FastAPI, settings: Settings) -> None:
