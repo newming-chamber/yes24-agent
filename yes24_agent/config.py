@@ -63,7 +63,11 @@ class Settings(BaseSettings):
     # responses API 브리지(모델ID의 responses/ 접두)에서는 병용이 된다. 재현 프로브
     # (도구 미호출 추천 창작) 실측: 'none' 3/3 실패 → 'low' 1/3 → 'medium' 0/5, 지연은
     # medium에서도 8~15s로 준수. 빈 문자열이면 미전달(벤더 기본).
-    litellm_reasoning_effort: str = "medium"
+    # 2026-08-21 high 승격(사용자 결정): 세션 무결률 high 18/18 vs medium 14/18(08-18
+    # 배터리) + 페어 실측 3건에서 속도 비용이 상시가 아님(7.5/45.3/50.5s vs medium
+    # 8.4/49.1/26.4s — 추천 턴 지연의 지배 변수는 effort가 아니라 조사 라운드 수,
+    # medium도 49s 관측). Luna는 드롭다운 선택지라 기본(flash) 사용자 무영향.
+    litellm_reasoning_effort: str = "high"
     # 사고 요약 스트리밍(Gemini include_thoughts). 벤더 사고 구간(첫 3~5초)은 본문 파트가
     # 없어 화면이 비는데, 사고 요약 파트는 그 구간에 먼저 도착한다 — runner가 이를 진행
     # 타임라인(stage=thinking)으로 흘려 첫 응답 체감 침묵을 줄인다(LLM 실생성 텍스트,
