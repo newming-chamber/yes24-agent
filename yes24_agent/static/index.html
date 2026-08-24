@@ -214,13 +214,25 @@
        안 보인다(도그푸딩 2026-07-28 실측: 7·6개 턴에서 마지막 칩 유실 체감). */
     .sources { display: flex; flex-wrap: wrap; gap: 8px; padding-bottom: 4px; }
     .sources:empty { display: none; }
-    /* meta 이벤트의 추천 이유(done 뒤 도착) — 해당 출처 카드 **안**에 몇 줄로 얹는다.
-       .info의 한 줄 말줄임을 풀고 3줄 클램프로 제한, 전체 문장은 카드 tooltip이 담당한다. */
+    /* meta 이벤트의 추천 이유 — 해당 출처 카드 **안**에 몇 줄로 얹는다(상시 노출 —
+       2026-08-21 사용자 확정). .info의 한 줄 말줄임을 풀고 3줄 클램프, 전체 문장은 툴팁. */
     .card.rec { max-width: 250px; }
     .card .info.reason {
       color: var(--muted); white-space: normal; display: -webkit-box;
-      -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+      -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
     }
+    /* 인용 마커 [n] 호버 프리뷰(퍼플렉시티식, 2026-08-21 사용자 요청) — 마커가 가리키는
+       출처의 요지(제목·저자·가격·추천 이유)를 작은 팝오버로 띄운다. 데이터는 같은 메시지의
+       카드 DOM에서 읽으므로 별도 상태가 없다(단일 진실 = 렌더된 카드). */
+    .marker-pop {
+      position: fixed; z-index: 60; max-width: 300px;
+      background: var(--card-bg); border: 1px solid var(--accent); border-radius: 8px;
+      padding: 9px 12px; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+      font-size: 12px; line-height: 1.5; pointer-events: none;
+    }
+    .marker-pop b { display: block; font-size: 12.5px; margin-bottom: 2px; }
+    .marker-pop .pop-sub { color: var(--muted); }
+    .marker-pop .pop-reason { color: var(--muted); margin-top: 4px; }
     .card {
       flex: 0 0 auto; max-width: 210px; background: var(--card-bg); border: 1px solid var(--border);
       border-radius: 10px; padding: 8px 10px; cursor: pointer; display: flex; flex-direction: row; gap: 8px;
@@ -274,6 +286,8 @@
       margin: 0 0 0 1px; text-decoration: none;
     }
     .marker:hover { background: var(--accent); color: #fff; text-decoration: none; }
+    /* 연속 동일 번호 마커는 표시만 숨긴다(collapseRepeatMarkers — 정본·검증 불변). */
+    .marker.marker-dup { display: none; }
     .marker + .marker { margin-left: 3px; }
     /* 키보드 포커스 가시성(a11y) — 클릭 가능한 것은 탭으로도 닿고 링이 보인다(matrix와 동일 계약). */
     .marker:focus-visible, .card:focus-visible {
@@ -1102,9 +1116,26 @@
         return m ? text.slice(0, m.index + m[1].length) : text;
       }
 
+      // 연속 동일 번호 마커의 **표시** 병합(2026-08-21 사용자 방향 — ChatGPT식 밀도 완화
+      // 실물 대조 후): 한 블록에서 연속 구간의 **마지막만** 남긴다(다음 마커가 같은 번호면
+      // 숨김) — 구간 끝 인용이 "여기까지가 이 출처"로 읽히는 관례(GPT·논문식)와 일치하고,
+      // 첫 개만 남기면 뒤 문장들이 무근거처럼 보인다(같은 날 사용자 교정). 다른 번호가
+      // 사이에 오면 다시 표시. 정본 done.text·인용 검증은 불변 — 렌더 후처리라 재렌더에도
+      // 일관된다(스트리밍 중엔 구간이 자라며 마커가 꼬리를 따라간다).
+      function collapseRepeatMarkers(el) {
+        const markers = [...el.querySelectorAll(".marker")];
+        markers.forEach((m, i) => {
+          m.classList.toggle(
+            "marker-dup",
+            i + 1 < markers.length && markers[i + 1].textContent === m.textContent
+          );
+        });
+      }
+
       // 본문 렌더 = 공용 모듈(md.js). 블록 하나를 자기 텍스트로 다시 그린다.
       function renderBlock(block) {
         renderMarkdown(block.el, finalized ? block.text : withHeldTail(block.text), markerOpts);
+        collapseRepeatMarkers(block.el);
       }
       function renderAll() {
         blocks.forEach(renderBlock);
@@ -1137,7 +1168,10 @@
         const safe = !cur.text || canSplitAfter(cur.text);
         if (pendingSplit && safe) {
           if (!cur.text.trim()) cur.el.remove();
-          else renderMarkdown(cur.el, cur.text, markerOpts);
+          else {
+            renderMarkdown(cur.el, cur.text, markerOpts);
+            collapseRepeatMarkers(cur.el);
+          }
           return pushBlock();
         }
         return cur;
@@ -1537,6 +1571,58 @@
       updateSendState();
       if (!on) input.focus();
     }
+
+    // 인용 마커 [n] 호버 프리뷰 — 마커가 가리키는 출처 요지를 마커 위 팝오버로 띄운다.
+    // 같은 메시지의 카드 DOM에서 제목·저자·가격·이유를 읽는다(카드가 아직 없으면 — 스트리밍
+    // 중 refs 단계 — 조용히 생략). 팝오버는 전역 1개, 화면 상단이 좁으면 마커 아래로 연다.
+    const markerPop = document.createElement("div");
+    markerPop.className = "marker-pop";
+    markerPop.hidden = true;
+    document.body.appendChild(markerPop);
+    conversation.addEventListener("mouseover", (e) => {
+      const m = e.target.closest(".marker");
+      if (!m) return;
+      const num = (m.textContent.match(/\d+/) || [])[0];
+      const msg = m.closest(".msg");
+      if (!num || !msg) return;
+      const card = [...msg.querySelectorAll(".card")].find(
+        (c) => c.querySelector(".num")?.textContent === num
+      );
+      if (!card) return;
+      markerPop.textContent = "";
+      const t = document.createElement("b");
+      t.textContent = card.querySelector(".title")?.textContent || "";
+      markerPop.appendChild(t);
+      const subText = [
+        card.querySelector(".info.author")?.textContent,
+        card.querySelector(".info.price")?.textContent,
+      ].filter(Boolean).join(" · ");
+      if (subText) {
+        const sub = document.createElement("div");
+        sub.className = "pop-sub";
+        sub.textContent = subText;
+        markerPop.appendChild(sub);
+      }
+      const reason = card.querySelector(".info.reason")?.textContent;
+      if (reason) {
+        const rr = document.createElement("div");
+        rr.className = "pop-reason";
+        rr.textContent = "💡 " + reason;
+        markerPop.appendChild(rr);
+      }
+      markerPop.hidden = false;
+      const mr = m.getBoundingClientRect();
+      const pr = markerPop.getBoundingClientRect();
+      const x = Math.max(8, Math.min(mr.left, window.innerWidth - pr.width - 12));
+      const y = mr.top - pr.height - 8;
+      markerPop.style.left = x + "px";
+      markerPop.style.top = (y < 8 ? mr.bottom + 8 : y) + "px";
+    });
+    conversation.addEventListener("mouseout", (e) => {
+      if (e.target.closest(".marker")) markerPop.hidden = true;
+    });
+    // 스크롤·새 대화 전환 시 남은 팝오버 정리(fixed라 스크롤을 따라가지 않는다).
+    document.addEventListener("scroll", () => { markerPop.hidden = true; }, true);
 
     async function submit(text) {
       const message = (text !== undefined ? text : input.value).trim();
