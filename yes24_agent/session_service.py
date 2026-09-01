@@ -195,8 +195,24 @@ async def _resolve_session(
         if existing is not None:
             return existing
 
-    return await service.create_session(
+    created = await service.create_session(
         app_name=get_settings().app_name,
         user_id=user_id or _POC_USER_ID,
         session_id=session_id,
+    )
+    # **만들자마자 다시 읽는다**(2026-08-31 실측 결함): ADK DatabaseSessionService의
+    # create_session이 돌려주는 객체는 last_update_time이 스토리지 값과 어긋나 있어, 곧바로
+    # append_event하면 "The session has been modified in storage since it was loaded"로
+    # 거부된다(최소 재현으로 확정 — create 직후 실패, 재조회 후 성공). runner는 유효 RBTI
+    # 코드가 오면 세션 상태에 그것을 기록하므로, 이 어긋남이 **신규 세션의 첫 턴 + RBTI**를
+    # 통째로 막고 있었다(RBTI 없는 턴은 None == None이라 그 분기를 안 타 멀쩡했다).
+    # 16유형 매트릭스는 전 셀이 session_id=None + rbti라 전부 이 경로였다.
+    # 재조회가 실패하면 생성본을 그대로 쓴다 — 상태를 안 쓰는 경로는 종전과 동일하다.
+    return (
+        await service.get_session(
+            app_name=get_settings().app_name,
+            user_id=user_id or _POC_USER_ID,
+            session_id=created.id,
+        )
+        or created
     )
