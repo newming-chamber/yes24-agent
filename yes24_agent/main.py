@@ -40,6 +40,7 @@ from yes24_agent.matrix.matrix_runner import run_matrix_stream
 from yes24_agent.rbti.profile import fetch_user_rbti
 from yes24_agent.runner import run_agent_stream
 from yes24_agent.session_service import SQLITE_DIALECT, db_dialect, persistence_mode
+from yes24_agent.sse import SSE_EVENT_CONTRACT
 from yes24_agent.thought_translation import warmup_translation
 from yes24_agent.toolsets import TOOLSETS, get_resolved_app, resolve_app_for
 from yes24_agent.usage import close_usage_logger
@@ -73,8 +74,10 @@ class _NoCacheStaticFiles(StaticFiles):
         resp.headers["Cache-Control"] = "no-cache"
         return resp
 
+
 # 로그인월이 켜져도 통과시키는 예외 경로(헬스체크·로그인 페이지·로그아웃 자체).
 _ACCESS_EXEMPT_PATHS = frozenset({"/health", "/login", "/logout"})
+
 
 def _branded_html(path: Path, app_config=None) -> HTMLResponse:
     """페이지 HTML의 브랜딩 마커를 persona 문안으로 치환해 반환한다.
@@ -192,6 +195,26 @@ NonBlankText = Annotated[
         max_length=get_settings().request_max_chars,
     ),
 ]
+
+
+# 스트리밍 라우트의 OpenAPI 응답 기술. FastAPI는 StreamingResponse의 미디어 타입을 추론하지
+# 못해 기본 `application/json`으로 문서화한다 — 프론트가 그 문서를 믿고 `res.json()`을 쓰면
+# 그냥 멈춘다(2026-09-01 지적). 계약 본문은 sse.py가 소유하고 여기선 싣기만 한다(사본 금지).
+_SSE_EXAMPLE = (
+    'event: status\ndata: {"stage":"searching","ts":1756000000000}\n\n'
+    'event: delta\ndata: {"text":"채식주의자는 ","ts":1756000000100}\n\n'
+    'event: source\ndata: {"source":{"id":1,"title":"채식주의자"},"ts":1756000000200}\n\n'
+    'event: done\ndata: {"text":"채식주의자는 15,300원입니다[1]","sources":[{"id":1}],'
+    '"cited_ids":[1],"session_id":"...","model":"...","ts":1756000000300}\n\n'
+)
+_SSE_RESPONSES: dict = {
+    200: {
+        "description": "SSE 이벤트 스트림 (application/json 아님)",
+        "content": {
+            "text/event-stream": {"schema": {"type": "string"}, "example": _SSE_EXAMPLE}
+        },
+    }
+}
 
 
 class ChatRequest(BaseModel):
@@ -443,7 +466,13 @@ def create_app() -> FastAPI:
             "active": sorted(app_config.active),
         }
 
-    @app.post("/chat/stream")
+    @app.post(
+        "/chat/stream",
+        responses=_SSE_RESPONSES,
+        response_class=StreamingResponse,
+        response_description="SSE 이벤트 스트림",
+        description="사용자 메시지 1건에 대한 답변을 SSE로 스트리밍한다.\n" + SSE_EVENT_CONTRACT,
+    )
     async def chat_stream(
         request: ChatRequest,
         http_request: Request,
@@ -497,7 +526,16 @@ def create_app() -> FastAPI:
     # 매트릭스 스트리밍 엔드포인트도 배포 게이팅(matrix_enabled) 대상 — off면 미등록(404).
     if settings.matrix_enabled:
 
-        @app.post("/chat/matrix")
+        @app.post(
+            "/chat/matrix",
+            responses=_SSE_RESPONSES,
+            response_class=StreamingResponse,
+            response_description="열(RBTI 코드)별 SSE 이벤트 스트림",
+            description=(
+                "질문 1건을 16개 RBTI 페르소나로 동시에 답한다. 프레임 구조는 챗과 같고, "
+                "각 프레임에 어느 열인지 알려주는 `col`이 붙는다.\n" + SSE_EVENT_CONTRACT
+            ),
+        )
         async def chat_matrix(request: MatrixRequest) -> StreamingResponse:
             """질문을 받아 16 RBTI 페르소나 답변을 열별 SSE로 스트리밍한다(retrieve-once)."""
             # 화이트리스트 값만 통과 — /chat/stream과 동일(임의 문자열은 config 기본 모델 폴백).

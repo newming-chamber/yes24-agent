@@ -7,6 +7,45 @@
 import json
 import time
 
+# 프론트 개발자용 **SSE 응답 계약**(OpenAPI 설명의 단일 소유자). 라우트가 이 상수를 실어
+# `/docs`에 그대로 노출한다 — 종전엔 OpenAPI가 스트리밍 라우트를 전부 `application/json`으로
+# 기술해, 문서대로 `res.json()`을 쓰면 그냥 멈췄다(2026-09-01 지적). 계약을 라우트마다 손으로
+# 적으면 사본이 갈라지므로, **이벤트를 만드는 이 모듈**이 설명도 소유한다.
+SSE_EVENT_CONTRACT = """
+**응답은 JSON이 아니라 `text/event-stream`(SSE)이다.** `EventSource`나 스트리밍 fetch로 읽는다.
+
+각 프레임은 `event: <타입>\ndata: <JSON>\n\n` 꼴이고, 모든 `data`에 `ts`(epoch ms)가 붙는다.
+
+| event | data | 뜻 |
+|---|---|---|
+| `status` | `{stage, detail?, refs?}` | 진행 상태. `refs`는 마커 렌더용 `{id, url}` 힌트 |
+| `delta` | `{text}` | 본문 조각. **이어 붙이면 본문이 된다** |
+| `source` | `{source}` | 인용된 출처 1건(제목·url·가격·평점 등) |
+| `reset` | `{}` | **이미 받은 본문을 버려라.** 인용 검증이 본문을 바꿨을 때만 온다 |
+| `meta` | `{recommendations?, session_title?}` | `done` **직전**의 부가 정보(선택적) |
+| `done` | `{text, sources, cited_ids, session_id, model}` | **종료 신호. 정확히 1회.** |
+| `error` | `{message}` | 사용자에게 보여줄 실패 문구 |
+
+**지켜지는 계약**
+- `done`은 **정확히 한 번** 온다. 실패해도 `error` 뒤에 `done`이 온다.
+- `reset`이 없으면 **`delta` 합계 == `done.text`**. `reset`이 오면 그 뒤 `delta`만 정본이다.
+- 본문의 `[n]` 마커는 **반드시** `done.sources`의 `id`에 매핑된다(무매핑 마커는 서버가 지운다).
+- `done.sources`는 **인용된 출처만** 담는다(검색 후보 전체가 아니다).
+- 후속 턴은 `done.session_id`를 요청에 실어 이어간다.
+
+**최소 예시**
+```bash
+curl -N -X POST "$BASE_URL/chat/stream" \\
+  -H 'Content-Type: application/json' \\
+  -d '{"message":"채식주의자 가격 알려줘"}'
+```
+```js
+const res = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"},
+                             body: JSON.stringify({message})});
+const reader = res.body.getReader(); // res.json() 아님
+```
+"""
+
 
 def format_sse(event: str, data: dict) -> str:
     """`event: {event}\\ndata: {json}\\n\\n` 형태의 SSE 프레임을 만든다.
