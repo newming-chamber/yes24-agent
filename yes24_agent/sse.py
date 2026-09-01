@@ -29,7 +29,7 @@ data: <JSON>
 | `source` | `{source}` | 인용된 출처 1건(제목·url·가격·평점 등) |
 | `reset` | `{}` | **이미 받은 본문을 버려라.** 인용 검증이 본문을 바꿨을 때만 온다 |
 | `meta` | `{recommendations?, session_title?}` | `done` **직전**의 부가 정보(선택적) |
-| `done` | `{text, sources, cited_ids, session_id, model}` | **종료 신호. 정확히 1회.** |
+| `done` | `{text, sources, cited_ids, session_id, model, turn_id, rbti_applied}` | 종료·1회 |
 | `error` | `{message}` | 사용자에게 보여줄 실패 문구 |
 
 **지켜지는 계약**
@@ -38,6 +38,12 @@ data: <JSON>
 - 본문의 `[n]` 마커는 **반드시** `done.sources`의 `id`에 매핑된다(무매핑 마커는 서버가 지운다).
 - `done.sources`는 **인용된 출처만** 담는다(검색 후보 전체가 아니다).
 - 후속 턴은 `done.session_id`를 요청에 실어 이어간다.
+- `done.rbti_applied`는 이 턴에 적용된 RBTI 코드다(미적용이면 `null`) — truthiness가 곧
+  "✦ RBTI 데이터가 활용됨" 배지 여부이고, 값은 어떤 독서 유형이 적용됐는지다.
+- `done.turn_id`는 이 턴의 서버 식별자다(피드백 API
+  `PUT /chat/sessions/{session_id}/turns/{turn_id}/feedback`와 히스토리 복원
+  `GET /chat/sessions/{session_id}`의 턴 id가 같은 값을 쓴다). 스트림 시작 전에 실패한
+  턴은 `null`일 수 있다.
 
 **최소 예시**
 ```bash
@@ -128,7 +134,7 @@ def sse_delta(text: str, col: int | None = None, extra: dict | None = None) -> s
 
 
 def sse_done(payload: dict, col: int | None = None) -> str:
-    """최종 출처 목록·grounding_supports·session_id를 담은 종료 이벤트."""
+    """최종 본문·출처 목록·session_id·turn_id를 담은 종료 이벤트(정확히 1회)."""
     return format_sse("done", _with_col(payload, col))
 
 

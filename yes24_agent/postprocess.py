@@ -319,9 +319,12 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
     # 근거가 아닌데, 그 근사 실패로 접지된 인용을 죽였다. 2026-07-15 게이트 스택 삭제와
     # 같은 근거·같은 결론이다.
     #
-    # `support_is_meaningful`은 남는다 — `build_done_payload`가 공개 grounding_supports를
-    # 그 술어로 거르므로, 빈 근거는 호버 스니펫에서 빠지되 **본문 마커는 살아 링크가 된다**.
-    # 4a의 실제 방어선은 무효 id 제거(위 분기)이고 그건 무손상이다.
+    # `support_is_meaningful`은 남는다 — runner가 `meaningful_support_count`로 실제 판정을
+    # 한다. 다만 **공개 페이로드의 `grounding_supports` 필드는 2026-09-01에 삭제했다**:
+    # 프론트 소비처가 0곳인데(인용 마커 호버 프리뷰는 13b83e2에서 이미 렌더된 출처 카드
+    # DOM — .title·.info.author·.info.price·.info.reason — 을 읽는다) done 페이로드에서
+    # 가장 큰 필드였고 본문을 통째로 한 번 더 실었다. "호버 스니펫용"이라던 종전 이 주석은
+    # 그 재구현 뒤로 사실이 아니었다.
     return CitationResult(
         text=final_text,
         supports=supports,
@@ -555,13 +558,48 @@ def _build_support(final_text: str, marker_start: int, source_ids: list[int]) ->
     }
 
 
+def finalize_answer(
+    text: str,
+    sources: list[dict],
+    session_id: str,
+) -> tuple[CitationResult, dict]:
+    """검증→재번호→done payload 조립의 공통 마감 시퀀스(순서가 계약이다).
+
+    runner의 평상·예외·타임아웃 세 경로와 히스토리 복원(history.py)이 같은 조립기를 쓴다 —
+    복원이 자체 시퀀스를 들면 스트림과 복원의 본문·번호가 갈라진다(같은 판정 두 곳 금지).
+
+    유효 인용이 0건이어도 **확보된 본문을 폐기하지 않는다.** 과거 require_evidence 분기가
+    본문을 정형 문구로 갈아끼웠는데, 2026-07-22 실측에서 캐치 0 · 오탐 14/14였다(40턴 중
+    14턴에서 접지된 정답이 죽었고 창작은 0건). 정상 경로에서 그 근거로 삭제했으면서
+    에러·타임아웃 경로에만 남겨두면 같은 결함이 드문 경로에서 계속 재발한다.
+
+    순번 인용(마커를 언급 순서로 매김) 계측은 source_id_base=101 도입으로 **구조적으로
+    발화 불가**가 되어 삭제했다 — 순번 마커는 무효 id가 되어 validate_citations가 이미
+    "존재하지 않는 source_id 마커 제거" 경고를 내므로, 그 제거율이 살아 있는 지표다.
+    """
+    citation = validate_citations(text or "", sources)
+    # 검증이 끝난 **뒤에만** 공개 번호를 1..n으로 다시 매긴다(renumber_for_display docstring).
+    citation, sources = renumber_for_display(citation, sources)
+    payload = build_done_payload(
+        sources=sources,
+        used_source_ids=citation.used_source_ids,
+        session_id=session_id,
+    )
+    payload["text"] = citation.text
+    return citation, payload
+
+
 def build_done_payload(
     sources: list[dict],
     used_source_ids: list[int],
     session_id: str,
-    supports: list[dict],
 ) -> dict:
-    """`done` SSE 이벤트 payload를 만든다. 실제로 인용된 출처만, 등장 순서대로 포함한다."""
+    """`done` SSE 이벤트 payload를 만든다. 실제로 인용된 출처만, 등장 순서대로 포함한다.
+
+    `supports` 인자는 2026-09-01에 **삭제했다** — 공개 `grounding_supports` 필드를 만드는
+    유일한 소비자였고 그 필드가 사라졌다. 인자만 남기면 다음 호출부가 무엇을 넘겨야 하는지
+    묻게 되는 죽은 표면이 된다.
+    """
     by_id = {source["id"]: source for source in sources}
     ordered_sources = [
         project_public_source(by_id[source_id])
@@ -571,7 +609,6 @@ def build_done_payload(
 
     return {
         "sources": ordered_sources,
-        "grounding_supports": [support for support in supports if support_is_meaningful(support)],
         "session_id": session_id,
         # 인용된 출처 id(등장 순서). sources와 source 이벤트 모두 같은 cited-only 집합을 쓰며,
         # 프론트가 본문 마커와 출처 카드를 연결하는 표시용 메타다.

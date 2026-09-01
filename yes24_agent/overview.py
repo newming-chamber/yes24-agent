@@ -2869,7 +2869,6 @@ async def _generate_with_planner(
         sources=sources,
         used_source_ids=citation.used_source_ids,
         session_id="",
-        supports=citation.supports,
     )
     payload.pop("session_id", None)
     payload["text"] = citation.text

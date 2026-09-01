@@ -18,7 +18,6 @@ ADK 세션 키 `(app_name, user_id, session_id)`의 user_id가 되어 대화 기
 
 from __future__ import annotations
 
-import asyncio
 import hmac
 import json
 import logging
@@ -28,11 +27,11 @@ from hashlib import sha256
 from secrets import compare_digest
 from typing import Any
 
-import aiomysql
 import httpx
 from fastapi import Header, HTTPException, Request
 
 from yes24_agent.config import get_settings
+from yes24_agent.db import LazyAiomysqlPool
 from yes24_agent.session_service import mysql_pool_kwargs
 
 logger = logging.getLogger(__name__)
@@ -108,17 +107,18 @@ class AuthService:
 
     def __init__(
         self,
-        pool_factory=aiomysql.create_pool,
+        pool_factory=None,
         fetch_user_info=fetch_yes24_user_info,
     ) -> None:
         self._pool_kwargs = _pool_kwargs(get_settings().session_db_url)
-        self._pool_factory = pool_factory
+        # 풀 생성 기계(지연 생성·태스크 공유·shield)는 db.LazyAiomysqlPool 단일 구현이다 —
+        # 여기 남는 것은 실패 정책(503 fail-loud)뿐이다. mysql이 아니면 풀 자체가 없다.
+        self._db = (
+            LazyAiomysqlPool(self._pool_kwargs, pool_factory)
+            if self._pool_kwargs is not None
+            else None
+        )
         self._fetch_user_info = fetch_user_info
-        self._pool: Any = None
-        # 풀 생성 태스크(공유) — 동시 첫 요청들이 check-then-act로 각자 풀을 만들면
-        # close()가 마지막 대입만 닫아 고아 연결이 남는다. 잠금이 아니라 태스크 공유인
-        # 이유는 _get_pool 주석 참조(usage.UsageLogger와 같은 구조).
-        self._pool_task: asyncio.Task | None = None
         # api_key → (사용자, 캐시 시각). TTL 안에서는 users 조회를 건너뛴다.
         # is_active 회수도 최대 TTL만큼 늦게 반영된다(rate limit은 캐시와 무관하게 매번 DB).
         self._cache: dict[str, tuple[AuthenticatedUser, float]] = {}
@@ -135,49 +135,16 @@ class AuthService:
         return self._pool_kwargs is not None
 
     async def close(self) -> None:
-        """커넥션 풀을 정리한다(앱 종료 훅).
-
-        진행 중인 생성 태스크도 직접 취소한다 — _get_pool의 shield가 대기자(요청) 취소
-        전파를 막으므로 태스크의 마감 책임은 여기에 있다(완료된 태스크면 no-op).
-        """
-        if self._pool_task is not None:
-            self._pool_task.cancel()
-            await asyncio.gather(self._pool_task, return_exceptions=True)
-            self._pool_task = None
-        if self._pool is not None:
-            self._pool.close()
-            await self._pool.wait_closed()
-            self._pool = None
+        """커넥션 풀을 정리한다(앱 종료 훅) — 마감은 공유 풀 구현이 소유한다."""
+        if self._db is not None:
+            await self._db.close()
 
     # ----- DB -----
 
-    async def _create_pool(self) -> Any:
-        """생성 본체. 성공 대입을 태스크 **안**에서 한다 — 대기자가 전부 취소돼도
-        만들어진 풀이 self._pool에 남아 close()가 닫을 수 있다(고아 풀 방지)."""
-        self._pool = await self._pool_factory(**self._pool_kwargs)
-        return self._pool
-
     async def _get_pool(self):
-        """풀 지연 생성 — 생성 시도를 태스크 하나로 공유한다(성공 뒤 빠른 경로는 무대기).
-
-        잠금 직렬화가 아니라 태스크 공유인 이유: 잠금은 생성 1회 보장은 되지만, DB가
-        TCP 블랙홀인 채 (재)기동해 첫 풀 생성 전에 인증 요청 k건이 동시 유입되면
-        대기자들이 잠금 **안에서 각자** connect 실패를 순차 대기해 k번째 503이
-        k×connect_timeout 뒤에 나온다(실패 지연이 병렬→직렬로 퇴행, 그동안 워커 점유).
-        한 태스크를 함께 await하면 동시 대기자 전원이 한 시도의 성공·실패를 동반
-        수신한다. 실패한 태스크는 버려 다음 요청이 새로 시도한다(장애 복구). shield는
-        한 요청의 취소(클라이언트 이탈)가 공유 태스크를 함께 취소해 무고한 동시
-        대기자들을 실패시키는 전파를 막는다 — 태스크 자체의 마감은 close()가 직접 한다.
-        check-then-create 사이에 await가 없어 asyncio 단일 스레드에서 원자적이다.
-        """
-        if self._pool is not None:
-            return self._pool
-        task = self._pool_task
-        if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
-            task = asyncio.get_running_loop().create_task(self._create_pool())
-            self._pool_task = task
+        """풀 획득 — 생성 기계는 db.LazyAiomysqlPool, 여기는 실패 정책(503)만 얹는다."""
         try:
-            return await asyncio.shield(task)
+            return await self._db.get()
         except Exception as exc:  # noqa: BLE001 — 어떤 드라이버 오류든 503으로 정직하게
             logger.error(f"인증 DB 풀 생성 실패: {exc}")
             raise HTTPException(status_code=503, detail="인증 DB에 연결할 수 없습니다.") from exc

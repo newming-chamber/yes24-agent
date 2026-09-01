@@ -664,6 +664,16 @@ class Settings(BaseSettings):
     rate_limit_rpm: int = 20
     rate_limit_rpd: int = 500
 
+    # 턴 피드백(feedback.py → turn_feedback 테이블) 커넥션 풀 상한. 접속 정보는 인증·사용량과
+    # 같이 session_db_url 파싱(단일 출처)이라 mysql이 아니면 스택이 자연 비활성이다. 쓰기는
+    # 사용자 행동(좋아요/싫어요)당 upsert 1건, 읽기는 세션 복원당 1질의뿐이라 usage와 같은
+    # 최소 크기로 둔다.
+    feedback_pool_max: int = 2
+    # 대화 목록(GET /chat/sessions) 응답 세션 수 상한(최근 갱신순 앞에서 자름). ADK
+    # list_sessions는 사용자 전체를 돌려주므로 장수 사용자의 목록 한 장이 무한히 크지 않게
+    # 천장을 둔다 — admin_page_size(운영 조회 페이지)와는 다른 축의 값이라 따로 둔다.
+    history_sessions_limit: int = 100
+
     # 토큰 사용량 기록(usage.py → usage_log 테이블) 커넥션 풀 상한. 접속 정보는 인증과
     # 같이 session_db_url을 파싱하므로(단일 출처) mysql이 아니면 스택 전체가 비활성이다 —
     # 별도 on/off 스위치는 두지 않는다(죽은 레버 금지, 구조 분기: mysql=on). 쓰기는
