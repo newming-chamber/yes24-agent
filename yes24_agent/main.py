@@ -86,12 +86,28 @@ _ACCESS_EXEMPT_PATHS = frozenset(
     {"/health", "/login", "/logout", "/docs", "/redoc", "/openapi.json"}
 )
 
-# x-api-key로 월을 대신할 수 있는 경로 — **라우트가 get_authenticated_user로 키를 실제로
-# 검사하는 곳만** 담는다(위 access_gate 주석이 근거). HTML 페이지(/ ·/matrix)는 그 의존성이
-# 없으므로 절대 넣지 않는다. 통과 허용 목록이라 빠뜨림은 노출이 아니라 불편이다.
-_API_KEY_ROUTES = frozenset(
-    {"/chat/stream", "/chat/matrix", "/overview", "/overview/warm", "/overview/continue"}
-)
+
+def _api_key_routes(app: FastAPI) -> frozenset[str]:
+    """x-api-key로 월을 대신할 수 있는 경로 — **라우트에서 파생한다**(손목록 금지).
+
+    월 통과는 면제가 아니라 **판정 위임**이다. 그러므로 위임받을 판정자, 즉
+    `get_authenticated_user` 의존성을 실제로 가진 라우트만 열 수 있다.
+
+    종전엔 이 집합이 손으로 적은 상수였고 거기 `/chat/matrix`가 들어가 있었다 — 그런데 그
+    라우트에는 인증 의존성이 없어서(등록 시그니처가 `request` 하나뿐) **아무 문자열이나
+    x-api-key에 넣으면 16 페르소나 LLM 호출이 무검사로 열렸다**(2026-09-01 적대 검증 실측 →
+    200, 스트림 시작). HTML 페이지에서 같은 실수를 한 번 잡고도 손목록이라 다른 자리에서
+    반복됐다. 목록을 지우고 의존성 그래프에서 파생하면 그 실수가 **구조적으로 불가능**해진다 —
+    라우트에 의존성을 붙이는 것이 곧 여는 것이고, 안 붙이면 안 열린다.
+    """
+    opened: set[str] = set()
+    for route in app.routes:
+        dependant = getattr(route, "dependant", None)
+        if dependant is None:
+            continue
+        if any(d.call is get_authenticated_user for d in dependant.dependencies):
+            opened.add(route.path)
+    return frozenset(opened)
 
 
 def _branded_html(path: Path, app_config=None) -> HTMLResponse:
@@ -328,6 +344,11 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
             pw for pw in (settings.access_password, settings.admin_access_password) if pw
         ]
 
+        # 허용 경로는 **첫 요청 때 한 번** 파생해 캐시한다. 등록 시점에 계산하면 안 된다 —
+        # _register_frontend는 create_app에서 API 라우트보다 **먼저** 돌아서 그때 app.routes가
+        # 비어 있고, 그러면 모든 API가 월에 막힌다(실측으로 잡은 함정).
+        route_cache: dict[str, frozenset[str]] = {}
+
         @app.middleware("http")
         async def access_gate(request: Request, call_next):
             path = request.url.path
@@ -350,9 +371,13 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
             # 구성에서는 get_authenticated_user가 헤더를 무시하고 익명 허용으로 흘려보내
             # 판정자가 사실상 없어진다.
             has_api_key = bool(request.headers.get("x-api-key"))
+            api_key_routes = route_cache.get("paths")
+            if api_key_routes is None:
+                api_key_routes = route_cache["paths"] = _api_key_routes(app)
+                logger.info(f"로그인월: x-api-key 통과 허용 경로 {sorted(api_key_routes)}")
             if (
                 has_api_key
-                and path in _API_KEY_ROUTES
+                and path in api_key_routes
                 and AuthService.get_instance().enabled
             ):
                 return await call_next(request)
