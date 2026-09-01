@@ -26,6 +26,7 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, StringConstraints
+from starlette.routing import Match
 
 from yes24_agent.admin import client_ip, register_admin
 from yes24_agent.auth import (
@@ -87,8 +88,8 @@ _ACCESS_EXEMPT_PATHS = frozenset(
 )
 
 
-def _api_key_routes(app: FastAPI) -> frozenset[str]:
-    """x-api-key로 월을 대신할 수 있는 경로 — **라우트에서 파생한다**(손목록 금지).
+def _key_checking_routes(app: FastAPI) -> list:
+    """x-api-key로 월을 대신할 수 있는 **라우트 객체** 목록 — 라우터에서 파생한다(손목록 금지).
 
     월 통과는 면제가 아니라 **판정 위임**이다. 그러므로 위임받을 판정자, 즉
     `get_authenticated_user` 의존성을 실제로 가진 라우트만 열 수 있다.
@@ -96,18 +97,26 @@ def _api_key_routes(app: FastAPI) -> frozenset[str]:
     종전엔 이 집합이 손으로 적은 상수였고 거기 `/chat/matrix`가 들어가 있었다 — 그런데 그
     라우트에는 인증 의존성이 없어서(등록 시그니처가 `request` 하나뿐) **아무 문자열이나
     x-api-key에 넣으면 16 페르소나 LLM 호출이 무검사로 열렸다**(2026-09-01 적대 검증 실측 →
-    200, 스트림 시작). HTML 페이지에서 같은 실수를 한 번 잡고도 손목록이라 다른 자리에서
-    반복됐다. 목록을 지우고 의존성 그래프에서 파생하면 그 실수가 **구조적으로 불가능**해진다 —
-    라우트에 의존성을 붙이는 것이 곧 여는 것이고, 안 붙이면 안 열린다.
+    200, 스트림 시작). 목록을 지우고 의존성 그래프에서 파생하면 그 실수가 **구조적으로
+    불가능**해진다 — 라우트에 의존성을 붙이는 것이 곧 여는 것이고, 안 붙이면 안 열린다.
+
+    **경로 문자열이 아니라 라우트 객체를 돌려준다.** 문자열 집합으로 만들면 `route.path`가
+    템플릿(`/chat/sessions/{id}`)인데 미들웨어가 비교하는 `request.url.path`는 구체 경로
+    (`/chat/sessions/abc`)라 **영원히 일치하지 않는다** — 파라미터 라우트에 인증을 붙이는
+    순간 그 라우트가 통째로 월에 막힌다(2026-09-01 적대 검증 5렌즈가 독립으로 같은 결함을
+    지적). Starlette의 `route.matches(scope)`가 그 매칭을 소유하므로 그것을 쓴다.
     """
-    opened: set[str] = set()
-    for route in app.routes:
-        dependant = getattr(route, "dependant", None)
-        if dependant is None:
-            continue
-        if any(d.call is get_authenticated_user for d in dependant.dependencies):
-            opened.add(route.path)
-    return frozenset(opened)
+    return [
+        route
+        for route in app.routes
+        if (dependant := getattr(route, "dependant", None)) is not None
+        and any(d.call is get_authenticated_user for d in dependant.dependencies)
+    ]
+
+
+def _key_route_matches(routes: list, request: Request) -> bool:
+    """이 요청이 위 라우트 중 하나에 실제로 매칭되는가 — 라우팅 규칙은 Starlette가 소유한다."""
+    return any(route.matches(request.scope)[0] != Match.NONE for route in routes)
 
 
 def _branded_html(path: Path, app_config=None) -> HTMLResponse:
@@ -347,7 +356,7 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
         # 허용 경로는 **첫 요청 때 한 번** 파생해 캐시한다. 등록 시점에 계산하면 안 된다 —
         # _register_frontend는 create_app에서 API 라우트보다 **먼저** 돌아서 그때 app.routes가
         # 비어 있고, 그러면 모든 API가 월에 막힌다(실측으로 잡은 함정).
-        route_cache: dict[str, frozenset[str]] = {}
+        route_cache: dict[str, list] = {}
 
         @app.middleware("http")
         async def access_gate(request: Request, call_next):
@@ -371,13 +380,16 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
             # 구성에서는 get_authenticated_user가 헤더를 무시하고 익명 허용으로 흘려보내
             # 판정자가 사실상 없어진다.
             has_api_key = bool(request.headers.get("x-api-key"))
-            api_key_routes = route_cache.get("paths")
-            if api_key_routes is None:
-                api_key_routes = route_cache["paths"] = _api_key_routes(app)
-                logger.info(f"로그인월: x-api-key 통과 허용 경로 {sorted(api_key_routes)}")
+            key_routes = route_cache.get("routes")
+            if key_routes is None:
+                key_routes = route_cache["routes"] = _key_checking_routes(app)
+                logger.info(
+                    "로그인월: x-api-key 통과 허용 경로 "
+                    f"{sorted(r.path for r in key_routes)}"
+                )
             if (
                 has_api_key
-                and path in api_key_routes
+                and _key_route_matches(key_routes, request)
                 and AuthService.get_instance().enabled
             ):
                 return await call_next(request)
