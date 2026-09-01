@@ -237,14 +237,14 @@ def _assemble_turns(events: list) -> list[dict[str, Any]]:
     return list(turns.values())  # dict 삽입 순서 = 턴 등장 순서(이벤트는 시간순)
 
 
-def _title_of(session, ui: dict[str, tuple[str | None, float | None]]) -> str | None:
-    """표시할 제목 — 사용자가 지은 것이 있으면 그것이, 없으면 서버 자동 생성분이 이긴다.
+def _title_of(session, user_title: str | None) -> str | None:
+    """표시할 제목의 **단일 판정** — 목록·복원이 같이 쓴다.
 
-    두 자리에 나눠 두는 이유는 소유권이다: 자동 제목은 대화에서 파생된 값이라 ADK 세션
-    state에 남고(runner가 쓴다), 사용자 제목은 사용자 데이터라 우리 테이블에 남는다.
-    runner의 `want_title`은 여전히 state만 보므로 자동 생성 로직은 이 변경을 모른다.
+    사용자가 지은 것이 있으면 그것이, 없으면 서버 자동 생성분이 이긴다. 두 자리에 나눠 둔
+    이유는 소유권이다: 자동 제목은 대화에서 파생된 값이라 ADK 세션 state에 남고(runner가
+    쓴다), 사용자 제목은 사용자 데이터라 우리 테이블에 남는다. runner의 `want_title`은
+    여전히 state만 보므로 자동 생성 로직은 이 변경을 모른다.
     """
-    user_title, _ = ui.get(session.id, (None, None))
     return user_title or session.state.get(SESSION_TITLE_STATE_KEY)
 
 
@@ -274,7 +274,7 @@ def _project_session_detail(
         )
     return SessionDetailResponse(
         session_id=session.id,
-        title=user_title or session.state.get(SESSION_TITLE_STATE_KEY),
+        title=_title_of(session, user_title),
         turns=turns,
     )
 
@@ -319,25 +319,22 @@ def register_history(app: FastAPI) -> None:
         recent = sorted(listing.sessions, key=lambda s: s.last_update_time, reverse=True)
         # 사용자 제목·읽음 시각을 **한 번에** 읽는다(세션당 질의는 N+1이 되는 자리다).
         ui = await SessionUiService.get_instance().for_user(user_id=user_no)
+        rows = [(s, *ui.get(s.id, (None, None))) for s in recent]
         if q is not None and (needle := _normalized(q)):
             # 제목 없는 세션(title=null)은 어떤 검색어에도 잡히지 않는다 — 보여줄 실마리가
             # 없는 항목을 부분일치로 내주면 목록이 왜 나왔는지 설명 불가능해진다.
-            recent = [
-                session
-                for session in recent
-                if needle in _normalized(_title_of(session, ui) or "")
-            ]
+            rows = [row for row in rows if needle in _normalized(_title_of(row[0], row[1]) or "")]
         return SessionListResponse(
             sessions=[
                 SessionSummary(
                     session_id=session.id,
-                    title=_title_of(session, ui),
+                    title=_title_of(session, user_title),
                     last_update_time=session.last_update_time,
-                    unread=_is_unread(
-                        session.last_update_time, ui.get(session.id, (None, None))[1]
-                    ),
+                    unread=_is_unread(session.last_update_time, last_read_at),
                 )
-                for session in recent[: get_settings().history_sessions_limit]
+                for session, user_title, last_read_at in rows[
+                    : get_settings().history_sessions_limit
+                ]
             ]
         )
 

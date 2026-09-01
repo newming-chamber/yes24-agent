@@ -318,8 +318,23 @@ async def get_authenticated_user(
 
     user = await service.authenticate(x_api_key)
     await service.check_rate_limit(user)
-    await service.record_request(x_api_key, request.url.path)
+    await service.record_request(x_api_key, _route_template(request))
     return user
+
+
+def _route_template(request: Request) -> str:
+    """요청이 실제로 매칭된 **라우트 템플릿**(`/chat/sessions/{session_id}`)을 돌려준다.
+
+    구체 경로(`request.url.path`)를 그대로 남기면 rate_limit_log의 endpoint가 세션·턴 id마다
+    고유해져 ① 엔드포인트별 집계가 불가능해지고(대화 수만큼 서로 다른 값) ② 컬럼 상한에서
+    잘리며 ③ 식별자가 로그 테이블에 복제된다. 판정에는 쓰이지 않는 컬럼이라(일일 카운트는
+    api_key만 본다) 동작은 그대로다 — 바뀌는 것은 기록의 쓸모뿐이다.
+
+    매칭 라우트는 FastAPI가 scope에 심는다(fastapi.routing에서 child_scope["route"]).
+    없으면(미들웨어 단계·404) 구체 경로로 떨어진다 — 기록이 비는 것보다 낫다.
+    """
+    route = request.scope.get("route")
+    return getattr(route, "path", None) or request.url.path
 
 
 def signed_access_token(password: str, message: bytes) -> str:
