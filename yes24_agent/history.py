@@ -307,6 +307,14 @@ def register_history(app: FastAPI) -> None:
     async def delete_session(session_id: str, user: _UserDep = None) -> None:
         user_no = _require_identified(user)
         service, session = await _owned_session(user_no, session_id)
+        # **피드백을 먼저 지운다.** 세션만 지우면 사용자가 쓴 코멘트가 session_id·user_id와
+        # 함께 남는다 — 이 API의 존재 이유가 프라이버시인데 그러면 삭제가 아니다(2026-09-01
+        # 라이브 검증에서 고아 행 관측). 순서가 이쪽인 이유: 피드백 삭제가 실패하면 5xx로
+        # 끊겨 세션이 남고 사용자가 다시 누를 수 있다. 반대로 하면 세션은 사라졌는데 코멘트만
+        # 남아 되지울 방법이 없어진다(soft-fail보다 재시도 가능한 실패가 낫다).
+        feedback = FeedbackService.get_instance()
+        if feedback.enabled:
+            await feedback.purge_session(user_id=user_no, session_id=session.id)
         await service.delete_session(
             app_name=get_settings().app_name, user_id=user_no, session_id=session.id
         )

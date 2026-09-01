@@ -106,6 +106,19 @@ class FeedbackService:
             (user_id, session_id, turn_id),
         )
 
+    async def purge_session(self, *, user_id: str, session_id: str) -> None:
+        """세션의 피드백을 전부 지운다 — **대화 삭제와 함께 불린다**.
+
+        세션만 지우고 이 행을 남기면 사용자가 쓴 코멘트가 session_id·user_id와 함께 남는다.
+        삭제 API의 존재 이유가 프라이버시인데 그게 남으면 삭제가 아니다(2026-09-01 라이브
+        검증에서 고아 행으로 관측 — 결정론 테스트는 DB가 없어 못 잡았다).
+        집계 신호를 잃는 대가는 치른다 — 사용자가 지우겠다고 한 것이 우선이다.
+        """
+        await self._run(
+            "DELETE FROM turn_feedback WHERE user_id=%s AND session_id=%s",
+            (user_id, session_id),
+        )
+
     async def for_session(self, *, user_id: str, session_id: str) -> dict[str, dict[str, Any]]:
         """세션 복원용 일괄 조회 — {turn_id: {"rating": …, "comment": …}}.
 
