@@ -1,4 +1,4 @@
-"""대화 히스토리 API — 목록·복원·삭제·턴 피드백 (`/chat/sessions*`).
+"""대화 히스토리 API — 목록(검색·unread)·복원(=읽음)·이름 변경·삭제·턴 피드백 (`/chat/sessions*`).
 
 **새 저장소가 없다.** 히스토리는 ADK 세션 서비스가 이미 영속한 `events`에서 투영하고
 (sessions·events의 소유자는 ADK다), 턴 경계는 ADK가 턴마다 부여하는 `invocation_id`다 —
@@ -21,9 +21,11 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Annotated, Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
+from google.adk.events import Event, EventActions
 from pydantic import BaseModel, Field, StringConstraints
 
 from yes24_agent.auth import AuthenticatedUser, get_authenticated_user
@@ -36,6 +38,12 @@ from yes24_agent.session_service import _get_session_service
 from yes24_agent.sources import get_sources
 
 logger = logging.getLogger(__name__)
+
+# "이 사용자가 이 세션을 마지막으로 본 시각"의 세션 state 키(rbti·session_title과 같은 자리 —
+# 세션이 이미 user 스코프라 사용자별 분리가 공짜다). 값은 ADK last_update_time과 **같은 시간
+# 도메인**의 epoch 초다 — 읽음 판정(unread)이 두 값을 직접 비교하므로, 우리 벽시계(time.time())
+# 가 아니라 세션 객체의 last_update_time을 그대로 기록한다(아래 _mark_read 참조).
+LAST_READ_AT_STATE_KEY = "last_read_at"
 
 
 # ── 응답/요청 모델 (OpenAPI가 목적 — /docs만 보고 클라이언트를 만들 수 있어야 한다) ──
@@ -69,6 +77,10 @@ class SessionSummary(BaseModel):
         description="서버가 생성한 세션 제목 — 아직 생성 전(첫 잡담 턴 등)이면 null"
     )
     last_update_time: float = Field(description="마지막 활동 시각(epoch 초)")
+    unread: bool = Field(
+        description="답변 생성 완료 후 아직 열어보지 않은 세션이면 true(LNB 파란 점)."
+        " GET /chat/sessions/{id}로 복원하는 순간 읽음이 된다 — 별도 읽음 API는 없다"
+    )
 
 
 class SessionListResponse(BaseModel):
@@ -122,6 +134,22 @@ _CommentText = Annotated[
 ]
 
 
+class SessionRenameRequest(BaseModel):
+    """`PATCH /chat/sessions/{id}` 요청 본문 — ⋯ 메뉴의 '이름 변경'."""
+
+    # 상한은 서버 생성 제목과 같은 축(목록 한 줄에 담기는 길이)이라 session_title_max_chars를
+    # 재사용한다. 빈 문자열·공백만은 422로 거절한다(트림 후 min_length) — 제목을 지우는
+    # 경로는 디자인에 없고, 지우면 다음 턴의 want_title 판정이 제목을 다시 생성해 버린다.
+    title: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=1,
+            max_length=get_settings().session_title_max_chars,
+        ),
+    ] = Field(description="새 세션 제목(트림 후 1자 이상)")
+
+
 class TurnFeedbackRequest(BaseModel):
     """`PUT …/feedback` 요청 본문. PUT은 멱등 — 같은 턴 재전송은 최신값으로 덮는다."""
 
@@ -159,6 +187,74 @@ async def _owned_session(user_no: str, session_id: str):
     if session is None:
         raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
     return service, session
+
+
+def _normalized(text: str) -> str:
+    """검색 비교용 정규화 — casefold + 공백 압축. 최소한만 한다(키워드 목록·형태소 금지)."""
+    return " ".join(text.casefold().split())
+
+
+def _is_unread(state: dict, last_update_time: float) -> bool:
+    """읽지 않음 판정의 단일 소유자 — 목록(unread 필드)과 복원(읽음 기록 여부)이 같이 쓴다.
+
+    한 번도 열어본 적 없는 세션(last_read_at 없음)은 true다.
+    """
+    read_at = state.get(LAST_READ_AT_STATE_KEY)
+    return read_at is None or last_update_time > read_at
+
+
+_TZ_WARNED = False
+
+
+def _warn_if_not_utc() -> None:
+    """프로세스 TZ가 UTC가 아니면 **한 번** 경고한다 — unread가 조용히 안 되는 것을 막는다.
+
+    ADK MySQL 경로의 naive-local 쓰기 때문에 비UTC 머신에서는 활동 시계가 TZ 오프셋만큼
+    밀려 읽음 표시가 무효가 된다(_append_state_only 독스트링). 프로덕션은 UTC라 정상이지만,
+    개발자가 로컬에서 "읽었는데 계속 unread"를 만나면 원인을 못 찾는다 — 그때 이 로그가
+    답이다. 동작을 바꾸지 않고 관측만 남긴다(부가 채널 계약).
+    """
+    global _TZ_WARNED
+    if _TZ_WARNED or time.timezone == 0:
+        return
+    _TZ_WARNED = True
+    logger.warning(
+        f"프로세스 TZ가 UTC가 아닙니다(offset {-time.timezone // 3600}h). "
+        "MySQL 세션 저장소에서 읽음 표시(unread)가 그 오프셋만큼 밀려 무효가 됩니다 — "
+        "프로덕션 컨테이너는 UTC라 정상입니다."
+    )
+
+
+async def _append_state_only(service, session, state_delta: dict) -> None:
+    """활동 시계를 밀지 않는 세션 state 쓰기 — 읽음 기록·이름 변경이 쓴다.
+
+    ADK append_event는 **어떤 이벤트든** 세션 update_time을 event.timestamp로 갱신한다
+    (DatabaseSessionService·InMemory 공통 — 2026-09-01 ADK 2.3.0 소스 확인). 벽시계로
+    기록하면 읽는 순간 last_update_time이 밀려 즉시 다시 unread가 되고, 이름 변경이
+    목록의 '최근 활동순'을 밀어 올린다. 그래서 event.timestamp에 **현재 last_update_time을
+    그대로** 실어, 저장 후에도 update_time이 같은 값으로 되쓰인다(활동 시계는 대화만 민다).
+
+    시간 도메인 주의 — **프로세스 TZ가 UTC여야 성립한다**(2026-09-01 라이브 실측):
+    sqlite/postgres 경로는 ADK가 UTC로 왕복해 항등이지만, **MySQL 경로는 naive local로 쓰고
+    UTC로 되읽는다**(adk database_session_service의 dialect 분기). 그래서 KST 머신에서
+    실행하면 이 쓰기 한 번에 last_update_time이 정확히 +9시간 밀리고(실측 32,400초),
+    `last_update_time > last_read_at`이 항상 참이 되어 **읽어도 영원히 unread**가 된다.
+    배포 컨테이너는 UTC(`time.timezone == 0`, MySQL도 UTC)라 프로덕션에서는 성립하지만,
+    UTC가 아닌 개발 머신에서는 깨진다 — 그 침묵을 아래 `_warn_if_not_utc`가 소리로 바꾼다.
+    (이 전제 자체는 last_update_time의 기존 성질이고 새로 더하는 가정은 아니다.)
+
+    invocation_id 없는 system 이벤트는 대화 투영
+    (_assemble_turns)·admin 턴 집계가 모두 건너뛴다 — runner의 rbti 기록과 같은 꼴이다.
+    """
+    _warn_if_not_utc()
+    await service.append_event(
+        session,
+        Event(
+            author="system",
+            timestamp=session.last_update_time,
+            actions=EventActions(state_delta=state_delta),
+        ),
+    )
 
 
 # ── 이력 투영 (이 모듈이 단일 소유자) ───────────────────────────────────────
@@ -253,21 +349,39 @@ def register_history(app: FastAPI) -> None:
         tags=["history"],
         response_model=SessionListResponse,
         responses=_AUTH_RESPONSES,
-        summary="내 대화 목록",
+        summary="내 대화 목록(+검색)",
         description="x-api-key 소유자의 세션을 최근 활동순으로 돌려준다. 제목이 아직 없는"
-        " 세션(첫 턴 진행 전·잡담만 한 세션)은 title이 null이다.",
+        " 세션(첫 턴 진행 전·잡담만 한 세션)은 title이 null이다. `q`는 **제목 기준**"
+        " 부분일치다(대소문자·공백 정규화) — 본문 전문 검색은 지원하지 않는다: 본문은"
+        " events의 JSON 안에 있어 검색이 사용자 전 세션·전 이벤트 스캔이 되고, 목록 API의"
+        " 비용 축이 달라진다(제목이 이미 대화 내용의 요약이라 히스토리 패널 용도로 충분).",
     )
-    async def list_sessions(user: _UserDep = None) -> SessionListResponse:
+    async def list_sessions(
+        q: Annotated[
+            str | None,
+            Query(description="제목 부분일치 검색어(대소문자·공백 정규화). 없으면 전체 목록"),
+        ] = None,
+        user: _UserDep = None,
+    ) -> SessionListResponse:
         user_no = _require_identified(user)
         service = _get_session_service()
         listing = await service.list_sessions(app_name=get_settings().app_name, user_id=user_no)
         recent = sorted(listing.sessions, key=lambda s: s.last_update_time, reverse=True)
+        if q is not None and (needle := _normalized(q)):
+            # 제목 없는 세션(title=null)은 어떤 검색어에도 잡히지 않는다 — 보여줄 실마리가
+            # 없는 항목을 부분일치로 내주면 목록이 왜 나왔는지 설명 불가능해진다.
+            recent = [
+                session
+                for session in recent
+                if needle in _normalized(session.state.get(SESSION_TITLE_STATE_KEY) or "")
+            ]
         return SessionListResponse(
             sessions=[
                 SessionSummary(
                     session_id=session.id,
                     title=session.state.get(SESSION_TITLE_STATE_KEY),
                     last_update_time=session.last_update_time,
+                    unread=_is_unread(session.state, session.last_update_time),
                 )
                 for session in recent[: get_settings().history_sessions_limit]
             ]
@@ -282,15 +396,58 @@ def register_history(app: FastAPI) -> None:
         description="세션의 턴들을 시간순으로 돌려준다. 본문 [n] 마커는 각 턴 sources의 id에"
         " 매핑된다(/chat/stream done과 같은 계약). **출처 값은 관측 스냅샷이 아니라 세션"
         " 레지스트리의 현재(최신 관측) 값이다** — 같은 상품을 나중 턴이 다시 관측했다면 이전"
-        " 턴의 카드도 그 최신 가격·평점으로 보인다(checked_at이 그 관측 시각).",
+        " 턴의 카드도 그 최신 가격·평점으로 보인다(checked_at이 그 관측 시각)."
+        " 이 조회가 곧 **읽음 처리**다 — 이후 목록의 unread가 false가 된다(별도 읽음 API"
+        " 없음: 복원해 화면에 그린 것이 '봤다'의 자연스러운 정의다).",
     )
     async def session_detail(session_id: str, user: _UserDep = None) -> SessionDetailResponse:
         user_no = _require_identified(user)
-        _, session = await _owned_session(user_no, session_id)
+        service, session = await _owned_session(user_no, session_id)
         feedback_by_turn = await FeedbackService.get_instance().for_session(
             user_id=user_no, session_id=session.id
         )
-        return _project_session_detail(session, feedback_by_turn)
+        detail = _project_session_detail(session, feedback_by_turn)
+        # 읽음 기록 — unread였을 때만 쓴다(반복 조회가 이벤트를 쌓지 않는다). 기록 실패는
+        # 복원 응답을 막지 않는다: 배지는 부가 채널이고, 복원이 제품이다(로그로 정직 노출).
+        if _is_unread(session.state, session.last_update_time):
+            try:
+                await _append_state_only(
+                    service, session, {LAST_READ_AT_STATE_KEY: session.last_update_time}
+                )
+            except Exception as exc:  # noqa: BLE001 — 부가 채널(복원 응답 보호)
+                logger.warning(f"읽음 기록 실패(session_id={session.id}): {exc}")
+        return detail
+
+    @app.patch(
+        "/chat/sessions/{session_id}",
+        tags=["history"],
+        response_model=SessionSummary,
+        responses=_SESSION_RESPONSES,
+        summary="대화 이름 변경",
+        description="⋯ 메뉴의 '이름 변경'. 세션 제목을 사용자가 준 값으로 바꾼다. 서버의"
+        " 자동 제목 생성은 '제목이 없을 때'만 도는 구조라(runner의 want_title 판정) 바꾼"
+        " 제목을 LLM이 되덮지 않는다. 빈 문자열·공백만인 제목은 422다(제목을 지우는 경로는"
+        " 없다). 이름 변경은 활동이 아니다 — last_update_time(목록 순서)과 unread를"
+        " 바꾸지 않는다.",
+    )
+    async def rename_session(
+        session_id: str, request: SessionRenameRequest, user: _UserDep = None
+    ) -> SessionSummary:
+        user_no = _require_identified(user)
+        service, session = await _owned_session(user_no, session_id)
+        # 자동 생성과 같은 state 키에 쓰는 것으로 끝이다 — runner.py의
+        # `want_title = enrich and not state.get(SESSION_TITLE_STATE_KEY)`가 "제목이 있으면
+        # 다시 만들지 않는다"라, 별도 '사용자 제목' 플래그·잠금이 필요 없다(그게 이 구현이
+        # 짧은 이유다). 소유자 하나: 제목의 자리는 이 키뿐이다.
+        await _append_state_only(
+            service, session, {SESSION_TITLE_STATE_KEY: request.title}
+        )
+        return SessionSummary(
+            session_id=session.id,
+            title=request.title,
+            last_update_time=session.last_update_time,
+            unread=_is_unread(session.state, session.last_update_time),
+        )
 
     @app.delete(
         "/chat/sessions/{session_id}",

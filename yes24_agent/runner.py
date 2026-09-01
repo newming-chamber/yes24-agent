@@ -332,6 +332,7 @@ def _closeout_error_frames(
     active_model: str,
     session_id: str,
     turn_id: str | None,
+    rbti_applied: str | None,
 ) -> list[str]:
     """타임아웃·예외 두 실패 경로가 공유하는 마감 시퀀스를 프레임 목록으로 조립한다.
 
@@ -359,6 +360,7 @@ def _closeout_error_frames(
         error_done["text"] = "".join(streamed)
     error_done["model"] = active_model
     error_done["turn_id"] = turn_id
+    error_done["rbti_applied"] = rbti_applied
     if _ensure_substantive_text(error_done):
         logger.warning(
             f"실패 경로의 본문이 비어 최후 방어 안내로 대체합니다(session_id={session_id})."
@@ -453,6 +455,7 @@ async def run_agent_stream(
             )
             error_done["model"] = None
             error_done["turn_id"] = None  # 스트림 시작 전 실패 — invocation이 아직 없다
+            error_done["rbti_applied"] = None  # 페르소나가 적용될 턴 자체가 없었다
             yield sse_delta(error_done["text"])
             yield sse_done(error_done)
             return
@@ -753,6 +756,13 @@ async def run_agent_stream(
 
                 done_payload["model"] = active_model
                 done_payload["turn_id"] = turn_id
+                # 이 턴에 적용된 RBTI 코드(미적용이면 null) — 프론트 배지("RBTI 데이터가
+                # 활용됨")의 근거다. bool이 아니라 코드인 이유: 배지는 truthiness로 충분하고,
+                # 16유형 뷰가 유형명을 표시하려는 순간 bool이면 필드가 하나 더 필요해진다
+                # (코드가 bool을 포섭한다). 페르소나는 매 턴 세션 state의 rbti로 조립되고
+                # (agent._instruction_provider) 그 state의 정본은 턴 시작에 쓴 `code`라,
+                # 이 값이 곧 이번 턴의 실제 적용분이다(턴 단위 정확).
+                done_payload["rbti_applied"] = code
                 if citation.removed_markers:
                     logger.warning(
                         f"무효 인용 마커 {len(citation.removed_markers)}개를 본문에서 "
@@ -834,6 +844,7 @@ async def run_agent_stream(
                 active_model=active_model,
                 session_id=resolved_session_id,
                 turn_id=turn_id,
+                rbti_applied=code,
             )
             for frame in frames:
                 yield frame
@@ -857,6 +868,7 @@ async def run_agent_stream(
                 active_model=active_model,
                 session_id=resolved_session_id,
                 turn_id=turn_id,
+                rbti_applied=code,
             )
             for frame in frames:
                 yield frame
