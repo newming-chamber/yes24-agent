@@ -7,8 +7,9 @@ fetch_many는 이 N개 열람을 **한 번의 도구 호출**로 받아 네트�
 +rps 페이싱이 Yes24 예의(동시성·요청률)를 그대로 지킨다.
 
 정확성 설계(레이스 0): register_source(출처 등록·id 부여)는 동시에 돌리지 않는다. 네트워크만
-gather로 동시 실행하고, 파싱·등록은 **순차 루프**(build_result_from_html)로 처리한다 — 단일
-tool_context.state에 대한 등록이 await 없이 순차라 source_id가 유일·단조로 부여되고, 기존
+gather로 동시 실행하고, 파싱은 워커 스레드 하나(parse_page)에서, 등록은 **순차 루프**
+(register_page)로 처리한다 — 단일 tool_context.state에 대한 등록이 await 없이 순차라 source_id가
+유일·단조로 부여되고, 기존
 settle_sources 정합을 그대로 유지한다(병렬 도구 유실 방지 로직 불변).
 
 열람 절약 실험 기각(2026-07-28, 재시도 금지): "검색 필드로 충분하면 상세를 아끼라"는 docstring
@@ -18,7 +19,7 @@ settle_sources 정합을 그대로 유지한다(병렬 도구 유실 방지 로�
 
 부분 실패 fail-loud: 어떤 url이 실패해도(네트워크 오류) 나머지는 정상 결과로 반환하고, 실패분은
 error 표식으로 섞어 반환한다 — 빈 성공으로 위장하지 않는다. 네트워크 오류는 특정 예외
-(Yes24FetchError)만 per-item error로 처리하고, 파싱 실패는 build_result_from_html이 이미
+(Yes24FetchError)만 per-item error로 처리하고, 파싱 실패는 parse_page가 이미
 구조화된 error dict로 돌려준다. 예상 밖 예외는 삼키지 않고 그대로 올려보낸다(broad except 금지).
 """
 
@@ -29,27 +30,22 @@ from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
 from yes24_agent.sources import now_checked_at
-from yes24_agent.tools.yes24_fetch import build_result_from_html
+from yes24_agent.tools.yes24_fetch import parse_page, register_page
 from yes24_agent.tools.yes24_search import get_client
 from yes24_agent.yes24.client import Yes24FetchError
 
 logger = logging.getLogger(__name__)
 
 
-
 async def fetch_many(items: list[dict], tool_context: ToolContext) -> dict:
     """여러 Yes24 페이지를 한 번에 열어 각 본문을 함께 가져온다.
 
-    상품 상세(줄거리·목차·서평)든 공지·정책 페이지든, 여러 페이지가 필요할 때 각각을
-    yes24_fetch로 하나씩 여는 대신 이 도구에 목록을 한 번에 넘긴다. 페이지들은 동시에 열려
-    몇 건을 넣든 한 번의 지연으로 끝나므로, 종류가 다른 페이지를 한 라운드에 함께 묶어도
-    추가 대기 없이 양쪽 근거를 얻는다. 보통 yes24_search 결과나 정책 입구의 url·제목을 그대로
-    담아 넘긴다(이미 url이 있으면 같은 대상을 다시 검색하지 말 것).
+    여러 페이지가 필요할 때 각각을 yes24_fetch로 하나씩 여는 대신 목록을 한 번에 넘긴다 —
+    페이지들은 동시에 열린다. 이미 url을 아는 대상을 다시 검색하지 않는다.
 
     Args:
         items: 열람할 페이지 목록. 각 항목은 {"url": 절대 URL(yes24_search 결과나 정책 입구의
-            url을 그대로), "title": 제목(진행 상태 표시용)} 형태의 dict. 상한을 넘는
-            항목은 처리하지 않는다.
+            url을 그대로), "title": 제목(진행 상태 표시용)} 형태의 dict.
 
     Returns:
         성공 항목이 하나 이상이면 status="ok"와 results 목록을 담은 dict. results의 각 항목은
@@ -57,9 +53,8 @@ async def fetch_many(items: list[dict], tool_context: ToolContext) -> dict:
         — 성공은 source_id·title·type(book_detail/notice)·본문(intro/toc/text 등), 실패는
         status="error"·error_type("fetch"|"parse"|"empty"|"invalid_url")·message. 성공 항목만
         인용 대상(source_id)이 된다. 상한을 넘겨 열지 않은 항목이 있으면 dropped_count·
-        dropped_urls·message로 **무엇을 안 열었는지 명시**한다 — 그 책들이 필요하면 남은
-        url로 한 번 더 호출한다(조용히 사라지지 않는다). items 자체가 목록이 아니거나 비었거나
-        전체 열람이 실패하면 status="error"이며, result_count는 성공 건수다.
+        dropped_urls·message로 무엇을 안 열었는지 명시한다. items 자체가 목록이 아니거나
+        비었거나 전체 열람이 실패하면 status="error"이며, result_count는 성공 건수다.
     """
     if not isinstance(items, list):
         return {
@@ -113,7 +108,16 @@ async def fetch_many(items: list[dict], tool_context: ToolContext) -> dict:
     gathered = await asyncio.gather(
         *(client.get_text(url) for url in valid_urls), return_exceptions=True
     )
-    gathered_iter = iter(gathered)
+    # 파싱(순수 계산, 상세 1건 ~100ms)은 **워커 스레드 하나**에서 순차로 내린다 — 등록은 아래
+    # 순차 루프. 페이지마다 스레드를 갈라 gather하면 GIL 경합으로 벽시계가 오히려 는다
+    # (실측 2026-08-27: 5건 순차 614ms vs 5스레드 924ms). 루프 차단 해소가 목적이지 병렬이 아니다.
+    parsed = await asyncio.to_thread(
+        lambda: [
+            parse_page(outcome, url, settings) if isinstance(outcome, str) else outcome
+            for url, outcome in zip(valid_urls, gathered)
+        ]
+    )
+    gathered_iter = iter(parsed)
 
     results: list[dict] = []
     for url in plan:
@@ -138,7 +142,7 @@ async def fetch_many(items: list[dict], tool_context: ToolContext) -> dict:
             raise outcome
         else:
             # 순차 호출: register_source가 await 없이 하나씩 실행돼 id 원자·단조.
-            results.append(build_result_from_html(outcome, url, settings, tool_context))
+            results.append(register_page(outcome, tool_context))
 
     checked_at = now_checked_at()
     ok = sum(1 for r in results if r.get("status") != "error")

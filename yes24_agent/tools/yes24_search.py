@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import contextvars
 import logging
+from typing import NamedTuple
 
 from google.adk.tools import ToolContext
 
@@ -54,8 +55,8 @@ logger = logging.getLogger(__name__)
 _shared_client: Yes24Client | None = None
 
 # 매트릭스 경로 전용 고처리량 클라이언트(lazy 싱글턴, 채팅 클라이언트와 별도 스로틀 상태).
-# 채팅 단일 경로는 _shared_client(rps=1.5)를 그대로 쓰고, 매트릭스 셀만 아래 contextvar가
-# 켜진 자기 태스크 컨텍스트에서 이 클라이언트(matrix_http_rps/concurrency)를 집어 든다.
+# 채팅 단일 경로는 _shared_client(rps=config http_rps)를 그대로 쓰고, 매트릭스 셀만 아래
+# contextvar가 켜진 자기 태스크 컨텍스트에서 이 클라이언트(matrix_http_rps/concurrency)를 집어 든다.
 _matrix_client: Yes24Client | None = None
 
 # 두 클라이언트가 **공유**하는 Yes24 HTTP 텍스트 캐시(lazy 싱글턴). 매트릭스 16셀 버스트의
@@ -73,6 +74,7 @@ def _get_cache(settings: Settings) -> Yes24TextCache:
             max_entries=settings.yes24_cache_max_entries,
         )
     return _shared_cache
+
 
 # "고처리량 경로인가" 신호. 매트릭스 셀 태스크가 자기 컨텍스트 사본에서만 True로 켜므로
 # (matrix_runner._run_cell), 동시에 도는 채팅 요청 태스크는 영향받지 않는다. asyncio.gather로
@@ -127,8 +129,36 @@ async def aclose_shared_client() -> None:
     _shared_cache = None
 
 
+# 검색 예산(1페이지 요청 폭·파스 상한)의 **요청 로컬 오버라이드** 키. 챗 세션 state엔 이 키가
+# 없으므로 도구는 config의 챗 예산으로 돈다 — state shim으로 도구를 직접 부르는 소비자(오버뷰)만
+# 자기 예산을 실어 보낸다(overview._new_search_state). 도구 인자로 열지 않는 이유: 상한을 모델이
+# 정하게 하면 컨텍스트 천장이 모델 재량이 되고, ADK 스키마에 소비자별 손잡이가 새 나간다.
+SEARCH_BUDGET_STATE_KEY = "yes24_search_budget"
+
+
+class SearchBudget(NamedTuple):
+    """검색 1콜의 상류 폭(size 파라미터)과 파스 상한 — 한 소비자의 한 벌이라 함께 옮긴다."""
+
+    result_limit: int
+    page_size: int
+
+
+def _search_budget(state, settings: Settings) -> SearchBudget:
+    """이 호출의 검색 예산 — state 오버라이드가 있으면 그것, 없으면 config의 챗 기본."""
+    override = state.get(SEARCH_BUDGET_STATE_KEY) if state is not None else None
+    if isinstance(override, SearchBudget):
+        return override
+    return SearchBudget(settings.search_result_limit, settings.search_page_size)
+
+
 async def _search_one(
-    query: str, section: str, order: str, author_no: str, client: Yes24Client, settings: Settings
+    query: str,
+    section: str,
+    order: str,
+    author_no: str,
+    client: Yes24Client,
+    settings: Settings,
+    budget: SearchBudget,
 ) -> dict:
     """한 검색 각도로 Yes24 검색 HTML을 받아 **파싱 결과만** 돌려준다(등록 없음).
 
@@ -142,7 +172,9 @@ async def _search_one(
     `section`은 **실제로 검색한 범위**다 — 호출부가 요청 범위와 대조해 넓히기 여부를 판정하고
     searches 요약에도 그대로 싣는다(별도 장부를 만들지 않는다).
     """
-    url = search_url(settings.yes24_base_url, query, section, order, author_no)
+    url = search_url(
+        settings.yes24_base_url, query, section, order, author_no, budget.page_size
+    )
     try:
         html = await client.get_text(url)
     except Yes24FetchError as exc:
@@ -156,8 +188,10 @@ async def _search_one(
         }
 
     try:
-        parsed = parse_search(
-            html, base_url=settings.yes24_base_url, limit=settings.search_result_limit
+        # 파싱은 순수 계산(1.1MB HTML에 ~100ms)이라 워커 스레드로 내린다 — 이벤트 루프가 그동안
+        # SSE 전송·다른 각도의 네트워크·오버뷰 판정 Task를 계속 돌린다(H17 오프로드).
+        parsed = await asyncio.to_thread(
+            parse_search, html, base_url=settings.yes24_base_url, limit=budget.result_limit
         )
     except ParseError as exc:
         logger.info(f"yes24_search query={query!r} status=error error_type=parse results=0")
@@ -181,14 +215,6 @@ async def yes24_search(
 ) -> dict:
     """Yes24에서 도서·상품을 검색해 현재 가격·평점·저자·출판사 등 실제 데이터를 얻는다.
 
-    당신은 Yes24의 현재 가격·평점을 알지 못한다 — 상품 사실은 아무리 유명한 책이어도 이 도구로
-    확인한다(잡담·인사·이전 대화 후속질문처럼 검색이 불필요한 경우만 예외). Yes24 검색은 키워드
-    색인이라 분위기·서술형 질의는 0건이거나 무관한 상품이 섞인다 — 무관한 결과는 인용하지 말고,
-    확인할 제목·저자 앵커 각도들을 queries에 함께 담아 검증한다. 검색 결과 행은 목록 수준의
-    메타데이터일 뿐이라 값이 없는 필드(null)와 행에 아예 없는 정보가 많다 — 그런 값은 관측되지
-    않은 것이므로 추정하지 말고, 답변이나 후보 선별에 필요하면 yes24_fetch/fetch_many로 상세를
-    읽어 확인한다.
-
     질문에 서로 독립적인 탐색 각도가 여럿 있으면 **그 각도들을 한 번에 queries에 함께 담는다**
     — 각도들은 동시에 검색되므로 여러 각도를 나눠 호출할 때보다 훨씬 빠르다. 단일 각도
     질문은 원소 하나만 전달한다. 같은 의도를 표현만 바꾼 중복 각도는 만들지 않고, 서로 다른
@@ -197,36 +223,28 @@ async def yes24_search(
     Args:
         queries: 검색 각도 리스트. 각 원소는 독립적으로 찾아볼 검색어이며, 핵심 키워드
             위주로 짧게 구성한다 — 불필요한 조사·수식어는 빼고 제목·저자·주제어를 담는다.
-            상한을 넘는 각도는 dropped_queries로 알리고 검색하지 않는다.
         section: 검색 범위(모든 각도에 공통 적용). "all"은 통합 검색(도서·음반·DVD 등 전체),
             "book"은 국내도서로 한정. 확실치 않으면 "all".
         order: 정렬(모든 각도에 공통 적용). 기본 ""는 인기도순 — 잘 팔리는 책이 앞이라
             **최신작이 목록 밖에 밀려날 수 있다**. 출간 시점이 답의 근거가 되는 질문은
             "recent"(신상품순)로 검색해야 출간일 내림차순의 실제 최신 목록이 근거가 된다.
-            단 신상품순은 관련도 필터가 풀려 검색어만 겹치는 무관 상품(동명이인의 신간
-            포함)이 섞이므로, 결과의 author·author_no·pub_date·kind로 대상을 확인하고
-            무관한 행은 무시한다. kind는 그 행이 어떤 종류의 상품인지 말하는 사이트
-            라벨이다 — 책에 대한 사실은 kind가 책인 행에만 근거한다. 연도를 검색어에
-            넣는 방식("작가명 2026")은 키워드 색인이라 0건이 되기 쉽다 — 대신 이 정렬을 쓴다.
+            단 신상품순은 관련도 필터가 풀려 검색어만 겹치는 무관 상품이 섞이므로,
+            결과의 author·author_no·pub_date·kind로 대상을 확인한다. kind는 그 행이
+            어떤 종류의 상품인지 말하는 사이트 라벨이다 — 책에 대한 사실은 kind가 책인
+            행에만 근거한다.
         author_no: 저자 스코프(모든 각도에 공통 적용). 검색 결과 행의 author_no 필드가
             그 저자의 동일성 키다 — 지정하면 검색어와 무관하게 **그 저자의 책만** 나온다.
-            같은 이름의 다른 저자 책이 결과에 섞이거나(결과의 author_no 값이 여러 개로
-            갈리면 동명이인이다), 신상품순 목록이 무관 저자의 신간으로 덮일 때, 관측한
-            author_no로 다시 검색해 확정한다. **키의 채집처가 중요하다**: author_no는
-            그 저자임이 이미 확인되는 행(대표작·아는 작품이 보이는 기본 인기도순 결과)에서
-            관측한다 — 신상품순 목록은 그 저자의 행이 통째로 밀려나고 동명이인 행만 남을
-            수 있어, 이름만 보고 거기서 집은 author_no는 다른 사람의 번호일 수 있다.
-            같은 이유로 **신상품순 목록에 그 저자의 책이 안 보인다고 "신간 없음"으로
-            단정하지 말 것** — 인기도순에서 확보한 author_no로 좁혀 재확인한다. 관측된
-            값만 쓰고 지어내지 않는다. author_no를 쓸 때 검색어는 사이트가 무시하므로
-            각도는 하나만 담는다.
+            같은 이름의 다른 저자 책이 결과에 섞이면(결과의 author_no 값이 여러 개로
+            갈리면 동명이인이다) 관측한 author_no로 다시 검색해 확정한다. author_no는
+            그 저자임이 확인되는 행에서 관측한 값만 쓰고 지어내지 않는다. author_no를
+            쓸 때 검색어는 사이트가 무시하므로 각도는 하나만 담는다.
 
     Returns:
         각도 중 하나라도 검색에 성공하면 status="ok"와 results 목록(모든 각도의 결과를
         상품 기준으로 병합·중복제거, 각 항목에 인용용 source_id와 어느 각도에서 나왔는지
         queries 포함), 각 각도의 성공/실패/결과 수를 담은 searches 요약, 검색 시각 checked_at,
         result_count를 담은 dict. 어느 각도에서도 상품을 찾지 못하면 results가 빈 목록이고
-        result_count=0이다(검색은 성공했으나 결과가 없는 상태). 섹션을 한정했는데 0건인
+        result_count=0이다. 섹션을 한정했는데 0건인
         각도는 통합 검색으로 한 번 더 자동 재검색되며, 그 항목은 searches에 expanded_from으로
         표시된다(원 각도의 0건 항목도 함께 남는다). 상한을 넘겨 검색하지 않은
         각도가 있으면 dropped_count·dropped_queries로 명시한다. 모든 각도가 실패했을 때만
@@ -257,11 +275,14 @@ async def yes24_search(
         }
 
     client = get_client(settings)
+    # 이 호출의 검색 예산은 호출자가 정한다 — 챗 세션 state엔 오버라이드가 없어 config 챗
+    # 기본이고, 오버뷰 shim만 자기 예산을 싣는다(_search_budget 주석).
+    budget = _search_budget(tool_context.state, settings)
 
     # 네트워크·파싱만 동시 실행한다(각도별 병렬). 등록은 아래 순차 루프에서 — 레이스 0.
     # _search_one이 예상 오류를 이미 error dict로 삼키므로 예상 밖 예외만 gather 밖으로 올라온다.
     searched = await asyncio.gather(
-        *(_search_one(q, section, order, author_no, client, settings) for q in planned)
+        *(_search_one(q, section, order, author_no, client, settings, budget) for q in planned)
     )
 
     # 섹션 한정 검색의 0건은 "없다"가 아니라 **범위 밖**일 수 있다 — 국내도서 한정은 영어판·
@@ -280,7 +301,7 @@ async def yes24_search(
                 *searched,
                 *await asyncio.gather(
                     *(
-                        _search_one(q, WIDEST_SECTION, order, author_no, client, settings)
+                        _search_one(q, WIDEST_SECTION, order, author_no, client, settings, budget)
                         for q in widen
                     )
                 ),

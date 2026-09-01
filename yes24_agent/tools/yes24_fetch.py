@@ -9,6 +9,7 @@
 error_type="empty"로 정직하게 반환한다.
 """
 
+import asyncio
 import logging
 from typing import NamedTuple
 
@@ -37,6 +38,7 @@ logger = logging.getLogger(__name__)
 _NOISE_TAGS = ("script", "style", "noscript", "template")
 
 # 실질 본문 판정 임계값은 config(fetch_min_meaningful_chars)에서 주입한다.
+
 
 def _render_faq_entries(entries: list[dict[str, str]]) -> str:
     return "\n\n".join(
@@ -77,41 +79,28 @@ def _select_complete_faq_entries(
 async def yes24_fetch(
     url: str, title: str, tool_context: ToolContext, find: str | None = None
 ) -> dict:
-    """Yes24 페이지의 본문을 열람한다.
-
-    검색 결과만으로 부족할 때, 상품 상세(줄거리·목차·출판사 서평·주간리뷰)나 공지
-    페이지의 실제 본문을 읽어오는 도구다. 보통 yes24_search가 반환한 결과의 url을
-    그대로 넣어 그 책의 상세 내용을 확인할 때 쓴다.
+    """Yes24 페이지의 본문(상품 상세·공지)을 열람한다.
 
     Args:
         url: 열람할 Yes24 페이지의 절대 URL. 상품 상세를 보려면 yes24_search 결과의
-            url을 그대로 전달한다. 정책·주문·결제·배송 관련은 공지사항 URL을 넣는다.
+            url을 그대로 전달한다.
         title: 열람 대상의 제목(진행 상태 표시용). yes24_search 결과의 제목을 그대로
-            넣는다. 공지 등 제목을 모르면 페이지 성격을 짧게 적는다(예: "공지사항").
-        find: (선택) 본문에서 찾는 정보의 핵심 키워드(예: "무이자"). 긴 페이지는 앞부분만
-            잘려 오는데(truncated=True), 찾는 내용이 그 안에 없으면 이 키워드로 다시
-            호출하면 **키워드가 나오는 위치부터** 본문을 잘라 돌려준다. FAQ처럼 여러
-            주제가 한 페이지에 있는 긴 문서에서 특정 규정을 찾을 때 쓴다.
+            넣는다. 공지 등 제목을 모르면 페이지 성격을 짧게 적는다.
+        find: (선택) 본문에서 찾는 정보의 핵심 키워드. 긴 페이지는 앞부분만 잘려
+            오는데(truncated=True), 찾는 내용이 그 안에 없으면 이 키워드로 다시
+            호출하면 **키워드가 나오는 위치부터** 본문을 잘라 돌려준다.
 
     Returns:
         성공 시 status="ok"와 인용용 source_id, 본문 내용을 담은 dict. 상품 상세는
-        type="book_detail"로 줄거리·목차 등을, 공지 페이지는 type="notice"로 text를
-        담는다. 상품 페이지에 설명 본문이 아예 없으면(굿즈·문구 등 비도서에서 흔하다)
-        intro·toc·pub_review·snippet이 모두 null이고 message가 그 사실을 명시한다 —
-        그 상품에 대해 관측된 것은 함께 실린 상품 정보 필드(가격·평점·제목 등)뿐이다.
-        상품 페이지에는 배송 소요·수령 예정일·재고 상태가 어떤 필드로도 담기지 않는다 —
-        주문 시점과 배송지에 따라 주문 화면에서 계산되는 값이라 페이지 본문에 실리지 않으며,
-        상세를 열어도 관측되지 않는다. 배송 소요·마감 시각·수령일 기준이 실제로 관측되는
-        곳은 배송 정책 페이지 본문뿐이다.
-        본문이 상한보다 길어 잘렸으면 truncated=True와 total_chars(전체 길이)가
-        함께 온다 — 찾는 내용이 안 보이면 find 키워드로 재호출해 뒷부분을 읽는다.
+        type="book_detail"로 줄거리·목차·출판사 서평·주간리뷰를, 공지 페이지는
+        type="notice"로 text를 담는다. 본문이 상한보다 길어 잘렸으면 truncated=True와
+        total_chars(전체 길이)가 함께 온다.
         상품 상세의 other_formats는 이 페이지가 함께 렌더한 **다른 판형**(eBook·중고 등)의
         판형명·판매가·url이다 — 열람 중인 상품이 아니라 그 판형이 값의 임자이며, 가격이
         관측된 판형은 자기 source_id를 갖는다(그 값을 답에 쓰면 그 번호로 인용한다).
         함께 오는 links는 이 페이지에서 더 볼 수 있는 다른 Yes24 페이지 후보
         목록이다(아직 열지 않은 페이지 — 인용 대상이 아니며, 필요하면 그 url로 다시
-        yes24_fetch를 호출해 이어서 열람할 수 있다). 상품 상세에서는 관련 상품 링크만,
-        공지 등 다른 페이지에서는 페이지 내비까지 함께 온다. 실패 시 status="error"와
+        yes24_fetch를 호출해 이어서 열람할 수 있다). 실패 시 status="error"와
         error_type("fetch"|"parse"|"empty"), message.
     """
     # title은 runner의 진행 상태 라벨용으로만 쓴다. 반환 dict의 title은 항상 페이지
@@ -131,22 +120,22 @@ async def yes24_fetch(
             "message": f"Yes24 페이지 조회에 실패했습니다: {exc}",
         }
 
-    return build_result_from_html(html, url, settings, tool_context, find=find)
+    # **두 단계로 가른 이유(H17 오프로드)**: 파싱(상세 400KB에 ~70ms)은 순수 계산이라 워커
+    # 스레드로 내리고, 등록은 **이벤트 루프에서 await 없이** 실행해 source_id의 원자·단조를
+    # 지킨다. 종전엔 이 근거가 둘을 한 번에 도는 동기 편의 함수(build_result_from_html)의
+    # 독스트링에 살았는데, 오늘 fetch·fetch_many가 둘 다 두 단계를 직접 부르게 되면서 그
+    # 함수의 호출자가 하나도 남지 않아 삭제했다(2026-08-31 적대 감사) — 근거는 여기로 옮긴다.
+    page = await asyncio.to_thread(parse_page, html, url, settings, find)
+    return register_page(page, tool_context)
 
 
-def build_result_from_html(
-    html: str, url: str, settings, tool_context: ToolContext, find: str | None = None
-) -> dict:
-    """이미 받아온 HTML을 파싱해 fetch 결과 dict를 조립한다(get_text 이후 전 로직).
+def parse_page(html: str, url: str, settings, find: str | None = None) -> dict:
+    """HTML → 등록 전 중간 레코드(순수 계산, 스레드 안전 — state를 만지지 않는다).
 
-    yes24_fetch(단건, 네트워크는 위에서)와 fetch_many(다건, 네트워크는 gather로 선행)가
-    공유하는 순수 파싱·등록 계층이다. register_source(출처 등록)는 이 함수 안에서 이뤄지므로,
-    fetch_many는 이 함수를 **순차 루프**로만 호출해 출처 id의 원자성·단조성을 지킨다.
     find는 범용 어포던스로, 상세(book_detail)·공지(notice) 양쪽에 적용된다 — 상세에서는
     키워드를 포함한 블록을 예산 우선순위 앞으로 당기고, 공지에서는 키워드 주변 창을 잘라준다.
+    반환은 `{"type": "book_detail"|"notice", ...}` 중간 레코드 또는 status="error" dict다.
     """
-    checked_at = now_checked_at()
-
     links = extract_links(
         html,
         base_url=settings.yes24_base_url,
@@ -159,40 +148,46 @@ def build_result_from_html(
     # 경로 판별은 대소문자 무시 — Yes24가 상품 링크를 /Product/Goods/(대문자)로도
     # 내보내며(크레마클럽 목록 등), 링크 팔로우로 그런 url이 오면 상세로 인식돼야 한다.
     if GOODS_PATH in url.lower():
-        return _fetch_product(
+        return _parse_product_page(
             html,
             url,
-            checked_at,
+            settings.yes24_base_url,
             settings.fetch_max_chars,
             settings.fetch_find_lead_chars,
             links,
-            tool_context,
             find=find,
         )
-    return _fetch_generic(
+    return _parse_generic_page(
         html,
         url,
-        checked_at,
         settings.fetch_max_chars,
         settings.fetch_min_meaningful_chars,
         settings.fetch_find_lead_chars,
         links,
-        tool_context,
         find=find,
     )
 
 
-def _fetch_product(
+def register_page(page: dict, tool_context: ToolContext) -> dict:
+    """parse_page 중간 레코드를 세션 출처 레지스트리에 등록하고 도구 응답을 조립한다.
+
+    이벤트 루프에서 await 없이 호출한다(fetch_many는 순차 루프) — 등록 id의 원자·단조 계약.
+    """
+    if page.get("status") == "error":
+        return page
+    return _REGISTRARS[page["type"]](page, tool_context)
+
+
+def _parse_product_page(
     html: str,
     url: str,
-    checked_at: str,
+    base_url: str,
     max_chars: int,
     lead_chars: int,
     links: list[dict],
-    tool_context: ToolContext,
     find: str | None = None,
 ) -> dict:
-    """상품 상세 페이지를 파싱해 book_detail 결과를 조립한다.
+    """상품 상세 페이지를 파싱해 book_detail 중간 레코드를 만든다(순수 계산).
 
     상세 본문(줄거리·목차·서평)을 합쳐 max_chars 예산으로 담되, 예산을 넘으면
     notice와 동일하게 truncated=True·total_chars를 가법으로 명시한다("짧은 상세"로
@@ -201,7 +196,7 @@ def _fetch_product(
     재호출로 읽히게 한다.
     """
     try:
-        product = parse_product(html, base_url=get_settings().yes24_base_url)
+        product = parse_product(html, base_url=base_url)
     except ParseError as exc:
         logger.info(f"yes24_fetch url={url!r} status=error error_type=parse")
         return {
@@ -220,12 +215,6 @@ def _fetch_product(
         lead_chars=lead_chars,
     )
 
-    # parse_product는 title이 None이 아님을 보장하지 않으므로 인용 라벨용 방어값을 둔다.
-    title = product.get("title") or "제목 미상"
-
-    # 검색·브라우즈와 같은 필드 집합(product_fields) — 상세만 연 턴에서도 게이트가 대조할
-    # 접지 필드(publisher·rating·sale_price·pub_date…)를 빠짐없이 싣는다.
-    fields = product_fields(product)
     # 설명 블록이 하나도 없는 상품(굿즈·문구 등)은 페이지에 설명 본문 자체가 없다. 이때 빈
     # 문자열을 근거(snippet)로 등록하면 모델에 남는 신호가 "열어봤다"뿐이라, 열어보고도 못 본
     # 내용을 파라메트릭으로 채운다(실측 2026-08-03: 책갈피·독서대 답변의 '특징'이 전부 창작,
@@ -233,10 +222,34 @@ def _fetch_product(
     content = (
         "\n\n".join(block for block in (intro, toc, pub_review, *weekly_reviews) if block) or None
     )
-    # 상품 상세의 page 링크는 전 페이지 공통 GNB(국내도서·카테고리 트리 …)라 정보가 0이다
-    # (실측 48건 중 35건). 공지·목록 페이지에서는 같은 kind가 정책 내비의 근간이므로
-    # _fetch_generic은 전부 유지한다 — 걸러내는 기준은 페이지 유형이지 링크 문구가 아니다.
-    links = [link for link in links if link.get("kind") == "product"]
+    return {
+        "type": "book_detail",
+        "url": url,
+        # parse_product는 title이 None이 아님을 보장하지 않으므로 인용 라벨용 방어값을 둔다.
+        "title": product.get("title") or "제목 미상",
+        # 검색·브라우즈와 같은 필드 집합(product_fields) — 상세만 연 턴에서도 게이트가 대조할
+        # 접지 필드(publisher·rating·sale_price·pub_date…)를 빠짐없이 싣는다.
+        "fields": product_fields(product),
+        "content": content,
+        "intro": intro,
+        "toc": toc,
+        "pub_review": pub_review,
+        "weekly_reviews": weekly_reviews,
+        "info_tables": product.get("info_tables"),
+        # 상품 상세의 page 링크는 전 페이지 공통 GNB(국내도서·카테고리 트리 …)라 정보가 0이다
+        # (실측 48건 중 35건). 공지·목록 페이지에서는 같은 kind가 정책 내비의 근간이므로
+        # 공지 경로는 전부 유지한다 — 걸러내는 기준은 페이지 유형이지 링크 문구가 아니다.
+        "links": [link for link in links if link.get("kind") == "product"],
+        "trunc": trunc,
+        "find": find,
+    }
+
+
+def _register_product(page: dict, tool_context: ToolContext) -> dict:
+    """book_detail 중간 레코드 → 출처 등록 + 도구 응답."""
+    checked_at = now_checked_at()
+    url, title, fields, content = page["url"], page["title"], page["fields"], page["content"]
+    trunc: _DetailTrunc = page["trunc"]
     source_id = register_source(
         tool_context.state,
         title=title,
@@ -260,7 +273,7 @@ def _fetch_product(
 
     logger.info(
         f"yes24_fetch url={url!r} status=ok type=book_detail total={trunc.total_chars} "
-        f"truncated={trunc.truncated} detail_text={content is not None} find={find!r}"
+        f"truncated={trunc.truncated} detail_text={content is not None} find={page['find']!r}"
     )
     detail = {
         "status": "ok",
@@ -281,22 +294,22 @@ def _fetch_product(
         # 2026-07-21 정본 하네스에서 evidence_faithfulness가 4 → 0~2로 급락해 실측됐다.
         # 페이로드 절감은 evidence_segments·GNB 링크 제거만으로 충분하다.
         "snippet": content,
-        "intro": intro,
-        "toc": toc,
-        "pub_review": pub_review,
-        "weekly_reviews": weekly_reviews,
-        "links": links,
+        "intro": page["intro"],
+        "toc": page["toc"],
+        "pub_review": page["pub_review"],
+        "weekly_reviews": page["weekly_reviews"],
+        "links": page["links"],
         "checked_at": checked_at,
     }
-    if product.get("info_tables"):
+    if page["info_tables"]:
         # 가법 필드: 페이지의 정보 테이블(강연 정보의 모집기간·모집마감 상태, 상품별 배송비
         # 등 — selectors.PRODUCT_INFO_TABLES 주석)을 {캡션: {라벨: 값}} 그대로 싣는다.
         # 표가 없는 상품은 키 자체가 없다(관측 불가 표시 규약).
-        detail["info_tables"] = product["info_tables"]
+        detail["info_tables"] = page["info_tables"]
     if content is None:
         # 페이지는 열렸고 가격·평점 등 구조 필드는 실제로 관측됐으므로 status=error로 버리지
         # 않는다(그러면 정당한 가격 인용까지 사라진다). 대신 없는 것을 없다고 명시한다 —
-        # _fetch_generic의 error_type="empty"와 같은 정신이되, 관측된 사실은 살린 형태다.
+        # notice 경로의 error_type="empty"와 같은 정신이되, 관측된 사실은 살린 형태다.
         detail["message"] = (
             "이 상품 페이지에는 설명 본문(책소개·목차·출판사 서평·주간 우수리뷰)이 없습니다. "
             "이 상품에 대해 관측된 내용은 함께 실린 상품 정보 필드가 전부이며, 재질·디자인·"
@@ -306,7 +319,7 @@ def _fetch_product(
         # 가법 필드: 잘리지 않은 상세의 반환 형태는 기존과 동일하다.
         detail["truncated"] = True
         detail["total_chars"] = trunc.total_chars
-    if find:
+    if page["find"]:
         detail["find_found"] = trunc.find_found
     return detail
 
@@ -359,18 +372,16 @@ def _register_other_formats(
     return registered
 
 
-def _fetch_generic(
+def _parse_generic_page(
     html: str,
     url: str,
-    checked_at: str,
     max_chars: int,
     min_meaningful_chars: int,
     lead_chars: int,
     links: list[dict],
-    tool_context: ToolContext,
     find: str | None = None,
 ) -> dict:
-    """공지 등 비상품 페이지에서 범용 본문 텍스트를 추출한다.
+    """공지 등 비상품 페이지에서 범용 본문 텍스트를 추출해 notice 중간 레코드를 만든다(순수 계산).
 
     본문이 max_chars보다 길면 잘라 담되 **truncated=True·total_chars를 명시**해
     "짧은 페이지였음"으로 위장하지 않는다(빈 성공 위장 금지와 같은 정신 — 실측:
@@ -420,6 +431,22 @@ def _fetch_generic(
     else:
         window, find_found = window_around_find(text, max_chars, find, lead_chars)
 
+    return {
+        "type": "notice",
+        "url": url,
+        "title": title,
+        "window": window,
+        "links": links,
+        "trunc": _DetailTrunc(total_chars > max_chars, total_chars, find_found),
+        "find": find,
+    }
+
+
+def _register_generic(page: dict, tool_context: ToolContext) -> dict:
+    """notice 중간 레코드 → 출처 등록 + 도구 응답."""
+    checked_at = now_checked_at()
+    url, title, window = page["url"], page["title"], page["window"]
+    trunc: _DetailTrunc = page["trunc"]
     source_id = register_source(
         tool_context.state,
         title=title,
@@ -432,7 +459,7 @@ def _fetch_generic(
 
     logger.info(
         f"yes24_fetch url={url!r} status=ok type=notice chars={len(window)} "
-        f"total={total_chars} find={find!r}"
+        f"total={trunc.total_chars} find={page['find']!r}"
     )
     result = {
         "status": "ok",
@@ -445,16 +472,20 @@ def _fetch_generic(
         # text와 같은 내용이지만 공개 출처 DTO가 근거로 읽는 필드는 snippet이다(위 book_detail
         # 주석과 같은 이유 — done.sources는 이 도구 응답에서 조립된다).
         "snippet": window,
-        "links": links,
+        "links": page["links"],
         "checked_at": checked_at,
     }
-    if total_chars > max_chars:
+    if trunc.truncated:
         # 가법 필드: 잘리지 않은 페이지의 반환 형태는 기존과 동일하다.
         result["truncated"] = True
-        result["total_chars"] = total_chars
-    if find:
-        result["find_found"] = find_found
+        result["total_chars"] = trunc.total_chars
+    if page["find"]:
+        result["find_found"] = trunc.find_found
     return result
+
+
+# 중간 레코드 type → 등록기. 페이지 유형이 늘면 이 표만 는다(if 분기 없음).
+_REGISTRARS = {"book_detail": _register_product, "notice": _register_generic}
 
 
 class _DetailTrunc(NamedTuple):

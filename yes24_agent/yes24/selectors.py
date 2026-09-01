@@ -76,6 +76,35 @@ ITEM_RATING = ".rating_grade em.yes_b"
 ITEM_SALE_INDEX = "span.saleNum"
 ITEM_REVIEW_COUNT = "span.rating_rvCount em.txC_blue"
 
+# 큐레이션 해시태그. 아이템의 태그 행(`div.info_row.info_tag`) 안에 태그마다
+# `span.tag`(그 안의 앵커 텍스트가 "#내별의책장_스트레이키즈" 꼴)로 SSR된다.
+# `.tag`는 범용 어휘라 반드시 행 컨테이너로 스코프해 잡는다(`em.yes_b`와 같은 규약 —
+# 실측상 지금은 행 밖 `.tag`가 없지만, 컨테이너 없이 잡으면 그 보장이 관측이 아니라
+# 요행이 된다). 태그가 없는 상품은 행 자체가 렌더되지 않는다(fixture 24개 중 15개만 행 존재).
+ITEM_TAG = "div.info_tag span.tag"
+# '#' 접두는 마크업 장식이다(anchor href·클릭 로그의 태그 이름엔 '#'가 없다 — 2026-08-26
+# 실측). ITEM_FORMAT_LABEL_DECORATION(대괄호)과 같은 성격이라 벗긴 값을 관측한다.
+ITEM_TAG_DECORATION = "#"
+
+# 예약판매 배지. 상태 배지 `span.iconC.reserv`(안의 em.txt 텍스트 "예약판매")가 미출시
+# 예약 상품의 목록 신호다. li의 data-statgb="01"과 정확히 상관함을 실측(2026-08-26,
+# bestseller/newproduct fixture: 배지 8건 전부 statgb=01, statgb=01인데 배지 없는 행 0).
+# 그래도 판정은 배지로 한다 — statgb 값 어휘("01"·"02"·"03"…)의 의미 맵을 코드에 두면
+# 사이트 소유 어휘의 정적 맵(하드코딩 등급)이 된다. `.iconC`는 분철·이벤트·할인·기획전 등
+# 다른 배지도 쓰는 범용 어휘라 반드시 reserv 클래스와 함께 잡는다. 배지 없음은 "판매중"
+# 관측이 아니다 — statgb=03/04/05 행(다른 상태, 배지 없음)이 실재하므로, 그 구분은
+# _item_fields의 키 생략("관측 없음")이 표현한다(태그와 같은 규약).
+ITEM_PREORDER_BADGE = "span.iconC.reserv"
+
+# 판형 부가 피처("양장"·"3권"·"EPUB"·"스페셜 오더 / 반품 불가 / 베트남판" 등 — 구매 조언
+# 접지용). 제목 옆 `span.gd_feature` 안에 피처마다 `span.feature`로 SSR된다. `.feature`도
+# 범용 어휘라 컨테이너로 스코프한다(ITEM_TAG와 같은 규약). 같은 내용의 평문 사본이
+# `div.info_row.info_signature`에도 렌더되지만 파싱하지 않는다 — 전 fixture 실측
+# (2026-08-26): signature는 gd_feature의 진부분집합(gd_feature 없이 signature만 있는 행 0,
+# 값은 피처 일부가 잘려 나간 평문)이라 두 경로를 읽으면 같은 관측의 진실이 둘이 된다.
+# gd_feature의 대괄호는 컨테이너 직계 텍스트 장식이라 span.feature 선택만으로 배제된다.
+ITEM_FEATURE = "span.gd_feature span.feature"
+
 # 검색 결과 0건(HTML 구조 파손이 아닌 진짜 "결과 없음") 신호.
 # 실측(tests/fixtures/search_empty.html, "보라색코끼리의은하수여행기xyz" 무결과 쿼리)
 # 기준: `ul#yesSchList` 컨테이너 자체가 없는 대신 `div.noData`가 나타난다.

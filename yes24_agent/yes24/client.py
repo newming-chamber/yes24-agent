@@ -238,6 +238,7 @@ class Yes24Client:
         max_replacement_ratio: float,
         disallowed_paths: tuple[str, ...],
         error_redirect_param: str = "",
+        burst: int | None = None,
         cache: Yes24TextCache | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
@@ -248,13 +249,17 @@ class Yes24Client:
         self._max_redirects = max_redirects
         self._max_replacement_ratio = max_replacement_ratio
         self._disallowed_paths = tuple(p.lower() for p in disallowed_paths)
-        self._min_interval_s = 1.0 / rps if rps > 0 else 0.0
+        # 토큰 버킷 스로틀: 평균 `rps`는 불변이고, 유휴 뒤 최대 `burst`콜만 간격 없이 나간다.
+        # burst=1이면 옛 고정 간격(1/rps)과 동일하다. 미지정 시 버킷 크기 = rps(1초 예산).
+        self._rps = rps if rps > 0 else 0.0
+        self._burst = max(1, round(self._rps) if burst is None else burst)
+        self._tokens = float(self._burst)
         # 여러 클라이언트(채팅·매트릭스)가 같은 인스턴스를 주입받아 캐시를 공유할 수 있다.
         self._cache = cache
 
         self._semaphore = asyncio.Semaphore(concurrency)
         self._throttle_lock = asyncio.Lock()
-        self._last_request_at: float | None = None
+        self._last_refill_at: float | None = None
 
         # 리다이렉트는 httpx에 맡기지 않고 직접 따라간다 — follow_redirects=True면 다음 홉이
         # **이미 전송된 뒤에야** 검증할 수 있어(사후 차단) SSRF 요청 자체는 나가 버린다.
@@ -272,6 +277,7 @@ class Yes24Client:
         *,
         concurrency: int | None = None,
         rps: float | None = None,
+        burst: int | None = None,
         cache: Yes24TextCache | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> "Yes24Client":
@@ -296,6 +302,7 @@ class Yes24Client:
             max_replacement_ratio=settings.http_max_replacement_char_ratio,
             disallowed_paths=tuple(settings.yes24_disallowed_paths),
             error_redirect_param=settings.yes24_error_redirect_param,
+            burst=burst,
             cache=cache,
             transport=transport,
         )
@@ -458,17 +465,28 @@ class Yes24Client:
         raise AssertionError("_fetch_once 재시도 루프가 값을 반환하지 않고 종료되었습니다")
 
     async def _throttle(self) -> None:
-        """마지막 요청 시각 기준으로 최소 요청 간격(`1/rps`초)을 보장한다."""
-        if self._min_interval_s <= 0:
+        """토큰 버킷으로 평균 요청률 `rps`를 보장한다(버킷 크기 `burst`).
+
+        토큰은 `rps`/초로 리필되고 버킷 상한은 `burst`다. 유휴 뒤 첫 `burst`콜은 즉시 나가고
+        그 뒤로는 1/rps 간격이 된다 — 장기 평균은 고정 간격과 같고 분포만 앞으로 몰린다
+        (보강 검색 N콜 발사 스프레드 (N-1)/rps → 0). 락 안에서 리필·차감·대기가 직렬화되므로
+        동시 호출자도 토큰을 초과 소비하지 못한다.
+        """
+        if self._rps <= 0:
             return
         async with self._throttle_lock:
             now = time.monotonic()
-            if self._last_request_at is not None:
-                wait = self._min_interval_s - (now - self._last_request_at)
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                    now = time.monotonic()
-            self._last_request_at = now
+            if self._last_refill_at is not None:
+                self._tokens = min(
+                    float(self._burst), self._tokens + (now - self._last_refill_at) * self._rps
+                )
+            self._last_refill_at = now
+            if self._tokens < 1.0:
+                wait = (1.0 - self._tokens) / self._rps
+                await asyncio.sleep(wait)
+                self._last_refill_at = time.monotonic()
+                self._tokens = 1.0
+            self._tokens -= 1.0
 
     async def _sleep_backoff(self, attempt: int) -> None:
         """지수 백오프(`backoff_base_s * 2**attempt`)만큼 대기한다."""

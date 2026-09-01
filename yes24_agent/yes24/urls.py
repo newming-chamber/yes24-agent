@@ -43,7 +43,12 @@ SEARCH_ORDERS = frozenset(_ORDER_PARAM)
 
 
 def search_url(
-    base_url: str, query: str, section: str = "all", order: str = "", author_no: str = ""
+    base_url: str,
+    query: str,
+    section: str = "all",
+    order: str = "",
+    author_no: str = "",
+    size: int = 0,
 ) -> str:
     """Yes24 검색 URL을 조립한다.
 
@@ -57,9 +62,13 @@ def search_url(
             그 저자의 책만 나온다. 2026-08-18 라이브 실측: authorNo가 있으면 사이트가
             **query를 무시하고** 저자 스코프로 대체한다(엉뚱한 query+authorNo도 저자
             전집이 나옴) — AND 필터가 아니므로 키워드 오염으로 0건이 되는 함정은 없다.
+        size: 1페이지 결과 수(사이트 UI 옵션 24/40/80/120 실측 — 2026-08-26). 0 이하면
+            파라미터를 붙이지 않아 사이트 기본(24)을 따른다. 값은 호출자가 config에서
+            주입한다(이 모듈은 config 임포트 금지 — 모듈 docstring).
 
     Returns:
-        `/product/search?domain=...&query=...[&order=...][&authorNo=...]` 형태의 완전한 검색 URL.
+        `/product/search?domain=...&query=...[&order=...][&authorNo=...][&size=...]` 형태의
+        완전한 검색 URL.
     """
     try:
         domain = _SECTION_DOMAIN[section]
@@ -78,6 +87,8 @@ def search_url(
             raise ValueError(f"지원하지 않는 order: {order!r} (허용값: {allowed})") from exc
     if author_no:
         url += f"&authorNo={quote(author_no, safe='')}"
+    if size > 0:
+        url += f"&size={size}"
     return url
 
 

@@ -8,6 +8,7 @@ yes24_search와 마찬가지로 결과를 세션 state의 출처 레지스트리
 구조화된 error dict로 반환한다(fail-loud).
 """
 
+import asyncio
 import logging
 
 from google.adk.tools import ToolContext
@@ -25,6 +26,21 @@ from yes24_agent.yes24.parsers import (
 from yes24_agent.yes24.urls import BROWSE_SEED_URLS, browse_category_prefix, browse_url
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_browse_page(html: str, section: str, settings) -> tuple[list[dict], list[dict]]:
+    """코너 페이지 HTML → (상품 목록, 분야 내비). 순수 계산이라 워커 스레드에서 돈다.
+
+    분야 내비는 모델이 분야 번호를 발견하는 유일한 표면(추측 금지)이라 목록과 함께 관측한다.
+    """
+    parsed = parse_browse_list(
+        html,
+        base_url=settings.yes24_base_url,
+        section=section,
+        limit=settings.browse_result_limit,
+    )
+    categories = parse_category_links(html, limit=settings.browse_categories_limit)
+    return parsed, categories
 
 
 def _squash(name: str) -> str:
@@ -71,14 +87,9 @@ async def yes24_browse(
 ) -> dict:
     """Yes24의 특정 코너(목록)를 직접 열람한다. 분야별로 좁힐 수 있다.
 
-    검색어가 아니라 코너 전체를 랭킹·목록으로 보고 싶을 때 쓴다. 베스트셀러 순위,
-    새로 나온 책, 크레마클럽 구독 인기처럼 "요즘 잘 나가는 책"류 질문에 적합하다.
-
-    "요즘 소설"·"경제 신간"처럼 **특정 분야가 목적이면 category_name으로 한 번에**
-    좁힌다(예: category_name="소설") — 도구가 코너의 분야 내비에서 이름을 해석해 그
-    분야 목록까지 바로 가져온다. 이름이 정확히 하나로 해석되지 않으면 실제 분야
-    목록(categories/candidates)을 돌려주니, 그중 번호를 골라 category_number로 다시
-    호출한다. 분야 번호를 추측으로 만들지 말고 결과에서 본 번호만 사용한다.
+    특정 분야가 목적이면 category_name으로 한 번에 좁힌다 — 도구가 코너의 분야 내비에서
+    이름을 해석해 그 분야 목록까지 바로 가져온다. 분야 번호를 추측으로 만들지 말고
+    결과에서 본 번호만 사용한다.
 
     Args:
         section: 열람할 코너 코드. 허용값과 설명:
@@ -212,12 +223,8 @@ async def yes24_browse(
         }
 
     try:
-        parsed = parse_browse_list(
-            html,
-            base_url=settings.yes24_base_url,
-            section=section,
-            limit=settings.browse_result_limit,
-        )
+        # 목록·분야 내비 파싱은 순수 계산이라 한 워커 스레드에서 묶어 처리한다(H17 오프로드).
+        parsed, categories = await asyncio.to_thread(_parse_browse_page, html, section, settings)
     except ParseError as exc:
         logger.info(f"yes24_browse section={section!r} status=error error_type=parse")
         return {
@@ -255,9 +262,6 @@ async def yes24_browse(
                 **fields,
             }
         )
-
-    # 이 페이지가 노출한 분야 내비 — 모델이 분야 번호를 발견하는 유일한 표면(추측 금지).
-    categories = parse_category_links(html, limit=settings.browse_categories_limit)
 
     logger.info(
         f"yes24_browse section={section!r} category={category_number!r} "

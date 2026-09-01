@@ -29,24 +29,20 @@ logger = logging.getLogger(__name__)
 async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None) -> dict:
     """외부 웹 페이지의 전문을 읽어온다.
 
-    web_search 결과의 근거만으로 부족할 때, 특정 페이지 url을 넣어 본문 전체를 확보한다.
-    보통 web_search가 반환한 결과의 url을 그대로 전달한다. 주의: 추출 결과가 최신 렌더임을
-    보장하지 못한다(추출기 캐시 히트 가능, JS로 그리는 값은 본문에 없을 수 있음 — 장중 시세가
-    전일 마감 렌더로 온 실측 있음). 본문에 적힌 기준 시점을 확인해 그 시점의 관측으로만
-    쓰고, 시시각각 변하는 수치의 현재 값은 web_search로 확인한다. Yes24 상품·정책 페이지는
-    이 도구가 아니라 yes24_fetch로 읽는다.
+    주의: 추출 결과가 최신 렌더임을 보장하지 못한다(추출기 캐시 히트 가능, JS로 그리는
+    값은 본문에 없을 수 있음). 본문에 적힌 기준 시점을 확인해 그 시점의 관측으로만 쓰고,
+    시시각각 변하는 수치의 현재 값은 web_search로 확인한다.
 
     Args:
         url: 읽을 외부 페이지의 절대 URL(http/https). web_search 결과의 url을 그대로 넣는다.
         find: (선택) 본문에서 찾는 정보의 핵심 키워드. 긴 페이지는 앞부분만 잘려 오는데
             (truncated=True), 찾는 내용이 그 안에 없으면 이 키워드로 다시 호출하면
-            **키워드가 나오는 위치부터** 본문을 잘라 돌려준다(yes24_fetch와 동일).
+            **키워드가 나오는 위치부터** 본문을 잘라 돌려준다.
 
     Returns:
         성공 시 status="ok"와 인용용 source_id, title, text(본문, 상한 초과 시 절단),
         type="web", checked_at을 담은 dict. 본문이 상한보다 길어 잘렸으면 truncated=True와
-        total_chars(전체 길이)가 함께 온다 — 찾는 내용이 안 보이면 find 키워드로 재호출해
-        뒷부분을 읽는다. 실패 시 status="error"와 error_type
+        total_chars(전체 길이)가 함께 온다. 실패 시 status="error"와 error_type
         ("invalid_url"|"invalid_find"|"not_configured"|"empty"|"fetch"), message를 담은 dict.
     """
     settings = get_settings()

@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from urllib.parse import parse_qsl, urljoin, urlparse, urlsplit
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, SoupStrainer
 
 from yes24_agent.sources import KST
 from yes24_agent.yes24.client import allowed_domain, is_allowed_host, is_disallowed_path
@@ -29,12 +29,14 @@ from yes24_agent.yes24.selectors import (
     ITEM_AUTHOR_LINK,
     ITEM_AUTHOR_TOGGLE,
     ITEM_EBOOK_LABEL,
+    ITEM_FEATURE,
     ITEM_FORMAT_LABEL,
     ITEM_FORMAT_LABEL_DECORATION,
     ITEM_GOODS_NO_ATTR,
     ITEM_IMAGE,
     ITEM_IMAGE_ATTR,
     ITEM_LIST_PRICE,
+    ITEM_PREORDER_BADGE,
     ITEM_PUB_DATE,
     ITEM_PUBLISHER,
     ITEM_RANK,
@@ -42,6 +44,8 @@ from yes24_agent.yes24.selectors import (
     ITEM_REVIEW_COUNT,
     ITEM_SALE_INDEX,
     ITEM_SALE_PRICE,
+    ITEM_TAG,
+    ITEM_TAG_DECORATION,
     ITEM_TITLE_LINK,
     LINK_NOISE_PATH_MARKERS,
     LINK_NOISE_SUBDOMAINS,
@@ -104,9 +108,12 @@ _ITEM_FIELDS = (
     "page_count",
     "sale_index",
     "review_count",
+    "tags",
+    "features",
     "image_url",
     "is_ebook",
     "kind",
+    "is_preorder",
     "other_formats",
 )
 
@@ -161,7 +168,12 @@ def _parse_list(
     경우도 마찬가지로 빈 리스트. 컨테이너와 아이템이 있는데도 전부 변환 실패하면 역시
     ParseError(부분적 구조 변경 감지 — 빈 성공 위장 금지).
     """
-    soup = BeautifulSoup(html, "lxml")
+    soup = _container_soup(html, container_selector)
+
+    if soup.select_one(container_selector) is None:
+        # 부분 트리에 컨테이너가 없다 — 무결과·구조 파손 판정은 전체 트리로만 내린다
+        # (부분 파싱은 최적화일 뿐 판정 근거가 아니다: 무결과 페이지는 수 KB라 비용 없음).
+        soup = BeautifulSoup(html, "lxml")
 
     if soup.select_one(container_selector) is None:
         if soup.select_one(NO_RESULTS_MARKER) is not None:
@@ -190,6 +202,32 @@ def _parse_list(
         )
 
     return results
+
+
+# 목록 컨테이너 셀렉터의 `tag#id` 꼴 — 부분 파싱(_container_soup)이 셀렉터 정본에서 가지치기
+# 규칙을 **파생**하는 데 쓴다(셀렉터를 두 번 선언하지 않는다).
+_ID_SELECTOR_RE = re.compile(r"^([a-zA-Z][\w-]*)#([\w-]+)$")
+
+
+def _container_soup(html: str, container_selector: str) -> BeautifulSoup:
+    """목록 컨테이너 서브트리만 트리로 세운다(H17 부분 파싱, 2026-08-27 실측).
+
+    size=40 검색 HTML(1.1~1.3MB)은 전체 트리 세우기가 145~150ms로 파싱 비용의 3/4다. 목록은
+    문서 중간(~54% 지점)의 `ul#id` 하나라, (1) id 속성의 첫 등장을 감싼 태그 시작점 앞을
+    문자열로 잘라 토크나이저가 앞쪽 절반을 건너뛰게 하고, (2) SoupStrainer로 그 컨테이너
+    서브트리만 Tag로 만든다. 둘 다 **상한을 넘지 않는 근사**다 — 문자열 절단은 첫 등장이라
+    실제 컨테이너보다 뒤에 있을 수 없고, 가지치기가 컨테이너를 놓치면 호출자(_parse_list)가
+    전체 트리로 되돌아가 같은 셀렉터로 판정한다. 셀렉터·필드 계약은 불변이다.
+
+    `tag#id` 꼴이 아닌 셀렉터는 파생할 규칙이 없으므로 전체 트리를 그대로 세운다.
+    """
+    match = _ID_SELECTOR_RE.match(container_selector)
+    if match is None:
+        return BeautifulSoup(html, "lxml")
+    name, element_id = match.groups()
+    hit = re.search(rf"""\bid\s*=\s*["']?{re.escape(element_id)}(?![\w-])""", html, re.IGNORECASE)
+    start = max(html.rfind("<", 0, hit.start()), 0) if hit else 0
+    return BeautifulSoup(html[start:], "lxml", parse_only=SoupStrainer(name, id=element_id))
 
 
 def _parse_item(item, base_url: str) -> dict | None:
@@ -222,8 +260,38 @@ def _parse_item(item, base_url: str) -> dict | None:
         else {}
     )
 
+    # 큐레이션 해시태그(ITEM_TAG 주석). 태그가 없는 상품은 행 자체가 없어 "태그 0개"와
+    # "관측 불가"를 마크업이 구분해 주지 않는다 — 값이 없으면 키를 생략한다(_item_fields
+    # 규약: None 목록을 지어내지 않는다). 값은 '#' 장식만 벗긴 사이트 어휘 그대로다.
+    tags = [
+        tag
+        for el in item.select(ITEM_TAG)
+        if (tag := el.get_text(strip=True).lstrip(ITEM_TAG_DECORATION))
+    ]
+    observed_tags = {"tags": tags} if tags else {}
+
+    # 판형 부가 피처(ITEM_FEATURE 주석 — 양장·권수·EPUB·반품 불가 등 구매 조언 접지용).
+    # 태그와 같은 규약: 피처가 없는 상품은 컨테이너 자체가 없어 "0개"와 "관측 불가"를
+    # 마크업이 구분해 주지 않으므로 키를 생략한다. 값은 사이트 어휘 그대로 통과시킨다.
+    features = [
+        feature
+        for el in item.select(ITEM_FEATURE)
+        if (feature := _normalize_whitespace(el.get_text(" ", strip=True)))
+    ]
+    observed_features = {"features": features} if features else {}
+
+    # 예약판매 배지(ITEM_PREORDER_BADGE 주석 — data-statgb="01"과 정확 상관 실측). 배지를
+    # 관측했을 때만 True를 싣는다. 배지 없음은 "판매중"이 아니다(품절·절판 등 다른 statgb
+    # 상태도 배지가 없다) — False로 되채우지 않고 키를 생략한다(관측 없음 신호).
+    observed_preorder = (
+        {"is_preorder": True} if item.select_one(ITEM_PREORDER_BADGE) is not None else {}
+    )
+
     return _item_fields(
         **observed_format,
+        **observed_tags,
+        **observed_features,
+        **observed_preorder,
         goods_no=item.get(ITEM_GOODS_NO_ATTR),
         title=title,
         url=urljoin(base_url, href),
