@@ -574,7 +574,18 @@ def create_app() -> FastAPI:
     # Starlette가 405 반환) 기능 활성으로 판정한다 — 별도 HEAD 라우트를 만들지 않는다.
     if settings.overview_model:
 
-        @app.post("/overview")
+        @app.post(
+            "/overview",
+            responses=_SSE_RESPONSES,
+            response_class=StreamingResponse,
+            response_description="SSE 이벤트 스트림",
+            description=(
+                "검색어 하나로 검색결과 상단 AI 오버뷰를 SSE로 스트리밍한다. 프레임 구조는 "
+                "챗과 같고 `done.overview`에 본문·출처가 담긴다. 낼 것이 없으면 "
+                "`done.degraded`(예: no_results·irrelevant·timeout)만 오고 본문은 없다 — "
+                "프론트는 그 경우 패널을 조용히 접는다(에러 배너 금지).\n" + SSE_EVENT_CONTRACT
+            ),
+        )
         async def overview_endpoint(
             request: OverviewRequest,
             http_request: Request,
@@ -623,7 +634,13 @@ def create_app() -> FastAPI:
             warm_search(request.query, request.section, get_settings())
             return {"status": "warming"}
 
-        @app.post("/overview/continue")
+        @app.post(
+            "/overview/continue",
+            description=(
+                "오버뷰 본문을 채팅 세션의 어시스턴트 턴으로 시딩한다(이어가기). "
+                "응답은 JSON이며, 돌려받은 session_id로 `/chat/stream`을 이어 부른다."
+            ),
+        )
         async def overview_continue_endpoint(
             request: OverviewRequest,
             user: Annotated[AuthenticatedUser | None, Depends(get_authenticated_user)] = None,
