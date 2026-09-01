@@ -101,9 +101,6 @@ class TurnView(BaseModel):
         " 레지스트리의 최신 관측이다(같은 URL 재관측이 가격·평점을 갱신함 — checked_at 참조)"
     )
     cited_ids: list[int] = Field(description="본문 마커와 sources를 잇는 인용 id(등장 순서)")
-    grounding_supports: list[dict] = Field(
-        description="마커별 근거 세그먼트(호버 스니펫용) — done.grounding_supports와 동일 형식"
-    )
     feedback: TurnFeedbackState | None = Field(
         description="내가 이 턴에 남긴 피드백(없으면 null)"
     )
@@ -226,7 +223,6 @@ def _project_session_detail(
                 text=payload["text"] if raw["body"] else "",
                 sources=payload["sources"],
                 cited_ids=payload["cited_ids"],
-                grounding_supports=payload["grounding_supports"],
                 feedback=TurnFeedbackState(**feedback) if feedback else None,
             )
         )

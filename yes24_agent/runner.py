@@ -354,7 +354,7 @@ def _closeout_error_frames(
         # 본문 그대로 최소 마감한다(비파괴).
         logger.exception(f"실패 마감의 인용 조립마저 실패했습니다: {exc}")
         error_done = build_done_payload(
-            sources=[], used_source_ids=[], session_id=session_id, supports=[]
+            sources=[], used_source_ids=[], session_id=session_id
         )
         error_done["text"] = "".join(streamed)
     error_done["model"] = active_model

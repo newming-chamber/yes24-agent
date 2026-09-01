@@ -230,7 +230,6 @@ async def run_matrix_stream(
         return sse_done(
             {
                 "sources": all_visible,
-                "grounding_supports": [],
                 "session_id": resolved_session_id,
                 "models": {},
             }
@@ -312,8 +311,7 @@ async def run_matrix_stream(
                         if source.get("id") is not None
                     ],
                     "picks": [{"id": book_id} for book_id in book_ids],
-                    "grounding_supports": [],
-                    "session_id": resolved_session_id,
+                        "session_id": resolved_session_id,
                     "fallback": fallback,
                     "gate_reason": "empty" if fallback else None,
                 },

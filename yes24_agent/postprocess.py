@@ -319,9 +319,12 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
     # 근거가 아닌데, 그 근사 실패로 접지된 인용을 죽였다. 2026-07-15 게이트 스택 삭제와
     # 같은 근거·같은 결론이다.
     #
-    # `support_is_meaningful`은 남는다 — `build_done_payload`가 공개 grounding_supports를
-    # 그 술어로 거르므로, 빈 근거는 호버 스니펫에서 빠지되 **본문 마커는 살아 링크가 된다**.
-    # 4a의 실제 방어선은 무효 id 제거(위 분기)이고 그건 무손상이다.
+    # `support_is_meaningful`은 남는다 — runner가 `meaningful_support_count`로 실제 판정을
+    # 한다. 다만 **공개 페이로드의 `grounding_supports` 필드는 2026-09-01에 삭제했다**:
+    # 프론트 소비처가 0곳인데(인용 마커 호버 프리뷰는 13b83e2에서 이미 렌더된 출처 카드
+    # DOM — .title·.info.author·.info.price·.info.reason — 을 읽는다) done 페이로드에서
+    # 가장 큰 필드였고 본문을 통째로 한 번 더 실었다. "호버 스니펫용"이라던 종전 이 주석은
+    # 그 재구현 뒤로 사실이 아니었다.
     return CitationResult(
         text=final_text,
         supports=supports,
@@ -581,7 +584,6 @@ def finalize_answer(
         sources=sources,
         used_source_ids=citation.used_source_ids,
         session_id=session_id,
-        supports=citation.supports,
     )
     payload["text"] = citation.text
     return citation, payload
@@ -591,9 +593,13 @@ def build_done_payload(
     sources: list[dict],
     used_source_ids: list[int],
     session_id: str,
-    supports: list[dict],
 ) -> dict:
-    """`done` SSE 이벤트 payload를 만든다. 실제로 인용된 출처만, 등장 순서대로 포함한다."""
+    """`done` SSE 이벤트 payload를 만든다. 실제로 인용된 출처만, 등장 순서대로 포함한다.
+
+    `supports` 인자는 2026-09-01에 **삭제했다** — 공개 `grounding_supports` 필드를 만드는
+    유일한 소비자였고 그 필드가 사라졌다. 인자만 남기면 다음 호출부가 무엇을 넘겨야 하는지
+    묻게 되는 죽은 표면이 된다.
+    """
     by_id = {source["id"]: source for source in sources}
     ordered_sources = [
         project_public_source(by_id[source_id])
@@ -603,7 +609,6 @@ def build_done_payload(
 
     return {
         "sources": ordered_sources,
-        "grounding_supports": [support for support in supports if support_is_meaningful(support)],
         "session_id": session_id,
         # 인용된 출처 id(등장 순서). sources와 source 이벤트 모두 같은 cited-only 집합을 쓰며,
         # 프론트가 본문 마커와 출처 카드를 연결하는 표시용 메타다.

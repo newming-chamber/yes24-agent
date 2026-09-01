@@ -132,7 +132,7 @@ def sse_delta(text: str, col: int | None = None, extra: dict | None = None) -> s
 
 
 def sse_done(payload: dict, col: int | None = None) -> str:
-    """최종 출처 목록·grounding_supports·session_id를 담은 종료 이벤트."""
+    """최종 본문·출처 목록·session_id·turn_id를 담은 종료 이벤트(정확히 1회)."""
     return format_sse("done", _with_col(payload, col))
 
 
