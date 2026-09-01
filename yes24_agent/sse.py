@@ -14,7 +14,13 @@ import time
 SSE_EVENT_CONTRACT = """
 **응답은 JSON이 아니라 `text/event-stream`(SSE)이다.** `EventSource`나 스트리밍 fetch로 읽는다.
 
-각 프레임은 `event: <타입>\ndata: <JSON>\n\n` 꼴이고, 모든 `data`에 `ts`(epoch ms)가 붙는다.
+각 프레임은 아래 꼴이고, 모든 `data`에 `ts`(프레임 생성 시각, epoch ms)가 붙는다.
+
+```
+event: <타입>
+data: <JSON>
+                 ← 빈 줄이 프레임 끝
+```
 
 | event | data | 뜻 |
 |---|---|---|
