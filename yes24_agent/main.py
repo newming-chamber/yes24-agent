@@ -37,6 +37,13 @@ from yes24_agent.auth import (
 )
 from yes24_agent.config import Settings, ensure_google_api_key_env, get_settings
 from yes24_agent.matrix.matrix_runner import run_matrix_stream
+from yes24_agent.overview import (
+    ARM_YES24,
+    OVERVIEW_ARMS,
+    continue_overview,
+    start_overview,
+    warm_search,
+)
 from yes24_agent.rbti.profile import fetch_user_rbti
 from yes24_agent.runner import run_agent_stream
 from yes24_agent.session_service import SQLITE_DIALECT, db_dialect, persistence_mode
@@ -73,8 +80,10 @@ class _NoCacheStaticFiles(StaticFiles):
         resp.headers["Cache-Control"] = "no-cache"
         return resp
 
+
 # 로그인월이 켜져도 통과시키는 예외 경로(헬스체크·로그인 페이지·로그아웃 자체).
 _ACCESS_EXEMPT_PATHS = frozenset({"/health", "/login", "/logout"})
+
 
 def _branded_html(path: Path, app_config=None) -> HTMLResponse:
     """페이지 HTML의 브랜딩 마커를 persona 문안으로 치환해 반환한다.
@@ -208,6 +217,28 @@ class ChatRequest(BaseModel):
     # 무효값을 조용히 폴백하지 않고 400으로 끊는다 — 도구 구성은 답변의 근거 범위를 바꾸므로
     # "요청과 다른 구성으로 답했다"가 조용히 성립하면 안 된다(resolve_app fail-loud 계승).
     enabled_toolsets: list[str] | None = None
+
+
+class OverviewRequest(BaseModel):
+    """`/overview` 요청 본문(검색결과 AI 오버뷰)."""
+
+    query: NonBlankText
+    # 검색 범위. 빈 문자열·미지 값은 start_overview 입구가 urls.py 정본(SEARCH_SECTIONS)으로
+    # 최광역 범위에 정규화한다 — 캐시 키·도구가 같은 값을 보므로 임의 변형이 키를 가르지
+    # 않는다. 여기서는 길이만 기존 본문 상한으로 잠근다(무제한 문자열 입구 차단, query와 동일
+    # config 상한 재사용).
+    section: Annotated[
+        str, StringConstraints(max_length=get_settings().request_max_chars)
+    ] = ""
+    # 접지원 팔(테스트 하네스 — config.overview_compare_enabled). 빈 문자열 = 미지정 =
+    # 현행 기본 팔(overview.ARM_YES24)이라 **프로덕션 요청은 이 필드를 모른다**. 값이 실리면
+    # 라우트가 스위치와 화이트리스트(overview.OVERVIEW_ARMS)를 검사해 400으로 거른다 —
+    # 스위치 off면 우회 경로가 없다. /overview/warm·/overview/continue는 이 필드를 읽지
+    # 않는다: 워밍은 Yes24 검색 선행일 뿐이고(팔 무관), 이어가기는 기본 팔 응답의 씨앗만
+    # 잇는다(비교 팔 본문을 채팅으로 들고 가는 것은 하네스의 일이 아니다).
+    sources: Annotated[
+        str, StringConstraints(max_length=get_settings().request_max_chars)
+    ] = ""
 
 
 class MatrixRequest(BaseModel):
@@ -381,6 +412,22 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
             return FileResponse(_MATRIX_HTML, media_type="text/html")
 
 
+def _overview_arm(sources: str) -> str:
+    """요청의 sources를 접지원 팔로 해석한다 — 미지정은 현행 기본 팔(동작 불변).
+
+    비활성 스위치에서의 명시 지정은 **조용히 기본으로 강등하지 않고** 400으로 거절한다:
+    하네스가 꺼진 서버에 3팔을 던지면 세 패널이 같은 답을 그려 "차이 없음"이라는 거짓
+    관측이 되기 때문이다(빈 성공 위장 금지와 같은 계열).
+    """
+    if not sources:
+        return ARM_YES24
+    if not get_settings().overview_compare_enabled or sources not in OVERVIEW_ARMS:
+        raise HTTPException(
+            status_code=400, detail=f"지원하지 않는 접지원입니다: {sources!r}"
+        )
+    return sources
+
+
 def create_app() -> FastAPI:
     """FastAPI 앱을 조립한다."""
     settings = get_settings()
@@ -493,6 +540,83 @@ def create_app() -> FastAPI:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    # 검색결과 AI 오버뷰 — 챗과 같은 SSE 스트리밍(delta/reset/done), 본체는 overview.py.
+    # overview_model이 빈 문자열이면 라우트 미등록(404 — matrix_enabled 관례의 구조적 off 스위치).
+    # [프론트 의존 계약] 프론트는 HEAD /overview의 상태가 **404가 아니면**(POST만 등록이라
+    # Starlette가 405 반환) 기능 활성으로 판정한다 — 별도 HEAD 라우트를 만들지 않는다.
+    if settings.overview_model:
+
+        @app.post("/overview")
+        async def overview_endpoint(
+            request: OverviewRequest,
+            http_request: Request,
+            user: Annotated[AuthenticatedUser | None, Depends(get_authenticated_user)] = None,
+        ) -> StreamingResponse:
+            """검색어 하나로 상단 AI 오버뷰를 SSE로 스트리밍한다(캐시·예산·degraded는 overview.py).
+
+            인증은 챗과 동일 의존성 재사용 — 헤더 없으면 익명 허용, 키 비활성 401·한도
+            429·인증 DB 503은 의존성이 처리한다. start_overview가 스트림 시작 전에 캐시
+            조회·예산 선차단을 끝내므로 예산 429는 여기서 HTTP 상태로 나간다.
+            """
+            frames = await start_overview(
+                request.query, request.section, get_settings(), _overview_arm(request.sources)
+            )
+            # 데모 역할(세팅 잠금)에는 done의 모델명 은닉 — 챗과 같은 프레임 필터 재사용.
+            return StreamingResponse(
+                frames if settings_unlocked(http_request) else _hide_model_frames(frames),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        # 접지원 비교 하네스(테스트 전용) — 스위치가 켜졌을 때만 등록한다. 프론트는 이
+        # 라우트로 비교 토글 노출을 게이팅하고(HEAD 프로브와 같은 fail-closed 관례),
+        # 팔 목록·순서를 여기서 받아 패널을 만든다(JS가 팔 이름을 다시 적지 않는다).
+        if settings.overview_compare_enabled:
+
+            @app.get("/overview/compare")
+            async def overview_compare_arms() -> dict:
+                """비교 뷰가 그릴 접지원 팔 목록(화면 왼→오 순서)."""
+                return {"arms": list(OVERVIEW_ARMS)}
+
+        @app.post("/overview/warm", status_code=202)
+        async def overview_warm_endpoint(
+            request: OverviewRequest,
+            user: Annotated[AuthenticatedUser | None, Depends(get_authenticated_user)] = None,
+        ) -> dict:
+            """타이핑 중 검색 프리워밍(W1) — Yes24 검색만 백그라운드로 실행해 TextCache를
+            데우고 즉시 202를 돌려준다. LLM 콜 0·예산 미소모·결과 본문 미반환(워밍 전용 —
+            남용 상한은 검색 rps 리미터와 캐시 single-flight, 근거는 warm_search docstring).
+            인증은 오버뷰와 동일 의존성이고 게이트(overview_model)도 동일이라 off면 함께
+            404다.
+            """
+            warm_search(request.query, request.section, get_settings())
+            return {"status": "warming"}
+
+        @app.post("/overview/continue")
+        async def overview_continue_endpoint(
+            request: OverviewRequest,
+            user: Annotated[AuthenticatedUser | None, Depends(get_authenticated_user)] = None,
+        ) -> dict:
+            """캐시된 오버뷰 교환(질의+본문+출처 레지스트리)을 챗 세션의 첫 턴으로 시딩하고
+            session_id를 돌려준다 — 재생성·재조사 없음(LLM 콜 0, usage 기록 없음).
+
+            캐시 미스·만료·degraded면 404 — 프론트는 현행 폴백(새 대화 + 질의 자동 전송)을
+            탄다. 인증은 /overview와 동일 의존성이라 시딩 세션이 같은 user_id 밑에 생긴다
+            (챗 후속 턴의 세션 조회 키와 일치).
+            """
+            user_no = str(user.user_no) if user and user.user_no else None
+            session_id = await continue_overview(
+                request.query, request.section, get_settings(), user_no
+            )
+            if session_id is None:
+                raise HTTPException(
+                    status_code=404, detail="이어갈 오버뷰가 캐시에 없습니다."
+                )
+            return {"session_id": session_id}
 
     # 매트릭스 스트리밍 엔드포인트도 배포 게이팅(matrix_enabled) 대상 — off면 미등록(404).
     if settings.matrix_enabled:

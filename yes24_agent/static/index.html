@@ -481,6 +481,167 @@
       }
     }
   </style>
+  <style>
+    /* ── 검색결과 AI 오버뷰 데모(추가 블록, docs/overview-impl-spec §4) ──
+       기존 채팅 CSS는 한 줄도 수정하지 않는다 — 신규 셀렉터는 전부 ov- 접두 또는
+       .overview-mode 스코프. 색·강조는 기존 :root 변수만 사용(다크 모드 자동). */
+    /* 오버뷰 모드에선 채팅 UI를 CSS로만 숨긴다(상태 보존 — 돌아오면 대화 그대로). */
+    .app.overview-mode #conversation, .app.overview-mode .composer,
+    .app.overview-mode .landing-extras, .app.overview-mode .landing-spacer,
+    .app.overview-mode .jump-anchor, .app.overview-mode .persona-active { display: none; }
+    #overview-view {
+      /* 배치 상수 — 패널 예약 높이(스켈레톤→본문 교체 시 레이아웃 시프트 방지) */
+      --ov-panel-min-h: 150px;
+      /* 오버뷰 모드의 유일 세로 스크롤러(채팅 #conversation의 대응물 — 페이지는 여전히 무스크롤). */
+      flex: 1 1 auto; min-height: 0; overflow-y: auto;
+      padding: 18px; display: flex; flex-direction: column; gap: 14px;
+    }
+    /* 스크롤 컨테이너의 직계 자식은 shrink 금지 — 내용이 길면 짜부라지는 게 아니라 스크롤돼야
+       한다(안 걸면 패널이 눌려 칩 그리드가 밖으로 삐져나오고 접힘 본문은 0까지 붕괴, QA 실측). */
+    #overview-view > * { flex-shrink: 0; }
+    #overview-view[hidden] { display: none; }
+    #ov-form { display: flex; gap: 8px; }
+    #ov-query {
+      /* D8: 우측 패딩은 type=search의 브라우저 내장 ✕(지우기) 버튼 자리 — 장문 질의가
+         버튼 밑으로 파고들지 않게 한다(도그푸딩 14). */
+      flex: 1; border: 1px solid var(--border); border-radius: 12px; padding: 10px 34px 10px 12px;
+      font-size: 14.5px; font-family: inherit; background: var(--panel); color: var(--text);
+    }
+    #ov-query:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    #ov-run {
+      border: none; border-radius: 12px; padding: 0 16px; height: 42px; font-size: 14px;
+      font-weight: 600; cursor: pointer; background: var(--accent); color: #fff; font-family: inherit;
+      white-space: nowrap; /* 좁은 뷰포트에서 버튼 라벨 두 줄 낙하 방지(D2 동족) */
+    }
+    #ov-run:hover:not(:disabled) { filter: brightness(1.08); }
+    #ov-run:disabled { opacity: 0.4; cursor: default; }
+    #ov-panel {
+      min-height: var(--ov-panel-min-h);
+      background: var(--panel); border: 1px solid var(--accent); border-radius: 14px;
+      padding: 14px 16px; display: flex; flex-direction: column; gap: 10px;
+    }
+    #ov-panel[hidden] { display: none; }
+    /* ── 출처 = 검색결과 (2026-08-28 사용자 요구: "출처는 상하로 / 중복이잖아 하나만 해") ──
+       구글은 출처가 외부 사이트라 별도 패널이 값을 갖지만 우리 출처는 **검색 결과 그 자체**다.
+       출처 카드 열과 결과 목록은 같은 상품을 두 번 그렸으므로 카드 열을 삭제하고, 인용 [n]↔상품
+       연결은 결과 행 왼쪽의 번호 배지가 맡는다. 배치는 상하 한 열(본문 패널 위 / 결과 목록 아래).
+       머리줄은 결과 목록 라벨 — 패널(위젯) **밖**이라 임베드 계약에는 없는 데모 요소다. */
+    .ov-res-head {
+      display: flex; align-items: baseline; gap: 5px;
+      font-size: 11.5px; font-weight: 700; color: var(--muted); letter-spacing: 0.02em;
+    }
+    .ov-res-head[hidden] { display: none; }
+    .ov-head { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; color: var(--accent); }
+    /* 접힘·더보기 삭제 — 본문 상시 전체 노출 (2026-08-26 사용자 결정) */
+    #ov-body { font-size: 14.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+    /* md.js 블록 요소의 오버뷰 스코프 보정 — 기존 규칙이 .bubble 스코프라 여기선 최소만 재정의.
+       넓은 표·코드는 자기 래퍼 안에서만 가로 스크롤(무스크롤 계약 — 페이지·패널은 안 넘침). */
+    #ov-body .md-list { margin: 6px 0; padding-left: 1.5em; }
+    #ov-body .md-list li { margin: 2px 0; }
+    #ov-body .md-table-wrap, #ov-body pre.md-pre { overflow-x: auto; }
+    #ov-foot { font-size: 11.5px; color: var(--muted); }
+    #ov-foot:empty { display: none; }
+    /* 이어가기 버튼 — 뮤트 톤의 보조 버튼(기존 토큰만, 신규 색·변수 없음). */
+    #ov-continue {
+      align-self: flex-start; font-size: 12px; color: var(--muted); background: transparent;
+      border: 1px solid var(--border); border-radius: 8px; padding: 5px 12px;
+      cursor: pointer; font-family: inherit;
+    }
+    #ov-continue:hover { color: var(--text); border-color: var(--accent); }
+    /* 데모 전용 빈 상태(패널 밖) — 뮤트 톤 유지, 맨 텍스트 한 줄 대신 가벼운 컨테이너로
+       (D3, 도그푸딩 07·14 — 기존 토큰만: 점선 테두리 + 여백 + 중앙 정렬, 과장 금지). */
+    #ov-empty {
+      font-size: 13px; color: var(--muted); text-align: center;
+      border: 1px dashed var(--border); border-radius: 12px;
+      padding: 22px 16px; background: var(--panel);
+    }
+    #ov-empty .ov-empty-ico { display: block; font-size: 20px; margin-bottom: 6px; }
+    /* 검색결과 목록 흉내 — 실전 임베드의 li[data-goods-no] 스크롤·하이라이트 계약 재현용. */
+    /* ── 접지원 비교 하네스(테스트 전용 — config.overview_compare_enabled) ──
+       같은 질의를 웹 / Yes24 / 둘 다 세 접지원으로 **병렬** 생성해 나란히 세운다. 기본은 위의
+       단일 패널이고(프로덕션 UX 불변) 이 영역은 토글이 켜졌을 때만 뜬다. 넓은 폭은 3단, 좁은
+       폭은 세로 스택. 세로 스크롤러는 여전히 #overview-view 하나다 — 패널마다 스크롤러를 두면
+       이중 스크롤바가 되므로 패널은 내용만큼 자라고 페이지가 아니라 뷰가 스크롤한다. */
+    #ov-cmp-toggle {
+      display: flex; align-items: center; gap: 5px; white-space: nowrap;
+      font-size: 12px; color: var(--muted); cursor: pointer; user-select: none;
+    }
+    #ov-cmp-toggle[hidden] { display: none; }
+    /* 토글이 붙은 폼만 줄바꿈을 허용한다 — 좁은 폭에서 입력+버튼+토글이 한 줄에 안 들어가
+       #ov-form이 뷰 폭을 넘겨(390px 뷰포트에서 414px 실측) #overview-view에 의도치 않은
+       가로 스크롤을 만들었다. :has로 조건을 걸어 하네스가 꺼진 화면의 폼 규칙은 무수정이다. */
+    #ov-form:has(#ov-cmp-toggle:not([hidden])) { flex-wrap: wrap; }
+    #ov-compare { display: grid; gap: 12px; grid-template-columns: 1fr; align-items: start; }
+    #ov-compare[hidden] { display: none; }
+    @media (min-width: 900px) { #ov-compare { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+    .ov-cmp-arm {
+      min-width: 0; min-height: var(--ov-panel-min-h);
+      background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+      padding: 12px 14px; display: flex; flex-direction: column; gap: 8px;
+    }
+    /* 접힌 팔(degraded·실패)도 자리를 지운다 — 3열 비교에서 자리가 사라지면 나머지 둘이
+       재배치돼 눈으로 견주기가 깨진다(단일 패널의 G1 조용한 접힘과는 목적이 다르다). */
+    .ov-cmp-arm.ov-cmp-off { border-style: dashed; }
+    .ov-cmp-head {
+      display: flex; align-items: baseline; gap: 6px;
+      font-size: 12.5px; font-weight: 700; color: var(--accent);
+    }
+    .ov-cmp-time {
+      margin-left: auto; font-size: 11px; font-weight: 500; color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .ov-cmp-body { font-size: 13.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+    .ov-cmp-body .md-list { margin: 6px 0; padding-left: 1.4em; }
+    .ov-cmp-body .md-list li { margin: 2px 0; }
+    .ov-cmp-body .md-table-wrap, .ov-cmp-body pre.md-pre { overflow-x: auto; }
+    .ov-cmp-meta { font-size: 11.5px; color: var(--muted); }
+    .ov-cmp-meta:empty { display: none; }
+    /* 출처는 좁은 열이라 한 줄에 한 장 — .sources의 flex-wrap을 여기서만 grid로 덮는다. */
+    .ov-cmp-src { display: grid; grid-template-columns: 1fr; gap: 6px; overflow: visible; }
+    .ov-cmp-src .card { max-width: none; min-width: 0; }
+    /* 비교 모드에서만 3열이 설 폭을 준다 — 단일 패널은 채팅과 같은 폭(.app 760px)이다. */
+    .app.overview-mode.ov-compare-mode { max-width: 1560px; }
+    #ov-results { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+    #ov-results li {
+      display: flex; gap: 10px; align-items: flex-start; background: var(--panel);
+      border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+    }
+    #ov-results .cover {
+      flex: 0 0 auto; width: 44px; height: 62px; object-fit: cover; border-radius: 4px;
+      background: var(--border);
+    }
+    /* 인용 번호 배지 — 출처 카드 열을 지운 뒤 [n]↔상품 연결을 명시하는 유일한 표식.
+       .card .num과 같은 시각 토큰이지만 채팅 규칙은 무수정이라 오버뷰 스코프에 따로 둔다. */
+    #ov-results .ov-r-num {
+      flex: 0 0 auto; margin-top: 1px;
+      font-size: 11px; font-weight: 700; color: #fff; background: var(--accent);
+      border-radius: 5px; min-width: 18px; height: 18px; display: inline-flex;
+      align-items: center; justify-content: center; padding: 0 4px;
+    }
+    #ov-results li.web .ov-r-num { background: var(--web); }
+    #ov-results li[role="button"] { cursor: pointer; }
+    #ov-results li[role="button"]:hover { border-color: var(--accent); }
+    #ov-results .ov-r-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+    #ov-results .ov-r-title { font-size: 13.5px; font-weight: 600; color: var(--text); line-height: 1.4; }
+    #ov-results .ov-r-sub { font-size: 12px; color: var(--muted); }
+    #ov-results .ov-r-price { font-size: 12.5px; color: var(--accent); font-weight: 600; }
+    /* 인용 칩 클릭 → 결과 행 accent 링 하이라이트 — 기존 .card.flash와 같은 1회 애니메이션
+       패턴(클래스 재부여 + 리플로우 재시작). prefers-reduced-motion 전역 무력화가 자동 커버. */
+    #ov-results li.ov-hit { animation: ovHit 2s ease; }
+    @keyframes ovHit {
+      0% { box-shadow: 0 0 0 2px var(--accent); background: var(--accent-soft); }
+      100% { box-shadow: none; background: var(--panel); }
+    }
+    /* D2(도그푸딩 12): 좁은 뷰포트에서 헤더 필 버튼이 짜부라져 글자가 세로로 낙하하고
+       타이틀이 다줄 붕괴 — 내비를 한 줄 가로 스크롤로 전환(가장 비침습: 채팅 헤더 공용이라
+       기존 규칙 무수정, 이 미디어쿼리 **추가**만). */
+    @media (max-width: 520px) {
+      header { overflow-x: auto; }
+      header > * { flex-shrink: 0; }
+      header .spacer { flex-shrink: 1; }
+      header h1, header a.navlink { white-space: nowrap; }
+    }
+  </style>
 </head>
 <body>
   <div class="app landing" id="app">
@@ -489,6 +650,8 @@
       <h1>__BRAND_TITLE__</h1>
       <span class="spacer"></span>
       <a id="matrix-navlink" class="navlink" href="/matrix" title="한 질문을 16가지 독서 성향으로 비교해 보기" hidden>🧭 16유형 비교</a>
+      <!-- AI 오버뷰 데모 진입(추가 블록) — POST /overview 라우트가 살아 있을 때만(HEAD ≠ 404) 노출. -->
+      <a id="ov-navlink" class="navlink" href="#" role="button" title="검색결과 AI 오버뷰 데모" hidden>✨ AI 오버뷰</a>
       <select id="model-select" class="model-select" title="답변 생성 모델" aria-label="답변 모델 선택"></select>
       <details id="tools-menu" class="tools-menu">
         <summary title="이 브라우저에서 사용할 도구" aria-label="도구 선택">🧰 도구</summary>
@@ -541,6 +704,44 @@
       <div class="chips" id="chips"></div>
     </div>
     <div class="landing-spacer"></div>
+
+    <!-- ── 검색결과 AI 오버뷰 데모(추가 블록) — 온디맨드: "AI 오버뷰" 버튼(=form submit)만이
+         POST /overview를 부른다(자동 호출 경로 없음). degraded·4xx/5xx·네트워크 실패는 전부
+         패널 비표시로 수렴한다(G1 조용한 접힘 — 에러 배너·"미제공" 문구 금지). -->
+    <section id="overview-view" hidden aria-label="AI 오버뷰 데모">
+      <form id="ov-form">
+        <input id="ov-query" type="search" placeholder="Yes24 검색어를 입력하세요" autocomplete="off">
+        <button id="ov-run" type="submit">✨ AI 오버뷰</button>
+        <!-- 접지원 비교 하네스 진입(테스트 전용) — GET /overview/compare가 404가 아닐 때만
+             노출된다(단일 패널이 기본, 프로덕션 UX 오염 금지). -->
+        <label id="ov-cmp-toggle" hidden title="같은 질의를 웹 / Yes24 / 둘 다로 각각 생성해 나란히 비교">
+          <input id="ov-cmp-on" type="checkbox"> 3접지원 비교
+        </label>
+        <!-- 자동 노출 UX는 임베드 스니펫 단계 몫 — 데모는 버튼만 (2026-08-26 사용자 결정) -->
+      </form>
+      <div id="ov-panel" hidden>
+        <!-- 접힘·더보기 삭제 — 본문 상시 전체 노출 (2026-08-26 사용자 결정) -->
+        <div class="ov-head"><span>AI 오버뷰</span></div>
+        <div id="ov-skeleton" hidden><span class="typing"><i></i><i></i><i></i></span></div>
+        <div id="ov-body"></div>
+        <div id="ov-foot"></div>
+        <!-- 이어가기 진입점(네이버 AIB 하단 패턴) — 성공 렌더에서만 노출, 클릭은 새 채팅에
+             렌더된 오버뷰의 원 질의를 그대로 재전송한다(오버뷰 텍스트·출처 이월 없음). -->
+        <button id="ov-continue" type="button" hidden>💬 채팅으로 이어가기</button>
+      </div>
+      <!-- 데모 전용 빈 상태 — 패널의 조용한 접힘(G1)은 불변이고, 접힐 때 데모 화면이 통째로
+           비어 사용자가 혼란하지 않게 패널 **밖** 한 줄만 보여준다(임베드 위젯에는 없는 요소). -->
+      <div id="ov-empty" hidden><span class="ov-empty-ico">🔍</span>관련 상품을 찾지 못했어요. 다른 검색어로 시도해 보세요.</div>
+      <!-- 접지원 비교 영역(테스트 전용) — 패널은 JS가 서버 팔 목록(GET /overview/compare)
+           으로 만든다. 팔 이름·순서를 여기에 적지 않는 이유는 그 목록의 소유자가 서버이기
+           때문이다(같은 목록의 이중 소유 금지). -->
+      <div id="ov-compare" hidden></div>
+      <!-- 검색결과 목록 흉내: 실전 임베드의 li[data-goods-no] 하이라이트 계약(selectors.py 정본) 재현.
+           오버뷰의 출처는 이 목록 그 자체다 — 별도 출처 카드 열을 두지 않고(중복) 행의 번호 배지가
+           인용 [n]과의 연결을 명시한다. done.overview.sources는 인용된 출처만 담는다(공개 집합 한정). -->
+      <div class="ov-res-head" id="ov-res-head" hidden><span>인용된 검색결과</span><span id="ov-res-count"></span></div>
+      <ul id="ov-results"></ul>
+    </section>
   </div>
 
   <script type="module">
@@ -554,7 +755,7 @@
       AXES as RBTI_AXES, parseCode as parseRbtiCode, deriveCode, deriveAxisLabel,
       RBTI_STORAGE_KEY, MATRIX_HANDOFF_KEY,
     } from "/static/lib/rbti.js?v=1";
-    import { WEB_TYPES, coverUrl, isSafeUrl, safeOpen, formatPrice, makeCoverImg, relayTypingFocus } from "/static/lib/sources.js?v=1";
+    import { WEB_TYPES, coverUrl, isSafeUrl, safeOpen, formatPrice, makeCoverImg, relayTypingFocus, overviewIsRenderable } from "/static/lib/sources.js?v=1";
 
     // 16유형 비교(/matrix) 네비 링크는 서버 배포 게이팅(matrix_enabled)을 따라간다.
     // 기본 hidden(fail-closed: 프로드 숨김)이고, /matrix가 살아 있을 때만(200) 노출한다.
@@ -1762,6 +1963,628 @@
     syncLandingMode(null);
     input.focus();
     updateSendState(); // 초기: 입력이 비어 있으니 전송 비활성
+
+    // ── 시딩 턴 메타줄 정직화(순수 추가 — 위 기존 라인 무수정) ──
+    // 오버뷰에서 이어온 턴은 이 화면에서 잰 소요 시간이 없다(기존 finalize 재사용의 대가로
+    // elapsed 0 → "0.0초" 허위 표기). 시간 대신 정직한 유래 라벨로 메타줄을 다시 쓴다.
+    function markSeededMeta(msgEl, turn) {
+      const meta = msgEl && msgEl.querySelector(".meta");
+      if (!meta) return;
+      const n = Array.isArray(turn.sources) ? turn.sources.length : 0;
+      const parts = [];
+      if (n) parts.push(`출처 ${n}개`);
+      parts.push("오버뷰에서 이어옴");
+      if (turn.model) parts.push(`모델 ${turn.model}`);
+      meta.textContent = (n ? "🔍 " : "") + parts.join(" · ");
+    }
+    // 복원 경로 커버: 방금 restoreTranscript()가 그린 DOM에서 시딩 턴(snapshot의 seeded
+    // 플래그)만 골라 메타줄을 재작성한다. transcript 항목과 .msg 요소는 1:1 순서 대응
+    // (addUserMessage·createAssistantMessage 모두 msg 하나를 append)이라 인덱스로 짝짓는다.
+    {
+      const seededMsgs = conversation.querySelectorAll(".msg");
+      transcript.forEach((turn, i) => {
+        if (turn && turn.seeded && seededMsgs[i]) markSeededMeta(seededMsgs[i], turn);
+      });
+    }
+
+    // ── 오버뷰 "채팅으로 이어가기" 시딩 진입점(순수 추가 — 위 기존 라인 무수정) ──
+    // 오버뷰 모듈이 POST /overview/continue로 서버 세션을 시딩한 뒤 이 함수로 화면을 맞춘다.
+    // 렌더·저장은 전부 기존 복원 경로 재사용(addUserMessage·createAssistantMessage의
+    // addSource/finalize·toSnapshot·saveTranscript) — 별도 마크업·저장 형식 없음.
+    // 세션 교체와 transcript 교체를 이 함수 하나가 함께 해 화면=세션 불변식을 지킨다.
+    const SEED_ABORT_MAX_FRAMES = 120; // 진행 중 턴 중단 마감(finally) 대기 상한
+    window.yes24SeedChatFromOverview = async function (newSessionId, userText, turn) {
+      // 진행 중 전송이 있으면 중단하고, 그 턴의 마감(finally: 스냅샷 push·저장)이 끝난 뒤에
+      // 교체한다 — 끊긴 턴의 스냅샷이 시딩된 새 transcript에 섞여 영속되는 레이스 차단.
+      if (sending && controller) controller.abort();
+      for (let i = 0; i < SEED_ABORT_MAX_FRAMES && sending; i++) {
+        await new Promise((r) => requestAnimationFrame(r));
+      }
+      sessionId = newSessionId;
+      try { sessionStorage.setItem(CHAT_SESSION_KEY, sessionId); } catch (e) {}
+      document.title = baseDocTitle; // 이전 세션 제목이 이어가기 대화에 남지 않게
+      transcript = [];
+      conversation.textContent = "";
+      addUserMessage(userText);
+      transcript.push({ role: "user", text: userText });
+      const asst = createAssistantMessage();
+      (Array.isArray(turn.sources) ? turn.sources : []).forEach((s) => asst.addSource(s));
+      asst.finalize(
+        { text: turn.text || "", cited_ids: turn.cited_ids || [], model: turn.model || "" },
+        0
+      );
+      const snap = asst.toSnapshot();
+      if (snap) transcript.push(snap);
+      // 시딩 턴 표시: 메타줄의 "0.0초"(재사용 elapsed)를 유래 라벨로 교체하고, 스냅샷에
+      // seeded 플래그를 남겨 새로고침 복원 때도 같은 재작성이 적용되게 한다(위 복원 커버).
+      if (snap) {
+        snap.seeded = true;
+        markSeededMeta(conversation.lastElementChild, snap);
+      }
+      saveTranscript();
+      syncLandingMode(null); // 메시지가 놓였으니 대화 상태(하단 컴포저)로.
+      input.focus();         // 자동 전송 없음 — 후속 질문은 사용자가 바로 타이핑.
+    };
+  </script>
+
+  <script type="module">
+    // ── 검색결과 AI 오버뷰 데모(추가 모듈, docs/overview-impl-spec §4) ──
+    // 기존 채팅 스크립트 블록은 무수정 — 모듈 스코프가 분리돼 전역 충돌이 없고, 공용 lib
+    // import는 브라우저가 캐시를 공유한다. 온디맨드 계약: 아래 submit 핸들러가 POST /overview의
+    // **유일한** 호출 지점이다(자동 호출 경로 0 — 사용자 확정 요구 1).
+    import { renderBody as ovRenderBody } from "/static/lib/md.js?v=1";
+    import { readEventStream as ovReadEventStream } from "/static/lib/sse.js?v=1";
+    import { WEB_TYPES, coverUrl, isSafeUrl, safeOpen, formatPrice, makeCoverImg, overviewIsRenderable } from "/static/lib/sources.js?v=1";
+
+    const ovApp = document.getElementById("app");
+    const ovNav = document.getElementById("ov-navlink");
+    const ovView = document.getElementById("overview-view");
+    const ovForm = document.getElementById("ov-form");
+    const ovQuery = document.getElementById("ov-query");
+    const ovRun = document.getElementById("ov-run");
+    const ovPanel = document.getElementById("ov-panel");
+    const ovSkeleton = document.getElementById("ov-skeleton");
+    const ovBody = document.getElementById("ov-body");
+    const ovResHead = document.getElementById("ov-res-head");
+    const ovResCount = document.getElementById("ov-res-count");
+    const ovFoot = document.getElementById("ov-foot");
+    const ovEmpty = document.getElementById("ov-empty");
+    const ovResults = document.getElementById("ov-results");
+    const ovContinue = document.getElementById("ov-continue");
+
+    // 마지막 성공 렌더의 질의·done payload — 이어가기 씨앗의 단일 진실. 클릭 시점의 입력창
+    // 값이 아니라 렌더된 오버뷰가 실제 서버에 보낸 질의·받은 정본을 잇는다(렌더 후 수정 무관).
+    let ovLastQuery = "";
+    let ovLastDone = null;
+
+    // G1 조용한 접힘 + 데모 전용 빈 상태 — 패널(위젯 계약)은 조용히 접고, 데모 페이지에서만
+    // 화면이 통째로 비지 않게 패널 밖 뮤트 한 줄을 켠다. 검색결과 행(#ov-results)은 손대지
+    // 않는다(있으면 그대로 보인다).
+    function ovCollapsePanel() {
+      ovPanel.hidden = true;
+      ovEmpty.hidden = false;
+    }
+
+    // 노출 게이팅 — revealMatrixLinkIfEnabled와 같은 fail-closed 방식. HEAD 프로브 계약(§1.1):
+    // 라우트 등록 시 Starlette가 405를 주므로 "404가 아니면" 기능 활성으로 판정한다.
+    (function revealOverviewLinkIfEnabled() {
+      if (!ovNav) return;
+      fetch("/overview", { method: "HEAD" })
+        .then((res) => { if (res.status !== 404) ovNav.hidden = false; })
+        .catch(() => { /* 실패 시 숨김 유지(fail-closed) */ });
+    })();
+
+    // 뷰 전환 — 채팅 DOM은 CSS(.overview-mode)로만 숨긴다(상태 보존: 돌아오면 대화 그대로).
+    const OV_LINK_LABEL = "✨ AI 오버뷰";
+    const OV_BACK_LABEL = "💬 채팅으로";
+    ovNav.addEventListener("click", (e) => {
+      e.preventDefault();
+      const on = !ovApp.classList.contains("overview-mode");
+      ovApp.classList.toggle("overview-mode", on);
+      ovView.hidden = !on;
+      ovNav.textContent = on ? OV_BACK_LABEL : OV_LINK_LABEL;
+      if (on) ovQuery.focus();
+    });
+
+    // 접힘·더보기 삭제 — 본문 상시 전체 노출 (2026-08-26 사용자 결정)
+
+    // 출처 칩 — 채팅 makeCard와 동일 DOM 구조·클래스(.card/.num/.title/.info)를 조립한다
+    // (함수 자체는 채팅 모듈 내부라 import 불가 — 구조·클래스만 동일하게, 스펙 §4.4).
+    // 타입 뱃지는 생략 — 오버뷰 출처는 전부 search_result(스펙 §1.3)라 정보량 0.
+    // 단일 패널은 이 카드를 쓰지 않는다(출처 = 아래 검색결과 그 자체 — 중복 삭제). 결과 목록이
+    // 없는 3접지원 비교 하네스만 남은 사용처다.
+    function makeOvCard(src) {
+      const isWeb = WEB_TYPES.has(src.type);
+      const card = document.createElement("div");
+      card.className = isWeb ? "card web" : "card";
+      const cover = coverUrl(src);
+      if (cover) card.appendChild(makeCoverImg(cover, "cover"));
+      const main = document.createElement("div");
+      main.className = "card-main";
+      const top = document.createElement("div");
+      top.className = "top";
+      const num = document.createElement("span");
+      num.className = "num";
+      num.textContent = src.id;
+      top.append(num);
+      const title = document.createElement("div");
+      title.className = "title";
+      title.textContent = src.title || "(제목 없음)";
+      main.append(top, title);
+      if (!isWeb) {
+        if (src.author) {
+          const au = document.createElement("div");
+          au.className = "info author";
+          au.textContent = src.author;
+          main.append(au);
+        }
+        const price = formatPrice(src);
+        if (price) {
+          const pr = document.createElement("div");
+          pr.className = "info price";
+          pr.textContent = price;
+          main.append(pr);
+        }
+      }
+      card.appendChild(main);
+      if (isSafeUrl(src.url)) {
+        const open = () => safeOpen(src.url);
+        card.tabIndex = 0;
+        card.setAttribute("role", "button");
+        card.addEventListener("click", open);
+        card.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
+        });
+      }
+      return card;
+    }
+
+    // 검색결과 행 흉내 — goods_no가 있는 항목만 data 속성을 얹는다(하이라이트 앵커).
+    function makeOvRow(src) {
+      const li = document.createElement("li");
+      if (src.goods_no != null && src.goods_no !== "") li.dataset.goodsNo = src.goods_no;
+      if (WEB_TYPES.has(src.type)) li.className = "web";
+      // 인용 번호 배지 — 칩 [n]과 이 행이 같은 출처임을 잇는 표식(출처 카드 열의 대체).
+      const num = document.createElement("span");
+      num.className = "ov-r-num";
+      num.textContent = src.id;
+      li.appendChild(num);
+      const cover = coverUrl(src);
+      if (cover) li.appendChild(makeCoverImg(cover, "cover"));
+      const main = document.createElement("div");
+      main.className = "ov-r-main";
+      const title = document.createElement("div");
+      title.className = "ov-r-title";
+      title.textContent = src.title || "(제목 없음)";
+      main.appendChild(title);
+      const subText = [src.author, src.rating ? "★ " + src.rating : null]
+        .filter(Boolean).join(" · ");
+      if (subText) {
+        const sub = document.createElement("div");
+        sub.className = "ov-r-sub";
+        sub.textContent = subText;
+        main.appendChild(sub);
+      }
+      const price = formatPrice(src);
+      if (price) {
+        const pr = document.createElement("div");
+        pr.className = "ov-r-price";
+        pr.textContent = price;
+        main.appendChild(pr);
+      }
+      li.appendChild(main);
+      // 상품 열기 — 삭제한 출처 카드가 갖던 어포던스를 행이 그대로 물려받는다(같은 유틸).
+      if (isSafeUrl(src.url)) {
+        const open = () => safeOpen(src.url);
+        li.tabIndex = 0;
+        li.setAttribute("role", "button");
+        li.addEventListener("click", open);
+        li.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
+        });
+      }
+      return li;
+    }
+
+    // 연속 동일 번호 마커의 표시 병합 — 채팅 collapseRepeatMarkers와 같은 규칙·같은
+    // .marker-dup 클래스(함수는 채팅 클로저 내부라 import 불가 — 표시 전용 후처리).
+    function ovCollapseRepeatMarkers(el) {
+      const markers = [...el.querySelectorAll(".marker")];
+      markers.forEach((m, i) => {
+        m.classList.toggle(
+          "marker-dup",
+          i + 1 < markers.length && markers[i + 1].textContent === m.textContent
+        );
+      });
+    }
+
+    // 이번 렌더의 출처(id → src). 마커 클릭 → goods_no로 결과 행을 찾아 하이라이트한다
+    // (외부 이동 대신 클릭을 페이지 내 결과로 되돌리는 우리 강점 — 스펙 §4.4).
+    let ovSrcById = new Map();
+    function ovHighlightRow(sid) {
+      const src = ovSrcById.get(String(sid));
+      if (!src || src.goods_no == null) return;
+      const row = ovResults.querySelector(
+        'li[data-goods-no="' + CSS.escape(String(src.goods_no)) + '"]'
+      );
+      if (!row) return;
+      row.scrollIntoView({ behavior: "smooth", block: "center" });
+      row.classList.remove("ov-hit");
+      void row.offsetWidth; // 리플로우 강제 → 애니메이션 재시작(.card.flash 패턴)
+      row.classList.add("ov-hit");
+    }
+
+    function renderOverview(overview) {
+      ovSrcById = new Map();
+      const sources = Array.isArray(overview.sources) ? overview.sources : [];
+      sources.forEach((src) => {
+        ovSrcById.set(String(src.id), src);
+        ovResults.appendChild(makeOvRow(src));
+      });
+      // 본문 렌더 = 공용 md.js 단일 콜(신규 정규식 금지). citationUrl은 빈 문자열 — 마커를
+      // 외부 링크가 아닌 <sup role=button> 칩으로 만들어 클릭을 결과 행으로 되돌린다.
+      ovRenderBody(ovBody, overview.text || "", {
+        isCitation: (sid) => ovSrcById.has(String(sid)),
+        citationUrl: () => "",
+        onMarker: ovHighlightRow,
+      });
+      ovCollapseRepeatMarkers(ovBody);
+      // 결과 머리줄은 실제 출처가 있을 때만(무출처면 목록 자체가 비어 라벨이 거짓말이 된다).
+      ovResCount.textContent = sources.length ? String(sources.length) : "";
+      ovResHead.hidden = sources.length === 0;
+      // 면책 1줄 + 관측 시점 — 표기이지 신선도 방어의 대체물이 아니다(TTL은 백엔드 몫).
+      // **가장 오래된** 출처가 전체를 대표한다(2026-08-31 적대 감사): 종전엔 sources[0]을 썼는데
+      // 행 캐시(600s)에서 온 출처와 상세 보강으로 갓 관측된 출처가 섞이면 첫 번째가 어느 쪽이냐에
+      // 따라 **더 신선한 시각으로 전체를 대표**할 수 있었다. 신선도 표기가 정직성의 한계인 이상
+      // (config 응답 TTL 주석) 대표값은 낙관이 아니라 보수여야 한다.
+      const checked = sources
+        .map((src) => src && src.checked_at)
+        .filter(Boolean)
+        .sort()[0];
+      ovFoot.textContent = "AI가 만든 요약으로 오류가 있을 수 있어요"
+        + (checked ? " · " + checked + " 확인" : "");
+    }
+
+    let ovBusy = false;
+    ovForm.addEventListener("submit", async (e) => {
+      e.preventDefault(); // 온디맨드 트리거 — 이 핸들러가 POST /overview의 유일한 호출 지점
+      const query = ovQuery.value.trim();
+      if (!query || ovBusy) return;
+      // 비교 모드 조기 분기 — 아래 단일 패널 경로는 한 줄도 바뀌지 않는다(테스트 하네스가
+      // 프로덕션 경로에 얹히지 않게 하는 유일한 접점).
+      if (ovCmpEnabled && ovCmpOn.checked) {
+        ovBusy = true;
+        ovRun.disabled = true;
+        try { await ovRunCompare(query); }
+        finally { ovBusy = false; ovRun.disabled = false; }
+        return;
+      }
+      ovBusy = true;
+      ovRun.disabled = true;
+      // 이전 결과 정리 + 스켈레톤 표시. 패널 min-height(CSS 예약)로 레이아웃 시프트를 막는다.
+      ovBody.textContent = "";
+      ovResCount.textContent = "";
+      ovResHead.hidden = true;
+      ovFoot.textContent = "";
+      ovResults.textContent = "";
+      ovContinue.hidden = true;
+      ovEmpty.hidden = true;
+      ovPanel.hidden = false;
+      ovSkeleton.hidden = false;
+      try {
+        // 챗 fetch 관례 동일: 커스텀 헤더 없음, 동일 오리진이라 로그인월 쿠키 자동 동반.
+        // section은 데모에서 생략(서버 빈 문자열 기본).
+        const res = await fetch("/overview", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query }),
+        });
+        // SSE 소비 — 챗과 같은 공용 파서(lib/sse.js, 비2xx는 여기서 throw → catch의 G1 접힘).
+        // delta는 수신 즉시 누적 렌더(스켈레톤은 첫 delta에 제거), reset이면 버퍼를 비우고
+        // 재누적, done이 정본이다(최종 렌더는 아래 renderOverview 경로).
+        let ovStreamText = "";
+        let ovDone = null;
+        await ovReadEventStream(res, (event, data) => {
+          if (event === "delta") {
+            ovSkeleton.hidden = true;
+            ovStreamText += data.text || "";
+            ovBody.textContent = ovStreamText;
+          } else if (event === "reset") {
+            ovStreamText = "";
+            ovBody.textContent = "";
+          } else if (event === "done") {
+            ovDone = data;
+          }
+        });
+        const ok = overviewIsRenderable(ovDone);
+        if (ok) {
+          renderOverview(ovDone.overview); // renderBody가 스트림 평문을 정본으로 교체
+          ovLastQuery = query;   // 성공 렌더에서만 세팅(세팅 지점 1곳) — 이어가기 씨앗
+          ovLastDone = ovDone;   // 이어가기 화면 주입용 정본(표시 번호 payload)
+          ovContinue.hidden = false;
+        }
+        // G1 조용한 접힘 — degraded 3종·error 프레임·overview null·done 미도착 전부 패널
+        // 비표시(배너 금지). 중간 delta가 보였더라도 done 시점 판정이 정본이다.
+        else ovCollapsePanel();
+      } catch (err) {
+        ovCollapsePanel(); // 네트워크 예외·4xx/5xx·스트림 절단도 같은 접힘(G1)
+      } finally {
+        ovSkeleton.hidden = true;
+        ovBusy = false;
+        ovRun.disabled = false;
+      }
+    });
+
+    // 자동 노출 UX는 임베드 스니펫 단계 몫 — 데모는 버튼만 (2026-08-26 사용자 결정)
+
+    // ── 접지원 비교 하네스(테스트 전용 — 서버 config.overview_compare_enabled) ──
+    // 같은 질의를 세 접지원(웹 / Yes24 / 둘 다)으로 **병렬** 요청해 나란히 렌더한다. 목적은
+    // "웹을 오버뷰에 넣는 게 나은가"를 논쟁이 아니라 화면에서 판단하는 것이라, 팔마다 본문·
+    // 출처·타이밍(첫 delta·완료)·인용 수·출처 타입 분포를 같은 자리에 붙여 둔다.
+    // 렌더 조립은 단일 패널과 **같은 부품**을 쓴다(makeOvCard·ovRenderBody·
+    // ovCollapseRepeatMarkers) — renderOverview는 고정 id에 묶여 있어 3회 호출이 불가하므로
+    // 부품 재사용이 중복을 피하는 최대치다(마커 클릭 → 결과 행 하이라이트는 비교 뷰에
+    // 결과 목록이 없어 제외).
+    const ovCompare = document.getElementById("ov-compare");
+    const ovCmpToggle = document.getElementById("ov-cmp-toggle");
+    const ovCmpOn = document.getElementById("ov-cmp-on");
+    // 팔 표시 라벨(표시 문구는 프론트 몫 — 팔 목록·순서의 소유자는 서버다).
+    const OV_ARM_LABELS = { web: "🌐 웹", yes24: "📚 Yes24", both: "🔀 둘 다" };
+    let ovCmpEnabled = false;
+    let ovCmpArms = [];
+    // 심사관용 원시 기록 — 마지막 비교 실행의 팔별 본문·출처·타이밍(compare_raw.json).
+    // 테스트 하네스 전용 전역이라 프로덕션 경로는 이 값을 읽지 않는다.
+    window.__ovCompareRaw = null;
+
+    (function revealCompareToggleIfEnabled() {
+      fetch("/overview/compare")
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (!data || !Array.isArray(data.arms) || !data.arms.length) return;
+          ovCmpEnabled = true;
+          ovCmpArms = data.arms;
+          ovCmpToggle.hidden = false;
+        })
+        .catch(() => { /* 실패 시 숨김 유지(fail-closed — 기존 HEAD 프로브와 같은 관례) */ });
+    })();
+
+    // 토글 자체는 화면 폭만 바꾼다 — 실행은 제출 시점에만 일어난다(온디맨드 계약 불변).
+    ovCmpOn.addEventListener("change", () => {
+      ovApp.classList.toggle("ov-compare-mode", ovCmpOn.checked);
+      if (!ovCmpOn.checked) ovCompare.hidden = true;
+    });
+
+    // 팔 패널 1개 조립 — 반환 객체가 이 패널의 렌더 접점 전부다(고정 id 없음 → 3회 호출 가능).
+    function ovBuildArmPanel(arm) {
+      const box = document.createElement("section");
+      box.className = "ov-cmp-arm";
+      const head = document.createElement("div");
+      head.className = "ov-cmp-head";
+      const label = document.createElement("span");
+      label.textContent = OV_ARM_LABELS[arm] || arm;
+      const time = document.createElement("span");
+      time.className = "ov-cmp-time";
+      const skeleton = document.createElement("span");
+      skeleton.className = "typing";
+      skeleton.append(document.createElement("i"), document.createElement("i"), document.createElement("i"));
+      head.append(label, time);
+      const body = document.createElement("div");
+      body.className = "ov-cmp-body";
+      const meta = document.createElement("div");
+      meta.className = "ov-cmp-meta";
+      const sources = document.createElement("div");
+      sources.className = "sources ov-cmp-src";
+      box.append(head, skeleton, body, meta, sources);
+      return { arm, box, time, skeleton, body, meta, sources };
+    }
+
+    // done payload를 패널에 렌더한다 — 단일 패널 renderOverview와 같은 부품·같은 순서.
+    function ovRenderArm(panel, done, timing) {
+      panel.skeleton.remove();
+      const overview = done && done.overview;
+      const sources = (overview && Array.isArray(overview.sources)) ? overview.sources : [];
+      const ids = new Set(sources.map((src) => String(src.id)));
+      panel.time.textContent = (timing.first != null ? "첫 " + timing.first + "ms · " : "")
+        + "완료 " + timing.done + "ms";
+      if (!overviewIsRenderable(done) || !ids.size) {
+        // 팔이 접혔다 — 자리는 남기고 사유만 적는다(3열 비교에서 자리가 사라지면 나란히
+        // 견주기가 깨진다). degraded 값은 서버가 만든 기존 구분 그대로다.
+        panel.box.classList.add("ov-cmp-off");
+        panel.body.textContent = "";
+        panel.meta.textContent = "접힘 · " + ((done && done.degraded) || "결과 없음");
+        return;
+      }
+      panel.body.textContent = "";
+      ovRenderBody(panel.body, overview.text || "", {
+        isCitation: (sid) => ids.has(String(sid)),
+        citationUrl: () => "",
+        onMarker: () => {},
+      });
+      ovCollapseRepeatMarkers(panel.body);
+      for (const src of sources) panel.sources.appendChild(makeOvCard(src));
+      // 관전 포인트를 숫자로 — 인용 수 + 출처 타입 분포(웹 출처가 상품 사실을 주장하는지는
+      // 본문과 이 분포를 함께 보면 드러난다).
+      const byType = {};
+      for (const src of sources) byType[src.type] = (byType[src.type] || 0) + 1;
+      panel.meta.textContent = "인용 " + (overview.cited_ids || []).length + "개 · 출처 "
+        + Object.keys(byType).map((t) => t + " " + byType[t]).join(" / ");
+    }
+
+    // 팔 1개 실행 — 단일 패널과 같은 SSE 소비 계약(delta 누적 / reset 비움 / done 정본).
+    async function ovRunArm(query, panel) {
+      const started = performance.now();
+      const timing = { first: null, done: 0 };
+      let streamText = "";
+      let done = null;
+      try {
+        const res = await fetch("/overview", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, sources: panel.arm }),
+        });
+        await ovReadEventStream(res, (event, data) => {
+          if (event === "delta") {
+            if (timing.first == null) {
+              timing.first = Math.round(performance.now() - started);
+              panel.skeleton.remove();
+            }
+            streamText += data.text || "";
+            panel.body.textContent = streamText;
+          } else if (event === "reset") {
+            streamText = "";
+            panel.body.textContent = "";
+          } else if (event === "done") {
+            done = data;
+          }
+        });
+      } catch (err) {
+        done = { overview: null, degraded: "request_failed" };
+      }
+      timing.done = Math.round(performance.now() - started);
+      ovRenderArm(panel, done, timing);
+      // 심사관이 나중에 채점할 수 있게 원시 산출을 그대로 남긴다(총점 판정은 여기서 하지 않는다).
+      return {
+        arm: panel.arm,
+        text: (done && done.overview && done.overview.text) || "",
+        cited_ids: (done && done.overview && done.overview.cited_ids) || [],
+        sources: (done && done.overview && done.overview.sources) || [],
+        degraded: (done && done.degraded) || null,
+        first_delta_ms: timing.first,
+        done_ms: timing.done,
+        stream_matches_done: streamText === ((done && done.overview && done.overview.text) || ""),
+      };
+    }
+
+    // 3팔 병렬 실행 — 팔마다 독립 SSE 스트림이라 계약도 팔마다 독립으로 성립한다.
+    async function ovRunCompare(query) {
+      ovPanel.hidden = true;
+      ovEmpty.hidden = true;
+      ovResHead.hidden = true;
+      ovResults.textContent = "";
+      ovCompare.textContent = "";
+      ovCompare.hidden = false;
+      ovApp.classList.add("ov-compare-mode");
+      const panels = ovCmpArms.map(ovBuildArmPanel);
+      for (const panel of panels) ovCompare.appendChild(panel.box);
+      const arms = await Promise.all(panels.map((panel) => ovRunArm(query, panel)));
+      window.__ovCompareRaw = { query, at: new Date().toISOString(), arms };
+    }
+
+    // ── W1 검색 프리워밍 ──
+    // 타이핑 정지(디바운스) 시 검색 HTTP만 서버 TextCache(90s)에 미리 데운다 — LLM 콜 0라
+    // 버튼 온디맨드/자동 노출 어느 계약과도 무관하고, 제출 시 흐름은 무변경(검색 구간이
+    // 캐시 히트로 자연 소멸해 콜드 완료가 짧아진다). 우리 데모는 검색창이 우리 것이라
+    // 성립하는 구조다 — 실전 임베드에서 Yes24 검색창 입력과의 워밍 연동은 향후 협의 항목.
+    // 실패는 무시한다(본 요청이 어차피 재검색).
+    const OV_WARM_DEBOUNCE_MS = 500;
+    const OV_WARM_MIN_CHARS = 2;
+    let ovWarmTimer = null;
+    let ovLastWarmed = "";
+    ovQuery.addEventListener("input", () => {
+      if (ovWarmTimer) clearTimeout(ovWarmTimer);
+      ovWarmTimer = setTimeout(() => {
+        const q = ovQuery.value.trim();
+        if (q.length < OV_WARM_MIN_CHARS || q === ovLastWarmed) return;
+        ovLastWarmed = q;
+        fetch("/overview/warm", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: q }),
+        }).catch(() => {});
+      }, OV_WARM_DEBOUNCE_MS);
+    });
+
+    // ── 채팅으로 이어가기(2026-08-25 사용자 결정: 오버뷰 교환을 그대로 들고 가서 이어간다) ──
+    // 주 경로: POST /overview/continue가 오버뷰 교환을 챗 세션 첫 턴으로 **서버에 시딩**하고
+    // (재생성·재조사 없음), 채팅 모듈이 순수 추가로 노출한 시딩 진입점(yes24SeedChatFromOverview)
+    // 이 그 세션·턴을 채팅 화면·transcript에 같은 형식으로 놓는다 — 2층(서버 세션=화면) 동기화.
+    // 폴백(캐시 미스 404·시딩 실패): 종전 계약 — 새 대화 + 같은 질의 자동 전송(재조사).
+    // 폴백 접촉 표면은 DOM id(#input·#send·#new-chat)와 합성 이벤트뿐.
+    // 프레임 상한 — sending 해제(abort → submit finally의 setSending(false))가 비동기라 유한 대기.
+    const OV_HANDOFF_MAX_FRAMES = 120;
+    const ovNextFrame = () => new Promise((r) => requestAnimationFrame(r));
+
+    ovContinue.addEventListener("click", async () => {
+      const q = ovLastQuery;
+      if (!q) return;
+      // 주 경로: 서버 시딩 먼저(뷰 전환 전 — 실패 판정을 안 뒤에 폴백 경로를 태운다).
+      let seeded = null;
+      try {
+        const res = await fetch("/overview/continue", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: q }),
+        });
+        if (res.ok) seeded = await res.json();
+      } catch (err) { /* 네트워크 예외 → 폴백 */ }
+      // 채팅 뷰 복귀 — 토글 핸들러 재사용: overview-mode일 때의 클릭 = 해제.
+      if (ovApp.classList.contains("overview-mode")) ovNav.click();
+      const ov = ovLastDone && ovLastDone.overview;
+      if (seeded && seeded.session_id && ov && window.yes24SeedChatFromOverview) {
+        // 화면 주입은 표시 번호 정본(done payload) 그대로 — 채팅 복원과 같은 렌더 경로.
+        // 입력창 포커스는 시딩 진입점이 한다(자동 전송 없음 — 후속 질문은 사용자 몫).
+        await window.yes24SeedChatFromOverview(seeded.session_id, q, {
+          text: ov.text,
+          sources: ov.sources,
+          cited_ids: ov.cited_ids,
+          model: ovLastDone.model || "",
+        });
+        return;
+      }
+      // ── 폴백: 새 대화 + 같은 질의 자동 전송(재조사) — 종전 경로 그대로 ──
+      // 1) 새 대화 — abort + 세션·기록·화면 초기화 원자 경로 재사용(옛 맥락 누출 방지).
+      document.getElementById("new-chat").click();
+      // 2) 전송 가능 대기 — input.disabled가 sending의 정확한 미러.
+      const input = document.getElementById("input");
+      for (let i = 0; i < OV_HANDOFF_MAX_FRAMES && input.disabled; i++) await ovNextFrame();
+      // 3) 보이는 프리필(매트릭스 핸드오프 선례 — 사용자가 보는 것 = 모델이 받는 것).
+      //    원 질의 그대로, 래핑 문장·오버뷰 텍스트 첨부 없음(숨은 컨텍스트 주입 금지).
+      input.value = q;
+      input.setSelectionRange(input.value.length, input.value.length);
+      input.dispatchEvent(new Event("input")); // 높이 자동성장 + 전송버튼 활성
+      // 4) 자동 전송 — 상한 내 해제 실패 시 프리필만 남긴다(전송 큐잉·재시도 금지).
+      const send = document.getElementById("send");
+      if (!send.disabled) send.click();
+      else input.focus();
+    });
+
+    // 마커 호버 미니카드 — 기존 .marker-pop CSS 재사용, #overview-view 스코프 리스너.
+    // 데이터는 이번 렌더의 출처 맵(ovSrcById)에서 읽는다 — 출처 카드 열을 지운 뒤로 카드 DOM은
+    // 없고, 이 맵이 렌더된 결과 행·마커와 같은 단일 진실이다(별도 상태 추가 아님).
+    const ovPop = document.createElement("div");
+    ovPop.className = "marker-pop";
+    ovPop.hidden = true;
+    document.body.appendChild(ovPop);
+    ovView.addEventListener("mouseover", (e) => {
+      const m = e.target.closest(".marker");
+      if (!m) return;
+      const num = (m.textContent.match(/\d+/) || [])[0];
+      const src = num ? ovSrcById.get(num) : null;
+      if (!src) return;
+      ovPop.textContent = "";
+      const t = document.createElement("b");
+      t.textContent = src.title || "";
+      ovPop.appendChild(t);
+      const subText = [src.author, formatPrice(src)].filter(Boolean).join(" · ");
+      if (subText) {
+        const sub = document.createElement("div");
+        sub.className = "pop-sub";
+        sub.textContent = subText;
+        ovPop.appendChild(sub);
+      }
+      ovPop.hidden = false;
+      const mr = m.getBoundingClientRect();
+      const pr = ovPop.getBoundingClientRect();
+      const x = Math.max(8, Math.min(mr.left, window.innerWidth - pr.width - 12));
+      const y = mr.top - pr.height - 8;
+      ovPop.style.left = x + "px";
+      ovPop.style.top = (y < 8 ? mr.bottom + 8 : y) + "px";
+    });
+    ovView.addEventListener("mouseout", (e) => {
+      if (e.target.closest(".marker")) ovPop.hidden = true;
+    });
+    // 스크롤 시 남은 팝오버 정리(fixed라 스크롤을 따라가지 않는다 — 채팅 팝오버와 동일).
+    document.addEventListener("scroll", () => { ovPop.hidden = true; }, true);
   </script>
 </body>
 </html>

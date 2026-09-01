@@ -55,3 +55,18 @@ export function relayTypingFocus(target, blocked) {
     if (e.key.length === 1 || e.key === "Process") target.focus();
   });
 }
+
+// "이 오버뷰 done을 화면에 낼 수 있는가"의 **단일 판정**. 종전엔 단일 패널이 cited_ids 개수로,
+// 비교 팔이 sources 개수로 같은 것을 각각 판정했다(2026-08-31 적대 감사). 서버가 sources를
+// 인용분으로 필터하니 지금은 대체로 일치하지만, 한쪽 계약이 바뀌면 조용히 갈리는 이중 기준이다.
+// 기준은 **인용된 출처가 하나라도 있는가**다 — 마커를 렌더할 근거가 그것뿐이다.
+export function overviewIsRenderable(done) {
+  const overview = done && done.overview;
+  if (!overview || done.degraded) return false;
+  // sources와 cited_ids는 **같은 cited-only 집합**이다(postprocess.build_done_payload:572-578 —
+  // ordered_sources는 인용분 한정이고 cited_ids는 used_source_ids ∩ by_id). 그래서 둘 중
+  // 무엇을 세도 같아야 하고, 합집합을 취하면 계약이 깨진 payload를 조용히 통과시킨다.
+  // 명시 필드를 우선하고 없을 때만 sources로 갈음한다(느슨해지지 않게).
+  if (Array.isArray(overview.cited_ids)) return overview.cited_ids.length > 0;
+  return Array.isArray(overview.sources) && overview.sources.length > 0;
+}
