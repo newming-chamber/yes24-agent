@@ -39,8 +39,7 @@ from yes24_agent.event_translate import (
 from yes24_agent.postprocess import (
     StreamRenumberer,
     build_done_payload,
-    renumber_for_display,
-    validate_citations,
+    finalize_answer,
 )
 from yes24_agent.rbti.persona import is_valid_code
 from yes24_agent.session_service import (
@@ -211,33 +210,8 @@ def _is_overloaded_error(exc: BaseException) -> bool:
     return isinstance(exc, APIError) and getattr(exc, "code", None) in _OVERLOAD_STATUS_CODES
 
 
-def _finalize_answer(
-    text: str,
-    sources: list[dict],
-    session_id: str,
-) -> tuple[object, dict]:
-    """평상·예외·타임아웃이 공통으로 거치는 최종 인용 조립기.
-
-    유효 인용이 0건이어도 **확보된 본문을 폐기하지 않는다.** 과거 require_evidence 분기가
-    본문을 정형 문구로 갈아끼웠는데, 2026-07-22 실측에서 캐치 0 · 오탐 14/14였다(40턴 중
-    14턴에서 접지된 정답이 죽었고 창작은 0건). 정상 경로에서 그 근거로 삭제했으면서
-    에러·타임아웃 경로에만 남겨두면 같은 결함이 드문 경로에서 계속 재발한다.
-
-    순번 인용(마커를 언급 순서로 매김) 계측은 source_id_base=101 도입으로 **구조적으로
-    발화 불가**가 되어 삭제했다 — 순번 마커는 무효 id가 되어 validate_citations가 이미
-    "존재하지 않는 source_id 마커 제거" 경고를 내므로, 그 제거율이 살아 있는 지표다.
-    """
-    citation = validate_citations(text or "", sources)
-    # 검증이 끝난 **뒤에만** 공개 번호를 1..n으로 다시 매긴다(renumber_for_display docstring).
-    citation, sources = renumber_for_display(citation, sources)
-    payload = build_done_payload(
-        sources=sources,
-        used_source_ids=citation.used_source_ids,
-        session_id=session_id,
-        supports=citation.supports,
-    )
-    payload["text"] = citation.text
-    return citation, payload
+# 평상·예외·타임아웃이 공통으로 거치는 최종 인용 조립기는 postprocess.finalize_answer다 —
+# 히스토리 복원(history.py)도 같은 조립기를 써야 해서 조립 소유권을 postprocess로 옮겼다.
 
 
 async def _settle_turn_sources(
@@ -357,6 +331,7 @@ def _closeout_error_frames(
     sources: list[dict],
     active_model: str,
     session_id: str,
+    turn_id: str | None,
 ) -> list[str]:
     """타임아웃·예외 두 실패 경로가 공유하는 마감 시퀀스를 프레임 목록으로 조립한다.
 
@@ -373,7 +348,7 @@ def _closeout_error_frames(
     frames.extend(_display_frames(renumberer, raw_body, known_sources, streamed, final=True))
     best_effort = _best_effort_text(raw_body, final_text)
     try:
-        _, error_done = _finalize_answer(best_effort, sources, session_id)
+        _, error_done = finalize_answer(best_effort, sources, session_id)
     except Exception as exc:  # noqa: BLE001 — 마감이 실패해도 done은 정확히 1회 나가야 한다
         # 원인 예외가 이 파이프라인에서 났다면 같은 입력으로 재발한다 — 인용 없이, 이미 흘린
         # 본문 그대로 최소 마감한다(비파괴).
@@ -383,6 +358,7 @@ def _closeout_error_frames(
         )
         error_done["text"] = "".join(streamed)
     error_done["model"] = active_model
+    error_done["turn_id"] = turn_id
     if _ensure_substantive_text(error_done):
         logger.warning(
             f"실패 경로의 본문이 비어 최후 방어 안내로 대체합니다(session_id={session_id})."
@@ -470,12 +446,13 @@ async def run_agent_stream(
             logger.exception(f"세션 준비 실패: {exc}")
             error_text = "대화 세션을 준비하지 못했어요. 잠시 후 다시 시도해 주세요."
             yield sse_error(error_text)
-            _, error_done = _finalize_answer(
+            _, error_done = finalize_answer(
                 error_text,
                 [],
                 session_id or "",
             )
             error_done["model"] = None
+            error_done["turn_id"] = None  # 스트림 시작 전 실패 — invocation이 아직 없다
             yield sse_delta(error_done["text"])
             yield sse_done(error_done)
             return
@@ -526,6 +503,11 @@ async def run_agent_stream(
         final_text = ""
         emitted_output = False
         retried_overload = False
+        # 이 턴의 공개 id(done.turn_id) = ADK가 부여한 invocation_id. events 테이블의 1급
+        # 컬럼과 같은 값이라 피드백(turn_feedback)·admin 턴 집계가 한 열쇠를 쓴다. Runner에
+        # **주입하지 않고 읽는다** — 주입은 ADK의 재개(resume) 분기를 켠다. 과부하 재시도는
+        # 새 invocation을 받으므로 매 이벤트 갱신이 자연스럽게 최종 시도의 id를 남긴다.
+        turn_id: str | None = None
 
         try:
             # 이전 턴들이 남긴 출처 레지스트리(멀티턴 영속). 마감 화해가 실패할 때의
@@ -636,6 +618,9 @@ async def run_agent_stream(
                             continue
                         raise
 
+                    if event.invocation_id:
+                        turn_id = event.invocation_id
+
                     # 토큰 사용량 누적 — 분기 앞 단일 지점이라 함수콜·최종 텍스트·미래
                     # 분기를 전부 덮는다(합산 규칙은 위 usage_calls 선언 주석 참조).
                     if not event.partial and event.usage_metadata is not None:
@@ -732,7 +717,7 @@ async def run_agent_stream(
                     service, resolved_session_id, observed_sources, prior_sources, session_user_id
                 )
 
-                citation, done_payload = _finalize_answer(
+                citation, done_payload = finalize_answer(
                     answer_text,
                     sources,
                     resolved_session_id,
@@ -767,6 +752,7 @@ async def run_agent_stream(
                     )
 
                 done_payload["model"] = active_model
+                done_payload["turn_id"] = turn_id
                 if citation.removed_markers:
                     logger.warning(
                         f"무효 인용 마커 {len(citation.removed_markers)}개를 본문에서 "
@@ -847,6 +833,7 @@ async def run_agent_stream(
                 ),
                 active_model=active_model,
                 session_id=resolved_session_id,
+                turn_id=turn_id,
             )
             for frame in frames:
                 yield frame
@@ -869,6 +856,7 @@ async def run_agent_stream(
                 ),
                 active_model=active_model,
                 session_id=resolved_session_id,
+                turn_id=turn_id,
             )
             for frame in frames:
                 yield frame

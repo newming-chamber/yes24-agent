@@ -29,7 +29,7 @@ data: <JSON>
 | `source` | `{source}` | 인용된 출처 1건(제목·url·가격·평점 등) |
 | `reset` | `{}` | **이미 받은 본문을 버려라.** 인용 검증이 본문을 바꿨을 때만 온다 |
 | `meta` | `{recommendations?, session_title?}` | `done` **직전**의 부가 정보(선택적) |
-| `done` | `{text, sources, cited_ids, session_id, model}` | **종료 신호. 정확히 1회.** |
+| `done` | `{text, sources, cited_ids, session_id, model, turn_id}` | **종료 신호. 정확히 1회.** |
 | `error` | `{message}` | 사용자에게 보여줄 실패 문구 |
 
 **지켜지는 계약**
@@ -38,6 +38,10 @@ data: <JSON>
 - 본문의 `[n]` 마커는 **반드시** `done.sources`의 `id`에 매핑된다(무매핑 마커는 서버가 지운다).
 - `done.sources`는 **인용된 출처만** 담는다(검색 후보 전체가 아니다).
 - 후속 턴은 `done.session_id`를 요청에 실어 이어간다.
+- `done.turn_id`는 이 턴의 서버 식별자다(피드백 API
+  `PUT /chat/sessions/{session_id}/turns/{turn_id}/feedback`와 히스토리 복원
+  `GET /chat/sessions/{session_id}`의 턴 id가 같은 값을 쓴다). 스트림 시작 전에 실패한
+  턴은 `null`일 수 있다.
 
 **최소 예시**
 ```bash

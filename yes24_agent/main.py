@@ -38,6 +38,8 @@ from yes24_agent.auth import (
     token_matches,
 )
 from yes24_agent.config import Settings, ensure_google_api_key_env, get_settings
+from yes24_agent.feedback import close_feedback_service
+from yes24_agent.history import register_history
 from yes24_agent.matrix.matrix_runner import run_matrix_stream
 from yes24_agent.rbti.profile import fetch_user_rbti
 from yes24_agent.runner import run_agent_stream
@@ -106,12 +108,27 @@ def _key_checking_routes(app: FastAPI) -> list:
     순간 그 라우트가 통째로 월에 막힌다(2026-09-01 적대 검증 5렌즈가 독립으로 같은 결함을
     지적). Starlette의 `route.matches(scope)`가 그 매칭을 소유하므로 그것을 쓴다.
     """
-    return [
-        route
-        for route in app.routes
-        if (dependant := getattr(route, "dependant", None)) is not None
-        and any(d.call is get_authenticated_user for d in dependant.dependencies)
-    ]
+    def _walk(routes) -> list:
+        found = []
+        for route in routes:
+            # FastAPI는 include_router로 얹은 라우트를 `_IncludedRouter` **프록시**로 감싸
+            # app.routes에 넣는다 — 프록시에는 dependant가 없어서, 평면 순회만 하면 라우터로
+            # 마운트한 라우트가 통째로 안 보인다(파생 집합이 비고 → 월이 그 기능을 죽인다).
+            # 2026-09-01 실측으로 잡았다. "app에 직접 등록한다"는 관례로 우회할 수도 있지만
+            # 그건 다음 사람이 include_router를 쓰는 순간 조용히 깨지므로, 여기서 **원 라우터로
+            # 내려가** 구조가 마운트 방식과 무관하게 성립하도록 한다.
+            inner = getattr(route, "original_router", None)
+            if inner is not None:
+                found.extend(_walk(inner.routes))
+                continue
+            dependant = getattr(route, "dependant", None)
+            if dependant is not None and any(
+                d.call is get_authenticated_user for d in dependant.dependencies
+            ):
+                found.append(route)
+        return found
+
+    return _walk(app.routes)
 
 
 def _key_route_matches(routes: list, request: Request) -> bool:
@@ -245,7 +262,7 @@ _SSE_EXAMPLE = (
     'event: delta\ndata: {"text":"채식주의자는 ","ts":1756000000100}\n\n'
     'event: source\ndata: {"source":{"id":1,"title":"채식주의자"},"ts":1756000000200}\n\n'
     'event: done\ndata: {"text":"채식주의자는 15,300원입니다[1]","sources":[{"id":1}],'
-    '"cited_ids":[1],"session_id":"...","model":"...","ts":1756000000300}\n\n'
+    '"cited_ids":[1],"session_id":"...","model":"...","turn_id":"...","ts":1756000000300}\n\n'
 )
 _SSE_RESPONSES: dict = {
     200: {
@@ -330,6 +347,8 @@ async def lifespan(app: FastAPI):
         await hook()
     # 인증 DB 커넥션 풀도 함께 닫는다(만들어진 적 없으면 no-op).
     await close_auth_service()
+    # 턴 피드백 풀도 같은 방식으로 닫는다(만들어진 적 없으면 no-op).
+    await close_feedback_service()
     # 토큰 사용량 기록 풀도 나란히 정리한다 — 진행 중인 fire-and-forget INSERT를
     # 배수한 뒤 닫는다(만들어진 적 없으면 no-op).
     await close_usage_logger()
@@ -462,7 +481,10 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
         """
         return _branded_html(_INDEX_HTML, app_config=app_for_request(request))
 
-    @app.get("/me")
+    # /me는 데모 UI의 역할 배지·세팅 노출 판단용이지 제품 API가 아니다 — /models·/toolsets와
+    # 함께 OpenAPI에서 뺀다(include_in_schema=False, 2026-09-01 사용자 결정). 라우트·권한은
+    # 그대로다(내장 프론트가 쓴다) — 문서에서만 감춘다.
+    @app.get("/me", include_in_schema=False)
     async def me(request: Request) -> dict:
         """현재 로그인 역할: {"role": "admin"|"demo"|null}. null = 로그인월 비활성.
 
@@ -522,7 +544,9 @@ def create_app() -> FastAPI:
         """
         return {"status": "ok", "persistence": persistence_mode()}
 
-    @app.get("/models")
+    # /models·/toolsets는 데모 UI의 세팅 컨트롤이지 제품 API가 아니다 — OpenAPI에서만 뺀다
+    # (include_in_schema=False, 2026-09-01 사용자 결정). 동작·권한(잠금 403)은 불변.
+    @app.get("/models", include_in_schema=False)
     async def models(request: Request) -> dict:
         """UI 모델 선택기용 목록(라벨→모델ID)과 기본 모델. 화이트리스트가 단일 진실.
 
@@ -534,7 +558,7 @@ def create_app() -> FastAPI:
         settings = get_settings()
         return {"models": settings.selectable_models, "default": settings.model_name}
 
-    @app.get("/toolsets")
+    @app.get("/toolsets", include_in_schema=False)
     async def toolsets(request: Request) -> dict:
         """UI 도구 토글용 목록. 레지스트리(TOOLSETS)가 단일 진실이라 새 toolset이 추가되면
         프론트 수정 없이 따라온다. 잠금 항목은 없다 — 비어있지만 않으면 모든 조합이 유효하고
@@ -608,6 +632,12 @@ def create_app() -> FastAPI:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    # 히스토리·피드백 API(/chat/sessions*). 라우트·투영은 history.py가 소유하고 여기선 얹기만
+    # 한다. 전 라우트가 get_authenticated_user를 직접 의존하므로 로그인월의 x-api-key 통과
+    # 집합에 자동으로 파생된다(_key_checking_routes). include_router가 아니라 직접 등록인
+    # 이유는 history.py 라우트 절 주석 참조(지연 프록시가 통과 집합 파생을 가린다).
+    register_history(app)
 
     # 매트릭스 스트리밍 엔드포인트도 배포 게이팅(matrix_enabled) 대상 — off면 미등록(404).
     if settings.matrix_enabled:

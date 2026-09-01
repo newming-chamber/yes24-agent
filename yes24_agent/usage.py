@@ -24,9 +24,8 @@ import asyncio
 import logging
 from typing import Any
 
-import aiomysql
-
 from yes24_agent.config import get_settings
+from yes24_agent.db import LazyAiomysqlPool
 from yes24_agent.session_service import mysql_pool_kwargs
 
 logger = logging.getLogger(__name__)
@@ -41,17 +40,17 @@ class UsageLogger:
 
     _instance: UsageLogger | None = None
 
-    def __init__(self, pool_factory=aiomysql.create_pool) -> None:
+    def __init__(self, pool_factory=None) -> None:
         self._pool_kwargs = mysql_pool_kwargs(
             get_settings().session_db_url, maxsize=get_settings().usage_pool_max
         )
-        self._pool_factory = pool_factory
-        self._pool: Any = None
-        # 풀 생성 태스크(공유) — fire-and-forget이라 첫 INSERT들이 버스트로 겹치면
-        # check-then-act만으로는 task마다 풀을 만들고, close()는 마지막 대입 하나만 닫아
-        # 고아 풀의 연결이 GC까지 잔류한다. 잠금이 아니라 태스크 공유인 이유는
-        # _get_pool 주석 참조(auth.AuthService와 같은 구조).
-        self._pool_task: asyncio.Task | None = None
+        # 풀 생성 기계(지연 생성·태스크 공유·shield)는 db.LazyAiomysqlPool 단일 구현이다 —
+        # 이 모듈에 남는 것은 부가 채널 실패 정책(전부 삼킴)뿐이다. mysql이 아니면 풀이 없다.
+        self._db = (
+            LazyAiomysqlPool(self._pool_kwargs, pool_factory)
+            if self._pool_kwargs is not None
+            else None
+        )
         # 진행 중인 INSERT task 참조 — GC 취소를 막고, close가 유실 없이 배수(drain)한다.
         self._tasks: set[asyncio.Task] = set()
 
@@ -105,36 +104,10 @@ class UsageLogger:
         except Exception as exc:  # noqa: BLE001 — 부가 채널: 예약 실패(루프 없음 등)도 삼킨다
             logger.warning(f"usage_log 기록 예약 실패(무시): {exc}")
 
-    async def _create_pool(self) -> Any:
-        """생성 본체. 성공 대입을 태스크 **안**에서 한다 — 대기자가 전부 취소돼도
-        만들어진 풀이 self._pool에 남아 close()가 닫을 수 있다(고아 풀 방지)."""
-        self._pool = await self._pool_factory(**self._pool_kwargs)
-        return self._pool
-
-    async def _get_pool(self):
-        """풀 지연 생성 — 생성 시도를 태스크 하나로 공유한다(성공 뒤 빠른 경로는 무대기).
-
-        잠금 직렬화가 아니라 태스크 공유인 이유: 잠금은 생성 1회 보장은 되지만, DB가
-        TCP 블랙홀이면 대기자들이 잠금 **안에서 각자** connect 실패를 순차 대기해
-        k번째 실패가 k×connect_timeout 뒤에 난다(실패 지연이 병렬→직렬로 퇴행).
-        한 태스크를 함께 await하면 동시 대기자 전원이 한 시도의 성공·실패를 동반
-        수신한다. 실패한 태스크는 버려 다음 호출이 새로 시도한다(장애 복구). shield는
-        대기자(INSERT task) 하나의 취소가 공유 태스크를 함께 취소해 나머지 대기자를
-        실패시키는 전파를 막는다 — 태스크 자체의 마감은 close()가 직접 한다.
-        check-then-create 사이에 await가 없어 asyncio 단일 스레드에서 원자적이다.
-        """
-        if self._pool is not None:
-            return self._pool
-        task = self._pool_task
-        if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
-            task = asyncio.get_running_loop().create_task(self._create_pool())
-            self._pool_task = task
-        return await asyncio.shield(task)
-
     async def _insert(self, row: tuple) -> None:
         """usage_log INSERT 1건. 풀 생성 실패·테이블 부재·연결 끊김 전부 warning 후 무시."""
         try:
-            pool = await self._get_pool()
+            pool = await self._db.get()
             async with pool.acquire() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -163,14 +136,8 @@ class UsageLogger:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
-        if self._pool_task is not None:
-            self._pool_task.cancel()  # 완료된 태스크면 no-op
-            await asyncio.gather(self._pool_task, return_exceptions=True)
-            self._pool_task = None
-        if self._pool is not None:
-            self._pool.close()
-            await self._pool.wait_closed()
-            self._pool = None
+        if self._db is not None:
+            await self._db.close()
 
 
 def record_usage(
