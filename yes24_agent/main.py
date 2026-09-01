@@ -394,12 +394,16 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
                 return RedirectResponse("/login", status_code=302)
             return JSONResponse({"detail": "인증이 필요합니다."}, status_code=401)
 
-        @app.get("/login")
+        # 데모 UI 페이지는 **OpenAPI 스키마에서 뺀다**(include_in_schema=False, 2026-09-01).
+        # /docs는 프론트 개발자가 클라이언트를 만들려고 보는 문서인데, 브라우저가 여는 HTML
+        # 페이지(/ ·/matrix ·/login ·/logout)가 섞이면 "무엇을 호출해야 하는가"가 흐려진다.
+        # 라우트는 그대로 살아 있고 문서에서만 감춘다.
+        @app.get("/login", include_in_schema=False)
         async def login_page() -> HTMLResponse:
             """로그인월 페이지(공유 패스워드 입력) — 브랜딩 마커 치환 서빙."""
             return _branded_html(_LOGIN_HTML)
 
-        @app.post("/login")
+        @app.post("/login", include_in_schema=False)
         async def login_submit(request: Request):
             """패스워드를 검증해 성공 시 접근 쿠키를 발급하고 홈으로 보낸다."""
             form = await request.form()
@@ -422,7 +426,7 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
             logger.warning(f"로그인월 인증 실패: ip={client_ip(request)}")
             return RedirectResponse("/login?error=1", status_code=303)
 
-        @app.get("/logout")
+        @app.get("/logout", include_in_schema=False)
         async def logout() -> RedirectResponse:
             """접근 쿠키를 지우고 로그인 페이지로 보낸다(데모↔세팅 계정 전환용)."""
             resp = RedirectResponse("/login", status_code=303)
@@ -442,7 +446,7 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
     # 모듈만 브라우저에 눌러앉아 구버전이 실행되던 문제를 막는다(버전 쿼리 없이 단일 지점 해결).
     app.mount("/static/lib", _NoCacheStaticFiles(directory=_STATIC_LIB_DIR), name="static-lib")
 
-    @app.get("/")
+    @app.get("/", include_in_schema=False)
     async def index(request: Request) -> HTMLResponse:
         """웹 채팅 UI를 반환한다(로그인월 활성 시 쿠키 필요) — 브랜딩 마커 치환 서빙.
 
@@ -466,7 +470,7 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
 
         # GET+HEAD 둘 다 등록한다 — 프론트 네비 링크가 HEAD로 활성 여부를 게이팅하는데,
         # FastAPI GET 라우트는 HEAD를 자동 허용하지 않아(405; 프록시 뒤에선 503) 링크가 안 뜬다.
-        @app.api_route("/matrix", methods=["GET", "HEAD"])
+        @app.api_route("/matrix", methods=["GET", "HEAD"], include_in_schema=False)
         async def matrix_ui() -> FileResponse:
             """16뷰 RBTI 매트릭스 시뮬레이터 UI를 반환한다(인증 없음)."""
             return FileResponse(_MATRIX_HTML, media_type="text/html")
