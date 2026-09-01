@@ -29,7 +29,7 @@ data: <JSON>
 | `source` | `{source}` | 인용된 출처 1건(제목·url·가격·평점 등) |
 | `reset` | `{}` | **이미 받은 본문을 버려라.** 인용 검증이 본문을 바꿨을 때만 온다 |
 | `meta` | `{recommendations?, session_title?}` | `done` **직전**의 부가 정보(선택적) |
-| `done` | `{text, sources, cited_ids, session_id, model, turn_id, rbti_applied}` | 종료·1회 |
+| `done` | `{text, sources, cited_ids, session_id, turn_id, rbti_applied}` | 종료·1회 |
 | `error` | `{message}` | 사용자에게 보여줄 실패 문구 |
 
 **지켜지는 계약**
@@ -38,6 +38,8 @@ data: <JSON>
 - 본문의 `[n]` 마커는 **반드시** `done.sources`의 `id`에 매핑된다(무매핑 마커는 서버가 지운다).
 - `done.sources`는 **인용된 출처만** 담는다(검색 후보 전체가 아니다).
 - 후속 턴은 `done.session_id`를 요청에 실어 이어간다.
+- `done`에 `model` 키는 **없다**. 모델명은 어드민(데모 로그인) 세션에만 실린다 — 같은 이유로
+  요청의 `model`·`toolsets`도 API 키 호출에서는 무시되고 서버 기본 구성으로 고정된다.
 - `done.rbti_applied`는 이 턴에 적용된 RBTI 코드다(미적용이면 `null`) — truthiness가 곧
   "✦ RBTI 데이터가 활용됨" 배지 여부이고, 값은 어떤 독서 유형이 적용됐는지다.
 - `done.turn_id`는 이 턴의 서버 식별자다(피드백 API

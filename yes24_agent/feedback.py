@@ -17,37 +17,31 @@ auth와 같은 503으로 정직하게 끊는다(fail-loud).
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
-from fastapi import HTTPException
-
 from yes24_agent.config import get_settings
-from yes24_agent.db import LazyAiomysqlPool
+from yes24_agent.db import MysqlBackedService
 from yes24_agent.session_service import mysql_pool_kwargs
 
-logger = logging.getLogger(__name__)
 
-
-class FeedbackService:
+class FeedbackService(MysqlBackedService):
     """turn_feedback 읽기/쓰기 서비스(프로세스 싱글턴).
 
-    풀 팩토리를 생성자로 주입할 수 있다 — 테스트는 실 DB 없이 스텁으로 전 경로를 돈다
-    (AuthService·UsageLogger와 같은 패턴).
+    풀 보유·활성 판정·질의·마감은 db.MysqlBackedService가 소유한다 — 이 클래스에 남는 것은
+    테이블과 SQL뿐이다. 풀 팩토리를 생성자로 주입할 수 있어 테스트는 실 DB 없이 전 경로를
+    돈다(AuthService·UsageLogger와 같은 패턴).
     """
 
     _instance: FeedbackService | None = None
 
     def __init__(self, pool_factory=None) -> None:
-        self._pool_kwargs = mysql_pool_kwargs(
-            get_settings().session_db_url, maxsize=get_settings().feedback_pool_max
-        )
-        # 풀 생성 기계(지연 생성·태스크 공유·shield)는 db.LazyAiomysqlPool 단일 구현이다 —
-        # 이 모듈에 남는 것은 실패 정책(503 fail-loud)뿐이다. mysql이 아니면 풀이 없다.
-        self._db = (
-            LazyAiomysqlPool(self._pool_kwargs, pool_factory)
-            if self._pool_kwargs is not None
-            else None
+        super().__init__(
+            mysql_pool_kwargs(
+                get_settings().session_db_url, maxsize=get_settings().feedback_pool_max
+            ),
+            pool_factory,
+            unavailable_detail="피드백 저장소가 없는 구성입니다(세션 DB가 MySQL이 아님).",
+            failure_detail="피드백 저장에 실패했습니다.",
         )
 
     @classmethod
@@ -55,38 +49,6 @@ class FeedbackService:
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
-
-    @property
-    def enabled(self) -> bool:
-        """피드백 스택이 성립하는가 — 세션 DB가 mysql일 때만 True(auth.enabled와 같은 판정)."""
-        return self._pool_kwargs is not None
-
-    async def close(self) -> None:
-        """커넥션 풀을 정리한다(앱 종료 훅) — 마감은 공유 풀 구현이 소유한다."""
-        if self._db is not None:
-            await self._db.close()
-
-    async def _run(self, sql: str, params: tuple, *, fetch_all: bool = False):
-        """질의 1건 실행(필요하면 전 행 반환). DB 오류는 삼키지 않고 503으로 올린다.
-
-        비활성 구성(sqlite)에서 호출되면 그것도 503이다 — 피드백 라우트는 인증 필수라
-        정상 배포에서 이 분기는 죽어 있지만, 조용한 no-op 성공으로 위장하지 않는다.
-        """
-        if self._db is None:
-            raise HTTPException(
-                status_code=503, detail="피드백 저장소가 없는 구성입니다(세션 DB가 MySQL이 아님)."
-            )
-        try:
-            pool = await self._db.get()
-            async with pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(sql, params)
-                    return await cur.fetchall() if fetch_all else None
-        except HTTPException:
-            raise
-        except Exception as exc:  # noqa: BLE001 — 저장 실패를 200으로 숨기지 않는다(fail-loud)
-            logger.error(f"피드백 DB 질의 실패: {exc}")
-            raise HTTPException(status_code=503, detail="피드백 저장에 실패했습니다.") from exc
 
     async def upsert(
         self, *, user_id: str, session_id: str, turn_id: str, rating: str, comment: str | None

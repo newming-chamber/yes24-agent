@@ -383,6 +383,10 @@ class Settings(BaseSettings):
     # 사용자 행동(좋아요/싫어요)당 upsert 1건, 읽기는 세션 복원당 1질의뿐이라 usage와 같은
     # 최소 크기로 둔다.
     feedback_pool_max: int = 2
+    # 대화 UI 상태(session_ui.py → session_ui 테이블: 읽음 시각·사용자 제목) 커넥션 풀 상한.
+    # 피드백과 같은 축(사용자 행동당 upsert 1건, 목록·복원당 1질의)이라 같은 최소 크기다.
+    # 별도 풀인 이유는 스택 경계 — 한 스택의 풀 고갈이 다른 스택을 굶기지 않는다.
+    session_ui_pool_max: int = 2
     # 대화 목록(GET /chat/sessions) 응답 세션 수 상한(최근 갱신순 앞에서 자름). ADK
     # list_sessions는 사용자 전체를 돌려주므로 장수 사용자의 목록 한 장이 무한히 크지 않게
     # 천장을 둔다 — admin_page_size(운영 조회 페이지)와는 다른 축의 값이라 따로 둔다.

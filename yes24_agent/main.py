@@ -44,6 +44,7 @@ from yes24_agent.matrix.matrix_runner import run_matrix_stream
 from yes24_agent.rbti.profile import fetch_user_rbti
 from yes24_agent.runner import run_agent_stream
 from yes24_agent.session_service import SQLITE_DIALECT, db_dialect, persistence_mode
+from yes24_agent.session_ui import close_session_ui_service
 from yes24_agent.sse import SSE_EVENT_CONTRACT
 from yes24_agent.thought_translation import warmup_translation
 from yes24_agent.toolsets import TOOLSETS, get_resolved_app, resolve_app_for
@@ -347,8 +348,9 @@ async def lifespan(app: FastAPI):
         await hook()
     # 인증 DB 커넥션 풀도 함께 닫는다(만들어진 적 없으면 no-op).
     await close_auth_service()
-    # 턴 피드백 풀도 같은 방식으로 닫는다(만들어진 적 없으면 no-op).
+    # 턴 피드백·대화 UI 상태 풀도 같은 방식으로 닫는다(만들어진 적 없으면 no-op).
     await close_feedback_service()
+    await close_session_ui_service()
     # 토큰 사용량 기록 풀도 나란히 정리한다 — 진행 중인 fire-and-forget INSERT를
     # 배수한 뒤 닫는다(만들어진 적 없으면 no-op).
     await close_usage_logger()
