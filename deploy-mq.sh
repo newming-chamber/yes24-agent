@@ -19,7 +19,14 @@
 set -euo pipefail
 
 SSH_HOST="${SSH_HOST:-mq}"          # ~/.ssh/config의 host 별칭 (User/HostName/IdentityFile 포함)
-HOST_PORT="${HOST_PORT:-8010}"      # mq 호스트 포트 (컨테이너 내부는 8010 고정)
+HOST_PORT="${HOST_PORT:-8010}"      # mq 호스트 포트
+# 컨테이너 **내부** 포트. `-p` 매핑과 앱이 실제로 듣는 포트가 반드시 같아야 하는데, 아래에서
+# `--env-file`이 Dockerfile의 `ENV PORT`를 **덮는다** — 로컬 .env에 PORT가 있으면(QA 관행:
+# qa/grounding_smoke.py가 8016을 권한다) 앱은 컨테이너 안에서 그 포트를 듣고 docker는 8010으로
+# 매핑해 **배포가 조용히 죽는다**(health가 영원히 안 뜬다). 종전엔 이 값이 -p 줄에 숫자로 박혀
+# 있어 그 어긋남을 막을 방법이 없었다(2026-08-31 적대 감사 지적). 한 변수로 모으고, 아래에서
+# 원격 .env에 PORT를 **강제 주입**해 로컬 값이 승계되지 않게 한다 — SERVE_FRONTEND와 같은 패턴.
+CONTAINER_PORT="${CONTAINER_PORT:-8010}"
 IMAGE="yes24-agent"
 TAG="$(date +%Y%m%d-%H%M%S)"        # 롤백용 날짜 태그
 # 원격 작업 디렉터리는 홈 하위다. mq는 translator-api·generative-api·rabbitmq가 함께 도는
@@ -59,28 +66,34 @@ ssh "$SSH_HOST" bash -lc "'
 #   - 로컬 .env는 건드리지 않고, 매 배포마다 새로 쓰므로 append 누적도 없다.
 # MATRIX_ENABLED: RBTI 16뷰 매트릭스 노출 스위치. 2026-07-28 사용자 결정으로 기본 **노출(true)** —
 #   과거 "rbti 제외하고 띄우자"(기본 false) 방침을 뒤집었다. 숨김 배포는 MATRIX_ENABLED=false ./deploy-mq.sh.
-# ACCESS_PASSWORD: 공유 패스워드 로그인월. 주어졌을 때만 주입한다(미지정이면 월 비활성).
-# SERVE_FRONTEND: 내장 프론트(UI 페이지·정적 파일·로그인월) 서빙 스위치. 2026-08-12 사용자
-#   결정으로 **배포 기본은 백엔드 전용(false)** — 프론트 코드는 그대로 두고 라우트만 끈다.
-#   내장 UI까지 띄우려면 SERVE_FRONTEND=true ./deploy-mq.sh. 로컬 개발 기본은 config의 true.
+# ACCESS_PASSWORD: 공유 패스워드 로그인월 **오버라이드**. 로컬 .env가 통째로 스트림되므로
+#   미지정이어도 로컬 .env의 ACCESS_PASSWORD가 그대로 프로드에 승계된다(월 활성) — 이 변수는
+#   프로드만 다른 비밀번호를 쓸 때만 필요하다. (과거 "미지정이면 월 비활성" 주석은 오기 —
+#   2026-08-24 배포 사고 조사에서 교정.)
+# SERVE_FRONTEND: 내장 프론트(UI 페이지·정적 파일·로그인월) 서빙 스위치. **배포 기본은
+#   현행 운영 모드인 true**(2026-08-19 사용자 결정 — 데모·로그인월 유지). 과거 기본
+#   false(2026-08-12)는 "새 프론트 연동 시 백엔드 전용 전환" 계획의 선반영이었는데, 운영
+#   모드와 어긋난 기본값이 무언 배포에서 데모를 404로 만든 사고(2026-08-24)로 뒤집었다.
+#   백엔드 전용 전환은 그때 SERVE_FRONTEND=false ./deploy-mq.sh로 명시한다.
 # SESSION_FALLBACK_ALLOWED: 세션 DB 생성 실패 시 InMemory 폴백 허용 여부. 배포 세션 DB는
 #   네트워크 MySQL이라 조용한 폴백은 "영속 중이라 믿는 비영속"(대화가 재시작마다 증발,
 #   admin·집계는 위장 정상)이 된다 — 배포 기본은 false(기동 실패로 즉시 드러낸다).
 MATRIX_ENABLED="${MATRIX_ENABLED:-true}"
-SERVE_FRONTEND="${SERVE_FRONTEND:-false}"
+SERVE_FRONTEND="${SERVE_FRONTEND:-true}"
 SESSION_FALLBACK_ALLOWED="${SESSION_FALLBACK_ALLOWED:-false}"
 {
   cat "$LOCAL_DIR/.env"
   printf '\nMATRIX_ENABLED=%s\n' "$MATRIX_ENABLED"
   printf 'SERVE_FRONTEND=%s\n' "$SERVE_FRONTEND"
   printf 'SESSION_FALLBACK_ALLOWED=%s\n' "$SESSION_FALLBACK_ALLOWED"
+  printf 'PORT=%s\n' "$CONTAINER_PORT"
   if [ -n "${ACCESS_PASSWORD:-}" ]; then printf 'ACCESS_PASSWORD=%s\n' "$ACCESS_PASSWORD"; fi
 } | ssh "$SSH_HOST" "install -m 600 /dev/stdin $REMOTE_BUILD/.env"
-echo "  → 원격 .env 전송(모드 600) · MATRIX_ENABLED=$MATRIX_ENABLED · SERVE_FRONTEND=$SERVE_FRONTEND · SESSION_FALLBACK_ALLOWED=$SESSION_FALLBACK_ALLOWED 주입(로컬 .env 불변)"
+echo "  → 원격 .env 전송(모드 600) · MATRIX_ENABLED=$MATRIX_ENABLED · SERVE_FRONTEND=$SERVE_FRONTEND · SESSION_FALLBACK_ALLOWED=$SESSION_FALLBACK_ALLOWED · PORT=$CONTAINER_PORT 주입(로컬 .env 불변)"
 if [ -n "${ACCESS_PASSWORD:-}" ]; then
-  echo "  → ACCESS_PASSWORD 주입(로그인월 활성)"
+  echo "  → ACCESS_PASSWORD 오버라이드 주입(로그인월 이 값으로 활성)"
 else
-  echo "  → ACCESS_PASSWORD 미지정 — 로그인월 비활성"
+  echo "  → ACCESS_PASSWORD 오버라이드 없음 — 로컬 .env 값 승계(있으면 월 활성)"
 fi
 
 echo "[5/6] 컨테이너 기동 (포트 $HOST_PORT, sqlite 바인드마운트, restart=unless-stopped)"
@@ -89,7 +102,7 @@ ssh "$SSH_HOST" bash -lc "'
   install -d -m 700 $REMOTE_DATA
   docker rm -f yes24-agent 2>/dev/null || true
   docker run -d --name yes24-agent \
-    -p $HOST_PORT:8010 \
+    -p $HOST_PORT:$CONTAINER_PORT \
     --env-file $REMOTE_BUILD/.env \
     -v $REMOTE_DATA:/app/data \
     --log-driver json-file --log-opt max-size=50m --log-opt max-file=3 \

@@ -354,6 +354,7 @@ async def get_authenticated_user(
     await service.record_request(x_api_key, request.url.path)
     return user
 
+
 def signed_access_token(password: str, message: bytes) -> str:
     """비밀번호에서 결정론적 접근 토큰(HMAC-SHA256 hex)을 만든다.
 

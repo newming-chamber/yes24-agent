@@ -57,6 +57,7 @@ TOOLSETS: dict[str, tuple] = {
     "web": (web_search, web_fetch),
 }
 
+
 @dataclass(frozen=True)
 class Expertise:
     """정체성이 선언하는 도메인 강점. `subject`는 "…에 특히 밝습니다"의 목적어,

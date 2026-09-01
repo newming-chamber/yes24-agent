@@ -41,6 +41,10 @@ pythonpath = ["."]
 line-length = 100
 
 [tool.ruff.lint]
+# E3(빈 줄 규칙)은 ruff에서 preview 게이트 뒤에 있어 select = ["E"]만으로는 켜지지 않는다 —
+# 2026-08-31 적대 감사가 그 사각을 실물로 보였다(빈 줄 PEP8 위반 15건이 게이트 초록으로 통과).
+# 명시 선택 + preview로 켠다. `tests/test_lint_gate.py`가 매 pytest마다 이 설정으로 돈다.
+preview = true
 select = ["E", "F", "I", "W", "UP"]
 
 [tool.ruff.lint.per-file-ignores]

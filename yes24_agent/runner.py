@@ -205,6 +205,7 @@ _EMPTY_RESPONSE_FALLBACK = (
     "죄송해요, 방금 답변을 제대로 만들지 못했어요. 질문을 한 번 더 보내주시겠어요?"
 )
 
+
 def _is_overloaded_error(exc: BaseException) -> bool:
     """Gemini API 과부하/일시장애(반응형 재시도 대상)인지 판정한다."""
     return isinstance(exc, APIError) and getattr(exc, "code", None) in _OVERLOAD_STATUS_CODES

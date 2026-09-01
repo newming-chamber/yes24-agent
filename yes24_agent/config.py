@@ -114,10 +114,20 @@ class Settings(BaseSettings):
 
     # Yes24 크롤링
     yes24_base_url: str = "https://www.yes24.com"
+    # 브라우저형 UA로 바꾸면 302가 난다(실측) — 이 값은 조정 대상이 아니다.
     user_agent: str = "Mozilla/5.0 (compatible; yes24-agent/0.1)"
     http_timeout_s: float = 15.0
     http_connect_timeout_s: float = 5.0
+    # 동시 연결 상한. rps와 **함께** 정중함 경계를 잡는다 — rps를 올려도 이 세마포어가 남는다.
     http_concurrency: int = 5
+    # 채팅 경로의 Yes24 요청률. **1.5 → 4.0(2026-08-03, cc38952)** — 근거를 여기에 둔다
+    # (종전엔 이 블록에 주석이 하나도 없는데 matrix_runner가 "공유 클라이언트 예산"이라며
+    # 이 필드를 근거의 집으로 가리키고 있었다 — 2026-08-31 적대 감사 지적).
+    # 조건 검증형 질의("300쪽 이하·2만원 이하 소설 2권"처럼 후보마다 상세를 여는 것)는 한 턴에
+    # 20요청까지 가므로 0.667초 간격이 그대로 누적됐다 — 냉 캐시 HTTP 구간의 절반이 스로틀
+    # 대기였다. 냉 캐시 통제 A/B(yes24_cache_ttl_s=0, 같은 세션 연속 3런): HTTP 구간 중앙
+    # 12.0s → 5.7s, 라운드당 2.4s → 1.4s. 정중함은 유지된다 — 같은 egress IP로 매트릭스가 이미
+    # matrix_http_rps를 쓰므로 채팅 4.0은 그보다 보수적이고 http_concurrency가 그대로 남는다.
     http_rps: float = 4.0
     # 매트릭스 경로 전용 Yes24 처리량. 매트릭스는 채팅 파이프라인을 16 페르소나로 **동시**
     # 실행하는 개발 확인 화면이라, 전역 rps=1.5의 단일 throttle_lock이 16셀의 Yes24 요청을
@@ -179,6 +189,21 @@ class Settings(BaseSettings):
     # 1회 + 동시 채팅을 덮고도 남는다. 처음 128로 잡았다가 독립 감사 지적으로 절반으로 줄였다
     # (표적 효과는 그대로이고 최악 메모리만 반감 — 2026-08-03).
     yes24_cache_max_entries: int = 64
+    # 검색 1페이지 요청 크기(size GET 파라미터) — **챗 예산**. 0 이하면 파라미터를 붙이지
+    # 않아 사이트 기본(24건) 페이지를 받는다. 챗은 파스 상한이 아래 search_result_limit이라
+    # 더 넓은 페이지를 받아도 버릴 행만 늘고 다운로드·파싱만 비싸진다(2026-08-27 실측: 같은
+    # 질의 495KB → 657KB, +33%). 넓은 풀이 필요한 소비자(오버뷰)는 자기 예산
+    # (overview_search_page_size)을 state로 실어 보낸다 — tools/yes24_search.py 예산 주석.
+    search_page_size: int = 0
+    # 파스 시점 결과 상한(각도당) — **챗 예산**이자 챗 프롬프트 토큰의 주 변수다(파스 행이
+    # 그대로 도구 결과 → 프롬프트로 직송되고, 컨텍스트는 라운드마다 재전송되므로 행 순증이
+    # 턴당 여러 번 청구된다). 오버뷰 캠페인(2026-08-26 W2)이 24로 올렸던 것을 2026-08-27
+    # 페어 A/B로 10에 복귀시켰다 — 같은 질의·2반복 인프로세스 계측(턴 전체 LLM 콜 프롬프트
+    # 합)에서 24는 추천 질의 59.6k → 75.5k(+26.7%), 상세 질의 43.8k → 45.3k(+3.5%)를
+    # 물렸고 그 대가로 얻은 것이 없었다: 소요는 추천 18.5s → 20.4s로 오히려 늘고 상세는
+    # 17.2s → 16.7s로 줄어(계측 노이즈), 인용 출처 수는 6·4 → 5·5로 동률이었다. 도구
+    # 결과 블록만 떼어 센 값(같은 검색 HTML, 각도 1개)은 3.1~3.4k → 7.4~8.0k다.
+    # 오버뷰는 자기 예산(overview_search_result_limit=24)을 유지한다 — 소비 구조가 달라서다.
     search_result_limit: int = 10
     # 한 번의 yes24_search 호출에서 동시에 던질 검색 각도(쿼리) 수 상한. 탐색 각도 하나당
     # LLM 왕복을 1회씩 소모하던 직렬 구조가 추천 경로 지연의 최대 덩어리였다(2026-07-20 실측:
@@ -187,11 +212,16 @@ class Settings(BaseSettings):
     # 공유 Yes24Client의 동시성 Semaphore(http_concurrency=5) 안에 들어가는 폭이기도 하다.
     # 초과분은 조용히 버리지 않고 dropped_queries로 명시한다(fail-loud).
     yes24_search_max_queries: int = 4
+    # 코너 목록 반환 상한. **초기값·근거 미기록**(e9cf930). 위 search_result_limit는 24→10
+    # 되돌림 A/B가 있는데 이쪽은 그 검토를 받은 적이 없다.
     browse_result_limit: int = 10
     # yes24_browse 결과에 싣는 카테고리 내비(이름·번호) 상한. 페이지의 카테고리 트리는
     # 144개+라 전부 실으면 도구 결과가 비대해진다 — 상위·중분류가 앞서 렌더되므로 문서
     # 순서 상위만 담아도 분야 좁히기(소설/경제 등)는 충분하다.
     browse_categories_limit: int = 60
+    # yes24_fetch 본문 상한. **초기값 그대로이고 근거가 기록된 적 없다**(e9cf930 스쿼시) —
+    # 아래 web_fetch_max_chars가 이 값을 '빌려 쓰지 않으려고' 분리됐을 뿐, 6000 자체의 근거는
+    # 미상이다. 조정 대상이 되면 먼저 재검토할 자리다(2026-08-31 적대 감사 표시).
     fetch_max_chars: int = 6000
     # yes24_fetch 결과에 싣는 페이지 내 이동 링크 후보 상한. FAQ 입구 같은 내비 허브는
     # 카테고리 메뉴가 40여 개라, 동적 정책 내비게이션(입구 fetch → links에서 카테고리 선택)이
@@ -266,6 +296,8 @@ class Settings(BaseSettings):
     # web_search판). 정상 종합 재료를 자르지 않도록 토큰 예산(≈1024토큰) 위로 넉넉히 둔 안전
     # 천장이며, 초과 시에만 발동해 문장 경계 근처에서 잘라내고 절단 표식을 남긴다.
     web_search_snippet_max_chars: int = 6000
+    # 웹 검색 서브콜 상한. **초기값·근거 미기록**(e9cf930). 그라운딩 전환(2026-07-28) 이후
+    # 실제 서브콜 지연과 대조된 적 없다.
     web_search_timeout_s: float = 10.0
     # web_fetch 본문 상한·리드 마진. Yes24 상세용 fetch_max_chars를 빌려 쓰면 자사 페이지 예산을
     # 바꿀 때 외부 문서 예산이 딸려 움직인다(무관한 두 결정의 커플링) — 별도 필드로 분리한다.
@@ -386,6 +418,7 @@ class Settings(BaseSettings):
     # 진행 status detail 상한(문자). 사고 요약 라벨·검색 각도는 모델이 쓴 자유 텍스트라
     # 길 수 있는데, 진행 타임라인 한 줄은 짧아야 읽힌다. 문구를 만들지 않고 길이만 자른다.
     status_detail_max_chars: int = 120
+    # SSE 연결 상한. **초기값·근거 미기록**(e9cf930). 긴 조사 턴의 실제 소요와 대조된 적 없다.
     sse_timeout_s: float = 180.0
     app_name: str = "yes24-agent"
     # 요청 본문 상한(문자). ChatRequest.message·MatrixRequest.question에 pydantic max_length로
@@ -405,6 +438,7 @@ class Settings(BaseSettings):
     openai_api_key: str = ""  # LiteLLM 경로(openai/*) 모델용
     perplexity_api_key: str = ""  # web_search(퍼플렉시티 /search)용 — Bearer 토큰
     tavily_api_key: str = ""  # web_fetch(Tavily /extract)용
+
 
 @lru_cache
 def get_settings() -> Settings:
