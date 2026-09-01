@@ -30,6 +30,7 @@ from pydantic import BaseModel, StringConstraints
 from yes24_agent.admin import client_ip, register_admin
 from yes24_agent.auth import (
     AuthenticatedUser,
+    AuthService,
     close_auth_service,
     get_authenticated_user,
     signed_access_token,
@@ -83,6 +84,13 @@ class _NoCacheStaticFiles(StaticFiles):
 # 실제 호출·테스트에는 여전히 비밀번호가 필요하다(Swagger "Try it out" 포함).
 _ACCESS_EXEMPT_PATHS = frozenset(
     {"/health", "/login", "/logout", "/docs", "/redoc", "/openapi.json"}
+)
+
+# x-api-key로 월을 대신할 수 있는 경로 — **라우트가 get_authenticated_user로 키를 실제로
+# 검사하는 곳만** 담는다(위 access_gate 주석이 근거). HTML 페이지(/ ·/matrix)는 그 의존성이
+# 없으므로 절대 넣지 않는다. 통과 허용 목록이라 빠뜨림은 노출이 아니라 불편이다.
+_API_KEY_ROUTES = frozenset(
+    {"/chat/stream", "/chat/matrix", "/overview", "/overview/warm", "/overview/continue"}
 )
 
 
@@ -324,6 +332,30 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
         async def access_gate(request: Request, call_next):
             path = request.url.path
             cookie = request.cookies.get(ACCESS_COOKIE)
+            # **API 키를 들고 온 요청은 월이 막지 않는다**(2026-09-01). 이 앱의 인증은 두
+            # 겹이다 — 데모 페이지용 공유 비밀번호 쿠키(이 월)와, 진짜 클라이언트용
+            # x-api-key(auth.AuthService: 사용자 식별·레이트리밋). 그런데 월이 모든 요청
+            # 앞에 서서 **후자를 가렸다**: 정상 API 키를 들고 와도 쿠키가 없으면 401이라
+            # get_authenticated_user가 실행조차 안 됐고, 외부 프론트가 데모 비밀번호를
+            # 알아야 하는 뒤집힌 상황이 됐다.
+            #
+            # 통과는 **판정 위임**이지 면제가 아니다 — 키의 유효성·한도는 라우트 의존성이
+            # 그대로 검사해 무효 키는 401, 초과는 429가 된다. 그래서 **위임할 판정자가 있는
+            # 경로만** 연다(_API_KEY_ROUTES): HTML 페이지 라우트에는 그 의존성이 없어,
+            # 열어 주면 아무 문자열이나 헤더에 넣고 데모 UI를 통째로 받아 갈 수 있다
+            # (실측으로 확인하고 되돌린 구멍이다). Accept 헤더로는 못 가른다 — 스푸핑된다.
+            # 목록은 **통과 허용**이라 fail-safe다: 새 라우트를 여기 안 적으면 월이 그대로
+            # 지키므로, 빠뜨림이 노출이 아니라 불편으로만 나타난다.
+            # `service.enabled`(세션 DB가 mysql)를 함께 요구하는 이유: 인증 스택이 없는
+            # 구성에서는 get_authenticated_user가 헤더를 무시하고 익명 허용으로 흘려보내
+            # 판정자가 사실상 없어진다.
+            has_api_key = bool(request.headers.get("x-api-key"))
+            if (
+                has_api_key
+                and path in _API_KEY_ROUTES
+                and AuthService.get_instance().enabled
+            ):
+                return await call_next(request)
             if path in _ACCESS_EXEMPT_PATHS or any(
                 token_valid(cookie, pw) for pw in wall_passwords
             ):
