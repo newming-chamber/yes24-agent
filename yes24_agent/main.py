@@ -76,7 +76,14 @@ class _NoCacheStaticFiles(StaticFiles):
 
 
 # 로그인월이 켜져도 통과시키는 예외 경로(헬스체크·로그인 페이지·로그아웃 자체).
-_ACCESS_EXEMPT_PATHS = frozenset({"/health", "/login", "/logout"})
+# **API 문서 3종을 함께 연다**(2026-09-01 사용자 결정): 프론트 개발자가 클라이언트를 만들려면
+# SSE 이벤트 계약을 봐야 하는데, 그 계약의 정본은 코드에서 생성되는 이 문서다(docs/는
+# gitignore라 clone해도 안 온다). 여는 것은 **스키마이지 데이터가 아니다** — 엔드포인트는
+# 그대로 월 뒤에 있고, admin 라우트는 애초에 OpenAPI에 실리지 않는다.
+# 실제 호출·테스트에는 여전히 비밀번호가 필요하다(Swagger "Try it out" 포함).
+_ACCESS_EXEMPT_PATHS = frozenset(
+    {"/health", "/login", "/logout", "/docs", "/redoc", "/openapi.json"}
+)
 
 
 def _branded_html(path: Path, app_config=None) -> HTMLResponse:
