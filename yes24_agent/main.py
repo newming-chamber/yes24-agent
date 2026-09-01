@@ -467,8 +467,14 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
         # GET+HEAD 둘 다 등록한다 — 프론트 네비 링크가 HEAD로 활성 여부를 게이팅하는데,
         # FastAPI GET 라우트는 HEAD를 자동 허용하지 않아(405; 프록시 뒤에선 503) 링크가 안 뜬다.
         @app.api_route("/matrix", methods=["GET", "HEAD"], include_in_schema=False)
-        async def matrix_ui() -> FileResponse:
-            """16뷰 RBTI 매트릭스 시뮬레이터 UI를 반환한다(인증 없음)."""
+        async def matrix_ui(request: Request) -> FileResponse:
+            """16뷰 RBTI 매트릭스 시뮬레이터 UI — **어드민 역할 전용**.
+
+            페이지만 열려 있어도 의미가 없다(호출하는 /chat/matrix가 403이다). 화면과 API의
+            권한을 같은 술어로 묶어 "열리는데 안 되는" 상태를 만들지 않는다.
+            """
+            if not settings_unlocked(request):
+                raise HTTPException(status_code=403, detail="설정 접근 권한이 없습니다.")
             return FileResponse(_MATRIX_HTML, media_type="text/html")
 
 
@@ -594,17 +600,16 @@ def create_app() -> FastAPI:
     # 매트릭스 스트리밍 엔드포인트도 배포 게이팅(matrix_enabled) 대상 — off면 미등록(404).
     if settings.matrix_enabled:
 
-        @app.post(
-            "/chat/matrix",
-            responses=_SSE_RESPONSES,
-            response_class=StreamingResponse,
-            response_description="열(RBTI 코드)별 SSE 이벤트 스트림",
-            description=(
-                "질문 1건을 16개 RBTI 페르소나로 동시에 답한다. 프레임 구조는 챗과 같고, "
-                "각 프레임에 어느 열인지 알려주는 `col`이 붙는다.\n" + SSE_EVENT_CONTRACT
-            ),
-        )
-        async def chat_matrix(request: MatrixRequest) -> StreamingResponse:
+        # **16유형 매트릭스는 프론트용 API가 아니라 어드민 도구다**(2026-09-01 사용자 결정).
+        # 그래서 ① OpenAPI에서 빼고(프론트가 호출할 목록이 아니다) ② 어드민 역할을 요구한다.
+        # 요구 근거는 비용이다 — 요청 1회가 16 페르소나 에이전트 루프를 동시에 돌려 실측
+        # 6만 토큰이 나가고, 이 라우트에는 레이트리밋(인증 의존성 없음)도 일일 예산도 없으며
+        # Yes24를 고처리량 모드(matrix_http_rps)로 16셀이 동시에 친다. 데모 비밀번호만으로
+        # 열어 둘 표면이 아니다.
+        @app.post("/chat/matrix", include_in_schema=False)
+        async def chat_matrix(request: MatrixRequest, http_request: Request) -> StreamingResponse:
+            if not settings_unlocked(http_request):
+                raise HTTPException(status_code=403, detail="설정 접근 권한이 없습니다.")
             """질문을 받아 16 RBTI 페르소나 답변을 열별 SSE로 스트리밍한다(retrieve-once)."""
             # 화이트리스트 값만 통과 — /chat/stream과 동일(임의 문자열은 config 기본 모델 폴백).
             allowed = set(get_settings().selectable_models.values())
