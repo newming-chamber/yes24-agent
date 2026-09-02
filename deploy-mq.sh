@@ -40,7 +40,11 @@ LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 echo "[1/6] 소스 패키징 (시크릿 제외)"
 SRC_TGZ="$(mktemp -t yes24-src.XXXX.tgz)"
 trap 'rm -f "$SRC_TGZ"' EXIT
-tar czf "$SRC_TGZ" -C "$LOCAL_DIR" Dockerfile pyproject.toml uv.lock yes24_agent
+# COPYFILE_DISABLE: macOS tar는 확장속성이 있는 파일마다 `._이름` AppleDouble 파일을 함께
+# 넣는다 — 이미지 안에 코드가 아닌 파일 5개가 딸려 들어가 있었다(2026-09-02 배포본 대조에서
+# 로컬 48 vs 배포 53으로 발견). 동작에는 영향이 없지만 배포본이 소스와 다르다는 신호를
+#만들어 대조를 흐린다.
+COPYFILE_DISABLE=1 tar czf "$SRC_TGZ" -C "$LOCAL_DIR" Dockerfile pyproject.toml uv.lock yes24_agent
 if tar tzf "$SRC_TGZ" | grep -qiE '(^|/)\.env'; then echo "중단: tar에 .env 포함됨"; exit 1; fi
 
 echo "[2/6] 소스 전송 → $SSH_HOST"
