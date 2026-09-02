@@ -71,7 +71,8 @@ class SessionSummary(BaseModel):
     last_update_time: float = Field(description="마지막 활동 시각(epoch 초)")
     unread: bool = Field(
         description="답변 생성 완료 후 아직 열어보지 않은 세션이면 true(LNB 파란 점)."
-        " GET /chat/sessions/{id}로 복원하는 순간 읽음이 된다 — 별도 읽음 API는 없다"
+        " 대화를 복원(GET /chat/sessions/{id})하면 읽음이 된다. 이미 화면에 떠 있는 대화의"
+        " 배지만 끄려면 POST /chat/sessions/{id}/read를 쓴다(대화를 다시 받아오지 않는다)."
     )
 
 
@@ -184,6 +185,25 @@ async def _owned_session(user_no: str, session_id: str):
 def _normalized(text: str) -> str:
     """검색 비교용 정규화 — casefold + 공백 압축. 최소한만 한다(키워드 목록·형태소 금지)."""
     return " ".join(text.casefold().split())
+
+
+async def _mark_read_best_effort(data, user_no: str, session, last_read_at: float | None) -> None:
+    """읽음 기록 — 복원(GET)과 읽음 표시(POST)가 **같은 판정·같은 실패 정책**을 쓴다.
+
+    이미 읽은 상태면 쓰지 않는다(반복 조회가 행을 갱신하지 않는다). 기록 실패는 응답을 막지
+    않는다: 배지는 부가 채널이고 복원이 제품이다 — 로그로 정직하게 남긴다.
+
+    저장하는 값이 벽시계가 아니라 `session.last_update_time`인 이유는 비교 대상과 **같은
+    값**이어야 시계 오차로 unread가 되살아나지 않기 때문이다(user_data.mark_read 참조).
+    """
+    if not _is_unread(session.last_update_time, last_read_at):
+        return
+    try:
+        await data.mark_read(
+            user_id=user_no, session_id=session.id, read_at=session.last_update_time
+        )
+    except Exception as exc:  # noqa: BLE001 — 부가 채널(응답 보호)
+        logger.warning(f"읽음 기록 실패(session_id={session.id}): {exc}")
 
 
 def _is_unread(last_update_time: float, last_read_at: float | None) -> bool:
@@ -347,8 +367,8 @@ def register_history(app: FastAPI) -> None:
         " 매핑된다(/chat/stream done과 같은 계약). **출처 값은 관측 스냅샷이 아니라 세션"
         " 레지스트리의 현재(최신 관측) 값이다** — 같은 상품을 나중 턴이 다시 관측했다면 이전"
         " 턴의 카드도 그 최신 가격·평점으로 보인다(checked_at이 그 관측 시각)."
-        " 이 조회가 곧 **읽음 처리**다 — 이후 목록의 unread가 false가 된다(별도 읽음 API"
-        " 없음: 복원해 화면에 그린 것이 '봤다'의 자연스러운 정의다).",
+        " 이 조회가 곧 **읽음 처리**다 — 복원해 화면에 그린 것이 '봤다'의 자연스러운 정의다."
+        " 대화를 다시 받지 않고 배지만 끄려면 POST /chat/sessions/{session_id}/read를 쓴다.",
     )
     async def session_detail(session_id: str, user: _UserDep = None) -> SessionDetailResponse:
         user_no = _require_identified(user)
@@ -359,16 +379,34 @@ def register_history(app: FastAPI) -> None:
         )
         user_title, last_read_at = await data.ui_get(user_id=user_no, session_id=session.id)
         detail = _project_session_detail(session, feedback_by_turn, user_title)
-        # 읽음 기록 — unread였을 때만 쓴다(반복 조회가 이벤트를 쌓지 않는다). 기록 실패는
-        # 복원 응답을 막지 않는다: 배지는 부가 채널이고, 복원이 제품이다(로그로 정직 노출).
-        if _is_unread(session.last_update_time, last_read_at):
-            try:
-                await data.mark_read(
-                    user_id=user_no, session_id=session.id, read_at=session.last_update_time
-                )
-            except Exception as exc:  # noqa: BLE001 — 부가 채널(복원 응답 보호)
-                logger.warning(f"읽음 기록 실패(session_id={session.id}): {exc}")
+        await _mark_read_best_effort(data, user_no, session, last_read_at)
         return detail
+
+    @app.post(
+        "/chat/sessions/{session_id}/read",
+        tags=["history"],
+        response_model=SessionSummary,
+        responses=_SESSION_RESPONSES,
+        summary="읽음 표시",
+        description="이 대화를 **읽은 것으로 표시**한다(멱등). 복원(GET)도 읽음 처리를 하므로"
+        " 대화를 열어 그리는 흐름에서는 따로 부를 필요가 없다. 이 라우트는 **이미 화면에 있는"
+        " 대화**를 위한 것이다 — 방금 답변을 받아 다 읽은 창에서 배지만 끄려고 대화 전체를"
+        " 다시 받아오는 낭비를 없앤다. 응답은 갱신된 목록 항목이라 그대로 목록에 반영하면 된다.",
+    )
+    async def mark_session_read(session_id: str, user: _UserDep = None) -> SessionSummary:
+        user_no = _require_identified(user)
+        _, session = await _owned_session(user_no, session_id)
+        data = UserDataService.get_instance()
+        user_title, last_read_at = await data.ui_get(user_id=user_no, session_id=session.id)
+        # 읽은 시점은 **서버가 정한다**(클라이언트가 보낸 시각을 믿지 않는다). 미래 시각을
+        # 실어 보내면 이후 어떤 새 답변도 영영 읽음으로 보이게 만들 수 있기 때문이다.
+        await _mark_read_best_effort(data, user_no, session, last_read_at)
+        return SessionSummary(
+            session_id=session.id,
+            title=_title_of(session, user_title),
+            last_update_time=session.last_update_time,
+            unread=False,
+        )
 
     @app.patch(
         "/chat/sessions/{session_id}",

@@ -142,8 +142,6 @@ def normalize_marker_dialects(text: str) -> str:
     return _DIALECT_MARKER_PATTERN.sub(_replace, text)
 
 
-# 소수점은 문장 경계가 아니다. 점 양쪽이 모두 숫자인 경우만 제외하고 나머지 문장부호를 찾는다.
-SENTENCE_BOUNDARY_PATTERN = re.compile(r"(?<!\d)\.|\.(?!\d)|[!?\n]")
 _PUNCT = re.compile(r"[^\w\s]")
 
 
@@ -153,32 +151,19 @@ class CitationResult:
 
     text: str
     """무효 마커가 제거된 최종 본문."""
-    supports: list[dict]
-    """최종 본문 기준, 유효 마커마다 하나씩(중복 허용) 대응하는 근거 세그먼트.
+    meaningful_supports: int
+    """앞에 실제 주장 문자가 있는 유효 마커의 개수.
 
-    그룹형 마커(`[2, 3, 4]`)는 하나의 segment에 `source_ids`가 여러 개 담긴다
-    (Gemini `groundingSupports` 스키마와 동일하게 다중 source_ids를 지원).
-
-    [프론트 계약] start_index/end_index는 Python 문자(유니코드 코드포인트) 기준이다.
-    JS의 `String.prototype.slice`는 UTF-16 코드유닛 기준이라 이모지 등 astral 문자가
-    앞에 있으면 인덱스가 어긋난다 — 프론트는 인덱스 대신 `segment.text`를 신뢰할 것.
+    **개수만 남긴 이유**: 유일한 소비자(`runner`)가 `== 0`인지만 본다. 예전에는 마커마다
+    문장 경계를 정규식으로 근사해 `{segment: {start_index, end_index, text}, source_ids}`
+    세그먼트를 조립했는데, 그 인덱스·본문 사본을 공개하던 `done.grounding_supports`가
+    2026-09-01에 삭제되면서 소비처가 0이 됐다 — 불리언 하나를 위해 본문을 마커 수만큼
+    슬라이스하고 있었다(2026-09-02 구조 감사 C1).
     """
     used_source_ids: list[int]
     """실제로 인용된 출처 id (등장 순서, 중복 제거)."""
     removed_markers: list[str]
     """제거된 무효 마커(또는 그룹형 마커 내부에서 제거된 개별 id) 원문 (예: `"[9]"`)."""
-
-    @property
-    def meaningful_support_count(self) -> int:
-        """실제 주장 문자가 있는 support 개수."""
-        return sum(support_is_meaningful(support) for support in self.supports)
-
-
-def support_is_meaningful(support: dict) -> bool:
-    """마커 앞 구간에 문자나 숫자가 있어 검증할 주장이 존재하는지 판정한다."""
-    segment = support.get("segment")
-    text = segment.get("text") if isinstance(segment, dict) else None
-    return isinstance(text, str) and any(char.isalnum() for char in text)
 
 
 def _seam_parts(prefix: str, rest: str) -> tuple[str, str]:
@@ -219,7 +204,6 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
     - 전부 무효 → 마커 전체를 제거한다 (단일 무효 마커와 동일하게 처리).
 
     유효하지 않은 id는 경고 로그를 남기고 `removed_markers`에 기록한다.
-    반환되는 `supports`의 인덱스는 (재작성·제거 반영 후) 최종 본문 기준이다.
 
     코드 스팬(펜스 블록·인라인 코드) 안의 `[n]`은 배열 인덱스·수식이므로 마커 검증에서
     제외하고 원문 그대로 보존한다(`code_span_ranges`).
@@ -308,10 +292,11 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
     cleaned_parts.append(text[cursor:])
     final_text = "".join(cleaned_parts)
 
-    supports = [
-        _build_support(final_text, marker_start, source_ids)
-        for marker_start, _marker_end, source_ids in marker_positions
-    ]
+    # 마커 앞에 주장할 문자가 있는가만 센다(문장 경계 근사는 필요 없다 — 소비자가 0인지만 본다).
+    meaningful_supports = sum(
+        any(char.isalnum() for char in final_text[:marker_start])
+        for marker_start, _marker_end, _source_ids in marker_positions
+    )
     # 근거 세그먼트가 빈 마커를 **본문에서 지우던** 블록은 삭제했다(2026-08-04, 팀리드 승인).
     # 캐치 0 · 오탐 100%였다: 재생 47턴에서 유령 id 제거는 0건인데, 관측된 제거는 전부
     # 책 제목 끝의 `!`·`?`를 문장 경계로 오독한 것이었다(`《사과가 쿵!》 [1]` → 세그먼트가
@@ -319,15 +304,12 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
     # 근거가 아닌데, 그 근사 실패로 접지된 인용을 죽였다. 2026-07-15 게이트 스택 삭제와
     # 같은 근거·같은 결론이다.
     #
-    # `support_is_meaningful`은 남는다 — runner가 `meaningful_support_count`로 실제 판정을
-    # 한다. 다만 **공개 페이로드의 `grounding_supports` 필드는 2026-09-01에 삭제했다**:
-    # 프론트 소비처가 0곳인데(인용 마커 호버 프리뷰는 13b83e2에서 이미 렌더된 출처 카드
-    # DOM — .title·.info.author·.info.price·.info.reason — 을 읽는다) done 페이로드에서
-    # 가장 큰 필드였고 본문을 통째로 한 번 더 실었다. "호버 스니펫용"이라던 종전 이 주석은
-    # 그 재구현 뒤로 사실이 아니었다.
+    # 공개 `grounding_supports` 필드는 2026-09-01에, 그것을 만들던 세그먼트 조립 기계는
+    # 2026-09-02에 삭제했다 — 프론트 소비처가 0곳이었다(인용 마커 호버 프리뷰는 13b83e2에서
+    # 이미 렌더된 출처 카드 DOM을 읽는다). 남은 것은 아래 개수뿐이다.
     return CitationResult(
         text=final_text,
-        supports=supports,
+        meaningful_supports=meaningful_supports,
         used_source_ids=used_source_ids,
         removed_markers=removed_markers,
     )
@@ -526,36 +508,6 @@ def renumber_for_display(
     renumbered = validate_citations(renumber_markers(citation.text, mapping), public_sources)
     renumbered.removed_markers = [*citation.removed_markers, *renumbered.removed_markers]
     return renumbered, public_sources
-
-
-def _build_support(final_text: str, marker_start: int, source_ids: list[int]) -> dict:
-    """마커 직전 문장을 근사한 세그먼트를 만든다.
-
-    완벽한 문장 분할이 목표가 아니라 프론트가 호버 스니펫을 만들 근사치면 충분하다.
-    마지막 문장 경계(`. ! ? \\n`) 이후부터 마커 시작 위치 전까지를 세그먼트로 삼는다.
-    """
-    content_end = marker_start
-    while content_end > 0 and final_text[content_end - 1] in " \t":
-        content_end -= 1
-    search_region = final_text[:content_end]
-    boundary_ends = [
-        match.end()
-        for match in SENTENCE_BOUNDARY_PATTERN.finditer(search_region)
-        if match.end() < content_end
-    ]
-    seg_start = boundary_ends[-1] if boundary_ends else 0
-
-    while seg_start < marker_start and final_text[seg_start] in " \t":
-        seg_start += 1
-
-    return {
-        "segment": {
-            "start_index": seg_start,
-            "end_index": marker_start,
-            "text": final_text[seg_start:marker_start],
-        },
-        "source_ids": source_ids,
-    }
 
 
 def finalize_answer(

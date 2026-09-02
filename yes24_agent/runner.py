@@ -745,7 +745,7 @@ async def run_agent_stream(
                 # 같은 실패를 반복했다. 무효 마커 제거(validate_citations)는 유지하되,
                 # **정상 본문을 거절문으로 갈아끼우는 파괴 경로만 제거한다.**
                 # 재도입하려면 "창작을 실제로 잡은" 관측을 먼저 가져올 것.
-                if not citation.meaningful_support_count and (
+                if not citation.meaningful_supports and (
                     citation.removed_markers or observed_sources
                 ):
                     logger.warning(
