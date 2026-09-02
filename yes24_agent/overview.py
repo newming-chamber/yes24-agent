@@ -117,6 +117,7 @@ from google.genai import types
 
 from yes24_agent.agent import AGENT_NAME
 from yes24_agent.config import Settings, get_genai_client
+from yes24_agent.enrichment import SESSION_TITLE_STATE_KEY
 from yes24_agent.postprocess import (
     CitationResult,
     StreamRenumberer,
@@ -3160,10 +3161,14 @@ async def _seed_chat_session(
     """
     service = _get_session_service()
     uid = user_id or _POC_USER_ID
+    # 제목을 **검색어로 미리 채운다**. 안 채우면 이어가기 세션이 이름 없이 목록에 뜨고(러너의
+    # 자동 제목은 사용자가 실제로 한 마디 한 뒤에야 붙는다), 오버뷰에서 넘어온 대화는 사용자가
+    # 친 검색어가 곧 가장 정확한 이름이라 LLM에게 다시 물을 이유도 없다 — runner의
+    # `want_title = enrich and not 이미_제목있음`이 이 값을 보고 서브콜을 건너뛴다.
     session = await service.create_session(
         app_name=settings.app_name,
         user_id=uid,
-        state={SOURCES_STATE_KEY: seed["sources"]},
+        state={SOURCES_STATE_KEY: seed["sources"], SESSION_TITLE_STATE_KEY: query},
     )
     # 두 이벤트는 **한 턴**이므로 같은 invocation_id를 공유한다. 이게 없으면 대화 복원
     # (history._assemble_turns)이 "invocation_id 없는 이벤트 = 러너의 시스템 write"로 보고

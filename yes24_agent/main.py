@@ -327,16 +327,29 @@ class ChatRequest(BaseModel):
 
 
 class OverviewRequest(BaseModel):
-    """`/overview` 요청 본문(검색결과 AI 오버뷰)."""
+    """`/overview`·`/overview/warm`·`/overview/continue` 요청 본문(검색결과 AI 오버뷰).
 
-    query: NonBlankText
+    프론트가 채우는 것은 `query`(+선택적 `section`)뿐이다. `sources`는 접지원 비교 하네스용이라
+    ADMIN_ONLY_MARK로 공개 문서에서 뺀다 — 프로덕션 요청은 이 필드를 모른다.
+    """
+
+    query: NonBlankText = Field(
+        description="사용자가 친 **검색어**(대화 메시지가 아니다). 세 라우트가 같은 값을 쓰고,"
+        " 그 값이 곧 오버뷰 캐시 키다 — /overview/warm으로 미리 데우고 /overview로 받은 뒤"
+        " /overview/continue로 대화를 이어갈 때 **셋에 같은 문자열**을 보내야 캐시가 맞는다.",
+        examples=["불편한 편의점"],
+    )
     # 검색 범위. 빈 문자열·미지 값은 start_overview 입구가 urls.py 정본(SEARCH_SECTIONS)으로
     # 최광역 범위에 정규화한다 — 캐시 키·도구가 같은 값을 보므로 임의 변형이 키를 가르지
     # 않는다. 여기서는 길이만 기존 본문 상한으로 잠근다(무제한 문자열 입구 차단, query와 동일
     # config 상한 재사용).
     section: Annotated[
         str, StringConstraints(max_length=get_settings().request_max_chars)
-    ] = ""
+    ] = Field(
+        default="",
+        description="검색 범위(Yes24 검색 페이지의 카테고리 탭). 비우면 최광역 범위다."
+        " 모르는 값도 서버가 최광역으로 정규화하므로 오류가 아니다.",
+    )
     # 접지원 팔(테스트 하네스 — config.overview_compare_enabled). 빈 문자열 = 미지정 =
     # 현행 기본 팔(overview.ARM_YES24)이라 **프로덕션 요청은 이 필드를 모른다**. 값이 실리면
     # 라우트가 스위치와 화이트리스트(overview.OVERVIEW_ARMS)를 검사해 400으로 거른다 —
@@ -345,7 +358,11 @@ class OverviewRequest(BaseModel):
     # 잇는다(비교 팔 본문을 채팅으로 들고 가는 것은 하네스의 일이 아니다).
     sources: Annotated[
         str, StringConstraints(max_length=get_settings().request_max_chars)
-    ] = ""
+    ] = Field(
+        default="",
+        json_schema_extra={ADMIN_ONLY_MARK: True},
+        description="접지원 비교 하네스 전용 — 프로덕션 요청은 쓰지 않는다.",
+    )
 
 
 class MatrixRequest(BaseModel):
