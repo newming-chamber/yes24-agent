@@ -220,7 +220,13 @@ class AuthService:
            무한히 부푼다.
         """
         settings = get_settings()
-        data = await self._fetch_user_info(api_key)
+        if settings.dev_api_key and api_key == settings.dev_api_key:
+            # 개발 키: Yes24 조회만 건너뛰고 나머지는 일반 키와 같은 경로다(행 등록·레이트리밋·
+            # is_active). 설정이 비어 있으면 이 분기 자체가 없다(구조적 off 스위치).
+            data = {"userNo": settings.dev_api_user_no, "userId": "dev"}
+            logger.info("개발 키 사용(Yes24 조회 생략)")
+        else:
+            data = await self._fetch_user_info(api_key)
         if data is None:
             self._reject_unidentified(api_key, "신규 키 조회 실패")
         await self._run(

@@ -649,6 +649,16 @@ class Settings(BaseSettings):
     # 회원 정보(userNo·userId) 재조회 주기(시간). users.user_cached_at이 이보다 오래되면
     # 다음 인증 때 Yes24를 다시 물어 갱신한다.
     yes24_user_cache_hours: int = 24
+    # 개발용 API 키 — **비우면 비활성**(배포 기본). 값이 있으면 그 키 하나만 Yes24 회원 조회를
+    # 건너뛰고 `dev_api_user_no`로 식별된 것으로 취급한다. 프론트가 로컬에서 개발하려면
+    # x-api-key가 필요한데 진짜 ServiceCookies를 꺼내 오게 하는 건 무리라, 그 통로를 하나 연다.
+    # DB에 손으로 행을 심는 대신 설정으로 두는 이유: 환경마다 켜고 끄기가 구조로 되고(빈 값 =
+    # 분기 자체가 없음), 값이 레포에 남지 않으며, 폐기가 env 한 줄이다.
+    # 나머지 판정(레이트리밋·is_active·세션 소유권)은 일반 키와 **완전히 같은 경로**를 탄다.
+    dev_api_key: str = ""
+    # 개발 키가 가장할 사용자 번호. 실 회원과 겹치지 않게 9자리 대역을 쓴다 — 대화·피드백이
+    # 이 번호 밑에만 쌓여 실사용자 데이터와 섞이지 않는다.
+    dev_api_user_no: str = "990000001"
     # api_key → 사용자 in-memory 캐시 TTL(초). 이 창 안의 재요청은 users 조회를 건너뛴다
     # (rate limit 체크는 캐시와 무관하게 매 요청 DB에서 센다).
     auth_cache_ttl_s: float = 300.0
