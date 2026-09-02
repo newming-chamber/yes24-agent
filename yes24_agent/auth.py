@@ -191,6 +191,10 @@ class AuthService:
             data = await self._refresh_yes24_user(api_key)
             if data is not None:
                 user_no, login_id, can_use_ai = _user_fields(data)
+        if user_no is None:
+            # 행은 있는데 한 번도 식별된 적 없는 키(옛 자동등록이 남긴 NULL 행). 신규 키와
+            # 같은 상태이므로 같게 끊는다 — 이 분기가 없으면 옛 행이 영구 우회로가 된다.
+            self._reject_unidentified(api_key, "저장된 user_no 없음")
 
         return self._remember(
             AuthenticatedUser(
@@ -221,11 +225,7 @@ class AuthService:
         settings = get_settings()
         data = await self._fetch_user_info(api_key)
         if data is None:
-            logger.warning(f"미식별 키 거절: key={api_key[:8]}…")
-            raise HTTPException(
-                status_code=403,
-                detail="Yes24 회원 식별이 완료되지 않은 키입니다. 잠시 후 다시 시도해 주세요.",
-            )
+            self._reject_unidentified(api_key, "신규 키 조회 실패")
         await self._run(
             "INSERT INTO users (api_key, rate_limit_rpm, rate_limit_rpd) VALUES (%s, %s, %s) "
             "ON DUPLICATE KEY UPDATE updated_at = NOW()",
@@ -244,6 +244,19 @@ class AuthService:
                 rate_limit_rpm=settings.rate_limit_rpm,
                 rate_limit_rpd=settings.rate_limit_rpd,
             )
+        )
+
+    def _reject_unidentified(self, api_key: str, why: str) -> None:
+        """Yes24 회원으로 **한 번도 식별되지 않은** 키를 거절한다(403) — 판정의 단일 소유자.
+
+        신규 키(조회 실패)와 레거시 행(user_no가 NULL인 채 남은 행) 두 경로가 같은 상태이므로
+        같은 문구·같은 코드로 끊는다. 이미 식별된 키는 여기 오지 않으므로 Yes24 API 장애가
+        기존 사용자를 끊지 않는다(fail-open은 그쪽에 남는다).
+        """
+        logger.warning(f"미식별 키 거절({why}): key={api_key[:8]}…")
+        raise HTTPException(
+            status_code=403,
+            detail="Yes24 회원 식별이 완료되지 않은 키입니다. 잠시 후 다시 시도해 주세요.",
         )
 
     async def _refresh_yes24_user(self, api_key: str) -> dict[str, Any] | None:
