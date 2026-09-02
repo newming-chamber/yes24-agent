@@ -733,9 +733,17 @@ class Settings(BaseSettings):
         # 아니라 도메인이 달라도 성립하고, baseUrl만 우리 주소로 바꾸면 계약이 그대로 맞는다.
         "https://chat.yes24.com",
         "https://chat-test.yes24.com",
-        # 프론트 개발 서버의 관례 포트(3000·5173, localhost·127.0.0.1).
+        # 프론트 개발 서버 포트. 3002·3003·3010은 **관례가 아니라 실측**이다 — crema DEV의
+        # Caddy 로그(2026-09-02, 24시간)에서 프론트 개발자들이 실제로 그 포트로 붙고 있었다.
+        # 우리 API로 갈아타는 순간 목록에 없는 포트는 브라우저가 막으므로 미리 넣어 둔다.
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "http://localhost:3002",
+        "http://127.0.0.1:3002",
+        "http://localhost:3003",
+        "http://127.0.0.1:3003",
+        "http://localhost:3010",
+        "http://127.0.0.1:3010",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ]
