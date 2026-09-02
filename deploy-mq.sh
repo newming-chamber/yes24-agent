@@ -78,6 +78,10 @@ ssh "$SSH_HOST" bash -lc "'
 # SESSION_FALLBACK_ALLOWED: 세션 DB 생성 실패 시 InMemory 폴백 허용 여부. 배포 세션 DB는
 #   네트워크 MySQL이라 조용한 폴백은 "영속 중이라 믿는 비영속"(대화가 재시작마다 증발,
 #   admin·집계는 위장 정상)이 된다 — 배포 기본은 false(기동 실패로 즉시 드러낸다).
+# LOG_FILE_PATH: 파일 로깅. 코드(RotatingFileHandler)는 있는데 배포가 값을 안 넣어 stdout만
+#   남고 있었다 — 컨테이너를 재기동하면 그전 로그가 사라져 사후 추적 근거가 없다(2026-09-02
+#   확인). 호스트에 마운트되는 /app/data 아래에 둬야 재기동·재배포를 넘어 남는다.
+LOG_FILE_PATH="${LOG_FILE_PATH:-/app/data/yes24-agent.log}"
 MATRIX_ENABLED="${MATRIX_ENABLED:-true}"
 SERVE_FRONTEND="${SERVE_FRONTEND:-true}"
 SESSION_FALLBACK_ALLOWED="${SESSION_FALLBACK_ALLOWED:-false}"
@@ -87,9 +91,10 @@ SESSION_FALLBACK_ALLOWED="${SESSION_FALLBACK_ALLOWED:-false}"
   printf 'SERVE_FRONTEND=%s\n' "$SERVE_FRONTEND"
   printf 'SESSION_FALLBACK_ALLOWED=%s\n' "$SESSION_FALLBACK_ALLOWED"
   printf 'PORT=%s\n' "$CONTAINER_PORT"
+  printf 'LOG_FILE_PATH=%s\n' "$LOG_FILE_PATH"
   if [ -n "${ACCESS_PASSWORD:-}" ]; then printf 'ACCESS_PASSWORD=%s\n' "$ACCESS_PASSWORD"; fi
 } | ssh "$SSH_HOST" "install -m 600 /dev/stdin $REMOTE_BUILD/.env"
-echo "  → 원격 .env 전송(모드 600) · MATRIX_ENABLED=$MATRIX_ENABLED · SERVE_FRONTEND=$SERVE_FRONTEND · SESSION_FALLBACK_ALLOWED=$SESSION_FALLBACK_ALLOWED · PORT=$CONTAINER_PORT 주입(로컬 .env 불변)"
+echo "  → 원격 .env 전송(모드 600) · MATRIX_ENABLED=$MATRIX_ENABLED · SERVE_FRONTEND=$SERVE_FRONTEND · SESSION_FALLBACK_ALLOWED=$SESSION_FALLBACK_ALLOWED · PORT=$CONTAINER_PORT · LOG_FILE_PATH=$LOG_FILE_PATH 주입(로컬 .env 불변)"
 if [ -n "${ACCESS_PASSWORD:-}" ]; then
   echo "  → ACCESS_PASSWORD 오버라이드 주입(로그인월 이 값으로 활성)"
 else
