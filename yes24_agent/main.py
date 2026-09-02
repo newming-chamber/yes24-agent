@@ -290,10 +290,12 @@ ADMIN_ONLY_MARK = "x-admin-only"
 class ChatRequest(BaseModel):
     """`/chat/stream` 요청 본문 — 설명은 **OpenAPI로 나간다**(주석은 /docs에 안 보인다).
 
-    프론트가 채우는 필드는 `message`·`session_id` 둘뿐이고, 공개 문서에도 그 둘만 나간다.
-    `rbti`는 **사람에게 붙는 값**이라 서버가 소유한다(`PUT /me/rbti`로 한 번 저장 →
-    매 턴 자동 적용). 요청 필드로 남아 있는 것은 데모 UI의 선택기가 일시적으로 덮어쓰기
-    위해서다. 나머지 둘은 어드민(데모 로그인) 화면의 모델·도구 토글용이라 API 키 호출에서는
+    프론트가 채우는 필드는 `message`·`session_id`·`use_rbti` 셋이다. RBTI **코드**는 사람에게
+    붙는 값이라 서버가 소유하지만(`PUT /me/rbti`로 한 번 저장), **이번 턴에 쓸지 말지**는
+    화면의 선택이므로 프론트가 보낸다. 감춰진 `rbti`는 데모 UI의 선택기가 저장된 유형을
+    일시적으로 덮어쓰기 위한 것이다.
+
+    나머지 둘은 어드민(데모 로그인) 화면의 모델·도구 토글용이라 API 키 호출에서는
     무시되는데, 효과 없는 필드가 스키마에 보이는 것이 가장 헷갈리므로 `ADMIN_ONLY_MARK`를
     달아 공개 스키마에서 뺀다(감출 이름을 손목록으로 적지 않고 **선언에서 파생**한다 —
     필드가 늘어도 표식만 달면 되고, 목록을 갱신하지 않아 새는 일이 없다).
@@ -307,6 +309,13 @@ class ChatRequest(BaseModel):
         default=None,
         description="이어갈 대화 id. **비우면 새 대화**가 만들어지고 그 id가 `done.session_id`로"
         " 돌아온다 — 다음 턴부터 그 값을 실어 보낸다.",
+    )
+    use_rbti: bool = Field(
+        default=True,
+        description="이 턴에 저장된 RBTI 독서 유형을 적용할지. 기본 **true**(저장돼 있으면"
+        " 자동 적용). `false`면 유형이 저장돼 있어도 이 턴은 적용하지 않는다"
+        " (`done.rbti_applied`가 null로 온다) — 화면의 '내 유형으로 보기' 토글을 끈 상태다."
+        " 유형을 아예 지우려면 `PUT /me/rbti`에 null을 보낸다(이건 저장값 자체를 바꾼다).",
     )
     rbti: str | None = Field(
         default=None,
@@ -778,10 +787,14 @@ def create_app() -> FastAPI:
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-        # 요청이 rbti를 명시하지 않으면 유저 프로필의 저장 코드로 폴백한다(현재 껍데기 —
-        # 항상 None이라 기존 동작과 동일. 데이터 소스가 정해지면 profile.py만 채운다).
+        # RBTI: **코드는 서버가, 켜고 끄기는 프론트가** 소유한다(2026-09-02 사용자 결정).
+        # 유형 자체는 사람에게 붙는 값이라 users.rbti에 저장돼 있고, 이번 턴에 그것을 쓸지는
+        # 화면의 토글이라 요청이 정한다. use_rbti=false면 저장돼 있어도 적용하지 않는다 —
+        # 저장값을 지우는 것(PUT /me/rbti null)과는 다른 층위다.
+        # request.rbti는 데모 UI 전용 덮어쓰기라 토글이 꺼져 있으면 그것도 무시한다(끄기가
+        # 이긴다 — "껐는데 페르소나가 적용됐다"가 성립하면 안 된다).
         user_no = str(user.user_no) if user and user.user_no else None
-        rbti = request.rbti or await fetch_user_rbti(user_no)
+        rbti = (request.rbti or await fetch_user_rbti(user_no)) if request.use_rbti else None
         stream = run_agent_stream(
             request.message,
             request.session_id,
