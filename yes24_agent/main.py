@@ -649,13 +649,24 @@ def _overview_arm(sources: str) -> str:
 # 엔드포인트 목록만 있고 "인증은 뭐로, 첫 호출은 뭘로, 응답은 어떻게 읽나"가 없으면 문서를
 # 열어도 시작을 못 한다. 스트리밍 계약 본문은 /chat/stream 설명에 붙는 SSE_EVENT_CONTRACT가
 # 정본이라 여기서 되풀이하지 않고 가리키기만 한다(같은 설명 두 벌 금지).
-API_DESCRIPTION = """Yes24 책·상품에 밝은 AI 대화 어시스턴트 API.
+API_DESCRIPTION = r"""Yes24 책·상품에 밝은 AI 대화 어시스턴트 API.
 
-**인증** — 모든 호출에 헤더 `x-api-key`를 넣는다. 값은 **Yes24 service_cookie**이고, 그 값이
-곧 사용자 식별자다(서버가 Yes24 회원 API로 userNo를 조회해 대화를 사람 단위로 가른다).
-crema-ai와 같은 계약이라 쓰던 키를 그대로 쓰면 된다. 위 **Authorize** 버튼에 한 번 넣으면
-이 페이지에서 바로 호출해 볼 수 있다. 키 없이 부르면 **모든 API가 401**이고,
-Yes24 회원으로 식별되지 않는 키는 **403**이다(임의 문자열은 키가 되지 않는다).
+**인증** — 모든 호출에 헤더 `x-api-key`를 넣는다. 값은 브라우저의 **`ServiceCookies` 쿠키
+값**이다(Yes24 로그인 쿠키, HttpOnly가 아니라 JS로 읽힌다). 서버가 그 값으로 Yes24 회원
+API를 조회해 userNo를 얻고, 그 userNo로 대화를 사람 단위로 가른다. crema-ai와 같은 계약이라
+프론트 코드를 그대로 쓰면 된다:
+
+```js
+const key = document.cookie.match(/(?:^|;\s*)ServiceCookies=([^;]*)/)?.[1];
+headers.set("x-api-key", decodeURIComponent(key));
+```
+
+**개발 환경**에서는 Yes24 로그인 없이 쓸 수 있는 별도 개발 키를 발급한다 — 값은 팀에
+문의(이 문서에 적지 않는다). 위 **Authorize** 버튼에 넣으면 이 페이지에서 바로 호출해 볼 수
+있다.
+
+키 없이 부르면 **모든 API가 401**이고, 식별되지 않는 키는 **403**이다(임의 문자열은 키가
+되지 않는다). 한도 초과는 429다.
 
 **RBTI 독서 유형** — 사용자의 유형은 `PUT /me/rbti`로 **한 번** 저장하면 그 뒤 모든 대화에
 서버가 자동 적용한다(요청마다 실어 보내지 않는다). 적용된 코드는 `done.rbti_applied`로

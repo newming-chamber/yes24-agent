@@ -360,9 +360,10 @@ async def close_auth_service() -> None:
 API_KEY_HEADER = APIKeyHeader(
     name="x-api-key",
     auto_error=False,
-    description="Yes24 service_cookie 값. 이 값 하나가 곧 사용자 식별자이며(서버가 Yes24 회원"
-    " API로 userNo를 조회한다) crema-ai와 같은 계약이라 쓰던 키를 그대로 쓰면 된다."
-    " 실패 코드: 헤더가 없으면 **401**, Yes24 회원으로 식별되지 않는 키는 **모든 API에서 403**,"
+    description="브라우저의 `ServiceCookies` 쿠키 값(Yes24 로그인 쿠키). 이 값 하나가 곧"
+    " 사용자 식별자이며 서버가 Yes24 회원 API로 userNo를 조회한다 — crema-ai와 같은 계약이다."
+    " 개발 환경에서는 별도 개발 키를 발급한다(값은 팀에 문의)."
+    " 실패 코드: 헤더가 없으면 **401**, 식별되지 않는 키는 **모든 API에서 403**,"
     " 비활성 키는 401, 한도 초과는 429다.",
 )
 
