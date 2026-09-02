@@ -66,7 +66,9 @@ class SessionSummary(BaseModel):
 
     session_id: str = Field(description="후속 /chat/stream·복원·삭제에 쓰는 세션 id")
     title: str | None = Field(
-        description="서버가 생성한 세션 제목 — 아직 생성 전(첫 잡담 턴 등)이면 null"
+        description="서버가 생성한 세션 제목 — **첫 턴이 완료되면** 잡담이든 아니든 자동"
+        " 생성된다. null인 것은 아직 완료된 턴이 없는 세션(오버뷰 이어가기로 막 만들어진"
+        " 세션 등)이거나 제목 생성이 실패한 세션이다"
     )
     last_update_time: float = Field(description="마지막 활동 시각(epoch 초)")
     unread: bool = Field(
@@ -319,8 +321,9 @@ def register_history(app: FastAPI) -> None:
         response_model=SessionListResponse,
         responses=_AUTH_RESPONSES,
         summary="내 대화 목록(+검색)",
-        description="x-api-key 소유자의 세션을 최근 활동순으로 돌려준다. 제목이 아직 없는"
-        " 세션(첫 턴 진행 전·잡담만 한 세션)은 title이 null이다. `q`는 **제목 기준**"
+        description="x-api-key 소유자의 세션을 최근 활동순으로 돌려준다. 제목은 첫 턴이"
+        " 끝날 때 자동 생성되므로 title이 null인 것은 **아직 완료된 턴이 없는 세션**이다."
+        " `q`는 **제목 기준**"
         " 부분일치다(대소문자·공백 정규화) — 본문 전문 검색은 지원하지 않는다: 본문은"
         " events의 JSON 안에 있어 검색이 사용자 전 세션·전 이벤트 스캔이 되고, 목록 API의"
         " 비용 축이 달라진다(제목이 이미 대화 내용의 요약이라 히스토리 패널 용도로 충분).",

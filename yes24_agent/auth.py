@@ -308,7 +308,8 @@ API_KEY_HEADER = APIKeyHeader(
     auto_error=False,
     description="Yes24 service_cookie 값. 이 값 하나가 곧 사용자 식별자이며(서버가 Yes24 회원"
     " API로 userNo를 조회한다) crema-ai와 같은 계약이라 쓰던 키를 그대로 쓰면 된다."
-    " 없으면 익명으로 흐르고, 대화 히스토리 API는 사용자 식별이 필요해 403이다.",
+    " 실패 코드: 헤더가 없으면 **401**, 키는 있으나 Yes24 회원 식별(userNo)이 안 되면 **403**,"
+    " 비활성 키도 401, 한도 초과는 429다.",
 )
 
 

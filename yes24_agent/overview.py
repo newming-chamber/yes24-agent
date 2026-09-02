@@ -104,6 +104,7 @@ import logging
 import re
 import time
 import unicodedata
+import uuid
 from collections import Counter, OrderedDict
 from collections.abc import AsyncIterator, Callable
 from copy import deepcopy
@@ -3164,10 +3165,21 @@ async def _seed_chat_session(
         user_id=uid,
         state={SOURCES_STATE_KEY: seed["sources"]},
     )
+    # 두 이벤트는 **한 턴**이므로 같은 invocation_id를 공유한다. 이게 없으면 대화 복원
+    # (history._assemble_turns)이 "invocation_id 없는 이벤트 = 러너의 시스템 write"로 보고
+    # 통째로 건너뛰어, 이어가기로 만든 대화를 나중에 열면 **빈 대화**가 뜬다(모델은 문맥을
+    # 기억하는데 화면에는 아무것도 없다 — 2026-09-02 문서 계약 검증 W5 실측).
+    # 형식은 ADK가 부여하는 것과 같게 맞춘다(done.turn_id·피드백 API의 turn_id와 같은 공간).
+    seed_turn_id = f"e-{uuid.uuid4()}"
     seed_events = [
-        Event(author="user", content=types.Content(role="user", parts=[types.Part(text=query)])),
+        Event(
+            author="user",
+            invocation_id=seed_turn_id,
+            content=types.Content(role="user", parts=[types.Part(text=query)]),
+        ),
         Event(
             author=AGENT_NAME,
+            invocation_id=seed_turn_id,
             content=types.Content(role="model", parts=[types.Part(text=seed["text"])]),
         ),
     ]

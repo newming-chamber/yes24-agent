@@ -61,6 +61,30 @@ const reader = res.body.getReader(); // res.json() 아님
 """
 
 
+# 오버뷰(/overview·/overview/warm) 전용 계약. **챗 계약표를 그대로 붙이면 거짓말이 된다** —
+# 오버뷰는 status·source·meta를 한 번도 내지 않고 done의 모양도 다르다(2026-09-02 문서 계약
+# 검증 W4 실측). 공통 규칙(delta 누적·reset 의미·done 1회·[n] 매핑)은 되풀이하지 않고
+# 위 계약을 가리킨다.
+OVERVIEW_EVENT_CONTRACT = """
+**이벤트** (챗보다 좁다 — `status`·`source`·`meta`는 **오지 않는다**)
+
+| event | data | 뜻 |
+|---|---|---|
+| `delta` | `{text}` | 본문 조각. 이어 붙이면 본문이 된다 |
+| `reset` | `{}` | 이미 받은 본문을 버려라(인용 검증이 본문을 바꿨을 때만) |
+| `done` | `{overview: {text, sources, cited_ids}}` 또는 `{degraded: "..."}` | 종료·1회 |
+| `error` | `{message}` | 실패 문구 |
+
+**지켜지는 계약**
+- `done`은 **정확히 한 번** 온다. 본문·출처는 챗처럼 최상위가 아니라 **`done.overview` 안**에 있다.
+- 낼 것이 없으면 `done.degraded`만 온다(`no_results`·`irrelevant`·`timeout` 등)—
+  `overview` 키가 없다. 이때 프론트는 패널을 **조용히 접는다**(에러 배너 금지).
+- `reset`이 없으면 `delta` 합계 == `done.overview.text`.
+- 본문의 `[n]` 마커는 `done.overview.sources`의 `id`에 매핑된다(챗과 같은 규칙).
+- 출처 카드는 `source` 이벤트가 아니라 **`done`이 올 때 한 번에** 그린다.
+"""
+
+
 def format_sse(event: str, data: dict) -> str:
     """`event: {event}\\ndata: {json}\\n\\n` 형태의 SSE 프레임을 만든다.
 

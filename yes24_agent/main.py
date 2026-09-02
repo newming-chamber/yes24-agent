@@ -50,7 +50,7 @@ from yes24_agent.overview import (
 from yes24_agent.rbti.profile import fetch_user_rbti
 from yes24_agent.runner import run_agent_stream
 from yes24_agent.session_service import SQLITE_DIALECT, db_dialect, persistence_mode
-from yes24_agent.sse import SSE_EVENT_CONTRACT
+from yes24_agent.sse import OVERVIEW_EVENT_CONTRACT, SSE_EVENT_CONTRACT
 from yes24_agent.thought_translation import warmup_translation
 from yes24_agent.toolsets import TOOLSETS, get_resolved_app, resolve_app_for
 from yes24_agent.usage import close_usage_logger
@@ -269,7 +269,7 @@ _SSE_EXAMPLE = (
     'event: delta\ndata: {"text":"채식주의자는 ","ts":1756000000100}\n\n'
     'event: source\ndata: {"source":{"id":1,"title":"채식주의자"},"ts":1756000000200}\n\n'
     'event: done\ndata: {"text":"채식주의자는 15,300원입니다[1]","sources":[{"id":1}],'
-    '"cited_ids":[1],"session_id":"...","model":"...","turn_id":"...","ts":1756000000300}\n\n'
+    '"cited_ids":[1],"session_id":"...","turn_id":"...","ts":1756000000300}\n\n'
 )
 _SSE_RESPONSES: dict = {
     200: {
@@ -595,7 +595,8 @@ API_DESCRIPTION = """Yes24 책·상품에 밝은 AI 대화 어시스턴트 API.
 **인증** — 모든 호출에 헤더 `x-api-key`를 넣는다. 값은 **Yes24 service_cookie**이고, 그 값이
 곧 사용자 식별자다(서버가 Yes24 회원 API로 userNo를 조회해 대화를 사람 단위로 가른다).
 crema-ai와 같은 계약이라 쓰던 키를 그대로 쓰면 된다. 위 **Authorize** 버튼에 한 번 넣으면
-이 페이지에서 바로 호출해 볼 수 있다. 키 없이 부르면 히스토리 API는 403이다.
+이 페이지에서 바로 호출해 볼 수 있다. 키 없이 부르면 **모든 API가 401**이고,
+등록되지 않은 키(회원 식별 실패)는 403이다.
 
 **첫 호출** — `POST /chat/stream`에 `{"message": "한강 작가 책 추천해줘"}`만 보내면 된다.
 `session_id`를 비우면 새 대화가 만들어지고, 그 id가 스트림 마지막 `done` 이벤트의
@@ -774,10 +775,10 @@ def create_app() -> FastAPI:
             response_class=StreamingResponse,
             response_description="SSE 이벤트 스트림",
             description=(
-                "검색어 하나로 검색결과 상단 AI 오버뷰를 SSE로 스트리밍한다. 프레임 구조는 "
-                "챗과 같고 `done.overview`에 본문·출처가 담긴다. 낼 것이 없으면 "
-                "`done.degraded`(예: no_results·irrelevant·timeout)만 오고 본문은 없다 — "
-                "프론트는 그 경우 패널을 조용히 접는다(에러 배너 금지).\n" + SSE_EVENT_CONTRACT
+                "검색어 하나로 검색결과 상단 AI 오버뷰를 SSE로 스트리밍한다. 대화가 아니라 "
+                "**검색결과 상단 요약**이라 세션이 생기지 않는다 — 사용자가 더 묻고 싶어 하면 "
+                "`POST /overview/continue`가 이 내용을 이어받은 대화 세션을 만들어 준다.\n"
+                + OVERVIEW_EVENT_CONTRACT
             ),
         )
         async def overview_endpoint(
