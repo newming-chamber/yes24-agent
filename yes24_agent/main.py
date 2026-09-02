@@ -308,8 +308,24 @@ class ChatRequest(BaseModel):
     session_id: str | None = Field(
         default=None,
         description="이어갈 대화 id. **비우면 새 대화**가 만들어지고 그 id가 `done.session_id`로"
-        " 돌아온다 — 다음 턴부터 그 값을 실어 보낸다.",
+        " 돌아온다 — 다음 턴부터 그 값을 실어 보낸다. 클라이언트가 직접 만든 id(UUID 등)를"
+        " 보내도 된다: 그 id의 대화가 없으면 **그 id 그대로** 새 대화가 만들어진다(crema 방식)."
+        " 남의 대화 id를 넣어도 자기 것만 조회되므로 탈취는 성립하지 않는다.",
     )
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                # Swagger UI의 "Try it out"이 이 본문을 그대로 채운다. 예시를 안 주면 스키마에서
+                # 자동 생성한 `{"session_id": "string", ...}`이 들어가는데, 그 자리표시자가 실제
+                # 값으로 전송돼 **"string"이라는 이름의 대화가 만들어진다**(2026-09-02 실측).
+                # 그래서 예시는 "복사해서 바로 보내도 맞는" 최소 본문으로 둔다.
+                {"message": "한강 작가 책 추천해줘"},
+                {"message": "그 책 몇 쪽이야?", "session_id": "이전 응답의 done.session_id"},
+                {"message": "요즘 읽을 만한 소설?", "use_rbti": True},
+            ]
+        }
+    }
+
     use_rbti: bool = Field(
         default=False,
         description="이 턴에 저장된 RBTI 독서 유형을 적용할지. **기본 false** — 보내지 않으면"
