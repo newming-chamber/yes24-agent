@@ -29,12 +29,11 @@ from pydantic import BaseModel, Field, StringConstraints
 from yes24_agent.auth import AuthenticatedUser, get_authenticated_user
 from yes24_agent.config import get_settings
 from yes24_agent.enrichment import SESSION_TITLE_STATE_KEY
-from yes24_agent.feedback import FeedbackService
 from yes24_agent.postprocess import finalize_answer
 from yes24_agent.runner import _event_text, _round_boundary_prefix
 from yes24_agent.session_service import _get_session_service
-from yes24_agent.session_ui import SessionUiService
 from yes24_agent.sources import get_sources
+from yes24_agent.user_data import UserDataService
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +190,7 @@ def _is_unread(last_update_time: float, last_read_at: float | None) -> bool:
     """읽지 않음 판정의 단일 소유자 — 목록(unread 필드)과 복원(읽음 기록 여부)이 같이 쓴다.
 
     한 번도 열어본 적 없는 세션(last_read_at 없음)은 true다. 두 값은 같은 시간 도메인이다
-    (읽음 기록이 벽시계가 아니라 그때의 last_update_time을 그대로 저장한다 — SessionUiService).
+    (읽음 기록이 벽시계가 아니라 그때의 last_update_time을 그대로 저장한다 — UserDataService).
     """
     return last_read_at is None or last_update_time > last_read_at
 
@@ -318,7 +317,7 @@ def register_history(app: FastAPI) -> None:
         listing = await service.list_sessions(app_name=get_settings().app_name, user_id=user_no)
         recent = sorted(listing.sessions, key=lambda s: s.last_update_time, reverse=True)
         # 사용자 제목·읽음 시각을 **한 번에** 읽는다(세션당 질의는 N+1이 되는 자리다).
-        ui = await SessionUiService.get_instance().for_user(user_id=user_no)
+        ui = await UserDataService.get_instance().ui_for_user(user_id=user_no)
         rows = [(s, *ui.get(s.id, (None, None))) for s in recent]
         if q is not None and (needle := _normalized(q)):
             # 제목 없는 세션(title=null)은 어떤 검색어에도 잡히지 않는다 — 보여줄 실마리가
@@ -354,17 +353,17 @@ def register_history(app: FastAPI) -> None:
     async def session_detail(session_id: str, user: _UserDep = None) -> SessionDetailResponse:
         user_no = _require_identified(user)
         service, session = await _owned_session(user_no, session_id)
-        feedback_by_turn = await FeedbackService.get_instance().for_session(
+        data = UserDataService.get_instance()
+        feedback_by_turn = await data.feedback_for_session(
             user_id=user_no, session_id=session.id
         )
-        ui = SessionUiService.get_instance()
-        user_title, last_read_at = await ui.get(user_id=user_no, session_id=session.id)
+        user_title, last_read_at = await data.ui_get(user_id=user_no, session_id=session.id)
         detail = _project_session_detail(session, feedback_by_turn, user_title)
         # 읽음 기록 — unread였을 때만 쓴다(반복 조회가 이벤트를 쌓지 않는다). 기록 실패는
         # 복원 응답을 막지 않는다: 배지는 부가 채널이고, 복원이 제품이다(로그로 정직 노출).
         if _is_unread(session.last_update_time, last_read_at):
             try:
-                await ui.mark_read(
+                await data.mark_read(
                     user_id=user_no, session_id=session.id, read_at=session.last_update_time
                 )
             except Exception as exc:  # noqa: BLE001 — 부가 채널(복원 응답 보호)
@@ -388,13 +387,13 @@ def register_history(app: FastAPI) -> None:
     ) -> SessionSummary:
         user_no = _require_identified(user)
         _, session = await _owned_session(user_no, session_id)
-        ui = SessionUiService.get_instance()
+        data = UserDataService.get_instance()
         # 사용자 제목은 **우리 테이블에** 쓴다(ADK 세션 state가 아니라). 그래야 이름 변경이
         # 목록의 활동 시각을 밀지 않는다 — ADK 세션은 state를 쓰는 순간 update_time이
         # onupdate로 현재가 된다(session_ui.py 독스트링). 자동 제목은 여전히 ADK state에
         # 남고, 표시할 때 사용자 제목이 그것을 덮는다(_title_of).
-        await ui.set_title(user_id=user_no, session_id=session.id, title=request.title)
-        _, last_read_at = await ui.get(user_id=user_no, session_id=session.id)
+        await data.set_title(user_id=user_no, session_id=session.id, title=request.title)
+        _, last_read_at = await data.ui_get(user_id=user_no, session_id=session.id)
         return SessionSummary(
             session_id=session.id,
             title=request.title,
@@ -418,13 +417,9 @@ def register_history(app: FastAPI) -> None:
         # 라이브 검증에서 고아 행 관측). 순서가 이쪽인 이유: 피드백 삭제가 실패하면 5xx로
         # 끊겨 세션이 남고 사용자가 다시 누를 수 있다. 반대로 하면 세션은 사라졌는데 코멘트만
         # 남아 되지울 방법이 없어진다(soft-fail보다 재시도 가능한 실패가 낫다).
-        feedback = FeedbackService.get_instance()
-        if feedback.enabled:
-            await feedback.purge_session(user_id=user_no, session_id=session.id)
-        # 사용자가 지은 제목도 사용자 데이터다 — 피드백과 같은 이유로 함께 지운다(고아 행).
-        session_ui = SessionUiService.get_instance()
-        if session_ui.enabled:
-            await session_ui.purge_session(user_id=user_no, session_id=session.id)
+        data = UserDataService.get_instance()
+        if data.enabled:
+            await data.purge_session(user_id=user_no, session_id=session.id)
         await service.delete_session(
             app_name=get_settings().app_name, user_id=user_no, session_id=session.id
         )
@@ -462,12 +457,14 @@ def register_history(app: FastAPI) -> None:
         # 이미 있는 invocation_id뿐이라 별도 인덱스·스캔 구조가 필요 없다.
         if not any(event.invocation_id == turn_id for event in session.events):
             raise HTTPException(status_code=404, detail="해당 턴을 찾을 수 없습니다.")
-        feedback = FeedbackService.get_instance()
+        data = UserDataService.get_instance()
         comment = request.comment or None
         if request.rating == "none":
-            await feedback.withdraw(user_id=user_no, session_id=session.id, turn_id=turn_id)
+            await data.withdraw_feedback(
+                user_id=user_no, session_id=session.id, turn_id=turn_id
+            )
             return TurnFeedbackState(rating=None, comment=None)
-        await feedback.upsert(
+        await data.upsert_feedback(
             user_id=user_no,
             session_id=session.id,
             turn_id=turn_id,

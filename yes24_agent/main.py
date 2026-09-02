@@ -25,7 +25,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints
 from starlette.routing import Match
 
 from yes24_agent.admin import client_ip, register_admin
@@ -38,7 +38,6 @@ from yes24_agent.auth import (
     token_matches,
 )
 from yes24_agent.config import Settings, ensure_google_api_key_env, get_settings
-from yes24_agent.feedback import close_feedback_service
 from yes24_agent.history import register_history
 from yes24_agent.matrix.matrix_runner import run_matrix_stream
 from yes24_agent.overview import (
@@ -51,11 +50,11 @@ from yes24_agent.overview import (
 from yes24_agent.rbti.profile import fetch_user_rbti
 from yes24_agent.runner import run_agent_stream
 from yes24_agent.session_service import SQLITE_DIALECT, db_dialect, persistence_mode
-from yes24_agent.session_ui import close_session_ui_service
 from yes24_agent.sse import SSE_EVENT_CONTRACT
 from yes24_agent.thought_translation import warmup_translation
 from yes24_agent.toolsets import TOOLSETS, get_resolved_app, resolve_app_for
 from yes24_agent.usage import close_usage_logger
+from yes24_agent.user_data import close_user_data_service
 
 logger = logging.getLogger(__name__)
 
@@ -283,19 +282,40 @@ _SSE_RESPONSES: dict = {
 
 
 class ChatRequest(BaseModel):
-    """`/chat/stream` 요청 본문."""
+    """`/chat/stream` 요청 본문 — 설명은 **OpenAPI로 나간다**(주석은 /docs에 안 보인다).
 
-    message: NonBlankText
-    session_id: str | None = None
-    # RBTI 독서 페르소나 코드(4글자, 예: "CADI"). 없거나 무효면 페르소나 미적용(기존 동작).
-    rbti: str | None = None
-    # 사용자가 UI에서 고른 모델ID. selectable_models 화이트리스트 값만 허용하고
-    # 그 밖(없음·임의 문자열)은 config 기본 모델로 폴백한다(임의 모델 주입 차단).
-    model: str | None = None
-    # 사용자가 UI에서 켠 toolset 키 목록. 미지정이면 config 기본 구성이다. 모델과 달리
-    # 무효값을 조용히 폴백하지 않고 400으로 끊는다 — 도구 구성은 답변의 근거 범위를 바꾸므로
-    # "요청과 다른 구성으로 답했다"가 조용히 성립하면 안 된다(resolve_app fail-loud 계승).
-    enabled_toolsets: list[str] | None = None
+    프론트가 실제로 채우는 필드는 `message`·`session_id`·`rbti` 셋뿐이다. 나머지 둘은
+    어드민(데모 로그인) 화면의 모델·도구 토글용이라 API 키 호출에서는 **무시된다** — 없는
+    척 숨기지 않고 그렇게 적는다(스키마에만 있고 효과가 없는 필드가 가장 헷갈린다).
+    """
+
+    message: NonBlankText = Field(
+        description="사용자 질문. 공백만이면 422, config `request_max_chars` 초과도 422다.",
+        examples=["한강 작가 책 추천해줘"],
+    )
+    session_id: str | None = Field(
+        default=None,
+        description="이어갈 대화 id. **비우면 새 대화**가 만들어지고 그 id가 `done.session_id`로"
+        " 돌아온다 — 다음 턴부터 그 값을 실어 보낸다.",
+    )
+    rbti: str | None = Field(
+        default=None,
+        description="RBTI 독서 페르소나 코드(4글자). 주면 그 유형에 맞춘 답변이 되고, 적용된"
+        " 코드가 `done.rbti_applied`로 되돌아온다(배지 근거). 없거나 무효면 미적용이며 오류가"
+        " 아니다 — 값은 매 턴 실어도 되고, 사용자 프로필에서 한 번 읽어 고정으로 보내도 된다.",
+        examples=["CADI"],
+    )
+    model: str | None = Field(
+        default=None,
+        description="**어드민 전용** — API 키 호출에서는 무시되고 서버 기본 모델이 쓰인다"
+        " (같은 이유로 `done`에 `model` 키도 오지 않는다).",
+    )
+    enabled_toolsets: list[str] | None = Field(
+        default=None,
+        description="**어드민 전용** — API 키 호출에서는 무시되고 서버 기본 도구 구성이 쓰인다."
+        " 어드민 세션에서 무효 키를 주면 조용히 폴백하지 않고 400이다(요청과 다른 구성으로"
+        " 답하는 일이 조용히 성립하면 안 된다).",
+    )
 
 
 class OverviewRequest(BaseModel):
@@ -377,9 +397,8 @@ async def lifespan(app: FastAPI):
         await hook()
     # 인증 DB 커넥션 풀도 함께 닫는다(만들어진 적 없으면 no-op).
     await close_auth_service()
-    # 턴 피드백·대화 UI 상태 풀도 같은 방식으로 닫는다(만들어진 적 없으면 no-op).
-    await close_feedback_service()
-    await close_session_ui_service()
+    # 사용자별 대화 데이터(피드백·읽음·제목) 풀도 같은 방식으로 닫는다(만들어진 적 없으면 no-op).
+    await close_user_data_service()
     # 토큰 사용량 기록 풀도 나란히 정리한다 — 진행 중인 fire-and-forget INSERT를
     # 배수한 뒤 닫는다(만들어진 적 없으면 no-op).
     await close_usage_logger()
