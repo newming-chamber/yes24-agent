@@ -28,7 +28,8 @@ from secrets import compare_digest
 from typing import Any
 
 import httpx
-from fastapi import Header, HTTPException, Request
+from fastapi import HTTPException, Request, Security
+from fastapi.security import APIKeyHeader
 
 from yes24_agent.config import get_settings
 from yes24_agent.db import LazyAiomysqlPool
@@ -298,9 +299,22 @@ async def close_auth_service() -> None:
         await AuthService._instance.close()
 
 
+# `x-api-key`를 **보안 스킴**으로 선언한다 — 평범한 Header 파라미터로 두면 OpenAPI에
+# securitySchemes가 생기지 않아 Swagger UI에 "Authorize" 버튼이 없고, 프론트 개발자가 키를
+# 엔드포인트마다 손으로 붙여 넣어야 한다(문서로 테스트가 안 된다). auto_error=False인 이유는
+# 헤더 없는 익명 요청을 그대로 흘려보내야 하기 때문이다 — 거절 판정은 아래 본문이 소유한다.
+API_KEY_HEADER = APIKeyHeader(
+    name="x-api-key",
+    auto_error=False,
+    description="Yes24 service_cookie 값. 이 값 하나가 곧 사용자 식별자이며(서버가 Yes24 회원"
+    " API로 userNo를 조회한다) crema-ai와 같은 계약이라 쓰던 키를 그대로 쓰면 된다."
+    " 없으면 익명으로 흐르고, 대화 히스토리 API는 사용자 식별이 필요해 403이다.",
+)
+
+
 async def get_authenticated_user(
     request: Request,
-    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+    x_api_key: str | None = Security(API_KEY_HEADER),
 ) -> AuthenticatedUser | None:
     """FastAPI 의존성: `x-api-key` 검증 + rate limit 기록.
 

@@ -586,6 +586,34 @@ def _overview_arm(sources: str) -> str:
     return sources
 
 
+# `/docs` 첫 화면에 뜨는 안내 — **여기가 프론트 개발자의 진입점**이다.
+# 엔드포인트 목록만 있고 "인증은 뭐로, 첫 호출은 뭘로, 응답은 어떻게 읽나"가 없으면 문서를
+# 열어도 시작을 못 한다. 스트리밍 계약 본문은 /chat/stream 설명에 붙는 SSE_EVENT_CONTRACT가
+# 정본이라 여기서 되풀이하지 않고 가리키기만 한다(같은 설명 두 벌 금지).
+API_DESCRIPTION = """Yes24 책·상품에 밝은 AI 대화 어시스턴트 API.
+
+**인증** — 모든 호출에 헤더 `x-api-key`를 넣는다. 값은 **Yes24 service_cookie**이고, 그 값이
+곧 사용자 식별자다(서버가 Yes24 회원 API로 userNo를 조회해 대화를 사람 단위로 가른다).
+crema-ai와 같은 계약이라 쓰던 키를 그대로 쓰면 된다. 위 **Authorize** 버튼에 한 번 넣으면
+이 페이지에서 바로 호출해 볼 수 있다. 키 없이 부르면 히스토리 API는 403이다.
+
+**첫 호출** — `POST /chat/stream`에 `{"message": "한강 작가 책 추천해줘"}`만 보내면 된다.
+`session_id`를 비우면 새 대화가 만들어지고, 그 id가 스트림 마지막 `done` 이벤트의
+`session_id`로 돌아온다. 다음 턴부터 그 값을 실어 보내면 대화가 이어진다.
+
+**응답 읽는 법** — 답변은 JSON이 아니라 **SSE 스트림**이다. 이벤트 종류와 지켜지는 계약,
+붙여 쓸 수 있는 예제는 아래 `POST /chat/stream` 설명에 전부 있다. 먼저 읽어라.
+
+**화면 만들기** — 대화 목록·복원·이름 변경·삭제·좋아요는 `/chat/sessions*`(history 태그)에
+있다. 목록의 `unread`는 "답변이 끝났는데 아직 안 본 대화"이고, 그 대화를
+`GET /chat/sessions/{session_id}`로 열면 자동으로 꺼진다(별도 읽음 API는 없다).
+
+**검색결과 오버뷰** — `POST /overview`는 검색어 하나로 상품군을 정리해 주는 별도 기능이다
+(대화가 아니다). 같은 SSE 계약을 쓰고, 사용자가 더 묻고 싶어 하면 `POST /overview/continue`가
+그 내용을 이어받은 대화 세션을 만들어 준다.
+"""
+
+
 def _hide_admin_only_fields(app: FastAPI) -> None:
     """생성된 OpenAPI에서 `ADMIN_ONLY_MARK`가 달린 요청 필드를 지운다.
 
@@ -616,7 +644,7 @@ def _hide_admin_only_fields(app: FastAPI) -> None:
 def create_app() -> FastAPI:
     """FastAPI 앱을 조립한다."""
     settings = get_settings()
-    app = FastAPI(title="yes24-agent", lifespan=lifespan)
+    app = FastAPI(title="yes24-agent", description=API_DESCRIPTION, lifespan=lifespan)
 
     # CORS: 자격증명 동반 요청과 `*`의 조합은 브라우저가 거부하므로 명시 목록만 허용.
     app.add_middleware(
