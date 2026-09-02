@@ -718,6 +718,12 @@ class Settings(BaseSettings):
     # 프론트가 Vite(5173)나 다른 포트를 쓰는 순간 원인 모를 CORS 차단을 만난다. 배포에서
     # 실제 도메인을 붙일 때는 `CORS_ORIGINS` 환경변수로 통째로 바꾼다(하드코딩 금지).
     cors_origins: list[str] = [
+        # 실제 프론트(2026-09-02 chat-test.yes24.com 번들 확인). Next.js 앱이 `ServiceCookies`
+        # 쿠키를 document.cookie로 읽어 `x-api-key` 헤더에 실어 보낸다 — 쿠키가 HttpOnly가
+        # 아니라 도메인이 달라도 성립하고, baseUrl만 우리 주소로 바꾸면 계약이 그대로 맞는다.
+        "https://chat.yes24.com",
+        "https://chat-test.yes24.com",
+        # 프론트 개발 서버의 관례 포트(3000·5173, localhost·127.0.0.1).
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:5173",
