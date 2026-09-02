@@ -14,10 +14,19 @@
 -- user_no는 실 회원과 겹치지 않게 9자리 대역을 쓴다. 대화·피드백은 이 user_no 밑에만
 -- 쌓이므로 실사용자 데이터와 섞이지 않는다.
 --
--- 적용: mysql -h <RDS> -u <user> -p <db> < scripts/dev_api_key.sql
--- 폐기: DELETE FROM users WHERE api_key = 'dev-frontend-local';
+-- **키 값은 이 파일에 적지 않는다.** 값이 레포에 있으면 레포를 읽을 수 있는 누구나 공개
+-- 도메인(https://yes24-agent.griplabs.io)에 붙어 LLM을 돌릴 수 있다 — 임의 문자열을 막은
+-- 이유를 정해진 문자열 하나로 되돌리는 셈이다(2026-09-02 판단). 값은 매번 새로 만들고
+-- 개발자에게 별도 경로로 전달한다:
+--
+--   KEY="dev-fe-$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
+--   sed "s/__DEV_API_KEY__/$KEY/" scripts/dev_api_key.sql | mysql -h <RDS> -u <user> -p <db>
+--   echo "$KEY"        # 이 값을 전달
+--
+-- 폐기(유출·퇴사·기간 만료 시): DELETE FROM users WHERE api_key LIKE 'dev-fe-%';
+-- rate limit을 낮게 두는 이유도 같다 — 새더라도 피해 범위가 분당 120·일 5000으로 묶인다.
 INSERT INTO users (api_key, user_no, user_login_id, rate_limit_rpm, rate_limit_rpd, user_cached_at)
-VALUES ('dev-frontend-local', 990000001, 'dev_frontend', 120, 5000, '2038-01-01 00:00:00')
+VALUES ('__DEV_API_KEY__', 990000001, 'dev_frontend', 120, 5000, '2038-01-01 00:00:00')
 ON DUPLICATE KEY UPDATE
     user_no = VALUES(user_no),
     user_login_id = VALUES(user_login_id),
