@@ -311,11 +311,12 @@ class ChatRequest(BaseModel):
         " 돌아온다 — 다음 턴부터 그 값을 실어 보낸다.",
     )
     use_rbti: bool = Field(
-        default=True,
-        description="이 턴에 저장된 RBTI 독서 유형을 적용할지. 기본 **true**(저장돼 있으면"
-        " 자동 적용). `false`면 유형이 저장돼 있어도 이 턴은 적용하지 않는다"
-        " (`done.rbti_applied`가 null로 온다) — 화면의 '내 유형으로 보기' 토글을 끈 상태다."
-        " 유형을 아예 지우려면 `PUT /me/rbti`에 null을 보낸다(이건 저장값 자체를 바꾼다).",
+        default=False,
+        description="이 턴에 저장된 RBTI 독서 유형을 적용할지. **기본 false** — 보내지 않으면"
+        " 페르소나 없이 답한다(유형이 저장돼 있어도). `true`로 보내면 `PUT /me/rbti`에 저장된"
+        " 유형이 적용되고, 적용된 코드가 `done.rbti_applied`로 돌아온다(배지 근거)."
+        " 저장된 유형이 없으면 true로 보내도 미적용이며 오류가 아니다."
+        " 유형 자체를 지우려면 `PUT /me/rbti`에 null을 보낸다(이건 저장값을 바꾼다).",
     )
     rbti: str | None = Field(
         default=None,
@@ -792,7 +793,9 @@ def create_app() -> FastAPI:
         # 화면의 토글이라 요청이 정한다. use_rbti=false면 저장돼 있어도 적용하지 않는다 —
         # 저장값을 지우는 것(PUT /me/rbti null)과는 다른 층위다.
         # request.rbti는 데모 UI 전용 덮어쓰기라 토글이 꺼져 있으면 그것도 무시한다(끄기가
-        # 이긴다 — "껐는데 페르소나가 적용됐다"가 성립하면 안 된다).
+        # 이긴다 — "껐는데 페르소나가 적용됐다"가 성립하면 안 된다). 그래서 데모 UI도 코드를
+        # 실을 때 use_rbti=true를 함께 보낸다(index.html) — 계약을 불리언 하나로 유지하려고
+        # 3상태(미지정/true/false)를 만들지 않고 호출부를 맞췄다.
         user_no = str(user.user_no) if user and user.user_no else None
         rbti = (request.rbti or await fetch_user_rbti(user_no)) if request.use_rbti else None
         stream = run_agent_stream(

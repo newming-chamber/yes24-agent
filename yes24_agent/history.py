@@ -26,12 +26,10 @@ from typing import Annotated, Any, Literal
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StringConstraints
 
-from yes24_agent.auth import AuthenticatedUser, AuthService, get_authenticated_user
+from yes24_agent.auth import AuthenticatedUser, get_authenticated_user
 from yes24_agent.config import get_settings
 from yes24_agent.enrichment import SESSION_TITLE_STATE_KEY
 from yes24_agent.postprocess import finalize_answer
-from yes24_agent.rbti.persona import is_valid_code
-from yes24_agent.rbti.profile import fetch_user_rbti
 from yes24_agent.runner import _event_text, _round_boundary_prefix
 from yes24_agent.session_service import _get_session_service
 from yes24_agent.sources import get_sources
@@ -129,26 +127,6 @@ _CommentText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, max_length=get_settings().request_max_chars),
 ]
-
-
-class RbtiState(BaseModel):
-    """현재 사용자의 RBTI 독서 유형."""
-
-    rbti: str | None = Field(
-        description="4글자 RBTI 코드(예: CADI). 아직 유형 검사를 하지 않았으면 null.",
-        examples=["CADI"],
-    )
-
-
-class RbtiRequest(BaseModel):
-    """`PUT /me/rbti` 요청 본문."""
-
-    rbti: str | None = Field(
-        description="저장할 4글자 RBTI 코드. **null이면 해제**(이후 대화에 페르소나 미적용)."
-        " 유효하지 않은 코드는 422다 — 조용히 무시하면 저장된 줄 알고 배지가 안 뜨는 이유를"
-        " 찾을 수 없다.",
-        examples=["CADI"],
-    )
 
 
 class SessionRenameRequest(BaseModel):
@@ -336,42 +314,6 @@ _UserDep = Annotated[AuthenticatedUser | None, Depends(get_authenticated_user)]
 
 def register_history(app: FastAPI) -> None:
     """히스토리·피드백 라우트를 앱에 등록한다 — 라우트·투영의 소유자는 이 모듈이다."""
-
-    @app.get(
-        "/me/rbti",
-        tags=["history"],
-        response_model=RbtiState,
-        responses=_AUTH_RESPONSES,
-        summary="내 RBTI 유형 조회",
-        description="이 사용자의 저장된 RBTI 독서 유형. 아직 검사를 안 했으면 `rbti: null`이다."
-        " **대화 요청에 이 값을 실을 필요는 없다** — 저장돼 있으면 서버가 매 턴 자동 적용하고,"
-        " 적용된 코드는 `done.rbti_applied`로 돌아온다(배지 근거).",
-    )
-    async def get_my_rbti(user: _UserDep = None) -> RbtiState:
-        user_no = _require_identified(user)
-        return RbtiState(rbti=await fetch_user_rbti(user_no))
-
-    @app.put(
-        "/me/rbti",
-        tags=["history"],
-        response_model=RbtiState,
-        responses=_AUTH_RESPONSES,
-        summary="내 RBTI 유형 저장",
-        description="유형 검사 결과를 **한 번** 저장한다. 그 뒤로는 모든 대화가 자동으로 이"
-        " 유형을 쓴다(요청마다 실어 보내지 않는다). `rbti: null`로 보내면 해제된다."
-        " 유형은 API 키가 아니라 **사람**(userNo)에게 붙으므로, 같은 사람의 다른 키로 접속해도"
-        " 같은 유형이 적용된다.",
-    )
-    async def put_my_rbti(request: RbtiRequest, user: _UserDep = None) -> RbtiState:
-        user_no = _require_identified(user)
-        code = request.rbti
-        if code is not None and not is_valid_code(code):
-            raise HTTPException(
-                status_code=422,
-                detail="RBTI 코드가 유효하지 않습니다(4글자 대문자, 자리별 허용값).",
-            )
-        await AuthService.get_instance().write_rbti(user_no, code)
-        return RbtiState(rbti=code)
 
     @app.get(
         "/chat/sessions",
