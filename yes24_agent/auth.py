@@ -204,20 +204,37 @@ class AuthService:
         )
 
     async def _register(self, api_key: str) -> AuthenticatedUser:
-        """미등록 키를 자동 등록하고 Yes24 회원 정보를 채운다.
+        """미등록 키를 등록한다 — **Yes24 회원으로 식별될 때만**.
 
-        헤더 값이 곧 service_cookie라, 등록 직후 같은 값으로 회원 API를 조회한다.
+        헤더 값이 곧 service_cookie라 그 값으로 회원 API를 조회한다. 조회를 **등록보다
+        먼저** 하는 이유가 둘이다(2026-09-02 전수 점검):
+
+        1. **아무 문자열이나 키가 되면 안 된다.** 종전에는 조회 실패도 `user_no=None`인
+           사용자로 통과시켜, 임의 문자열로 `/chat/stream`·`/overview`를 호출해 LLM 비용을
+           태울 수 있었다(히스토리만 `_require_identified`가 막고 있었다). 식별을 한 번도
+           못 한 키는 여기서 끊는다. **이미 식별된 키는 영향이 없다** — 그 키는 users에
+           user_no가 있어 이 경로로 오지 않으므로, Yes24 API가 일시적으로 죽어도 기존
+           사용자의 대화는 계속된다(fail-open은 그쪽에 그대로 남는다).
+        2. 실패한 키로 users에 행을 만들지 않는다 — 임의 문자열마다 행이 생기면 테이블이
+           무한히 부푼다.
         """
         settings = get_settings()
+        data = await self._fetch_user_info(api_key)
+        if data is None:
+            logger.warning(f"미식별 키 거절: key={api_key[:8]}…")
+            raise HTTPException(
+                status_code=403,
+                detail="Yes24 회원 식별이 완료되지 않은 키입니다. 잠시 후 다시 시도해 주세요.",
+            )
         await self._run(
             "INSERT INTO users (api_key, rate_limit_rpm, rate_limit_rpd) VALUES (%s, %s, %s) "
             "ON DUPLICATE KEY UPDATE updated_at = NOW()",
             (api_key, settings.rate_limit_rpm, settings.rate_limit_rpd),
         )
-        logger.info(f"신규 api_key 자동 등록: {api_key[:8]}…")
+        await self._store_user_info(api_key, data)
+        logger.info(f"신규 api_key 등록: {api_key[:8]}…")
 
-        data = await self._refresh_yes24_user(api_key)
-        user_no, login_id, can_use_ai = _user_fields(data) if data else (None, None, False)
+        user_no, login_id, can_use_ai = _user_fields(data)
         return self._remember(
             AuthenticatedUser(
                 api_key=api_key,
@@ -238,7 +255,11 @@ class AuthService:
         if data is None:
             logger.warning(f"Yes24 회원 정보 갱신 실패: key={api_key[:8]}…")
             return None
+        await self._store_user_info(api_key, data)
+        return data
 
+    async def _store_user_info(self, api_key: str, data: dict[str, Any]) -> None:
+        """조회된 회원 정보를 users에 캐시한다(갱신·최초 등록 공용)."""
         user_no, login_id, can_use_ai = _user_fields(data)
         await self._run(
             "UPDATE users SET user_no = %s, user_login_id = %s, self_cert = %s, "
@@ -308,8 +329,8 @@ API_KEY_HEADER = APIKeyHeader(
     auto_error=False,
     description="Yes24 service_cookie 값. 이 값 하나가 곧 사용자 식별자이며(서버가 Yes24 회원"
     " API로 userNo를 조회한다) crema-ai와 같은 계약이라 쓰던 키를 그대로 쓰면 된다."
-    " 실패 코드: 헤더가 없으면 **401**, 키는 있으나 Yes24 회원 식별(userNo)이 안 되면 **403**,"
-    " 비활성 키도 401, 한도 초과는 429다.",
+    " 실패 코드: 헤더가 없으면 **401**, Yes24 회원으로 식별되지 않는 키는 **모든 API에서 403**,"
+    " 비활성 키는 401, 한도 초과는 429다.",
 )
 
 
