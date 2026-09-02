@@ -713,7 +713,16 @@ class Settings(BaseSettings):
     # 소스 변경 시 uvicorn 자동 재기동(로컬 개발 편의). 배포 컨테이너에선 켜지 않는다 —
     # 리로드 워커는 신호 처리·성능 특성이 달라 운영 경로가 아니다.
     dev_reload: bool = False
-    cors_origins: list[str] = ["http://localhost:3000"]  # `*`+credentials 조합 금지 — 명시 목록
+    # 브라우저가 API를 부를 수 있는 오리진 목록. `*`+credentials 조합은 브라우저가 거부하므로
+    # 명시 목록만 쓴다. 기본값에 프론트 개발 서버들의 관례 포트를 담아 둔다 — 하나만 두면
+    # 프론트가 Vite(5173)나 다른 포트를 쓰는 순간 원인 모를 CORS 차단을 만난다. 배포에서
+    # 실제 도메인을 붙일 때는 `CORS_ORIGINS` 환경변수로 통째로 바꾼다(하드코딩 금지).
+    cors_origins: list[str] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
     # 진행 status detail 상한(문자). 사고 요약 라벨·검색 각도는 모델이 쓴 자유 텍스트라
     # 길 수 있는데, 진행 타임라인 한 줄은 짧아야 읽힌다. 문구를 만들지 않고 길이만 자른다.
     status_detail_max_chars: int = 120

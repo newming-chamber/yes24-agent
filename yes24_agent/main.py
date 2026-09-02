@@ -473,6 +473,20 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
             # `service.enabled`(세션 DB가 mysql)를 함께 요구하는 이유: 인증 스택이 없는
             # 구성에서는 get_authenticated_user가 헤더를 무시하고 익명 허용으로 흘려보내
             # 판정자가 사실상 없어진다.
+            # **CORS 프리플라이트는 월이 막지 않는다**(2026-09-02 외부 브라우저 실측).
+            # 브라우저는 실제 요청 전에 OPTIONS를 먼저 보내는데, 그 프리플라이트에는 설계상
+            # 인증 헤더가 실리지 않는다 — "x-api-key를 보내도 되냐"고 묻는 요청 자체이기
+            # 때문이다. 월이 그것을 키 없는 요청으로 보고 401을 내면 CORS 헤더가 나가지
+            # 않고, 브라우저는 본 요청을 아예 보내지 않는다. 즉 **키가 맞고 오리진이 허용
+            # 목록에 있어도 브라우저에서는 이 API를 쓸 수 없었다**(curl은 프리플라이트를
+            # 보내지 않아 전 점검이 이를 통과시켰다).
+            # 판정은 `Access-Control-Request-Method` 헤더의 존재로 한다 — 브라우저만 붙이는
+            # 프리플라이트의 정의 그 자체다(경로 목록·User-Agent 문자열이 아니다). 흘려보내면
+            # CORSMiddleware가 허용 오리진일 때만 응답하므로 우회로가 되지 않는다: 프리플라이트
+            # 응답에는 본문이 없고, 실제 요청은 다시 월과 라우트 의존성을 통과해야 한다.
+            if request.method == "OPTIONS" and "access-control-request-method" in request.headers:
+                return await call_next(request)
+
             has_api_key = bool(request.headers.get("x-api-key"))
             key_routes = route_cache.get("routes")
             if key_routes is None:
