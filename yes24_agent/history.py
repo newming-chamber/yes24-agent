@@ -26,12 +26,12 @@ from typing import Annotated, Any, Literal
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, StringConstraints
 
-from yes24_agent.auth import AuthenticatedUser, get_authenticated_user
+from yes24_agent.auth import AuthenticatedUser, AuthService, get_authenticated_user
 from yes24_agent.config import get_settings
 from yes24_agent.enrichment import SESSION_TITLE_STATE_KEY
 from yes24_agent.postprocess import finalize_answer
 from yes24_agent.runner import _event_text, _round_boundary_prefix
-from yes24_agent.session_service import _get_session_service
+from yes24_agent.session_service import _POC_USER_ID, _get_session_service
 from yes24_agent.sources import get_sources
 from yes24_agent.user_data import UserDataService
 
@@ -162,8 +162,16 @@ def _require_identified(user: AuthenticatedUser | None) -> str:
 
     401 detail은 로그인월의 문구("인증이 필요합니다.")와 다르게 둔다 — 월 차단과 라우트
     판정을 응답만 보고 구분할 수 있어야 한다(테스트·운영 디버깅 공통).
+
+    **인증 스택이 없는 구성(로컬 sqlite)에서는 러너와 같은 단일 사용자로 흘린다.** 그러지
+    않으면 로컬에서 대화는 되는데(runner가 `user_id or _POC_USER_ID`로 폴백한다) 그 대화의
+    목록·복원만 401이라, 프론트가 히스토리 화면을 로컬에서 만들 수 없다(2026-09-02 실측).
+    같은 요청을 두 계층이 다르게 판정하던 것이라 러너 쪽에 맞춘다 — 배포에서는 인증 스택이
+    항상 켜져 있어 이 분기가 돌지 않는다(구조 분기, 키워드 예외가 아니다).
     """
     if user is None:
+        if not AuthService.get_instance().enabled:
+            return _POC_USER_ID
         raise HTTPException(status_code=401, detail="x-api-key 인증이 필요합니다.")
     if not user.user_no:
         raise HTTPException(
