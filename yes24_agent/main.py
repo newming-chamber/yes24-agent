@@ -281,12 +281,20 @@ _SSE_RESPONSES: dict = {
 }
 
 
+# 요청 필드 중 **어드민 전용**임을 선언하는 표식. 공개 OpenAPI에서 그 필드를 빼는 근거이고,
+# 감출 이름을 어딘가에 손으로 적어 두지 않기 위한 장치다(월 통과 집합을 의존성 그래프에서
+# 파생한 것과 같은 이유 — 손목록은 갱신을 잊는 순간 조용히 어긋난다).
+ADMIN_ONLY_MARK = "x-admin-only"
+
+
 class ChatRequest(BaseModel):
     """`/chat/stream` 요청 본문 — 설명은 **OpenAPI로 나간다**(주석은 /docs에 안 보인다).
 
-    프론트가 실제로 채우는 필드는 `message`·`session_id`·`rbti` 셋뿐이다. 나머지 둘은
-    어드민(데모 로그인) 화면의 모델·도구 토글용이라 API 키 호출에서는 **무시된다** — 없는
-    척 숨기지 않고 그렇게 적는다(스키마에만 있고 효과가 없는 필드가 가장 헷갈린다).
+    프론트가 채우는 필드는 `message`·`session_id`·`rbti` 셋뿐이고, **공개 문서에도 그 셋만
+    나간다**. 나머지 둘은 어드민(데모 로그인) 화면의 모델·도구 토글용이라 API 키 호출에서는
+    무시되는데, 효과 없는 필드가 스키마에 보이는 것이 가장 헷갈리므로 `ADMIN_ONLY_MARK`를
+    달아 공개 스키마에서 뺀다(감출 이름을 손목록으로 적지 않고 **선언에서 파생**한다 —
+    필드가 늘어도 표식만 달면 되고, 목록을 갱신하지 않아 새는 일이 없다).
     """
 
     message: NonBlankText = Field(
@@ -307,14 +315,14 @@ class ChatRequest(BaseModel):
     )
     model: str | None = Field(
         default=None,
-        description="**어드민 전용** — API 키 호출에서는 무시되고 서버 기본 모델이 쓰인다"
-        " (같은 이유로 `done`에 `model` 키도 오지 않는다).",
+        json_schema_extra={ADMIN_ONLY_MARK: True},
+        description="어드민 전용 — 데모 로그인 세션의 모델 선택. API 키 호출에서는 무시된다.",
     )
     enabled_toolsets: list[str] | None = Field(
         default=None,
-        description="**어드민 전용** — API 키 호출에서는 무시되고 서버 기본 도구 구성이 쓰인다."
-        " 어드민 세션에서 무효 키를 주면 조용히 폴백하지 않고 400이다(요청과 다른 구성으로"
-        " 답하는 일이 조용히 성립하면 안 된다).",
+        json_schema_extra={ADMIN_ONLY_MARK: True},
+        description="어드민 전용 — 데모 로그인 세션의 도구 토글. API 키 호출에서는 무시된다."
+        " 어드민 세션에서 무효 키를 주면 조용히 폴백하지 않고 400이다.",
     )
 
 
@@ -578,6 +586,33 @@ def _overview_arm(sources: str) -> str:
     return sources
 
 
+def _hide_admin_only_fields(app: FastAPI) -> None:
+    """생성된 OpenAPI에서 `ADMIN_ONLY_MARK`가 달린 요청 필드를 지운다.
+
+    어드민(데모 로그인) 전용 필드는 API 키 호출에서 무시되는데, 효과 없는 필드가 스키마에
+    보이면 프론트가 "보내면 되는 값"으로 오해한다 — 보내도 아무 일이 없고 에러도 안 나서
+    원인을 찾기 어렵다. **문서에서만** 감춘다(파싱은 원본 모델이 그대로 하므로 어드민
+    화면은 계속 보낼 수 있다. 차단은 이미 라우트의 unlocked 판정이 한다).
+
+    감출 이름을 손목록으로 적지 않고 **필드 선언의 표식에서 파생**한다 — 월 통과 집합을
+    의존성 그래프에서 파생한 것과 같은 이유로, 목록은 갱신을 잊는 순간 조용히 어긋난다.
+    요청 본문 스키마를 openapi_extra로 통째 교체하는 길은 막혀 있다: FastAPI가 그것을
+    덮어쓰지 않고 **깊은 병합**을 해서 원래의 `$ref`가 그대로 남는다(실측).
+    """
+    schemas = app.openapi().get("components", {}).get("schemas", {})
+    for schema in schemas.values():
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        hidden = [
+            name
+            for name, spec in properties.items()
+            if isinstance(spec, dict) and spec.pop(ADMIN_ONLY_MARK, False)
+        ]
+        for name in hidden:
+            del properties[name]
+
+
 def create_app() -> FastAPI:
     """FastAPI 앱을 조립한다."""
     settings = get_settings()
@@ -825,6 +860,8 @@ def create_app() -> FastAPI:
                 },
             )
 
+    # 문서 마감 — 어드민 전용 필드를 공개 스키마에서 걷어낸다(선언의 표식에서 파생).
+    _hide_admin_only_fields(app)
     return app
 
 
