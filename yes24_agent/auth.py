@@ -45,9 +45,6 @@ class AuthenticatedUser:
     api_key: str
     user_no: str | None
     user_login_id: str | None
-    # crema 전용 권한 플래그. 우리는 **저장만 하고 게이트하지 않는다** — crema club AI
-    # 이용 자격이지 이 서비스의 차단 근거가 아니다(컬럼명도 crema 계약 그대로 유지).
-    canUseCremaclubAI: bool
     rate_limit_rpm: int
     rate_limit_rpd: int
 
@@ -56,7 +53,7 @@ async def fetch_yes24_user_info(service_cookie: str) -> dict[str, Any] | None:
     """service_cookie로 Yes24 회원 정보를 조회한다 — 실패·비정상 응답이면 None.
 
     성공 응답: `{"success": True, "userNo": …, "userId": …, "SelfCert": …,
-    "canUseCremaclubAI": …}`. 회원 정보 조회 실패는 인증 실패가 아니다(키는 유효한데
+    "userId": …}`. 회원 정보 조회 실패는 인증 실패가 아니다(키는 유효한데
     Yes24가 잠깐 죽은 경우) — 호출부가 user_no 없는 사용자로 진행한다.
     """
     settings = get_settings()
@@ -87,14 +84,15 @@ def _pool_kwargs(db_url: str) -> dict[str, Any] | None:
     return mysql_pool_kwargs(db_url, maxsize=get_settings().auth_pool_max)
 
 
-def _user_fields(data: dict[str, Any]) -> tuple[str | None, str | None, bool]:
-    """Yes24 회원 응답에서 (user_no, user_login_id, canUseCremaclubAI)를 뽑는다."""
+def _user_fields(data: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Yes24 회원 응답에서 (user_no, user_login_id)를 뽑는다.
+
+    `canUseCremaclubAI`는 **뽑지 않는다**(2026-09-02 삭제). crema club AI 이용 자격 플래그라
+    이 서비스의 판정에 쓰인 적이 없고(게이트 사용 0건), 응답 원본이 통째로 `raw_user_info`에
+    저장되므로 전용 필드는 같은 값의 사본이었다. 필요해지면 그 JSON에서 읽으면 된다.
+    """
     user_no = data.get("userNo")
-    return (
-        str(user_no) if user_no is not None else None,
-        data.get("userId"),
-        bool(data.get("canUseCremaclubAI")),
-    )
+    return (str(user_no) if user_no is not None else None, data.get("userId"))
 
 
 class AuthService:
@@ -173,7 +171,7 @@ class AuthService:
         # 회원 정보 만료 판정을 DB에서 한다 — timestamp 컬럼은 타임존 없는 값이라
         # 파이썬 로컬 시각과 빼면 서버 타임존 차이만큼 통째로 어긋난다(같은 DB 시계끼리 비교).
         row = await self._run(
-            "SELECT user_no, user_login_id, canUseCremaclubAI, is_active, "
+            "SELECT user_no, user_login_id, is_active, "
             "rate_limit_rpm, rate_limit_rpd, "
             "(user_cached_at IS NULL OR user_cached_at < NOW() - INTERVAL %s HOUR) "
             "FROM users WHERE api_key = %s",
@@ -183,14 +181,14 @@ class AuthService:
         if row is None:
             return await self._register(api_key)
 
-        user_no, login_id, can_use_ai, is_active, rpm, rpd, stale = row
+        user_no, login_id, is_active, rpm, rpd, stale = row
         if not is_active:
             raise HTTPException(status_code=401, detail="사용할 수 없는 API 키입니다.")
 
         if user_no is None or stale:
             data = await self._refresh_yes24_user(api_key)
             if data is not None:
-                user_no, login_id, can_use_ai = _user_fields(data)
+                user_no, login_id = _user_fields(data)
         if user_no is None:
             # 행은 있는데 한 번도 식별된 적 없는 키(옛 자동등록이 남긴 NULL 행). 신규 키와
             # 같은 상태이므로 같게 끊는다 — 이 분기가 없으면 옛 행이 영구 우회로가 된다.
@@ -201,7 +199,6 @@ class AuthService:
                 api_key=api_key,
                 user_no=user_no,
                 user_login_id=login_id,
-                canUseCremaclubAI=bool(can_use_ai),
                 rate_limit_rpm=rpm,
                 rate_limit_rpd=rpd,
             )
@@ -234,13 +231,12 @@ class AuthService:
         await self._store_user_info(api_key, data)
         logger.info(f"신규 api_key 등록: {api_key[:8]}…")
 
-        user_no, login_id, can_use_ai = _user_fields(data)
+        user_no, login_id = _user_fields(data)
         return self._remember(
             AuthenticatedUser(
                 api_key=api_key,
                 user_no=user_no,
                 user_login_id=login_id,
-                canUseCremaclubAI=can_use_ai,
                 rate_limit_rpm=settings.rate_limit_rpm,
                 rate_limit_rpd=settings.rate_limit_rpd,
             )
@@ -273,16 +269,15 @@ class AuthService:
 
     async def _store_user_info(self, api_key: str, data: dict[str, Any]) -> None:
         """조회된 회원 정보를 users에 캐시한다(갱신·최초 등록 공용)."""
-        user_no, login_id, can_use_ai = _user_fields(data)
+        user_no, login_id = _user_fields(data)
         await self._run(
             "UPDATE users SET user_no = %s, user_login_id = %s, self_cert = %s, "
-            "canUseCremaclubAI = %s, raw_user_info = %s, user_cached_at = NOW() "
+            "raw_user_info = %s, user_cached_at = NOW() "
             "WHERE api_key = %s",
             (
                 user_no,
                 login_id,
                 1 if data.get("SelfCert") else 0,
-                1 if can_use_ai else 0,
                 json.dumps(data, ensure_ascii=False),
                 api_key,
             ),
