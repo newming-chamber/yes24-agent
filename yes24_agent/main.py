@@ -290,8 +290,10 @@ ADMIN_ONLY_MARK = "x-admin-only"
 class ChatRequest(BaseModel):
     """`/chat/stream` 요청 본문 — 설명은 **OpenAPI로 나간다**(주석은 /docs에 안 보인다).
 
-    프론트가 채우는 필드는 `message`·`session_id`·`rbti` 셋뿐이고, **공개 문서에도 그 셋만
-    나간다**. 나머지 둘은 어드민(데모 로그인) 화면의 모델·도구 토글용이라 API 키 호출에서는
+    프론트가 채우는 필드는 `message`·`session_id` 둘뿐이고, 공개 문서에도 그 둘만 나간다.
+    `rbti`는 **사람에게 붙는 값**이라 서버가 소유한다(`PUT /me/rbti`로 한 번 저장 →
+    매 턴 자동 적용). 요청 필드로 남아 있는 것은 데모 UI의 선택기가 일시적으로 덮어쓰기
+    위해서다. 나머지 둘은 어드민(데모 로그인) 화면의 모델·도구 토글용이라 API 키 호출에서는
     무시되는데, 효과 없는 필드가 스키마에 보이는 것이 가장 헷갈리므로 `ADMIN_ONLY_MARK`를
     달아 공개 스키마에서 뺀다(감출 이름을 손목록으로 적지 않고 **선언에서 파생**한다 —
     필드가 늘어도 표식만 달면 되고, 목록을 갱신하지 않아 새는 일이 없다).
@@ -308,10 +310,10 @@ class ChatRequest(BaseModel):
     )
     rbti: str | None = Field(
         default=None,
-        description="RBTI 독서 페르소나 코드(4글자). 주면 그 유형에 맞춘 답변이 되고, 적용된"
-        " 코드가 `done.rbti_applied`로 되돌아온다(배지 근거). 없거나 무효면 미적용이며 오류가"
-        " 아니다 — 값은 매 턴 실어도 되고, 사용자 프로필에서 한 번 읽어 고정으로 보내도 된다.",
-        examples=["CADI"],
+        json_schema_extra={ADMIN_ONLY_MARK: True},
+        description="어드민 전용 — 데모 UI의 페르소나 선택기가 저장된 유형을 일시적으로"
+        " 덮어쓸 때만 쓴다. 일반 클라이언트는 실을 필요가 없다: 사용자의 유형은"
+        " `PUT /me/rbti`로 한 번 저장하면 서버가 매 턴 자동 적용한다.",
     )
     model: str | None = Field(
         default=None,
@@ -628,6 +630,10 @@ API_DESCRIPTION = """Yes24 책·상품에 밝은 AI 대화 어시스턴트 API.
 crema-ai와 같은 계약이라 쓰던 키를 그대로 쓰면 된다. 위 **Authorize** 버튼에 한 번 넣으면
 이 페이지에서 바로 호출해 볼 수 있다. 키 없이 부르면 **모든 API가 401**이고,
 Yes24 회원으로 식별되지 않는 키는 **403**이다(임의 문자열은 키가 되지 않는다).
+
+**RBTI 독서 유형** — 사용자의 유형은 `PUT /me/rbti`로 **한 번** 저장하면 그 뒤 모든 대화에
+서버가 자동 적용한다(요청마다 실어 보내지 않는다). 적용된 코드는 `done.rbti_applied`로
+돌아오니 그 값으로 "✦ RBTI 데이터가 활용됨" 배지를 켜면 된다.
 
 **첫 호출** — `POST /chat/stream`에 `{"message": "한강 작가 책 추천해줘"}`만 보내면 된다.
 `session_id`를 비우면 새 대화가 만들어지고, 그 id가 스트림 마지막 `done` 이벤트의

@@ -1,0 +1,12 @@
+-- 사용자 RBTI 독서 유형 — users 테이블에 컬럼 하나.
+--
+-- **프론트가 매 요청에 싣는 값이 아니다**(2026-09-02 사용자 확인). RBTI는 사람에게 붙어 있는
+-- 속성이라 서버가 소유하고, `/chat/stream`은 요청에 아무것도 없어도 이 값을 자동 적용한다
+-- (main.chat_stream의 `request.rbti or await fetch_user_rbti(user_no)`). 프론트는 유형 검사
+-- 결과를 `PUT /me/rbti`로 **한 번** 저장하면 그 뒤 모든 대화에 반영된다.
+--
+-- users는 우리 소유 테이블이다(crema와 공유하지 않는다 — 2026-09-01 확인: 이 계정에 보이는
+-- 스키마는 dev_yes24_agent 하나뿐이고 users·rate_limit_log 전부 그 안에 있다).
+--
+-- 적용: mysql -h <RDS> -u <user> -p <db> < scripts/users_rbti.sql
+ALTER TABLE users ADD COLUMN rbti VARCHAR(4) NULL COMMENT 'RBTI 독서 유형 4글자 코드(예: CADI)';

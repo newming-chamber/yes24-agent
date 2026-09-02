@@ -319,6 +319,25 @@ class AuthService:
                 detail=f"일일 요청 한도({user.rate_limit_rpd}회)를 초과했습니다.",
             )
 
+    async def read_rbti(self, user_no: str) -> str | None:
+        """저장된 RBTI 코드를 읽는다(없으면 None).
+
+        `users`는 이 서비스가 소유한 테이블이라 여기 둔다. 유효성은 호출부(persona.is_valid_code)가
+        보므로 형식을 보증하지 않는다 — 저장 경로가 이미 유효 코드만 넣는다.
+        """
+        row = await self._run(
+            "SELECT rbti FROM users WHERE user_no = %s AND rbti IS NOT NULL LIMIT 1",
+            (user_no,),
+            fetch=True,
+        )
+        return row[0] if row else None
+
+    async def write_rbti(self, user_no: str, code: str | None) -> None:
+        """RBTI 코드를 저장한다(None이면 해제). 같은 사람의 키가 여럿이면 전부 갱신한다 —
+        유형은 키가 아니라 **사람**에게 붙는 값이기 때문이다."""
+        await self._run("UPDATE users SET rbti = %s WHERE user_no = %s", (code, user_no))
+        self._cache.clear()  # 캐시된 사용자 레코드가 낡지 않게 한다(다음 요청이 다시 읽는다)
+
     async def record_request(self, api_key: str, endpoint: str) -> None:
         """요청을 rate_limit_log에 남긴다(다음 요청의 슬라이딩 윈도우 재료)."""
         await self._run(
