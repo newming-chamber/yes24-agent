@@ -1,4 +1,4 @@
--- turn_feedback: 턴(=ADK invocation) 단위 사용자 피드백 (쓰기·읽기는 yes24_agent/feedback.py 단일 경로).
+-- turn_feedback: 턴(=ADK invocation) 단위 사용자 피드백 (쓰기·읽기는 yes24_agent/user_data.py 단일 경로).
 --
 -- 세션 DB와 같은 MySQL database에 **수동 적용**한다 — 코드에 DDL·마이그레이션이 없는
 -- 관례(users·rate_limit_log·usage_log와 동일)를 따른다.

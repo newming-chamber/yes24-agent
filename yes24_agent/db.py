@@ -108,6 +108,33 @@ class MysqlBackedService:
         if self._db is not None:
             await self._db.close()
 
+    async def _run_all(self, statements: list[tuple[str, tuple]]) -> None:
+        """여러 문장을 **한 트랜잭션**으로 실행한다 — 중간에 실패하면 전부 되돌린다.
+
+        `_run`을 여러 번 부르면 풀이 autocommit이라 각 문장이 독립 커밋된다(session_service.
+        mysql_pool_kwargs). 그러면 "절반만 지워진 삭제" 같은 중간 상태가 사용자에게 남는다
+        — 실패했다고 알렸는데 일부는 이미 사라진 상태다(2026-09-02 적대 감사 F2 실측).
+        """
+        if self._db is None:
+            raise HTTPException(status_code=503, detail=self._unavailable_detail)
+        try:
+            pool = await self._db.get()
+            async with pool.acquire() as conn:
+                await conn.begin()
+                try:
+                    async with conn.cursor() as cur:
+                        for sql, params in statements:
+                            await cur.execute(sql, params)
+                    await conn.commit()
+                except Exception:
+                    await conn.rollback()
+                    raise
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001 — 실패를 200으로 숨기지 않는다(fail-loud)
+            logger.error(f"{self._failure_detail} ({type(exc).__name__}): {exc}")
+            raise HTTPException(status_code=503, detail=self._failure_detail) from exc
+
     async def _run(self, sql: str, params: tuple, *, fetch_all: bool = False):
         """질의 1건 실행(필요하면 전 행 반환). DB 오류는 삼키지 않고 503으로 올린다."""
         if self._db is None:

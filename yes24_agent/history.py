@@ -376,11 +376,10 @@ def register_history(app: FastAPI) -> None:
         response_model=SessionSummary,
         responses=_SESSION_RESPONSES,
         summary="대화 이름 변경",
-        description="⋯ 메뉴의 '이름 변경'. 세션 제목을 사용자가 준 값으로 바꾼다. 서버의"
-        " 자동 제목 생성은 '제목이 없을 때'만 도는 구조라(runner의 want_title 판정) 바꾼"
-        " 제목을 LLM이 되덮지 않는다. 빈 문자열·공백만인 제목은 422다(제목을 지우는 경로는"
-        " 없다). 이름 변경은 활동이 아니다 — last_update_time(목록 순서)과 unread를"
-        " 바꾸지 않는다.",
+        description="⋯ 메뉴의 '이름 변경'. 세션 제목을 사용자가 준 값으로 바꾼다. 사용자 제목은"
+        " 서버의 자동 제목보다 **항상 우선**이라 이후 턴의 자동 생성이 화면을 되덮지 않는다."
+        " 빈 문자열·공백만인 제목은 422다(제목을 지우는 경로는 없다)."
+        " 이름 변경은 활동이 아니다 — last_update_time(목록 순서)과 unread를 바꾸지 않는다.",
     )
     async def rename_session(
         session_id: str, request: SessionRenameRequest, user: _UserDep = None
@@ -390,7 +389,7 @@ def register_history(app: FastAPI) -> None:
         data = UserDataService.get_instance()
         # 사용자 제목은 **우리 테이블에** 쓴다(ADK 세션 state가 아니라). 그래야 이름 변경이
         # 목록의 활동 시각을 밀지 않는다 — ADK 세션은 state를 쓰는 순간 update_time이
-        # onupdate로 현재가 된다(session_ui.py 독스트링). 자동 제목은 여전히 ADK state에
+        # onupdate로 현재가 된다(user_data.py 독스트링). 자동 제목은 여전히 ADK state에
         # 남고, 표시할 때 사용자 제목이 그것을 덮는다(_title_of).
         await data.set_title(user_id=user_no, session_id=session.id, title=request.title)
         _, last_read_at = await data.ui_get(user_id=user_no, session_id=session.id)
@@ -407,7 +406,10 @@ def register_history(app: FastAPI) -> None:
         status_code=204,
         responses={**_SESSION_RESPONSES, 204: {"description": "삭제 완료(응답 본문 없음)"}},
         summary="대화 삭제",
-        description="세션과 그 이벤트를 삭제한다. 남긴 턴 피드백은 집계 재료로 보존된다.",
+        description="세션과 그 이벤트, 그리고 **그 대화에 남긴 것 전부**(좋아요/싫어요·코멘트·"
+        "직접 지은 제목)를 지운다. 되돌릴 수 없다. 집계 신호를 잃는 대가는 치른다 — 사용자가"
+        " 지우겠다고 한 것이 우선이다(삭제 API의 존재 이유가 프라이버시인데 코멘트가 남으면"
+        " 삭제가 아니다).",
     )
     async def delete_session(session_id: str, user: _UserDep = None) -> None:
         user_no = _require_identified(user)
@@ -420,9 +422,18 @@ def register_history(app: FastAPI) -> None:
         data = UserDataService.get_instance()
         if data.enabled:
             await data.purge_session(user_id=user_no, session_id=session.id)
-        await service.delete_session(
-            app_name=get_settings().app_name, user_id=user_no, session_id=session.id
-        )
+        try:
+            await service.delete_session(
+                app_name=get_settings().app_name, user_id=user_no, session_id=session.id
+            )
+        except Exception as exc:  # noqa: BLE001 — 500이 아니라 **재시도 가능한** 실패로 알린다
+            # 여기까지 왔으면 우리 쪽 데이터는 이미 지워졌다. 그대로 500을 내면 프론트는
+            # 재시도 가능한 실패인지 알 수 없다 — 다시 누르면 세션까지 지워져 최종 상태가
+            # 맞으므로(우리 쪽 삭제는 멱등) 503으로 정직하게 알린다.
+            logger.error(f"세션 삭제 실패(session_id={session.id}): {exc}")
+            raise HTTPException(
+                status_code=503, detail="대화를 지우지 못했습니다. 잠시 후 다시 시도해 주세요."
+            ) from exc
         logger.info(f"세션 삭제: session_id={session.id} user_no={user_no}")
 
     @app.put(

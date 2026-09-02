@@ -311,7 +311,7 @@ async def run_matrix_stream(
                         if source.get("id") is not None
                     ],
                     "picks": [{"id": book_id} for book_id in book_ids],
-                        "session_id": resolved_session_id,
+                    "session_id": resolved_session_id,
                     "fallback": fallback,
                     "gate_reason": "empty" if fallback else None,
                 },

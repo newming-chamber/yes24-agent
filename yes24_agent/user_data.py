@@ -82,11 +82,17 @@ class UserDataService(MysqlBackedService):
     async def feedback_for_session(
         self, *, user_id: str, session_id: str
     ) -> dict[str, dict[str, Any]]:
-        """세션 복원용 일괄 조회 — {turn_id: {"rating": …, "comment": …}}.
+        """세션 복원용 일괄 조회 — {turn_id: {"rating": …, "comment": …}}. 비활성이면 빈 dict.
 
-        복원 화면의 썸 상태는 저장의 반대면이라 같은 fail-loud를 쓴다 — 조회 실패를 빈 dict로
-        숨기면 "피드백이 없는 것"과 "읽지 못한 것"이 같은 화면이 된다.
+        **저장소가 있는데 못 읽은 것**은 fail-loud다(503) — 조회 실패를 빈 dict로 숨기면
+        "피드백이 없는 것"과 "읽지 못한 것"이 같은 화면이 된다. 반면 **저장소가 아예 없는
+        구성**(sqlite 로컬)은 "남긴 피드백이 없다"가 사실이므로 빈 값이 맞다. 이 가드가
+        빠져 있어 sqlite에서 대화 복원 전체가 503이었다(2026-09-02 적대 감사 F1) — 목록은
+        뜨는데 아무거나 클릭하면 죽어서 원인을 찾기 어려웠다. 읽기 셋(ui_for_user·ui_get·
+        이 함수)이 같은 규칙을 따라야 그 비대칭이 다시 생기지 않는다.
         """
+        if not self.enabled:
+            return {}
         rows = await self._run(
             "SELECT turn_id, rating, comment FROM turn_feedback "
             "WHERE user_id = %s AND session_id = %s",
@@ -148,14 +154,21 @@ class UserDataService(MysqlBackedService):
         남는다. 삭제 API의 존재 이유가 프라이버시인데 그게 남으면 삭제가 아니다(2026-09-01
         라이브 검증에서 고아 행으로 관측 — 결정론 테스트는 DB가 없어 못 잡았다).
         두 테이블이 한 서비스라 **빠뜨릴 수 있는 자리가 없다**(테이블이 늘면 여기만 는다).
+
+        **한 트랜잭션**으로 묶는다 — 문장을 따로 보내면 풀이 autocommit이라 앞 테이블만 지워진
+        채 실패할 수 있고, 그러면 "삭제 실패"라고 알린 뒤에 코멘트만 사라진 상태가 남는다.
         """
-        await self._run(
-            "DELETE FROM turn_feedback WHERE user_id=%s AND session_id=%s",
-            (user_id, session_id),
-        )
-        await self._run(
-            "DELETE FROM session_ui WHERE user_id = %s AND session_id = %s",
-            (user_id, session_id),
+        await self._run_all(
+            [
+                (
+                    "DELETE FROM turn_feedback WHERE user_id = %s AND session_id = %s",
+                    (user_id, session_id),
+                ),
+                (
+                    "DELETE FROM session_ui WHERE user_id = %s AND session_id = %s",
+                    (user_id, session_id),
+                ),
+            ]
         )
 
 

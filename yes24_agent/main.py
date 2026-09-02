@@ -873,9 +873,9 @@ def create_app() -> FastAPI:
         # 열어 둘 표면이 아니다.
         @app.post("/chat/matrix", include_in_schema=False)
         async def chat_matrix(request: MatrixRequest, http_request: Request) -> StreamingResponse:
+            """질문을 받아 16 RBTI 페르소나 답변을 열별 SSE로 스트리밍한다(retrieve-once)."""
             if not settings_unlocked(http_request):
                 raise HTTPException(status_code=403, detail="설정 접근 권한이 없습니다.")
-            """질문을 받아 16 RBTI 페르소나 답변을 열별 SSE로 스트리밍한다(retrieve-once)."""
             # 화이트리스트 값만 통과 — /chat/stream과 동일(임의 문자열은 config 기본 모델 폴백).
             allowed = set(get_settings().selectable_models.values())
             model = request.model if request.model in allowed else None
