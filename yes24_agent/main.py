@@ -291,9 +291,9 @@ class ChatRequest(BaseModel):
     """`/chat/stream` 요청 본문 — 설명은 **OpenAPI로 나간다**(주석은 /docs에 안 보인다).
 
     프론트가 채우는 필드는 `message`·`session_id`·`use_rbti` 셋이다. RBTI **코드**는 사람에게
-    붙는 값이라 서버가 소유하지만(`PUT /me/rbti`로 한 번 저장), **이번 턴에 쓸지 말지**는
-    화면의 선택이므로 프론트가 보낸다. 감춰진 `rbti`는 데모 UI의 선택기가 저장된 유형을
-    일시적으로 덮어쓰기 위한 것이다.
+    붙는 값이라 **서버가 조회**하고(조회처는 미정 — rbti/profile.py), **이번 턴에 쓸지 말지**는
+    화면의 선택이므로 프론트가 보낸다. 감춰진 `rbti`는 데모 UI의 선택기가 유형을 일시적으로
+    덮어쓰기 위한 것이다.
 
     나머지 둘은 어드민(데모 로그인) 화면의 모델·도구 토글용이라 API 키 호출에서는
     무시되는데, 효과 없는 필드가 스키마에 보이는 것이 가장 헷갈리므로 `ADMIN_ONLY_MARK`를
@@ -328,18 +328,18 @@ class ChatRequest(BaseModel):
 
     use_rbti: bool = Field(
         default=False,
-        description="이 턴에 저장된 RBTI 독서 유형을 적용할지. **기본 false** — 보내지 않으면"
-        " 페르소나 없이 답한다(유형이 저장돼 있어도). `true`로 보내면 `PUT /me/rbti`에 저장된"
-        " 유형이 적용되고, 적용된 코드가 `done.rbti_applied`로 돌아온다(배지 근거)."
-        " 저장된 유형이 없으면 true로 보내도 미적용이며 오류가 아니다."
-        " 유형 자체를 지우려면 `PUT /me/rbti`에 null을 보낸다(이건 저장값을 바꾼다).",
+        description="이 턴에 RBTI 독서 유형을 적용할지. **기본 false**."
+        " ⚠️ 현재는 서버의 유형 조회처가 미정이라 `true`로 보내도 항상 미적용이고"
+        " `done.rbti_applied`가 null이다(오류 아님). 계약은 고정이므로 지금 붙여 두면"
+        " 조회처가 정해지는 순간 프론트 수정 없이 동작한다 — 배지는 `done.rbti_applied`가"
+        " null이 아닌지로 판단한다.",
     )
     rbti: str | None = Field(
         default=None,
         json_schema_extra={ADMIN_ONLY_MARK: True},
         description="어드민 전용 — 데모 UI의 페르소나 선택기가 저장된 유형을 일시적으로"
         " 덮어쓸 때만 쓴다. 일반 클라이언트는 실을 필요가 없다: 사용자의 유형은"
-        " `PUT /me/rbti`로 한 번 저장하면 서버가 매 턴 자동 적용한다.",
+        " 서버가 사용자 유형을 조회해 적용한다(조회처 미정 — 현재는 항상 미적용).",
     )
     model: str | None = Field(
         default=None,
@@ -668,9 +668,13 @@ headers.set("x-api-key", decodeURIComponent(key));
 키 없이 부르면 **모든 API가 401**이고, 식별되지 않는 키는 **403**이다(임의 문자열은 키가
 되지 않는다). 한도 초과는 429다.
 
-**RBTI 독서 유형** — 사용자의 유형은 `PUT /me/rbti`로 **한 번** 저장하면 그 뒤 모든 대화에
-서버가 자동 적용한다(요청마다 실어 보내지 않는다). 적용된 코드는 `done.rbti_applied`로
-돌아오니 그 값으로 "✦ RBTI 데이터가 활용됨" 배지를 켜면 된다.
+**RBTI 독서 유형** — ⚠️ **현재 미완성이다.** 유형 코드는 프론트가 싣는 값이 아니라 서버가
+사용자(userNo)로 조회할 값인데, **조회처가 아직 정해지지 않았다**. 그래서 `use_rbti: true`를
+보내도 지금은 항상 `done.rbti_applied: null`이고 페르소나가 적용되지 않는다(오류는 아니다).
+
+계약은 이미 고정돼 있으니 프론트는 지금 붙여도 된다: 요청에 `use_rbti`(불리언)만 싣고,
+응답의 `done.rbti_applied`가 **null이 아니면** "✦ RBTI 데이터가 활용됨" 배지를 켠다.
+조회처가 정해지면 서버만 고치면 되고 **프론트 코드는 그대로**다.
 
 **첫 호출** — `POST /chat/stream`에 `{"message": "한강 작가 책 추천해줘"}`만 보내면 된다.
 `session_id`를 비우면 새 대화가 만들어지고, 그 id가 스트림 마지막 `done` 이벤트의
@@ -820,7 +824,7 @@ def create_app() -> FastAPI:
         # RBTI: **코드는 서버가, 켜고 끄기는 프론트가** 소유한다(2026-09-02 사용자 결정).
         # 유형 자체는 사람에게 붙는 값이라 users.rbti에 저장돼 있고, 이번 턴에 그것을 쓸지는
         # 화면의 토글이라 요청이 정한다. use_rbti=false면 저장돼 있어도 적용하지 않는다 —
-        # 저장값을 지우는 것(PUT /me/rbti null)과는 다른 층위다.
+        # 저장된 유형 자체를 바꾸는 것과는 다른 층위다(이 토글은 이번 턴만).
         # request.rbti는 데모 UI 전용 덮어쓰기라 토글이 꺼져 있으면 그것도 무시한다(끄기가
         # 이긴다 — "껐는데 페르소나가 적용됐다"가 성립하면 안 된다). 그래서 데모 UI도 코드를
         # 실을 때 use_rbti=true를 함께 보낸다(index.html) — 계약을 불리언 하나로 유지하려고
