@@ -476,10 +476,14 @@ async def run_agent_stream(
         observed_sources: list[dict] = []
         # 이번 턴에 도구가 돈 횟수. 최후 방어 실패 로그(tools=%d)의 진단값으로만 쓴다.
         tool_call_count = 0
-        turn_started = time.perf_counter()
+        # 턴이 어떻게 끝났는지. 기본이 aborted인 이유: 아무 분기도 안 지나고 finally에
+        # 도달하는 유일한 경로가 클라이언트 이탈이다(정상·실패는 각자 값을 세운다).
+        outcome = "aborted"
+        # finally(기록 지점)가 참조하므로 성공 경로 밖에서도 정의돼 있어야 한다.
+        final_done: dict | None = None
         # 이 턴의 식별자를 로그 문맥에 심는다 — 도구·후처리가 남기는 줄에 자동으로 붙어
         # 동시 사용자의 로그가 섞여도 가릴 수 있다(logctx). 값은 식별자뿐, 본문은 담지 않는다.
-        log_update(session=resolved_session_id[:8], user=session_user_id)
+        log_update(session=resolved_session_id, user=session_user_id)
         # 이번 턴 LLM 콜들의 토큰 합계(usage_log 재료). **non-partial 이벤트의 usage만**
         # 더한다 — LLM 콜 1회당 non-partial 모델 이벤트가 정확히 1개이고 그 usage는 콜
         # 단독분이라(Gemini·LiteLLM 양 경로 공통), 이 합이 콜마다 프롬프트를 다시 세는
@@ -488,6 +492,9 @@ async def run_agent_stream(
         # 않는다 — 버려진 첫 시도의 콜도 실제 과금된 호출이다(관찰만, 본류 무간섭).
         usage_calls = 0
         usage_prompt = usage_response = usage_total = 0
+        # 사고·캐시 토큰도 센다 — 이 둘이 없으면 금액이 안 나온다(실측: total-prompt-response가
+        # 턴당 964토큰으로 기록된 출력 661보다 컸다 — 과금되는 사고 토큰이 통째로 누락).
+        usage_thoughts = usage_cached = 0
         # 모델이 쓴 **원시** 본문 조각(세션 누적 id 그대로). 인용 검증의 입력이다.
         raw_body: list[str] = []
         # 화면에 흘린 **표시 번호** 본문 조각. 마감의 4b 대조(_emit_final_body)가 이 값 위에
@@ -636,6 +643,10 @@ async def run_agent_stream(
                         usage_prompt += event.usage_metadata.prompt_token_count or 0
                         usage_response += event.usage_metadata.candidates_token_count or 0
                         usage_total += event.usage_metadata.total_token_count or 0
+                        usage_thoughts += event.usage_metadata.thoughts_token_count or 0
+                        usage_cached += (
+                            event.usage_metadata.cached_content_token_count or 0
+                        )
 
                     if not event.partial and event.get_function_calls():
                         # 도구 직전 예고·경과 서술은 이미 본문 delta로 흘렀다(내레이션 전환).
@@ -776,7 +787,9 @@ async def run_agent_stream(
                     )
 
                 final_done = done_payload
+                outcome = "ok"
                 if _ensure_substantive_text(final_done):
+                    outcome = "empty"
                     logger.warning(
                         f"본문이 비어 최후 방어 안내로 대체합니다"
                         f"(session_id={resolved_session_id} tools={tool_call_count} "
@@ -829,7 +842,7 @@ async def run_agent_stream(
                     except Exception as exc:  # noqa: BLE001 — 부가 채널(정상 done 마감 보호)
                         logger.warning(f"meta 파이프라인 마감 실패(생략): {exc}")
                 logger.info(
-                    f"턴 완료 {int((time.perf_counter() - turn_started) * 1000)}ms "
+                    f"턴 완료 {int((time.monotonic() - turn_started) * 1000)}ms "
                     f"tools={tool_call_count} sources={len(final_done.get('sources', []))} "
                     f"cited={len(final_done.get('cited_ids', []))} "
                     f"chars={len(final_done.get('text', ''))} "
@@ -839,6 +852,7 @@ async def run_agent_stream(
                 break
 
         except asyncio.TimeoutError:
+            outcome = "timeout"
             logger.error(
                 f"LLM 응답이 {settings.sse_timeout_s}초 내 오지 않아 스트림을 "
                 f"종료합니다(session_id={resolved_session_id})."
@@ -861,6 +875,7 @@ async def run_agent_stream(
             for frame in frames:
                 yield frame
         except Exception as exc:  # noqa: BLE001 — SSE 스트림 최상위 방어선(마지막 수단)
+            outcome = "error"
             # 어떤 예외든 제너레이터를 예외로 종료시키지 않고 사용자에게 error를 알린 뒤 done으로
             # 스트림을 정상 마감한다. **빈 done으로 마감하지 않는다**: 모델이 완주한 뒤 재조립·세션
             # 재조립·인용 검증 구간에서 예외가 나면 이미 만들어 둔 답이 통째로 사라진다(실측:
@@ -890,20 +905,26 @@ async def run_agent_stream(
             # 않은 턴(스트림 시작 전 실패 등)은 잴 것이 없어 기록하지 않는다 — 계측
             # 채널이라 0행이 빈 성공 위장이 아니다. record_usage는 fire-and-forget이며
             # 어떤 실패도 던지지 않는다(부가 채널 계약 — usage.py).
-            if usage_calls:
-                record_usage(
-                    "main",
-                    types.GenerateContentResponseUsageMetadata(
-                        prompt_token_count=usage_prompt,
-                        candidates_token_count=usage_response,
-                        total_token_count=usage_total,
-                    ),
-                    model=active_model or None,
-                    session_id=resolved_session_id,
-                    user_id=session_user_id,
-                    endpoint=endpoint,
-                    latency_ms=int((time.monotonic() - turn_started) * 1000),
-                )
+            record_usage(
+                "main",
+                types.GenerateContentResponseUsageMetadata(
+                    prompt_token_count=usage_prompt,
+                    candidates_token_count=usage_response,
+                    total_token_count=usage_total,
+                    thoughts_token_count=usage_thoughts,
+                    cached_content_token_count=usage_cached,
+                ),
+                model=active_model or None,
+                session_id=resolved_session_id,
+                user_id=session_user_id,
+                endpoint=endpoint,
+                latency_ms=int((time.monotonic() - turn_started) * 1000),
+                turn_id=turn_id,
+                outcome=outcome,
+                llm_calls=usage_calls,
+                tool_calls=tool_call_count,
+                cited_sources=len(final_done.get("cited_ids", [])) if final_done else None,
+            )
             # 타임아웃·클라이언트 중단 시 미소진 제너레이터의 자원을 정리한다.
             # 미완 번역·병합 대기 task도 함께 취소한다(부가 채널이라 유실이 아니다).
             for task in thought_tasks:

@@ -75,6 +75,11 @@ class UsageLogger:
         user_id: str | None = None,
         endpoint: str | None = None,
         latency_ms: int | None = None,
+        turn_id: str | None = None,
+        outcome: str | None = None,
+        llm_calls: int | None = None,
+        tool_calls: int | None = None,
+        cited_sources: int | None = None,
     ) -> None:
         """사용량 1행 기록을 예약한다(fire-and-forget) — 어떤 실패도 밖으로 던지지 않는다.
 
@@ -95,7 +100,18 @@ class UsageLogger:
                 getattr(usage, "prompt_token_count", None),
                 getattr(usage, "candidates_token_count", None),
                 getattr(usage, "total_token_count", None),
+                # 사고·캐시 토큰은 usage 객체에서 그대로 뽑는다 — 서브콜은 원본
+                # usage_metadata를 넘기므로 호출부 수정 없이 자동으로 채워진다. 이 둘이
+                # 없으면 금액이 안 나온다: 우리 246행 실측에서 total-prompt-response가
+                # 턴당 964토큰이었고(기록된 출력 661보다 크다), 그게 과금되는 사고 토큰이다.
+                getattr(usage, "thoughts_token_count", None),
+                getattr(usage, "cached_content_token_count", None),
                 latency_ms,
+                turn_id,
+                outcome,
+                llm_calls,
+                tool_calls,
+                cited_sources,
             )
             # 본류(스트리밍·서브콜)와 분리된 task로 쓴다 — DB 왕복이 턴 지연에 얹히지 않는다.
             task = asyncio.get_running_loop().create_task(self._insert(row))
@@ -112,8 +128,10 @@ class UsageLogger:
                 async with conn.cursor() as cur:
                     await cur.execute(
                         "INSERT INTO usage_log (session_id, user_id, endpoint, component, "
-                        "model, prompt_tokens, response_tokens, total_tokens, latency_ms) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        "model, prompt_tokens, response_tokens, total_tokens, "
+                        "thinking_tokens, cached_tokens, latency_ms, turn_id, outcome, "
+                        "llm_calls, tool_calls, cited_sources) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                         row,
                     )
         except Exception as exc:  # noqa: BLE001 — 부가 채널: 기록 실패가 턴을 막으면 안 된다
@@ -149,6 +167,11 @@ def record_usage(
     user_id: str | None = None,
     endpoint: str | None = None,
     latency_ms: int | None = None,
+    turn_id: str | None = None,
+    outcome: str | None = None,
+    llm_calls: int | None = None,
+    tool_calls: int | None = None,
+    cited_sources: int | None = None,
 ) -> None:
     """모듈 진입점 — 호출부(runner·서브콜들)는 이 함수 하나만 안다(최소 결합).
 
@@ -163,6 +186,11 @@ def record_usage(
         user_id=user_id,
         endpoint=endpoint,
         latency_ms=latency_ms,
+        turn_id=turn_id,
+        outcome=outcome,
+        llm_calls=llm_calls,
+        tool_calls=tool_calls,
+        cited_sources=cited_sources,
     )
 
 

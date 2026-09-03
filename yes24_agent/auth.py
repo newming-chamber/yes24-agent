@@ -64,7 +64,9 @@ async def fetch_yes24_user_info(service_cookie: str) -> dict[str, Any] | None:
                 json={"serviceCookies": service_cookie},
             )
         if resp.status_code != 200:
-            logger.warning(f"Yes24 회원 API status={resp.status_code} body={resp.text[:200]}")
+            # 응답 본문에는 회원 정보가 들어 있다 — 상태코드만 남긴다
+            # (로그는 오래 남고 열람 범위가 넓다).
+            logger.warning(f"Yes24 회원 API status={resp.status_code}")
             return None
         data = resp.json()
         if not data.get("success"):
@@ -288,7 +290,8 @@ class AuthService:
                 api_key,
             ),
         )
-        logger.info(f"Yes24 회원 정보 캐시: userNo={user_no} userId={login_id}")
+        # 로그인 ID는 개인정보다 — userNo(내부 식별자)만 남긴다.
+        logger.info(f"Yes24 회원 정보 캐시: userNo={user_no}")
         return data
 
     def _remember(self, user: AuthenticatedUser) -> AuthenticatedUser:

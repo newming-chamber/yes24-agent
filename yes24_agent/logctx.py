@@ -57,7 +57,19 @@ class ContextFilter(logging.Filter):
     문맥이 비면 빈 문자열이라 기동 로그처럼 요청 밖에서 나는 줄은 지저분해지지 않는다.
     """
 
+    # 로그 줄에서만 줄여 보여줄 필드(전체 값은 문맥에 그대로 둔다 — 잘라 담으면 DB·API의
+    # 같은 값과 조인이 안 된다. 줄 길이는 표시의 문제이지 저장의 문제가 아니다).
+    _ABBREV = {"session": 8, "turn": 10}
+
     def filter(self, record: logging.LogRecord) -> bool:
         ctx = _CTX.get()
-        record.ctx = (" [" + " ".join(f"{k}={v}" for k, v in ctx.items()) + "]") if ctx else ""
+        if not ctx:
+            record.ctx = ""
+            return True
+        parts = []
+        for key, value in ctx.items():
+            text = str(value)
+            width = self._ABBREV.get(key)
+            parts.append(f"{key}={text[:width] if width else text}")
+        record.ctx = " [" + " ".join(parts) + "]"
         return True

@@ -646,7 +646,7 @@ def _cached_rows(
     result, sources, boost_tried = deepcopy(entry)
     state = _new_search_state(settings)
     state[SOURCES_STATE_KEY] = sources
-    logger.info(f"overview 행 캐시 히트(G2) query={query!r} rows={result.get('result_count')}")
+    logger.info(f"overview 행 캐시 히트(G2) qlen={len(query)} rows={result.get('result_count')}")
     return result, state, boost_tried
 
 
@@ -675,7 +675,7 @@ def _store_rows(
     if state.get(SEARCH_TRUNCATED_STATE_KEY):
         logger.info(
             f"overview 행 캐시 저장 생략(잘린 증거) "
-            f"query={query!r} rows={result['result_count']}"
+            f"qlen={len(query)} rows={result['result_count']}"
         )
         return
     _rows.set(
@@ -1341,7 +1341,7 @@ async def _judge_relevance(raw_query: str, titles: list[str], settings: Settings
         )
         if verdict.target_missing:
             logger.info(
-                f"overview 회수 무도달 — query={raw_query!r} 재검색어={list(queries)}"
+                f"overview 회수 무도달 — qlen={len(raw_query)} 재검색어={list(queries)}"
             )
         if not verdict.relevant:
             # 판정 근거는 모델의 산문(삭제한 reason) 대신 **판정기가 실제로 본 제목**을
@@ -1349,7 +1349,7 @@ async def _judge_relevance(raw_query: str, titles: list[str], settings: Settings
             # 실제로 필요했던 정보가 이것이었다("토익 교재 추천"이 접힌 이유는 1차 검색이
             # IoT 도서만 물어왔기 때문이고, 제목 목록만 있으면 바로 보인다).
             logger.info(
-                f"overview 관련성 게이트 false — query={raw_query!r} 본_제목={titles[:5]}"
+                f"overview 관련성 게이트 false — qlen={len(raw_query)} 본_제목={titles[:5]}"
             )
         return verdict
     except Exception as exc:  # noqa: BLE001 — fail-open: 판정기 장애는 무게이트 강등
@@ -1423,7 +1423,7 @@ async def _retry_search(
     철학). 플래너 대기도 같은 예산 안이다(_plan_requery가 같은 deadline을 받는다).
     """
     if deadline - time.monotonic() <= 0:
-        logger.info(f"overview {reason} — 검색 총예산 소진, 보강 생략 query={raw_query!r}")
+        logger.info(f"overview {reason} — 검색 총예산 소진, 보강 생략 qlen={len(raw_query)}")
         state[SEARCH_TRUNCATED_STATE_KEY] = True  # 같은 예산 사건 — _bounded_search와 같은 신호
         return None
     # 보강 재검색도 **자기 몫만** 쓴다 — 1차 RECENT 각도에 2026-08-28에 적용한 회계를
@@ -1450,7 +1450,7 @@ async def _retry_search(
         label = "축약"
     if not queries:
         return None
-    logger.info(f"overview {reason} — 보강 재검색 query={raw_query!r} {label}={queries}")
+    logger.info(f"overview {reason} — 보강 재검색 qlen={len(raw_query)} {label}={queries}")
     return _merge_search_results(
         *primary,
         *await _bounded_search(queries, section, state, f"{reason} {label}", deadline=deadline),
@@ -1552,7 +1552,7 @@ async def _run_search(
     except asyncio.TimeoutError:
         base_result = None  # wait_for가 이미 취소했다 — RECENT 각도 도착분으로 진행
         state[SEARCH_TRUNCATED_STATE_KEY] = True  # 같은 예산 사건 — _bounded_search와 같은 신호
-        logger.info(f"overview 1차 기본 각도 검색 총예산 초과 — 취소 query={query!r}")
+        logger.info(f"overview 1차 기본 각도 검색 총예산 초과 — 취소 qlen={len(query)}")
     except BaseException:
         recent_task.cancel()  # 고아 Task 금지 — 기본 각도 실패면 recent도 함께 마감
         raise
@@ -1565,7 +1565,7 @@ async def _run_search(
     if result is None:
         # 두 각도 모두 예산 초과 — 빈 성공 위장 금지(원칙 7): 검색 단계 실패로 마감한다
         # (degraded 값은 기존 parse_error 버킷 그대로, 상류 구분은 error_type·로그에).
-        logger.info(f"overview 1차 검색 총예산 초과(양 각도) query={query!r}")
+        logger.info(f"overview 1차 검색 총예산 초과(양 각도) qlen={len(query)}")
         return (
             {"status": "error", "error_type": "search_timeout", "result_count": 0, "results": []},
             state,
@@ -2364,7 +2364,7 @@ async def _append_details(
         logger.warning(f"overview 상세 이어쓰기 실패 — 1차 본문으로 마감: {exc!r}")
         return first.citation, first.streamed + "".join(streamed)
     if not released:
-        logger.info(f"overview 상세 이어쓰기 무인용 — 1차 본문으로 마감 query={raw_query!r}")
+        logger.info(f"overview 상세 이어쓰기 무인용 — 1차 본문으로 마감 qlen={len(raw_query)}")
         return first.citation, first.streamed
     return (
         validate_citations(prefix + text, first.sources),
@@ -2574,7 +2574,7 @@ async def _generate_with_planner(
         # 가른 이유이고, 여기서 그 구분이 처음으로 쓰인다).
         return _degraded(degraded)
     if result["result_count"] == 0:
-        logger.info(f"overview degraded=no_results query={raw_query!r}")
+        logger.info(f"overview degraded=no_results qlen={len(raw_query)}")
         return _degraded("no_results")
 
     # 예산은 LLM 콜 직전에만 소모한다 — 위의 degraded 경로는 **이 콜의** 비용이 없으므로
@@ -2635,7 +2635,7 @@ async def _generate_with_planner(
                 speculative.append(recovery_task)
             return _recovery_secured if recovery_task is not None else None
         if early.relevant and early.needs_detail and not detail_tasks:
-            logger.info(f"overview needs_detail — 상세 보강 열람 시작 query={raw_query!r}")
+            logger.info(f"overview needs_detail — 상세 보강 열람 시작 qlen={len(raw_query)}")
             detail_rows = result["results"]
             detail_tasks = _spawn_detail_fetches(detail_rows, state, settings)
             speculative.extend(detail_tasks)
@@ -2656,7 +2656,7 @@ async def _generate_with_planner(
         # 빈 문자열)이고, 프론트는 degraded를 값 무관 일괄 접힘으로 처리한다(무접촉).
         # 캐시는 degraded를 서빙하지 않으므로 다음 요청이 재생성한다. 재시도 체인 안의
         # 타임아웃은 각 재시도의 "보강은 실패 사유가 아니다" catch가 1차 결과로 마감한다.
-        logger.info(f"overview degraded=timeout query={raw_query!r} (방류 전 데드라인)")
+        logger.info(f"overview degraded=timeout qlen={len(raw_query)} (방류 전 데드라인)")
         return _degraded("timeout")
     current_results = result["results"]
 
@@ -2846,7 +2846,7 @@ async def _generate_with_planner(
         # 뭉개진다. 새 config·새 degraded 값은 없다.
         payload = _degraded("irrelevant")
         logger.info(
-            f"overview degraded=irrelevant query={raw_query!r} "
+            f"overview degraded=irrelevant qlen={len(raw_query)} "
             f"discarded_len={len(citation.text)} "
             f"search_truncated={payload['evidence_incomplete']}"
         )
@@ -2883,7 +2883,7 @@ async def _generate_with_planner(
             emit(sse_reset())
         emit(sse_delta(citation.text))
     logger.info(
-        f"overview ok query={raw_query!r} cited={len(payload['cited_ids'])} "
+        f"overview ok qlen={len(raw_query)} cited={len(payload['cited_ids'])} "
         f"model={settings.overview_model}"
     )
     return {
@@ -3127,7 +3127,7 @@ def warm_search(query: str, section: str, settings: Settings) -> None:
     if 0 < settings.overview_warm_max_inflight <= len(_warm_tasks):
         logger.info(
             f"overview 워밍 동시 상한({settings.overview_warm_max_inflight}) 초과 — 드롭 "
-            f"query={query!r}"
+            f"qlen={len(query)}"
         )
         return
 
@@ -3203,7 +3203,7 @@ async def _seed_chat_session(
         await service.append_event(session, event)
     logger.info(
         f"overview continue: 세션 시딩 session_id={session.id} "
-        f"sources={len(seed['sources'])} query={query!r}"
+        f"sources={len(seed['sources'])} qlen={len(query)}"
     )
     return session.id
 
