@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field, StringConstraints
 from yes24_agent.auth import AuthenticatedUser, AuthService, get_authenticated_user
 from yes24_agent.config import get_settings
 from yes24_agent.enrichment import SESSION_TITLE_STATE_KEY
-from yes24_agent.event_translate import TurnProcess, _status_for_call
+from yes24_agent.event_translate import PROCESS_TIMING_KEY, TurnProcess, _status_for_call
 from yes24_agent.postprocess import finalize_answer, finalize_text
 from yes24_agent.runner import _event_text, _round_boundary_prefix
 from yes24_agent.session_service import _POC_USER_ID, _get_session_service
@@ -95,24 +95,52 @@ class TurnFeedbackState(BaseModel):
     comment: str | None = Field(default=None, description="선택 코멘트")
 
 
+class StepSource(BaseModel):
+    """found 스텝이 찾은 출처 1건 — 키는 url이다(표시 번호 없음: `[n]`은 인용된 출처만 받는다)."""
+
+    url: str = Field(
+        description="출처 url — 인용되면 status refs{id,url}·출처 카드가 이 url로 잇는다"
+    )
+    title: str = Field(description="도구가 돌려준 제목(가격·평점 등 상품 사실은 싣지 않는다)")
+
+
 class TurnProcessStep(BaseModel):
-    """턴 과정의 도구 스텝 1건 — /chat/stream status 프레임과 같은 stage·detail."""
+    """턴 과정의 도구 스텝 1건 — /chat/stream status 프레임과 같은 stage·detail(·sources)."""
 
     round: int = Field(description="이 스텝이 속한 LLM 라운드(0부터)")
     stage: str = Field(description="searching·searching_web·reading·browsing·found·notice")
     detail: str = Field(description="검색 각도·상세 제목·코너명·'N건 찾았어요'·안내 문구")
+    # 라이브 done.process.steps와 **같은 모양**이 계약이다 — found 스텝에만 키가 있고, 없는 스텝은
+    # null이 아니라 키 생략이다(exclude_if).
+    sources: list[StepSource] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="found 스텝이 찾은 출처의 url·title(도구 응답 순서). 다른 스텝엔 키가 없다",
+    )
 
 
 class TurnProcessView(BaseModel):
     """턴 과정 요약 — /chat/stream `done.process`와 동형(같은 누적기가 만든다)."""
 
-    elapsed_ms: int = Field(description="턴 첫 이벤트 → 마지막 이벤트(영속 timestamp 기준)")
+    elapsed_ms: int = Field(
+        description="라이브 done.process.elapsed_ms와 같은 값(라이브가 턴에 영속한 것)."
+        " 타이밍 영속 이전의 구 턴만 영속 timestamp(첫 이벤트 → 마지막 이벤트)로 근사"
+    )
+    answer_at_ms: int = Field(
+        description="라이브 done.process.answer_at_ms와 같은 값 — 접힌 헤더 'N초'의 재료."
+        " 구 턴만 마지막 라운드 텍스트 이벤트의 timestamp로 근사(텍스트가 없으면 elapsed_ms)"
+    )
     sources_reviewed: int = Field(
         description="이 턴 도구 응답으로 관측한 고유 출처 수(인용 수와 다르다)"
     )
     answer_start: int = Field(
         description="text에서 최종 답(마지막 라운드)이 시작하는 문자 오프셋 — text[:n]이 조사"
-        " 경과, text[n:]이 답. 단일 라운드면 0"
+        " 경과, text[n:]이 답. 단일 라운드면 0. 항상 round_starts[-1]과 같다"
+    )
+    round_starts: list[int] = Field(
+        description="라운드 r의 텍스트가 text에서 시작하는 오프셋(첫 원소 0, 단조 비감소, 마지막"
+        " = answer_start). 라운드 r 텍스트 = text[round_starts[r]:round_starts[r+1]](마지막은"
+        " 끝까지 = 최종 답), round==r인 스텝은 그 텍스트 뒤에 온다 — 라이브 순서의 복원 재료"
     )
     steps: list[TurnProcessStep] = Field(
         description="도구 스텝(순서대로). 사고 요약(thinking)은 영속되지 않아 복원엔 없다"
@@ -267,7 +295,12 @@ def _assemble_turns(events: list) -> list[dict[str, Any]]:
 
     턴 과정(`process`)도 여기서 라이브와 **같은 누적기**(TurnProcess)로 먹인다 — 모델
     이벤트·도구 호출·도구 응답을 runner와 같은 순서로 알리면 라운드·스텝·관측 출처가 같은
-    판정에서 나온다. 소요는 영속 timestamp(첫·마지막 이벤트)로 잰다.
+    판정에서 나온다. 시간 값(`elapsed_ms`·`answer_at_ms`)은 라이브가 done 직전에 턴에 영속한
+    것(`custom_metadata[PROCESS_TIMING_KEY]`, runner `_persist_process_timing`)을 `timing`으로
+    꺼내 둔다 — 그 이벤트는 content가 없어 본문·스텝·라운드의 재료가 아니므로 누적기에 먹이지
+    않는다(먹이면 모델 이벤트로 오인돼 라운드가 갈린다). 영속이 없는 구 턴은 timestamp로
+    근사한다(첫·마지막 이벤트, 텍스트 이벤트 시각) — ADK는 라운드당 non-partial 이벤트 1건을
+    라운드 스트림이 끝난 시각으로 영속하므로 그 근사는 라이브보다 늦다.
     """
     turns: dict[str, dict[str, Any]] = {}
     for event in events:
@@ -284,7 +317,12 @@ def _assemble_turns(events: list) -> list[dict[str, Any]]:
                 "body": [],
                 "tool_ran": False,
                 "process": TurnProcess(),
+                "timing": None,
             }
+        timing = (event.custom_metadata or {}).get(PROCESS_TIMING_KEY)
+        if timing is not None:
+            turn["timing"] = timing
+            continue
         turn["ended_at"] = event.timestamp
         process: TurnProcess = turn["process"]
         responses = event.get_function_responses()
@@ -301,6 +339,7 @@ def _assemble_turns(events: list) -> list[dict[str, Any]]:
                 chunk = _round_boundary_prefix(turn["body"], chunk) + chunk
             turn["tool_ran"] = False
             turn["body"].append(chunk)
+            process.text_event(int((event.timestamp - turn["started_at"]) * 1000))
         for call in event.get_function_calls():
             process.step(_status_for_call(call))
         for response in responses:
@@ -336,6 +375,14 @@ def _project_session_detail(
         _, payload = finalize_answer(body, registry, session.id)
         text = payload["text"] if raw["body"] else ""
         feedback = feedback_by_turn.get(raw["turn_id"])
+        process = raw["process"].payload(
+            raw_body=body,
+            text=text,
+            finalize_text=partial(finalize_text, sources=registry, session_id=session.id),
+            elapsed_ms=int((raw["ended_at"] - raw["started_at"]) * 1000),
+        )
+        # 라이브가 확정한 시간 값이 있으면 그것이 정본이다(구 턴만 위 timestamp 근사).
+        process.update(raw["timing"] or {})
         turns.append(
             TurnView(
                 turn_id=raw["turn_id"],
@@ -345,12 +392,7 @@ def _project_session_detail(
                 sources=payload["sources"],
                 cited_ids=payload["cited_ids"],
                 feedback=TurnFeedbackState(**feedback) if feedback else None,
-                process=raw["process"].payload(
-                    raw_body=body,
-                    text=text,
-                    finalize_text=partial(finalize_text, sources=registry, session_id=session.id),
-                    elapsed_ms=int((raw["ended_at"] - raw["started_at"]) * 1000),
-                ),
+                process=process,
             )
         )
     return SessionDetailResponse(

@@ -24,7 +24,7 @@ data: <JSON>
 
 | event | data | 뜻 |
 |---|---|---|
-| `status` | `{stage, detail, round?, refs?, code?}` | 진행 상태(stage 열거는 아래) |
+| `status` | `{stage, detail, round?, refs?, code?, sources?}` | 진행 상태(stage 열거는 아래) |
 | `delta` | `{text, round?}` | 본문 조각. **이어 붙이면 본문이 된다** |
 | `source` | `{source}` | 인용된 출처 1건(제목·url·가격·평점 등) |
 | `reset` | `{}` | **이미 받은 본문을 버려라.** 인용 검증이 본문을 바꿨을 때만 온다 |
@@ -43,7 +43,12 @@ data: <JSON>
 - `searching_web` — 툴 호출(web_search). detail = 검색 각도들(` · ` 구분).
 - `reading` — 툴 호출(yes24_fetch·fetch_many). detail = 여는 상세의 제목(들).
 - `browsing` — 툴 호출(yes24_browse). detail = 코너명.
-- `found` — 툴 결과. detail = `"N건 찾았어요"`(0건이면 프레임 없음).
+- `found` — 툴 결과. detail = `"N건 찾았어요"`(0건이면 프레임 없음). `sources: [{url, title}]`가
+  함께 실린다 — 찾은 출처를 **즉시**(카드보다 먼저) 보여 주기 위한 스텝 출처다. 표시 번호(`id`)와
+  가격·평점은 없다(`[n]`은 인용된 출처만 받는다) — 키는 url이고, 인용되면 `refs{id,url}`가 url로
+  잇는다. 실을 항목이 없으면 키가 없다. 목록은 그 응답이 **관측시킨 출처 전체**라
+  `done.process.sources_reviewed`와 같은 집합이고, detail의 N건과 길이가 다를 수 있다(상세
+  열람은 한 권이 종이책·eBook 판형 레코드를 함께 돌려준다 — "2건 찾았어요" 아래 4개).
 - `notice` — 툴 결과(실패 안내). detail = 안내 문구(재시도를 암시하지 않는다).
 - `refs` — 힌트(마커 렌더). detail = `""`, `refs: [{id, url}]`가 본체. 그 번호가 처음 실리는
   delta보다 먼저 온다.
@@ -61,20 +66,40 @@ round가 없다.
 ```json
 "process": {
   "elapsed_ms": 21340,      // 턴 시작 → done 직전(서버 계측)
+  "answer_at_ms": 16020,    // 턴 시작 → 최종 답(마지막 라운드)의 첫 본문 청크(접힌 헤더 "N초")
   "sources_reviewed": 5,    // 이번 턴 도구 응답으로 관측한 고유 출처 수(인용 수와 다르다)
   "answer_start": 187,      // done.text에서 최종 답(마지막 라운드)이 시작하는 문자 오프셋
+  "round_starts": [0, 187], // 라운드 r 텍스트의 done.text 시작 오프셋(마지막 = answer_start)
   "steps": [                // 이번 턴의 툴 status(thinking·refs·persona 제외), 순서대로
     {"round": 0, "stage": "searching", "detail": "에세이 베스트셀러 · 요즘 인기 에세이"},
-    {"round": 0, "stage": "found", "detail": "10건 찾았어요"}
+    {"round": 0, "stage": "found", "detail": "2건 찾았어요",
+     "sources": [{"url": "<출처 url>", "title": "책 1"}, {"url": "<출처 url>", "title": "책 2"}]}
   ]
 }
 ```
+`found` 스텝의 `sources`는 라이브 `found` status의 그것과 같은 목록(url·title뿐, 번호·가격
+없음)이고, 다른 스텝엔 키가 없다.
 `text[:answer_start]`가 내레이션, `text[answer_start:]`가 최종 답이다. 단일 라운드면 0,
 마지막 라운드에 텍스트가 없으면 `len(text)`, 본문이 최후 방어 안내로 대체됐으면 0. 라운드
-사이의 문단 구분자는 답 쪽에 붙는다. 실패 턴(`error` 뒤 `done`)에도 그 시점까지의 누적분이
-실린다 — 스트림 시작 전 실패(세션 준비 실패)의 `done`에는 빈 과정(`steps: []`,
-`sources_reviewed: 0`, `answer_start: 0`)이 실린다. 히스토리 복원(`GET /chat/sessions/{id}`)의
-각 턴 `process`도 같은 모양이다 — 단 `thinking`은 영속되지 않으므로 복원 steps에는 원래 없다.
+사이의 문단 구분자는 답 쪽에 붙는다. **`round_starts`는 그 분할을 라운드별로 편 것** —
+`round_starts[0] == 0`, 단조 비감소, `round_starts[-1] == answer_start`(항상), 라운드 r의
+텍스트 = `text[round_starts[r]:round_starts[r+1]]`(마지막은 끝까지 = 최종 답). **히스토리
+복원의 순서 재현: r번 텍스트 → r번 스텝(`step.round == r`) → r+1번 텍스트 → …** — 라이브의
+`delta.round` 없이도 이 배열과 `steps`만으로 같은 순서를 그린다. 단일 라운드면 `[0]`, 도구
+응답 뒤 모델 이벤트 없이 마감된 대기 라운드는 마지막 원소가 `len(text)`(빈 답). 어떤 중간
+경계가 정본 안에서 못 맞으면 직전 경계로 클램프(그 라운드 내레이션은 빈 문자열), 마지막
+경계가 못 맞으면 전부 0(전부 답 — `answer_start`와 한 판정).
+`answer_at_ms`는 헤더 "N초"의 N이다 — 전체 소요가 아니라 **답이 시작되기까지의 조사
+시간**(단일 라운드면 벤더 사고 구간 뒤 첫 청크). 마지막
+라운드에 텍스트가 없거나 본문이 대체됐으면 `elapsed_ms`와 같다(`answer_at_ms <= elapsed_ms`
+항상). 실패 턴(`error` 뒤 `done`)에도 그 시점까지의 누적분이 실린다 — 스트림 시작 전
+실패(세션 준비 실패)의 `done`에는 빈 과정(`steps: []`, `sources_reviewed: 0`,
+`answer_start: 0`, `round_starts: [0]`, `answer_at_ms == elapsed_ms`)이 실린다. 히스토리 복원
+(`GET /chat/sessions/{id}`)의 각 턴 `process`도 같은 모양이다 — 단 `thinking`은 영속되지
+않으므로 복원 steps에는 원래 없다. `elapsed_ms`·`answer_at_ms`는 라이브가 done 직전에 확정한
+그 값을 턴에 영속해 히스토리도 **같은 값**을 낸다(라이브·새로고침 복원·히스토리의 헤더
+"N초"가 동일). 타이밍 영속 이전의 구 턴만 영속 이벤트 timestamp로 근사한다(라운드 스트림이
+끝난 시각이라 라이브보다 늦다).
 
 **지켜지는 계약**
 - `done`은 **정확히 한 번** 온다. 실패해도 `error` 뒤에 `done`이 온다.
@@ -181,7 +206,7 @@ def sse_status(
 
     `round`는 이 status가 속한 LLM 라운드(0부터), `extra`는 stage별 구조 데이터(persona의
     `code` — 값이 None이어도 **키는 실린다**: "요청했지만 코드 없음"을 프론트가 값으로
-    판정한다). 둘 다 가법이다.
+    판정한다 — 와 found의 `sources` = 스텝 출처 `[{url, title}]`). 둘 다 가법이다.
     """
     data = {"stage": stage, "detail": detail}
     if refs:

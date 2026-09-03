@@ -220,11 +220,23 @@ def project_registry_record(source: dict) -> dict:
 def project_source_ref(source_event: dict) -> dict:
     """출처 이벤트에서 **스트리밍 중 마커를 렌더할 최소 정보만** 투영한다(id·url).
 
-    제목·저자·가격·평점은 여기로 나가지 않는다(원칙 4a — 검증 전 상품 사실은 어떤 공개
-    채널로도 새지 않는다). url은 마커를 하이퍼링크로 만들기 위한 것이고, 없으면 프론트가
-    링크 대신 칩으로 폴백한다.
+    제목·저자·가격·평점은 여기로 나가지 않는다. 원칙 4/4a가 막는 것은 **증거 표면**의 표시
+    번호와 가격·평점이다 — `[n]`은 인용된 출처만 받고, 상품 사실은 검증을 거친 카드로만 나간다.
+    도구가 돌려준 제목·url 자체는 과정 표면(스텝, `project_step_source`)으로 즉시 나간다.
+    url은 마커를 하이퍼링크로 만들기 위한 것이고, 없으면 프론트가 링크 대신 칩으로 폴백한다.
     """
     return {"id": source_event.get("id"), "url": source_event.get("url") or ""}
+
+
+def project_step_source(source: dict) -> dict | None:
+    """관측 출처를 **과정 스텝에 실을 최소 정보**로 투영한다(url·title) — 없으면 None(항목 생략).
+
+    스텝 출처의 키는 url이다: 표시 번호(id)는 인용된 출처만 받으므로 싣지 않고(인용되면
+    `refs{id,url}`가 url로 잇는다), 가격·평점·저자 같은 상품 사실은 증거 표면(카드) 몫이라
+    싣지 않는다. 필드는 둘뿐이고, 둘 중 하나라도 비면 항목이 아니다.
+    """
+    url, title = source.get("url"), source.get("title")
+    return {"url": url, "title": title} if url and title else None
 
 
 def _iter_source_dicts(value: object):
@@ -300,91 +312,168 @@ def settle_sources(registry: list[dict], observed_sources: list[dict]) -> list[d
 # ── 턴 과정 누적기(done.process · 히스토리 TurnView.process) ─────────────────
 
 
-def _answer_start(text: str, narration: str) -> int:
-    """마감된 정본 `text`에서 최종 답(마지막 라운드)이 시작하는 오프셋.
+def _prefix_length(text: str, narration: str) -> int | None:
+    """마감된 정본 `text` 안에서 마감된 접두 `narration`이 끝나는 오프셋(접두가 정본에 없으면 None).
 
-    `narration`은 마지막 라운드 이전의 원시 본문을 **같은 조립기**(finalize_answer)로 마감한
+    `narration`은 어떤 라운드 이전의 원시 본문을 **같은 조립기**(finalize_answer)로 마감한
     것이다. 조립기는 `[n]` 마커만 치환·삭제하고 재번호는 첫 등장 순서라, 접두를 따로 마감해도
-    정본의 접두와 같다 — 그래서 답의 시작은 접두의 길이다(테스트가 등식으로 고정한다).
+    정본의 접두와 같다 — 그래서 라운드의 시작은 접두의 길이다(테스트가 등식으로 고정한다).
 
-    등식이 깨지는 경로는 둘이다. ① 무효 마커 삭제의 seam: 답 라운드가 **통째로 무효인
+    등식이 깨지는 경로는 둘이다. ① 무효 마커 삭제의 seam: 다음 라운드가 **통째로 무효인
     마커**로 시작하면 `validate_citations._seam_parts`가 그 앞(내레이션 꼬리)의 가로 공백을
     흡수해 정본의 접두가 내레이션보다 짧아진다. 그때는 꼬리 공백을 뗀 접두로 다시 맞춘다 —
-    답 쪽은 정확히 답이고 접두는 공백만 다르다(구분자 `\n\n`은 떼지 않으므로 답 쪽에 남는다).
-    내레이션이 "공백+구두점"으로 끝나면 seam이 그 안쪽 공백까지 지워 이 재시도로도 못 닫는다.
-    ② 코드 스팬 문맥: 내레이션이 인라인 백틱을 연 채 도구를 부르고 답에서 닫히면, 정본에서는
-    그 구간의 마커가 리터럴로 보존되지만 접두 단독 마감은 스팬이 성립하지 않아 재번호된다
-    (`code_span_ranges`가 뒤 문맥에 좌우된다).
-    어느 쪽이든, 그리고 본문이 최후 방어 안내로 대체된 경우에도, 접두가 정본 안에 없으면 0 —
-    과정만 남고 답이 사라지는 분할은 어떤 경우에도 만들지 않는다(matrix의 process_chars와
-    같은 원칙). 0 폴백은 경고로 남겨 발생 빈도를 잴 수 있게 한다(본문은 싣지 않는다).
+    뒤쪽은 정확히 다음 라운드이고 접두는 공백만 다르다(구분자 `\n\n`은 떼지 않으므로 뒤쪽에
+    남는다). 내레이션이 "공백+구두점"으로 끝나면 seam이 그 안쪽 공백까지 지워 이 재시도로도 못
+    닫는다. ② 코드 스팬 문맥: 내레이션이 인라인 백틱을 연 채 도구를 부르고 다음 라운드에서
+    닫히면, 정본에서는 그 구간의 마커가 리터럴로 보존되지만 접두 단독 마감은 스팬이 성립하지
+    않아 재번호된다(`code_span_ranges`가 뒤 문맥에 좌우된다).
+    어느 쪽이든, 그리고 본문이 최후 방어 안내로 대체된 경우에도, 접두가 정본 안에 없으면 None —
+    폴백은 `_round_starts`가 한 판정으로 정한다.
     """
     for prefix in (narration, narration.rstrip(" \t")):
         if text.startswith(prefix):
             return len(prefix)
-    logger.warning(
-        f"answer_start 접두 불일치 → 0 폴백(narration_len={len(narration)} text_len={len(text)})"
-    )
-    return 0
+    return None
+
+
+def _round_starts(
+    text: str, raw_body: str, raw_starts: list[int], finalize_text: Callable[[str], str]
+) -> list[int] | None:
+    """라운드별 원시 시작 오프셋을 정본 `text`의 오프셋으로 사상한다 — `process.round_starts`.
+
+    계약: `[0] == 0`, 단조 비감소, 마지막 원소가 답의 시작(`answer_start`). 라운드 r 이전의 원시
+    본문(`raw_body[:raw_starts[r]]`)을 정본과 같은 조립기로 마감해 접두 길이를 잰다(접두 0은
+    마감 생략). 어떤 경계가 정본 안에서 못 맞거나 앞 경계보다 뒤로 물러나면(`_prefix_length`의
+    두 사각) **직전 경계로 클램프**한다 — 그 라운드의 내레이션은 빈 문자열이 되고 답은 온전하다.
+    마지막 경계(답의 시작)가 못 맞으면 None — 호출부가 전부 0으로 떨어뜨린다(전부 답). 과정만
+    남고 답이 사라지는 분할은 어떤 경우에도 만들지 않는다(matrix의 process_chars와 같은 원칙).
+    폴백은 경고로 남겨 발생 빈도를 잴 수 있게 한다(본문은 싣지 않는다).
+    """
+    starts = [0]
+    for round_index, raw_start in enumerate(raw_starts[1:], start=1):
+        narration = finalize_text(raw_body[:raw_start]) if raw_start else ""
+        offset = _prefix_length(text, narration)
+        if offset is None or offset < starts[-1]:
+            last = round_index == len(raw_starts) - 1
+            logger.warning(
+                f"round_starts 접두 불일치(round={round_index}) → "
+                f"{'전부 답(0) 폴백' if last else '직전 경계로 클램프'}"
+                f"(narration_len={len(narration)} text_len={len(text)})"
+            )
+            if last:
+                return None
+            offset = starts[-1]
+        starts.append(offset)
+    return starts
+
+
+# 라이브가 확정한 `process`의 시간 값을 턴에 영속하는 자리 — content 없는 system 이벤트의
+# `custom_metadata[PROCESS_TIMING_KEY] = {elapsed_ms, answer_at_ms}`(runner가 쓰고 history가
+# 읽는다). 스텝·검토 출처·round_starts는 영속 이벤트에서 같은 TurnProcess로 정확히 재구성되므로
+# 영속하지 않는다(최소 영속). 시간만 영속하는 이유: ADK는 라운드당 non-partial 이벤트 1건을
+# 라운드 스트림이 **끝난** 시각으로 남겨 timestamp로는 라이브의 첫 청크 시각·요청 수신 기준
+# 소요를 복원할 수 없다.
+PROCESS_TIMING_KEY = "process_timing"
+PROCESS_TIMING_FIELDS = ("elapsed_ms", "answer_at_ms")
 
 
 class TurnProcess:
     """턴 과정 누적기 — 라이브 스트림(runner)과 히스토리 복원(history)이 **같은 인스턴스 규칙**으로
-    `process`(elapsed_ms·sources_reviewed·answer_start·steps)를 만든다(같은 판정 두 곳 금지).
+    `process`(elapsed_ms·answer_at_ms·sources_reviewed·answer_start·round_starts·steps)를
+    만든다(같은 판정 두 곳 금지).
 
     라운드 = LLM 콜 인덱스(0부터). 도구 응답을 처리한 뒤 **처음 도착하는 모델 이벤트**(사고·본문
     partial·function_call·final)에서 +1이다. 호출부는 이벤트 종류를 그대로 알려 주기만 한다 —
     `model_event(raw_len)`은 그 시점의 원시 본문 누적 길이를 받는데, 새 라운드가 시작되면 그
-    값이 곧 마지막 라운드의 원시 시작 오프셋이다(라운드 첫 청크에 붙는 문단 구분자 **이전**).
+    값이 곧 그 라운드의 원시 시작 오프셋이다(라운드 첫 청크에 붙는 문단 구분자 **이전**).
+    라운드 수는 그 오프셋 목록의 길이다 — `round`는 목록에서 읽는다.
+    `text_event(at_ms)`는 본문 청크가 도착한 경과 시각을 받고, 라운드의 **첫 청크만** 남긴다 —
+    마지막 라운드의 그 값이 `answer_at_ms`(답이 시작되기까지의 조사 시간)다.
     스텝은 도구 status(호출·결과)만이다 — thinking·refs·persona는 과정의 재료가 아니다.
+    스텝 dict는 `{round, stage, detail}`이고 결과 스텝(found)만 `sources: [{url, title}]`를 더
+    갖는다.
     """
 
     def __init__(self) -> None:
-        self.round = 0
         self.steps: list[dict] = []
         self.source_ids: set[int] = set()
         self._tool_pending = False  # 도구 응답을 처리했고 아직 다음 모델 이벤트가 안 왔다
-        self._answer_raw_start = 0  # 마지막 라운드의 원시 본문 시작 오프셋
+        self._raw_starts = [0]  # 라운드별 원시 본문 시작 오프셋(인덱스 = 라운드)
+        self._answer_at_ms: int | None = None  # 마지막 라운드의 첫 본문 청크 경과 시각
+
+    @property
+    def round(self) -> int:
+        """현재 LLM 라운드 인덱스(0부터) — delta·status 프레임의 `round`."""
+        return len(self._raw_starts) - 1
 
     def model_event(self, raw_len: int) -> None:
         """모델 이벤트 도착 — 도구 응답 뒤 첫 이벤트면 새 라운드(raw_len = 그 시점 원시 길이)."""
         if self._tool_pending:
             self._tool_pending = False
-            self.round += 1
-            self._answer_raw_start = raw_len
+            self._raw_starts.append(raw_len)
 
-    def step(self, status: tuple[str, str] | None) -> tuple[str, str] | None:
-        """도구 status를 현재 라운드의 스텝으로 기록하고 그대로 돌려준다(None이면 기록 없음)."""
-        if status is not None:
-            self.steps.append({"round": self.round, "stage": status[0], "detail": status[1]})
-        return status
+    def text_event(self, at_ms: int) -> None:
+        """본문 청크 도착(경과 ms) — 라운드의 첫 청크만 남는다(뒤 청크는 시점을 바꾸지 않는다)."""
+        if self._answer_at_ms is None:
+            self._answer_at_ms = at_ms
 
-    def tool_response(self, payload: dict) -> tuple[tuple[str, str] | None, list[dict]]:
+    def step(self, status: tuple[str, str] | None) -> dict | None:
+        """도구 status를 현재 라운드의 스텝으로 기록하고 **그 스텝 dict**를 돌려준다(None이면 없음).
+
+        돌려주는 것이 기록본 그 자체라, 호출부(runner)는 프레임에 실을 것을 다시 계산하지 않고
+        스텝을 그대로 status 프레임으로 낸다 — 라이브 프레임과 done.process.steps·히스토리가
+        한 dict에서 나온다.
+        """
+        if status is None:
+            return None
+        step = {"round": self.round, "stage": status[0], "detail": status[1]}
+        self.steps.append(step)
+        return step
+
+    def tool_response(self, payload: dict) -> tuple[dict | None, list[dict]]:
         """도구 응답 하나를 소화한다 — 다음 모델 이벤트가 새 라운드가 되고, 출처를 관측한다.
 
-        돌려주는 것은 `(낼 status, 관측 출처)`다. 실패 응답의 출처는 관측하지 않는다(runner의
-        종전 동작 그대로 — 실패 payload는 번호를 갖지 않는다).
+        돌려주는 것은 `(기록한 스텝, 관측 출처)`다. 실패 응답의 출처는 관측하지 않는다(runner의
+        종전 동작 그대로 — 실패 payload는 번호를 갖지 않는다). 결과 스텝(`found`)에는 관측
+        출처의 url·title 목록을 `sources`로 **즉시** 붙인다 — 검색은 2초 만에 끝나는데 카드는
+        마감 뒤에야 오는 체감 지연과 투명성 때문(2026-09-03). 실패 스텝은 관측 출처가 없어
+        구조적으로 붙지 않고, 실을 항목이 없으면 키를 넣지 않는다.
         """
         self._tool_pending = True
+        # 도구 응답 뒤의 텍스트는 새 라운드의 것이다 — 여기서 지우면 "대기 중인 라운드(모델
+        # 이벤트 없이 마감)"도 값이 없어, payload가 라운드 시작 여부를 따로 보지 않아도 된다.
+        self._answer_at_ms = None
         sources = [] if payload.get("status") == "error" else _sources_from_response(payload)
         self.source_ids.update(source["id"] for source in sources)
-        return self.step(_status_for_response(payload)), sources
+        step = self.step(_status_for_response(payload))
+        step_sources = [item for item in map(project_step_source, sources) if item is not None]
+        if step is not None and step_sources:
+            step["sources"] = step_sources
+        return step, sources
 
     def payload(
         self, *, raw_body: str, text: str, finalize_text: Callable[[str], str], elapsed_ms: int
     ) -> dict:
         """`process` dict를 만든다 — `text`는 마감된 정본, `finalize_text`는 그 정본을 만든 조립기.
 
-        마지막 라운드 이전 원시 본문(`raw_body[:시작 오프셋]`)을 같은 조립기로 마감해 답의 시작을
-        잰다(`_answer_start`). 단일 라운드(오프셋 0)면 마감을 부르지 않는다 — 답이 곧 본문이다.
+        라운드별 원시 시작 오프셋을 정본 오프셋으로 사상한 것이 `round_starts`(`_round_starts`)이고
+        `answer_start`는 그 마지막 원소다(클라이언트 편의 — 항상 같다). 단일 라운드면 `[0]`.
         도구 응답 뒤 모델 이벤트 없이 마감되면(타임아웃·예외·중단된 영속 턴) 대기 중인 라운드는
-        텍스트가 없다 — 본문 전체가 내레이션이라 답의 시작은 len(text)로 떨어진다.
+        텍스트가 없다 — 본문 전체가 내레이션이라 마지막 원소는 len(text)로 떨어진다.
+
+        `answer_at_ms`는 마지막 라운드의 첫 본문 청크 시각(`text_event`)이다. 그 라운드에 텍스트가
+        없거나(도구 응답 직후 마감·타임아웃) 답이 정본 안에 없으면(최후 방어 대체·스트림 시작 전
+        실패) 답은 마감 시점에 생긴 것이라 `elapsed_ms`와 같다 — 두 필드의 폴백이 한 판정이다.
         """
-        start = len(raw_body) if self._tool_pending else self._answer_raw_start
-        narration = finalize_text(raw_body[:start]) if start else ""
+        raw_starts = self._raw_starts + ([len(raw_body)] if self._tool_pending else [])
+        round_starts = _round_starts(text, raw_body, raw_starts, finalize_text)
+        answer_at_ms = self._answer_at_ms if round_starts is not None else None
+        round_starts = round_starts or [0] * len(raw_starts)
         return {
             "elapsed_ms": elapsed_ms,
+            "answer_at_ms": elapsed_ms if answer_at_ms is None else answer_at_ms,
             "sources_reviewed": len(self.source_ids),
-            "answer_start": _answer_start(text, narration),
+            "answer_start": round_starts[-1],
+            "round_starts": round_starts,
             "steps": list(self.steps),
         }

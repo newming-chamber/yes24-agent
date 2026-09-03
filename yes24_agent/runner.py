@@ -25,11 +25,14 @@ from google.genai.errors import APIError
 
 from yes24_agent.adk_stream import iter_adk_events
 from yes24_agent.agent import (
+    AGENT_NAME,
     get_agent,
 )
 from yes24_agent.config import get_settings
 from yes24_agent.enrichment import SESSION_TITLE_STATE_KEY, extract_turn_meta
 from yes24_agent.event_translate import (
+    PROCESS_TIMING_FIELDS,
+    PROCESS_TIMING_KEY,
     TurnProcess,
     _status_for_call,
     project_source_ref,
@@ -115,6 +118,18 @@ def _round_boundary_prefix(raw_body: list[str], chunk: str) -> str:
     if not raw_body or raw_body[-1][-1:].isspace() or chunk[:1].isspace():
         return ""
     return _ROUND_SEPARATOR
+
+
+def _step_frame(step: dict) -> str:
+    """기록된 과정 스텝(`TurnProcess.step`)을 **그대로** status 프레임으로 낸다.
+
+    round·stage·detail 외의 키(found 스텝의 `sources` = 찾은 출처의 url·title)는 가법 extra로
+    함께 실린다 — 라이브 프레임과 done.process.steps가 같은 dict에서 나오므로 두 표면이 갈릴
+    수 없다. 키가 없으면 extra도 없어 프레임 바이트가 종전과 같다.
+    """
+    data = dict(step)
+    stage, detail, round = data.pop("stage"), data.pop("detail"), data.pop("round")
+    return sse_status(stage, detail, round=round, extra=data or None)
 
 
 def _display_frames(
@@ -277,6 +292,54 @@ async def _settle_turn_sources(
     return settled
 
 
+async def _persist_process_timing(
+    service: BaseSessionService,
+    session_id: str,
+    user_id: str,
+    turn_id: str | None,
+    process: dict,
+) -> None:
+    """라이브 `done.process`가 확정한 시간 값을 턴(invocation)에 영속한다 — done 직전, 부가 채널.
+
+    히스토리 복원이 이 값을 우선해 라이브·새로고침 복원·히스토리의 헤더 "N초"가 한 값이 된다
+    (event_translate.PROCESS_TIMING_KEY 주석 — timestamp로는 복원할 수 없는 이유). 값은 done에
+    실리는 그 dict에서 그대로 꺼낸다(재계측 금지). turn_id가 없으면(스트림 시작 전 실패) 붙일
+    턴이 없어 생략한다.
+
+    매체는 content 없는 이벤트(author=루트 에이전트명)의 `custom_metadata`다.
+    DatabaseSessionService는 v1 스키마에서 이벤트를 `event.model_dump()` 통째로
+    `event_data` JSON에 저장·복원하고(schemas/v1.py `StorageEvent.from_event/to_event`),
+    v0 스키마엔 `custom_metadata` 전용 컬럼이 있다 — sqlite·MySQL 공통. 다음 턴의 LLM
+    컨텍스트엔 섞이지 않는다: ADK contents 조립은 content가 없는 이벤트를 건너뛴다
+    (flows/llm_flows/contents.py `_contains_empty_content` — "events that only changed
+    session state"와 같은 취급). 세션 state·본문·스텝 재료도 아니므로 history는 이
+    이벤트를 턴 재료에서 제외한다.
+
+    append는 제목 영속과 같은 이유로 **재조회한 최신 세션**에 한다(턴 스냅샷은 Runner의 이벤트
+    영속으로 stale — 낙관적 락 거부). 실패는 경고 로그만이다 — 정상 done 마감을 오염시키지
+    않는다(meta 파이프라인과 같은 규율).
+    """
+    if not turn_id:
+        return
+    timing = {field: process[field] for field in PROCESS_TIMING_FIELDS}
+    try:
+        fresh = await _resolve_session(service, session_id, user_id)
+        await service.append_event(
+            fresh,
+            # author는 루트 에이전트명이다 — "system"이면 이 이벤트가 세션의 마지막이 되는 매 턴마다
+            # ADK Runner._find_agent_to_run이 "Event from an unknown agent" 경고를 찍는다(동작은
+            # 정상이지만 운영 로그 소음). content가 없으므로 LLM 컨텍스트·history 재료에서 제외되는
+            # 것은 author와 무관하다(custom_metadata 판정이 먼저).
+            Event(
+                author=AGENT_NAME,
+                invocation_id=turn_id,
+                custom_metadata={PROCESS_TIMING_KEY: timing},
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — 부가 채널(정상 done 마감 보호)
+        logger.warning(f"턴 타이밍 영속 실패(생략, turn_id={turn_id}): {exc}")
+
+
 def _best_effort_text(raw_body: list[str], final_text: str) -> str:
     """실패 시점까지 확보한 본문을 정상 경로와 같은 규약으로 조립한다.
 
@@ -325,7 +388,7 @@ def _emit_final_body(streamed_text: str, payload: dict) -> list[str]:
     return [sse_reset()] + ([sse_delta(remaining)] if remaining else [])
 
 
-def _closeout_error_frames(
+async def _closeout_error_frames(
     error_text: str,
     *,
     renumberer: StreamRenumberer,
@@ -335,20 +398,23 @@ def _closeout_error_frames(
     final_text: str,
     sources: list[dict],
     active_model: str,
+    service: BaseSessionService,
     session_id: str,
+    user_id: str,
     turn_id: str | None,
     rbti_applied: str | None,
     process: TurnProcess,
     elapsed_ms: int,
-) -> list[str]:
-    """타임아웃·예외 두 실패 경로가 공유하는 마감 시퀀스를 프레임 목록으로 조립한다.
+) -> AsyncIterator[str]:
+    """타임아웃·예외 두 실패 경로가 공유하는 마감 시퀀스를 프레임으로 흘린다.
 
-    순서: sse_error → source* → 본문 → done. 내레이션 전환으로 본문은 이미 전량 흘렀으므로
-    (홀드 없음) 여기서 붙일 잔여 조각은 없다 — 화면에 흐른 경과 서술("~찾아볼게요")은
-    비파괴 원칙대로 done.text에 남고, 사용자는 error 프레임으로 실패를 안내받는다.
-    출처는 정상 경로와 동일하게 `_settle_turn_sources`를 거친 화해본을 받는다 — 과거 두
-    실패 경로만 raw observed_sources를 넘겨 병렬 도구 유실 보정이 빠지는 드리프트가
+    순서: sse_error → source* → 본문 → (타이밍 영속) → done. 내레이션 전환으로 본문은 이미
+    전량 흘렀으므로(홀드 없음) 여기서 붙일 잔여 조각은 없다 — 화면에 흐른 경과 서술
+    ("~찾아볼게요")은 비파괴 원칙대로 done.text에 남고, 사용자는 error 프레임으로 실패를
+    안내받는다. 출처는 정상 경로와 동일하게 `_settle_turn_sources`를 거친 화해본을 받는다 —
+    과거 두 실패 경로만 raw observed_sources를 넘겨 병렬 도구 유실 보정이 빠지는 드리프트가
     있었다(판정을 세 벌 두면 한 벌만 고치는 실수가 반복된다는 _emit_final_body의 실례).
+    done.process의 시간 값 영속도 정상 경로와 같은 자리(done 직전)·같은 함수다.
     """
     frames = [sse_error(error_text)]
     # 이월해 둔 표시 번호 꼬리를 먼저 방류한다 — 실패 경로에서도 화면에 흐른 본문과
@@ -388,8 +454,10 @@ def _closeout_error_frames(
     for source in error_done.get("sources", []):
         frames.append(sse_source(source))
     frames.extend(_emit_final_body("".join(streamed), error_done))
-    frames.append(sse_done(error_done))
-    return frames
+    for frame in frames:
+        yield frame
+    await _persist_process_timing(service, session_id, user_id, turn_id, error_done["process"])
+    yield sse_done(error_done)
 
 
 async def run_agent_stream(
@@ -722,21 +790,21 @@ async def run_agent_stream(
                             yield frame
                         tool_ran_since_text = True
                         for call in event.get_function_calls():
-                            status = process.step(_status_for_call(call))
-                            if status is None:
+                            step = process.step(_status_for_call(call))
+                            if step is None:
                                 continue  # 알릴 진행이 없는 도구는 조용히 지나간다
                             emitted_output = True
-                            yield sse_status(*status, round=process.round)
+                            yield _step_frame(step)
                         continue
 
                     if responses:
                         tool_ran_since_text = True
                         for resp in responses:
                             tool_call_count += 1
-                            status, sources = process.tool_response(resp.response or {})
-                            if status is not None:
+                            step, sources = process.tool_response(resp.response or {})
+                            if step is not None:
                                 emitted_output = True
-                                yield sse_status(*status, round=process.round)
+                                yield _step_frame(step)
                             for source in sources:
                                 # 관측 순서대로 그대로 쌓는다. 병합은 마감에서 레지스트리를
                                 # base로 한 번에 한다 — 관찰본끼리 먼저 합치면 fidelity를
@@ -773,6 +841,7 @@ async def run_agent_stream(
                                 chunk = _round_boundary_prefix(raw_body, chunk) + chunk
                                 tool_ran_since_text = False
                             raw_body.append(chunk)
+                            process.text_event(_elapsed_ms())
                             for frame in _display_frames(
                                 renumberer, raw_body, known_sources, streamed, round=process.round
                             ):
@@ -856,7 +925,7 @@ async def run_agent_stream(
                         f"sources={len(sources)} rbti={bool(rbti)})."
                     )
                 # 턴 과정 요약 — 정본이 확정된 뒤(대체 포함) 잰다. 대체된 본문엔 내레이션
-                # 접두가 없으므로 answer_start는 0으로 떨어진다(_answer_start).
+                # 접두가 없으므로 answer_start·round_starts는 0으로 떨어진다(_round_starts).
                 final_done["process"] = process.payload(
                     raw_body="".join(raw_body),
                     text=final_done["text"],
@@ -918,6 +987,10 @@ async def run_agent_stream(
                     f"chars={len(final_done.get('text', ''))} "
                     f"rbti={final_done.get('rbti_applied') or '-'} model={active_model or '-'}"
                 )
+                # done에 실리는 그 시간 값을 턴에 영속한다(히스토리가 우선하는 값) — done 직전.
+                await _persist_process_timing(
+                    service, resolved_session_id, session_user_id, turn_id, final_done["process"]
+                )
                 yield sse_done(final_done)
                 break
 
@@ -938,13 +1011,15 @@ async def run_agent_stream(
                     service, resolved_session_id, observed_sources, prior_sources, session_user_id
                 ),
                 active_model=active_model,
+                service=service,
                 session_id=resolved_session_id,
+                user_id=session_user_id,
                 turn_id=turn_id,
                 rbti_applied=code,
                 process=process,
                 elapsed_ms=_elapsed_ms(),
             )
-            for frame in frames:
+            async for frame in frames:
                 yield frame
         except Exception as exc:  # noqa: BLE001 — SSE 스트림 최상위 방어선(마지막 수단)
             outcome = "error"
@@ -965,13 +1040,15 @@ async def run_agent_stream(
                     service, resolved_session_id, observed_sources, prior_sources, session_user_id
                 ),
                 active_model=active_model,
+                service=service,
                 session_id=resolved_session_id,
+                user_id=session_user_id,
                 turn_id=turn_id,
                 rbti_applied=code,
                 process=process,
                 elapsed_ms=_elapsed_ms(),
             )
-            for frame in frames:
+            async for frame in frames:
                 yield frame
         finally:
             # 턴 마감 usage_log 1행 — 정상 done·타임아웃·예외·클라이언트 중단 전부 이
