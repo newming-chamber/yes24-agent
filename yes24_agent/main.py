@@ -721,10 +721,12 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title="yes24-agent", description=API_DESCRIPTION, lifespan=lifespan)
 
-    # CORS: 자격증명 동반 요청과 `*`의 조합은 브라우저가 거부하므로 명시 목록만 허용.
+    # CORS: 자격증명 동반 요청과 `*`의 조합은 브라우저가 거부하므로 패턴으로 허용한다
+    # (조직 도메인 + 로컬). 명시 목록은 패턴 밖 예외용이고 둘은 OR로 합쳐진다.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
+        allow_origin_regex=settings.cors_origin_regex or None,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
