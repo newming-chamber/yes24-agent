@@ -8,6 +8,7 @@
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -39,6 +40,7 @@ from yes24_agent.auth import (
 )
 from yes24_agent.config import Settings, ensure_google_api_key_env, get_settings
 from yes24_agent.history import register_history
+from yes24_agent.logctx import ContextFilter, bound, new_request_id
 from yes24_agent.matrix.matrix_runner import run_matrix_stream
 from yes24_agent.overview import (
     ARM_YES24,
@@ -416,7 +418,9 @@ def _configure_logging() -> None:
     읽어 하드코딩을 피한다. 파일 경로가 비면 stdout만(로컬 개발 기본).
     """
     settings = get_settings()
-    log_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    # `%(ctx)s`는 logctx.ContextFilter가 채운다 — 요청 문맥(req·session·turn·user)이 모든
+    # 줄에 자동으로 붙는다. 문맥 밖(기동 로그)에서는 빈 문자열이라 지저분해지지 않는다.
+    log_format = "%(asctime)s %(levelname)s %(name)s:%(ctx)s %(message)s"
     logging.basicConfig(level=logging.INFO, format=log_format)
     if settings.log_file_path:
         path = Path(settings.log_file_path)
@@ -429,6 +433,9 @@ def _configure_logging() -> None:
         )
         file_handler.setFormatter(logging.Formatter(log_format))
         logging.getLogger().addHandler(file_handler)
+    # 필터는 **핸들러마다** 달아야 한다(로거에 달면 상위 로거로 전파된 레코드를 놓친다).
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(ContextFilter())
     logging.getLogger("yes24_agent").setLevel(logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -727,6 +734,33 @@ def create_app() -> FastAPI:
 
     # CORS: 자격증명 동반 요청과 `*`의 조합은 브라우저가 거부하므로 패턴으로 허용한다
     # (조직 도메인 + 로컬). 명시 목록은 패턴 밖 예외용이고 둘은 OR로 합쳐진다.
+    @app.middleware("http")
+    async def request_log(request: Request, call_next):
+        """요청 1건에 문맥을 부여하고 접근 로그를 남긴다 — **가장 바깥 미들웨어**.
+
+        여기서 bind한 문맥은 이 요청이 만드는 모든 로그 줄(도구·러너·후처리)에 자동으로
+        붙는다(logctx). 그래야 동시 사용자의 줄이 섞여도 가릴 수 있다.
+
+        접근 로그가 따로 필요한 이유: uvicorn의 것은 **stdout에만** 나가고 파일 로그에는
+        없어서, 컨테이너를 재기동하면 사라진다. 그리고 uvicorn 줄에는 소요 시간도 요청
+        문맥도 없다. 여기서 남기면 파일에 함께 쌓이고 회전 정책도 같이 적용된다.
+
+        **본문·질의어는 남기지 않는다** — 로그는 오래 남고 열람 범위가 넓다. 경로·상태·시간만
+        남기고, 무엇을 물었는지는 events(대화 원문)에 이미 있으며 그쪽이 삭제 API의 대상이다.
+        """
+        started = time.perf_counter()
+        route_path = request.url.path
+        with bound(req=new_request_id()):
+            response = await call_next(request)
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            # 라우트 템플릿이 있으면 그것으로 — 구체 경로는 세션 id가 섞여 집계가 안 된다.
+            matched = request.scope.get("route")
+            path = getattr(matched, "path", None) or route_path
+            logger.info(
+                f"{request.method} {path} {response.status_code} {elapsed_ms}ms"
+            )
+        return response
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,

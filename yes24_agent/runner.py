@@ -36,6 +36,7 @@ from yes24_agent.event_translate import (
     project_source_ref,
     settle_sources,
 )
+from yes24_agent.logctx import update as log_update
 from yes24_agent.postprocess import (
     StreamRenumberer,
     build_done_payload,
@@ -475,6 +476,10 @@ async def run_agent_stream(
         observed_sources: list[dict] = []
         # 이번 턴에 도구가 돈 횟수. 최후 방어 실패 로그(tools=%d)의 진단값으로만 쓴다.
         tool_call_count = 0
+        turn_started = time.perf_counter()
+        # 이 턴의 식별자를 로그 문맥에 심는다 — 도구·후처리가 남기는 줄에 자동으로 붙어
+        # 동시 사용자의 로그가 섞여도 가릴 수 있다(logctx). 값은 식별자뿐, 본문은 담지 않는다.
+        log_update(session=resolved_session_id[:8], user=session_user_id)
         # 이번 턴 LLM 콜들의 토큰 합계(usage_log 재료). **non-partial 이벤트의 usage만**
         # 더한다 — LLM 콜 1회당 non-partial 모델 이벤트가 정확히 1개이고 그 usage는 콜
         # 단독분이라(Gemini·LiteLLM 양 경로 공통), 이 합이 콜마다 프롬프트를 다시 세는
@@ -823,6 +828,13 @@ async def run_agent_stream(
                                 )
                     except Exception as exc:  # noqa: BLE001 — 부가 채널(정상 done 마감 보호)
                         logger.warning(f"meta 파이프라인 마감 실패(생략): {exc}")
+                logger.info(
+                    f"턴 완료 {int((time.perf_counter() - turn_started) * 1000)}ms "
+                    f"tools={tool_call_count} sources={len(final_done.get('sources', []))} "
+                    f"cited={len(final_done.get('cited_ids', []))} "
+                    f"chars={len(final_done.get('text', ''))} "
+                    f"rbti={final_done.get('rbti_applied') or '-'} model={active_model or '-'}"
+                )
                 yield sse_done(final_done)
                 break
 
