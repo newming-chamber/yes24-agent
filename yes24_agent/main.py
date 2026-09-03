@@ -872,6 +872,9 @@ def create_app() -> FastAPI:
             model=model,
             app=app_config,
             user_id=user_no,
+            # persona status(턴 시작 신호)의 게이트 — 코드 유무와 별개로 "요청했는가"다
+            # (요청했지만 코드가 없는 회원도 그 사실을 화면이 그린다, 피그마 10-C).
+            use_rbti=request.use_rbti,
         )
         return StreamingResponse(
             stream if unlocked else _hide_model_frames(stream),

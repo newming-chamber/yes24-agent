@@ -24,13 +24,57 @@ data: <JSON>
 
 | event | data | 뜻 |
 |---|---|---|
-| `status` | `{stage, detail?, refs?}` | 진행 상태. `refs`는 마커 렌더용 `{id, url}` 힌트 |
-| `delta` | `{text}` | 본문 조각. **이어 붙이면 본문이 된다** |
+| `status` | `{stage, detail, round?, refs?, code?}` | 진행 상태(stage 열거는 아래) |
+| `delta` | `{text, round?}` | 본문 조각. **이어 붙이면 본문이 된다** |
 | `source` | `{source}` | 인용된 출처 1건(제목·url·가격·평점 등) |
 | `reset` | `{}` | **이미 받은 본문을 버려라.** 인용 검증이 본문을 바꿨을 때만 온다 |
 | `meta` | `{recommendations?, session_title?}` | `done` **직전**의 부가 정보(선택적) |
-| `done` | `{text, sources, cited_ids, session_id, turn_id, rbti_applied}` | 종료·1회 |
+| `done` | `{text, sources, cited_ids, session_id, turn_id, rbti_applied, process}` | 종료·1회 |
 | `error` | `{message}` | 사용자에게 보여줄 실패 문구 |
+
+**`status.stage` 열거** — 문장은 서버가 만들지 않는다. `detail`은 모델 산출물(검색 각도·상세
+제목·코너명)이거나 구조 신호(건수)뿐이고, 무엇을 하는 중인지의 동사는 stage가 담당한다.
+- `thinking` — 힌트(사고 요약 헤드라인). detail = 모델 사고 요약의 단계 제목. 본문이 아니며
+  `done.process.steps`에도 없다.
+- `persona` — 턴 시작 신호. **`use_rbti: true`일 때만** 첫 모델 이벤트 전 1회, `round: 0`.
+  detail = 적용된 RBTI 축 라벨(`"완독-분석-깊이-정보"`, `-`로 나눠 칩), `code`가 함께 실린다 —
+  적용됐으면 코드, 요청했지만 코드가 없으면 `code: null`·`detail: ""`.
+- `searching` — 툴 호출(yes24_search). detail = 검색 각도들(` · ` 구분).
+- `searching_web` — 툴 호출(web_search). detail = 검색 각도들(` · ` 구분).
+- `reading` — 툴 호출(yes24_fetch·fetch_many). detail = 여는 상세의 제목(들).
+- `browsing` — 툴 호출(yes24_browse). detail = 코너명.
+- `found` — 툴 결과. detail = `"N건 찾았어요"`(0건이면 프레임 없음).
+- `notice` — 툴 결과(실패 안내). detail = 안내 문구(재시도를 암시하지 않는다).
+- `refs` — 힌트(마커 렌더). detail = `""`, `refs: [{id, url}]`가 본체. 그 번호가 처음 실리는
+  delta보다 먼저 온다.
+
+**`round`(가법, delta·status 공통)** — 0부터 시작하는 LLM 라운드(콜) 인덱스. 도구 응답을
+처리한 뒤 처음 도착하는 모델 이벤트에서 +1이다. 렌더 규칙: **round r의 텍스트 뒤에 툴
+status가 오면 그 텍스트는 조사 경과(내레이션)이고, 마지막 라운드의 텍스트가 최종 답이다.**
+라이브 중에는 현재 라운드가 마지막인지 알 수 없으므로 (a) `done.process.answer_start`로
+확정 분할하거나 (b) 문단 휴리스틱으로 미리 답 스타일을 시작한다 — 서버는 (a)를 보장한다.
+`thinking`은 번역이 비동기라 다음 라운드의 첫 텍스트보다 늦게 나갈 수 있다(라벨의 round는
+방류 시점의 현재 라운드). `reset` 뒤의 정본 재전송 delta는 여러 라운드를 합친 본문이라
+round가 없다.
+
+**`done.process`(항상 존재)** — 턴 과정 요약. 접힌 헤더 "N초 · 출처 M개 검토"의 재료다.
+```json
+"process": {
+  "elapsed_ms": 21340,      // 턴 시작 → done 직전(서버 계측)
+  "sources_reviewed": 5,    // 이번 턴 도구 응답으로 관측한 고유 출처 수(인용 수와 다르다)
+  "answer_start": 187,      // done.text에서 최종 답(마지막 라운드)이 시작하는 문자 오프셋
+  "steps": [                // 이번 턴의 툴 status(thinking·refs·persona 제외), 순서대로
+    {"round": 0, "stage": "searching", "detail": "에세이 베스트셀러 · 요즘 인기 에세이"},
+    {"round": 0, "stage": "found", "detail": "10건 찾았어요"}
+  ]
+}
+```
+`text[:answer_start]`가 내레이션, `text[answer_start:]`가 최종 답이다. 단일 라운드면 0,
+마지막 라운드에 텍스트가 없으면 `len(text)`, 본문이 최후 방어 안내로 대체됐으면 0. 라운드
+사이의 문단 구분자는 답 쪽에 붙는다. 실패 턴(`error` 뒤 `done`)에도 그 시점까지의 누적분이
+실린다 — 스트림 시작 전 실패(세션 준비 실패)의 `done`에는 빈 과정(`steps: []`,
+`sources_reviewed: 0`, `answer_start: 0`)이 실린다. 히스토리 복원(`GET /chat/sessions/{id}`)의
+각 턴 `process`도 같은 모양이다 — 단 `thinking`은 영속되지 않으므로 복원 steps에는 원래 없다.
 
 **지켜지는 계약**
 - `done`은 **정확히 한 번** 온다. 실패해도 `error` 뒤에 `done`이 온다.
@@ -108,7 +152,21 @@ def sse_reset() -> str:
     return format_sse("reset", {})
 
 
-def sse_status(stage: str, detail: str = "", refs: list[dict] | None = None) -> str:
+# 가법 kwarg의 공통 규율: **None이면 키를 넣지 않는다** — 그래서 지정하지 않은 경로의 프레임은
+# 바이트 동일하다. 16뷰 매트릭스(/chat/matrix)의 `col`(열 인덱스 0~15)과 사고과정 UI의 `round`
+# (LLM 라운드 인덱스)가 같은 규율을 쓴다. 매트릭스·오버뷰는 round를 넘기지 않는다.
+def _with(data: dict, **optional) -> dict:
+    """값이 None이 아닌 가법 키만 payload에 더한다(전부 None이면 원본 그대로)."""
+    return {**data, **{key: value for key, value in optional.items() if value is not None}}
+
+
+def sse_status(
+    stage: str,
+    detail: str = "",
+    refs: list[dict] | None = None,
+    round: int | None = None,
+    extra: dict | None = None,
+) -> str:
     """진행 상태 이벤트 (예: "Yes24 검색 중…").
 
     `refs`는 **마커를 렌더할 최소 정보(id·url)**를 도구 응답 시점에 미리 실어 보내는
@@ -119,20 +177,18 @@ def sse_status(stage: str, detail: str = "", refs: list[dict] | None = None) -> 
     **카드가 아니다.** 제목·가격 등 검증 대상 상품 사실은 싣지 않고, 프론트도 이걸로
     출처 카드를 만들지 않는다 — 공개 `source`와 `done.sources`가 최종 인용분만 담는다는
     원칙 4는 그대로다. refs 미지정(기본)이면 페이로드에 키를 넣지 않아 기존 프레임과
-    바이트 동일하다(_with_col과 같은 규율).
+    바이트 동일하다(_with와 같은 규율).
+
+    `round`는 이 status가 속한 LLM 라운드(0부터), `extra`는 stage별 구조 데이터(persona의
+    `code` — 값이 None이어도 **키는 실린다**: "요청했지만 코드 없음"을 프론트가 값으로
+    판정한다). 둘 다 가법이다.
     """
     data = {"stage": stage, "detail": detail}
     if refs:
         data["refs"] = refs
-    return format_sse("status", data)
-
-
-# 16뷰 매트릭스(/chat/matrix)용 가법 kwarg `col`. col=None(기본)이면 페이로드에 키를 넣지
-# 않아 /chat/stream 프레임과 **바이트 동일**하다(단일 채팅·스트리밍 팀 무영향). col 지정 시에만
-# payload에 "col":k(0~15)를 실어, 매트릭스 프론트가 프레임을 열별로 라우팅한다.
-def _with_col(data: dict, col: int | None) -> dict:
-    """col이 주어지면 payload에 열 인덱스를 더한다(None이면 원본 그대로)."""
-    return data if col is None else {**data, "col": col}
+    if extra:
+        data.update(extra)
+    return format_sse("status", _with(data, round=round))
 
 
 def sse_source(source: dict, col: int | None = None) -> str:
@@ -145,23 +201,28 @@ def sse_source(source: dict, col: int | None = None) -> str:
     (예: 새 출처 타입의 메타 필드) 라이브 카드만 조용히 탈락하는 드리프트를 냈다
     (2026-08-04 실측: 카드 정보줄이 새로고침 후에만 표시).
     """
-    return format_sse("source", _with_col(dict(source), col))
+    return format_sse("source", _with(dict(source), col=col))
 
 
-def sse_delta(text: str, col: int | None = None, extra: dict | None = None) -> str:
+def sse_delta(
+    text: str, col: int | None = None, extra: dict | None = None, round: int | None = None
+) -> str:
     """답변 본문 조각(인용 마커 포함 가능) 이벤트.
 
     extra는 매트릭스 열 카드 정체성(code·name·axis_label 등)을 delta에 함께 실어 프론트가
-    첫 페인트에서 카드 제목·부제를 확보하게 하는 가법 필드다. col=None·extra=None(기본)이면
-    페이로드가 {"text":…}뿐이라 /chat/stream delta와 바이트 동일하다.
+    첫 페인트에서 카드 제목·부제를 확보하게 하는 가법 필드다. round는 이 조각이 속한 LLM
+    라운드(0부터)다 — 라이브 partial에만 실리고, reset 뒤 정본 재전송처럼 여러 라운드를
+    합친 조각에는 없다(`done.process.answer_start`가 그 분할을 소유한다). col=None·
+    extra=None·round=None(기본)이면 페이로드가 {"text":…}뿐이라 /chat/stream delta와
+    바이트 동일하다.
     """
     data = {"text": text, **extra} if extra else {"text": text}
-    return format_sse("delta", _with_col(data, col))
+    return format_sse("delta", _with(data, col=col, round=round))
 
 
 def sse_done(payload: dict, col: int | None = None) -> str:
     """최종 본문·출처 목록·session_id·turn_id를 담은 종료 이벤트(정확히 1회)."""
-    return format_sse("done", _with_col(payload, col))
+    return format_sse("done", _with(payload, col=col))
 
 
 def sse_meta(payload: dict) -> str:

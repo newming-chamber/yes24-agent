@@ -19,3 +19,9 @@ ALTER TABLE usage_log
   ADD COLUMN tool_calls      SMALLINT     NULL COMMENT 'main 행만: 이 턴에 돈 도구 수',
   ADD COLUMN cited_sources   SMALLINT     NULL COMMENT 'main 행만: 인용된 출처 수. tools>0 AND cited=0 = 무접지 의심',
   ADD KEY idx_usage_log_turn (turn_id);
+
+-- 인덱스 교체(2026-09-03). `idx_usage_log_model`은 카디널리티 5(모델 종류 수)라 4,718행에서
+-- 옵티마이저가 쓰지 않는다 — 저카디널리티 인덱스는 쓰기 비용만 낸다. 반면 "사용자별 기간
+-- 원가"는 이 테이블의 1급 조회인데 쓸 인덱스가 없었다. 개수는 그대로(순증 0).
+ALTER TABLE usage_log DROP INDEX idx_usage_log_model;
+ALTER TABLE usage_log ADD KEY idx_usage_log_user_time (user_id, created_at);

@@ -1,0 +1,11 @@
+-- 보존 정리 — **외부 스케줄러(cron)로 주기 실행**. 앱은 이 문장을 돌리지 않는다.
+--
+-- rate_limit_log는 슬라이딩 윈도우 판정에 **1일치만** 쓴다(auth.py: `requested_at >
+-- NOW(3) - INTERVAL 1 DAY`). 그런데 행은 영구히 쌓인다. `idx_rate_key_time
+-- (api_key, requested_at)`이 있어 **질의 속도는 안 느려지고**(2026-09-03 확인), 늘어나는
+-- 것은 저장 용량뿐이다 — 그래서 급한 작업이 아니라 정기 정리 대상이다.
+-- 7일을 남기는 이유: 판정에 필요한 1일보다 넉넉히 둬야 "어제 왜 429가 났나"를 사후에
+-- 볼 수 있다(그 조회가 이 로그의 두 번째 쓸모다).
+--
+-- 적용 예: 0 4 * * *  mysql -h <RDS> -u <user> -p<pw> <db> < scripts/retention.sql
+DELETE FROM rate_limit_log WHERE requested_at < NOW() - INTERVAL 7 DAY;

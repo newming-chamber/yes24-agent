@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -29,7 +30,8 @@ from pydantic import BaseModel, Field, StringConstraints
 from yes24_agent.auth import AuthenticatedUser, AuthService, get_authenticated_user
 from yes24_agent.config import get_settings
 from yes24_agent.enrichment import SESSION_TITLE_STATE_KEY
-from yes24_agent.postprocess import finalize_answer
+from yes24_agent.event_translate import TurnProcess, _status_for_call
+from yes24_agent.postprocess import finalize_answer, finalize_text
 from yes24_agent.runner import _event_text, _round_boundary_prefix
 from yes24_agent.session_service import _POC_USER_ID, _get_session_service
 from yes24_agent.sources import get_sources
@@ -93,6 +95,30 @@ class TurnFeedbackState(BaseModel):
     comment: str | None = Field(default=None, description="선택 코멘트")
 
 
+class TurnProcessStep(BaseModel):
+    """턴 과정의 도구 스텝 1건 — /chat/stream status 프레임과 같은 stage·detail."""
+
+    round: int = Field(description="이 스텝이 속한 LLM 라운드(0부터)")
+    stage: str = Field(description="searching·searching_web·reading·browsing·found·notice")
+    detail: str = Field(description="검색 각도·상세 제목·코너명·'N건 찾았어요'·안내 문구")
+
+
+class TurnProcessView(BaseModel):
+    """턴 과정 요약 — /chat/stream `done.process`와 동형(같은 누적기가 만든다)."""
+
+    elapsed_ms: int = Field(description="턴 첫 이벤트 → 마지막 이벤트(영속 timestamp 기준)")
+    sources_reviewed: int = Field(
+        description="이 턴 도구 응답으로 관측한 고유 출처 수(인용 수와 다르다)"
+    )
+    answer_start: int = Field(
+        description="text에서 최종 답(마지막 라운드)이 시작하는 문자 오프셋 — text[:n]이 조사"
+        " 경과, text[n:]이 답. 단일 라운드면 0"
+    )
+    steps: list[TurnProcessStep] = Field(
+        description="도구 스텝(순서대로). 사고 요약(thinking)은 영속되지 않아 복원엔 없다"
+    )
+
+
 class TurnView(BaseModel):
     """복원된 턴 1건 — 사용자 발화와 마감된 답변."""
 
@@ -110,6 +136,9 @@ class TurnView(BaseModel):
     cited_ids: list[int] = Field(description="본문 마커와 sources를 잇는 인용 id(등장 순서)")
     feedback: TurnFeedbackState | None = Field(
         description="내가 이 턴에 남긴 피드백(없으면 null)"
+    )
+    process: TurnProcessView = Field(
+        description="턴 과정 요약(접힌 사고과정 헤더 재료) — 라이브 done.process와 같은 모양"
     )
 
 
@@ -235,6 +264,10 @@ def _assemble_turns(events: list) -> list[dict[str, Any]]:
     라운드 사이 문단 구분은 스트림과 **같은 규칙**(_round_boundary_prefix — 도구가 돈 뒤의
     이어붙는 텍스트에만, 경계에 공백이 없을 때만)을 쓴다. invocation_id 없는 이벤트(러너의
     state_delta 시스템 write)는 대화가 아니므로 건너뛴다.
+
+    턴 과정(`process`)도 여기서 라이브와 **같은 누적기**(TurnProcess)로 먹인다 — 모델
+    이벤트·도구 호출·도구 응답을 runner와 같은 순서로 알리면 라운드·스텝·관측 출처가 같은
+    판정에서 나온다. 소요는 영속 timestamp(첫·마지막 이벤트)로 잰다.
     """
     turns: dict[str, dict[str, Any]] = {}
     for event in events:
@@ -246,10 +279,17 @@ def _assemble_turns(events: list) -> list[dict[str, Any]]:
             turn = turns[invocation_id] = {
                 "turn_id": invocation_id,
                 "started_at": event.timestamp,
+                "ended_at": event.timestamp,
                 "user": [],
                 "body": [],
                 "tool_ran": False,
+                "process": TurnProcess(),
             }
+        turn["ended_at"] = event.timestamp
+        process: TurnProcess = turn["process"]
+        responses = event.get_function_responses()
+        if event.author != "user" and not responses:
+            process.model_event(sum(map(len, turn["body"])))
         chunk = _event_text(event)
         if event.author == "user":
             if chunk:
@@ -261,7 +301,11 @@ def _assemble_turns(events: list) -> list[dict[str, Any]]:
                 chunk = _round_boundary_prefix(turn["body"], chunk) + chunk
             turn["tool_ran"] = False
             turn["body"].append(chunk)
-        if event.get_function_calls() or event.get_function_responses():
+        for call in event.get_function_calls():
+            process.step(_status_for_call(call))
+        for response in responses:
+            process.tool_response(response.response or {})
+        if event.get_function_calls() or responses:
             turn["tool_ran"] = True
     return list(turns.values())  # dict 삽입 순서 = 턴 등장 순서(이벤트는 시간순)
 
@@ -288,17 +332,25 @@ def _project_session_detail(
     registry = get_sources(session.state)
     turns: list[TurnView] = []
     for raw in _assemble_turns(session.events):
-        _, payload = finalize_answer("".join(raw["body"]), registry, session.id)
+        body = "".join(raw["body"])
+        _, payload = finalize_answer(body, registry, session.id)
+        text = payload["text"] if raw["body"] else ""
         feedback = feedback_by_turn.get(raw["turn_id"])
         turns.append(
             TurnView(
                 turn_id=raw["turn_id"],
                 started_at=raw["started_at"],
                 user_text="\n".join(raw["user"]),
-                text=payload["text"] if raw["body"] else "",
+                text=text,
                 sources=payload["sources"],
                 cited_ids=payload["cited_ids"],
                 feedback=TurnFeedbackState(**feedback) if feedback else None,
+                process=raw["process"].payload(
+                    raw_body=body,
+                    text=text,
+                    finalize_text=partial(finalize_text, sources=registry, session_id=session.id),
+                    elapsed_ms=int((raw["ended_at"] - raw["started_at"]) * 1000),
+                ),
             )
         )
     return SessionDetailResponse(

@@ -6,9 +6,14 @@
 스트림 관찰본으로 보정한다(settle_sources).
 """
 
+import logging
+from collections.abc import Callable
+
 from yes24_agent.sources import REGISTRY_RECORD_FIELDS, SUMMARY_FIDELITY, merge_source_records
 from yes24_agent.toolsets import TOOLSET_SOURCE_TYPES
 from yes24_agent.yes24.urls import BROWSE_SEED_URLS
+
+logger = logging.getLogger(__name__)
 
 
 def _browse_label(section: str) -> str | None:
@@ -93,6 +98,17 @@ _ERROR_STATUS_FALLBACK: tuple[str, str] = ("notice", "정보를 가져오지 못
 def _status_for_error(payload: dict) -> tuple[str, str] | None:
     """도구 error 응답의 error_type별 status(stage, detail)를 만든다(알릴 게 없으면 None)."""
     return _ERROR_STATUS.get(payload.get("error_type"), _ERROR_STATUS_FALLBACK)
+
+
+def _status_for_response(payload: dict) -> tuple[str, str] | None:
+    """도구 응답 하나의 status — 실패면 error_type별 안내, 아니면 건수(둘 다 None일 수 있다).
+
+    라이브(runner)와 복원(history)이 같은 판정을 쓴다 — 두 분기를 각자 들면 한쪽만 고쳐진다.
+    """
+    if payload.get("status") == "error":
+        return _status_for_error(payload)
+    count = payload.get("result_count")
+    return _status_for_result(count) if isinstance(count, int) else None
 
 
 def _status_for_result(count: int) -> tuple[str, str] | None:
@@ -279,3 +295,96 @@ def settle_sources(registry: list[dict], observed_sources: list[dict]) -> list[d
                 settled.get(source_id, {}), project_registry_record(source)
             )
     return [settled[key] for key in sorted(settled)]
+
+
+# ── 턴 과정 누적기(done.process · 히스토리 TurnView.process) ─────────────────
+
+
+def _answer_start(text: str, narration: str) -> int:
+    """마감된 정본 `text`에서 최종 답(마지막 라운드)이 시작하는 오프셋.
+
+    `narration`은 마지막 라운드 이전의 원시 본문을 **같은 조립기**(finalize_answer)로 마감한
+    것이다. 조립기는 `[n]` 마커만 치환·삭제하고 재번호는 첫 등장 순서라, 접두를 따로 마감해도
+    정본의 접두와 같다 — 그래서 답의 시작은 접두의 길이다(테스트가 등식으로 고정한다).
+
+    등식이 깨지는 경로는 둘이다. ① 무효 마커 삭제의 seam: 답 라운드가 **통째로 무효인
+    마커**로 시작하면 `validate_citations._seam_parts`가 그 앞(내레이션 꼬리)의 가로 공백을
+    흡수해 정본의 접두가 내레이션보다 짧아진다. 그때는 꼬리 공백을 뗀 접두로 다시 맞춘다 —
+    답 쪽은 정확히 답이고 접두는 공백만 다르다(구분자 `\n\n`은 떼지 않으므로 답 쪽에 남는다).
+    내레이션이 "공백+구두점"으로 끝나면 seam이 그 안쪽 공백까지 지워 이 재시도로도 못 닫는다.
+    ② 코드 스팬 문맥: 내레이션이 인라인 백틱을 연 채 도구를 부르고 답에서 닫히면, 정본에서는
+    그 구간의 마커가 리터럴로 보존되지만 접두 단독 마감은 스팬이 성립하지 않아 재번호된다
+    (`code_span_ranges`가 뒤 문맥에 좌우된다).
+    어느 쪽이든, 그리고 본문이 최후 방어 안내로 대체된 경우에도, 접두가 정본 안에 없으면 0 —
+    과정만 남고 답이 사라지는 분할은 어떤 경우에도 만들지 않는다(matrix의 process_chars와
+    같은 원칙). 0 폴백은 경고로 남겨 발생 빈도를 잴 수 있게 한다(본문은 싣지 않는다).
+    """
+    for prefix in (narration, narration.rstrip(" \t")):
+        if text.startswith(prefix):
+            return len(prefix)
+    logger.warning(
+        f"answer_start 접두 불일치 → 0 폴백(narration_len={len(narration)} text_len={len(text)})"
+    )
+    return 0
+
+
+class TurnProcess:
+    """턴 과정 누적기 — 라이브 스트림(runner)과 히스토리 복원(history)이 **같은 인스턴스 규칙**으로
+    `process`(elapsed_ms·sources_reviewed·answer_start·steps)를 만든다(같은 판정 두 곳 금지).
+
+    라운드 = LLM 콜 인덱스(0부터). 도구 응답을 처리한 뒤 **처음 도착하는 모델 이벤트**(사고·본문
+    partial·function_call·final)에서 +1이다. 호출부는 이벤트 종류를 그대로 알려 주기만 한다 —
+    `model_event(raw_len)`은 그 시점의 원시 본문 누적 길이를 받는데, 새 라운드가 시작되면 그
+    값이 곧 마지막 라운드의 원시 시작 오프셋이다(라운드 첫 청크에 붙는 문단 구분자 **이전**).
+    스텝은 도구 status(호출·결과)만이다 — thinking·refs·persona는 과정의 재료가 아니다.
+    """
+
+    def __init__(self) -> None:
+        self.round = 0
+        self.steps: list[dict] = []
+        self.source_ids: set[int] = set()
+        self._tool_pending = False  # 도구 응답을 처리했고 아직 다음 모델 이벤트가 안 왔다
+        self._answer_raw_start = 0  # 마지막 라운드의 원시 본문 시작 오프셋
+
+    def model_event(self, raw_len: int) -> None:
+        """모델 이벤트 도착 — 도구 응답 뒤 첫 이벤트면 새 라운드(raw_len = 그 시점 원시 길이)."""
+        if self._tool_pending:
+            self._tool_pending = False
+            self.round += 1
+            self._answer_raw_start = raw_len
+
+    def step(self, status: tuple[str, str] | None) -> tuple[str, str] | None:
+        """도구 status를 현재 라운드의 스텝으로 기록하고 그대로 돌려준다(None이면 기록 없음)."""
+        if status is not None:
+            self.steps.append({"round": self.round, "stage": status[0], "detail": status[1]})
+        return status
+
+    def tool_response(self, payload: dict) -> tuple[tuple[str, str] | None, list[dict]]:
+        """도구 응답 하나를 소화한다 — 다음 모델 이벤트가 새 라운드가 되고, 출처를 관측한다.
+
+        돌려주는 것은 `(낼 status, 관측 출처)`다. 실패 응답의 출처는 관측하지 않는다(runner의
+        종전 동작 그대로 — 실패 payload는 번호를 갖지 않는다).
+        """
+        self._tool_pending = True
+        sources = [] if payload.get("status") == "error" else _sources_from_response(payload)
+        self.source_ids.update(source["id"] for source in sources)
+        return self.step(_status_for_response(payload)), sources
+
+    def payload(
+        self, *, raw_body: str, text: str, finalize_text: Callable[[str], str], elapsed_ms: int
+    ) -> dict:
+        """`process` dict를 만든다 — `text`는 마감된 정본, `finalize_text`는 그 정본을 만든 조립기.
+
+        마지막 라운드 이전 원시 본문(`raw_body[:시작 오프셋]`)을 같은 조립기로 마감해 답의 시작을
+        잰다(`_answer_start`). 단일 라운드(오프셋 0)면 마감을 부르지 않는다 — 답이 곧 본문이다.
+        도구 응답 뒤 모델 이벤트 없이 마감되면(타임아웃·예외·중단된 영속 턴) 대기 중인 라운드는
+        텍스트가 없다 — 본문 전체가 내레이션이라 답의 시작은 len(text)로 떨어진다.
+        """
+        start = len(raw_body) if self._tool_pending else self._answer_raw_start
+        narration = finalize_text(raw_body[:start]) if start else ""
+        return {
+            "elapsed_ms": elapsed_ms,
+            "sources_reviewed": len(self.source_ids),
+            "answer_start": _answer_start(text, narration),
+            "steps": list(self.steps),
+        }

@@ -541,6 +541,12 @@ def finalize_answer(
     return citation, payload
 
 
+def finalize_text(text: str, sources: list[dict], session_id: str) -> str:
+    """`finalize_answer`의 본문만 — 턴 과정 누적기(TurnProcess)가 내레이션 접두를 정본과
+    **같은 조립기**로 마감해 답의 시작 오프셋을 잴 때 쓴다(조립기가 둘이면 접두가 갈린다)."""
+    return finalize_answer(text, sources, session_id)[1]["text"]
+
+
 def build_done_payload(
     sources: list[dict],
     used_source_ids: list[int],
