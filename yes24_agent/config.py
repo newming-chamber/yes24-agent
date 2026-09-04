@@ -96,8 +96,6 @@ class Settings(BaseSettings):
     # 강제하고, 출구에서 한 번 더 자른다. 0이면 필드 자체가 스키마에서 빠진다(구조적 off —
     # want_title과 같은 관례). 프론트가 답변 아래 한 줄씩 칩으로 세우는 폭이다.
     enrichment_follow_ups: int = 3
-    # 후속 질문 한 건의 표시 상한(문자). 칩 한 줄에 담기는 길이 — 제목·상태와 다른 축이다.
-    follow_up_max_chars: int = 40
     # meta 서브콜에 싣는 직전 턴 답변의 앞부분 길이. 맥락 힌트라 전문이 필요 없고, 본문
     # 전량을 실으면 서브콜 토큰이 턴마다 답변 길이만큼 는다. 배터리 재생은 600으로 돌렸다.
     enrichment_prior_answer_chars: int = 600

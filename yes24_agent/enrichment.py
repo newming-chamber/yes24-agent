@@ -154,12 +154,17 @@ def _validated_meta(raw: dict, cited_ids: list[int], want_title: bool) -> dict |
         meta["recommendations"] = recommendations
     # 후속 질문: 스키마가 개수를 강제하지만 출구도 한 번 더 본다 — 모델이 빈 문자열이나
     # 같은 질문을 반복해 칸을 채우면 개수만 맞고 화면엔 빈 칩·중복 칩이 선다.
+    # 길이는 자르지 않는다 — 이 문자열은 표시용이 아니라 **누르면 그대로 전송되는 질문**이라
+    # 자르면 잘린 문장이 다음 질문으로 나간다(2026-09-04 프로덕션에서 "…발언의 구체적인
+    # 내용은…" 실측). 눈가림 배터리 72개 표본이 최대 52자·p90 44자로 모델 출력이 이미
+    # 유계이고, 표시 줄임은 프론트 CSS 몫이다. 40자 절단이 배터리 표본의 25%를 잘랐을 것이라
+    # 검증 대상과 배포본이 달랐다.
     follow_ups: list[str] = []
     for item in raw.get("follow_ups") or []:
         question = " ".join(str(item or "").split())
         if not question or question in follow_ups:
             continue
-        follow_ups.append(_clip_title(question, settings.follow_up_max_chars))
+        follow_ups.append(question)
     if follow_ups:
         meta["follow_ups"] = follow_ups[: settings.enrichment_follow_ups]
     if want_title:
