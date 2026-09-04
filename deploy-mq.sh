@@ -9,17 +9,34 @@
 #   - Dockerfile이 COPY하는 파일만 전송(Dockerfile pyproject.toml uv.lock yes24_agent/) → ~295KB.
 #   - 시크릿은 이미지에 굽지 않는다. .env를 mq로 따로 전송해 `--env-file`로 런타임 주입.
 #
+# 왜 blue/green인가 (2026-09-04):
+#   종전엔 `docker rm -f` 뒤 `docker run`이라 그 사이 진행 중이던 요청이 그냥 끊겼다 —
+#   실측으로 확인됐다: 04:51:00 컨테이너 교체 → 04:51:24 시작한 사용자 턴(e-bac091b1)이
+#   도구 2회를 돌던 04:51:37에 끊겨 done에 도달하지 못했고(usage_log 행 없음), 사용자는
+#   같은 질문을 04:52:06에 다시 보내야 했다. /chat/stream은 20~30초 걸리는 롱리퀘스트라
+#   교체 창이 짧아도 실사용 턴을 문다. 헬스 게이트를 앞에 둬도 마지막 교체 구간은 남으므로,
+#   포트를 둘 두고 Caddy가 가리키는 곳만 바꾼다 — caddy reload는 기존 연결을 끊지 않는다.
+#   (crema DEV의 scripts/deploy-crema.sh와 같은 구조. 그쪽은 Caddy가 컨테이너라
+#   `docker exec caddy caddy reload`, mq는 시스템 서비스라 `systemctl reload caddy`다.)
+#
 # 포트: mq에서 8010/8011 모두 free 확인됨(기존: translator-api:30001, generative-api:50100,
 #       rabbitmq:5672/15672). 기본 HOST_PORT=8010. 필요시 환경변수로 override.
 #
 # 사용:  ./deploy-mq.sh            # 빌드+기동
-#        HOST_PORT=8011 ./deploy-mq.sh
+#        HOST_PORT=8016 ./deploy-mq.sh    # blue/green 끄고 그 포트에 직접(임시 검증)
 #
-# 롤백:  ssh mq 'docker rm -f yes24-agent && docker run -d ... yes24-agent:<이전_날짜태그>'
+# 롤백:  Caddyfile을 /etc/caddy/Caddyfile.bak 로 되돌리고 `sudo systemctl reload caddy`.
+#        (이미지 롤백이 필요하면 위 전환 뒤 yes24-agent:<이전_날짜태그>로 다시 배포)
 set -euo pipefail
 
 SSH_HOST="${SSH_HOST:-mq}"          # ~/.ssh/config의 host 별칭 (User/HostName/IdentityFile 포함)
-HOST_PORT="${HOST_PORT:-8010}"      # mq 호스트 포트
+# blue/green 호스트 포트 쌍. 활성 포트는 Caddyfile에서 읽고, 나머지 하나에 새 컨테이너를
+# 띄운다(둘 다 mq에서 free 확인). HOST_PORT를 주면 blue/green을 끄고 그 포트에 직접 띄운다 —
+# Caddy 뒤가 아닌 임시 검증용 경로다(운영 배포에는 쓰지 않는다).
+PORT_A="${PORT_A:-8010}"
+PORT_B="${PORT_B:-8011}"
+CADDYFILE="${CADDYFILE:-/etc/caddy/Caddyfile}"
+DOMAIN="${DOMAIN:-yes24-agent.griplabs.io}"
 # 컨테이너 **내부** 포트. `-p` 매핑과 앱이 실제로 듣는 포트가 반드시 같아야 하는데, 아래에서
 # `--env-file`이 Dockerfile의 `ENV PORT`를 **덮는다** — 로컬 .env에 PORT가 있으면(QA 관행:
 # qa/grounding_smoke.py가 8016을 권한다) 앱은 컨테이너 안에서 그 포트를 듣고 docker는 8010으로
@@ -105,26 +122,63 @@ else
   echo "  → ACCESS_PASSWORD 오버라이드 없음 — 로컬 .env 값 승계(있으면 월 활성)"
 fi
 
-echo "[5/6] 컨테이너 기동 (포트 $HOST_PORT, sqlite 바인드마운트, restart=unless-stopped)"
+# HOST_PORT를 명시하면 blue/green을 건너뛰고 그 포트에 직접 띄운다(임시 검증 경로).
+# 운영 배포는 아래 blue/green — Caddy가 가리키는 포트만 바꾸므로 교체 창이 없다.
+if [ -n "${HOST_PORT:-}" ]; then
+  echo "[5/6] 단일 포트 기동 (포트 $HOST_PORT — blue/green 생략, 임시 검증 경로)"
+  ssh "$SSH_HOST" bash -lc "'
+    set -e
+    install -d -m 700 $REMOTE_DATA
+    docker rm -f $IMAGE-$HOST_PORT 2>/dev/null || true
+    docker run -d --name $IMAGE-$HOST_PORT -p $HOST_PORT:$CONTAINER_PORT \
+      --env-file $REMOTE_BUILD/.env -v $REMOTE_DATA:/app/data \
+      --log-driver json-file --log-opt max-size=50m --log-opt max-file=3 \
+      --restart unless-stopped $IMAGE:latest >/dev/null
+  '"
+  echo "[6/6] 헬스체크"
+  ssh "$SSH_HOST" "for i in \$(seq 1 20); do s=\$(curl -fsS http://localhost:$HOST_PORT/health 2>/dev/null) && { echo \"health: \$s\"; break; }; sleep 1; done"
+  echo "완료(임시). 컨테이너 $IMAGE-$HOST_PORT, 태그 $IMAGE:$TAG."
+  exit 0
+fi
+
+echo "[5/6] 새 컨테이너 기동 (blue/green) — 기존은 그대로 서비스 중"
+# 활성 포트는 Caddyfile이 정본이다(스크립트가 기억하지 않는다 — 손으로 바꿔도 따라간다).
+ACTIVE=$(ssh "$SSH_HOST" "sudo awk '/${DOMAIN} \{/,/\}/' $CADDYFILE | grep -oE 'localhost:[0-9]+' | cut -d: -f2")
+[ -n "$ACTIVE" ] || { echo "중단: Caddyfile에서 $DOMAIN 블록을 못 찾음"; exit 1; }
+if [ "$ACTIVE" = "$PORT_A" ]; then NEW=$PORT_B; else NEW=$PORT_A; fi
+echo "  현재 $ACTIVE → 새 $NEW"
 ssh "$SSH_HOST" bash -lc "'
   set -e
   install -d -m 700 $REMOTE_DATA
-  docker rm -f yes24-agent 2>/dev/null || true
-  docker run -d --name yes24-agent \
-    -p $HOST_PORT:$CONTAINER_PORT \
+  docker rm -f $IMAGE-$NEW 2>/dev/null || true
+  docker run -d --name $IMAGE-$NEW \
+    -p $NEW:$CONTAINER_PORT \
     --env-file $REMOTE_BUILD/.env \
     -v $REMOTE_DATA:/app/data \
     --log-driver json-file --log-opt max-size=50m --log-opt max-file=3 \
     --restart unless-stopped \
-    $IMAGE:latest
+    $IMAGE:latest >/dev/null
 '"
 
-echo "[6/6] 헬스체크 (최대 20s 대기)"
-ssh "$SSH_HOST" bash -lc "'
-  for i in \$(seq 1 20); do
-    s=\$(curl -fsS http://localhost:$HOST_PORT/health 2>/dev/null) && { echo \"health: \$s\"; break; }
-    sleep 1
-  done
-  docker inspect --format \"{{json .State.Health}}\" yes24-agent
-'"
-echo "완료. 태그 $IMAGE:$TAG (롤백용). 로그: ssh $SSH_HOST 'docker logs -f --tail 200 yes24-agent'"
+echo "[6/6] 헬스 확인 후 Caddy 전환 (최대 60s)"
+for i in $(seq 1 12); do
+  sleep 5
+  H=$(ssh "$SSH_HOST" "curl -s --max-time 4 localhost:$NEW/health" || true)
+  if echo "$H" | grep -q '"status":"ok"'; then echo "  health: $H"; break; fi
+  # 새 컨테이너가 안 뜨면 **전환하지 않고** 그것만 걷는다 — 기존 :$ACTIVE 가 계속 서비스한다.
+  [ "$i" = 12 ] && { echo "  중단: 새 컨테이너가 안 뜬다 — 기존 :$ACTIVE 유지"; ssh "$SSH_HOST" "docker rm -f $IMAGE-$NEW"; exit 1; }
+done
+ssh "$SSH_HOST" "sudo cp $CADDYFILE ${CADDYFILE}.bak
+sudo python3 - <<'CADDY_EDIT'
+import re
+p='$CADDYFILE'; s=open(p).read()
+s=re.sub(r'($DOMAIN \{[^}]*localhost:)[0-9]+', r'\g<1>$NEW', s, count=1)
+open(p,'w').write(s)
+CADDY_EDIT
+sudo systemctl reload caddy
+sleep 2
+docker rm -f $IMAGE-$ACTIVE $IMAGE 2>/dev/null || true
+docker image prune -f --filter 'until=24h' >/dev/null 2>&1 || true"
+echo "완료. 활성 :$NEW · 태그 $IMAGE:$TAG (롤백용)."
+echo "  롤백: ssh $SSH_HOST 'sudo cp ${CADDYFILE}.bak $CADDYFILE && sudo systemctl reload caddy'"
+echo "  로그: ssh $SSH_HOST 'docker logs -f --tail 200 $IMAGE-$NEW'"
