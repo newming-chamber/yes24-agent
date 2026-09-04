@@ -487,7 +487,7 @@ async def run_agent_stream(
     user_id는 인증된 요청의 Yes24 userNo다(auth.py). None이면 인증 없는 단일 사용자
     (_POC_USER_ID)로 돌아 로컬·익명·매트릭스 동작이 그대로다.
 
-    enrich=False면 done 직전의 meta 부가 파이프라인(추천 이유·세션 제목)을 끈다 —
+    enrich=False면 done 직전의 meta 부가 파이프라인(추천 이유·후속 질문·세션 제목)을 끈다 —
     매트릭스가 16셀에서 서브콜을 16번 쏘는 낭비를 막는 경로다(셀 세션은 1회성이라
     제목·추천 구조화의 소비자도 없다).
 
@@ -943,11 +943,15 @@ async def run_agent_stream(
                 # 사용자 결정): 스트림은 항상 done으로 끝나므로 done에서 닫는 소비자도
                 # meta를 받는다. 비용은 추천 턴의 done이 추출 시간(~1.4s, 상한
                 # enrichment_timeout_s)만큼 늦어지는 것 — 본문은 이미 전량 흘렀다.
-                # 게이트는 구조 판정뿐이다: 인용 출처도 없고 만들 제목도 없으면 추출할 재료가
-                # 없다(의미 분류 아님). 실패 경로(타임아웃·예외 closeout)에서는 돌리지 않는다.
+                # 게이트는 구조 판정뿐이다: 뽑을 것이 하나도 없으면 부르지 않는다(의미 분류
+                # 아님). 후속 질문은 인용 출처가 없는 턴(잡담·정보 답변)에도 뽑을 수 있어
+                # — 재료는 질문과 답변 본문이다 — 켜져 있으면 게이트를 항상 통과한다. 그전엔
+                # "출처 또는 제목"이라 2번째 턴부터의 무출처 답변엔 meta가 통째로 빠졌다.
+                # 실패 경로(타임아웃·예외 closeout)에서는 돌리지 않는다.
                 # extract_turn_meta가 예외를 삼키지만, 프레임 방출·제목 영속까지 한 번 더
                 # 감싼다 — 부가 채널 실패가 정상 답변의 done 마감을 오염시키면 안 된다.
-                if enrich and (final_done.get("sources") or want_title):
+                want_follow_ups = settings.enrichment_follow_ups > 0
+                if enrich and (final_done.get("sources") or want_title or want_follow_ups):
                     try:
                         meta = await extract_turn_meta(
                             message,

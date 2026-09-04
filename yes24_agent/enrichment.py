@@ -1,9 +1,9 @@
-"""턴 부가 정보(meta) 추출 — 추천 이유·세션 제목 (best-effort · 비파괴).
+"""턴 부가 정보(meta) 추출 — 추천 이유·후속 질문·세션 제목 (best-effort · 비파괴).
 
 답변 본문과 별도의 경량 서브콜로 "프론트가 구조로 쓰는 부가 정보"를 뽑는다: 답변이
 책·상품을 추천했다면 **추천 항목 단위**의 이유(카드용 한 줄 — 출처 나열이 아니다),
-세션에 아직 제목이 없다면 대화 제목. `thought_translation.py`와 같은 경량 유틸
-계열이다(전용 config 필드, 실패 시 폴백).
+사용자가 이어서 누를 후속 질문, 세션에 아직 제목이 없다면 대화 제목.
+`thought_translation.py`와 같은 경량 유틸 계열이다(전용 config 필드, 실패 시 폴백).
 
 계약:
 - **done 직전 채널**: 이 추출은 최종 본문이 다 흐른 뒤, `done` 프레임 **직전**에 불린다
@@ -49,16 +49,24 @@ _EXTRACT_INSTRUCTION = (
     "책의 매력과 질문에 맞는 이유에 집중하고, 줄거리 나열이나 본문에 없는 이유 창작, "
     "검색·출처·시스템 동작 언급은 하지 않는다. "
     "한 항목이 여러 출처로 인용됐으면 대표 출처 id 하나만 쓴다. "
+    "follow_ups는 사용자가 이 답변을 읽고 이어서 물을 법한 질문이다. 방금 답한 것을 "
+    "되묻지 않고 한 걸음 더 나아가며, 서로 다른 방향을 향한다. 사용자가 그대로 눌러 "
+    "보낼 수 있도록 사용자의 말투로 쓴 완결된 한국어 질문이고, 답변에 근거가 없어도 "
+    "대화에서 자연스럽게 이어지면 된다(창작 금지는 recommendations에만 걸린다 — 이쪽은 "
+    "사실 주장이 아니라 사용자가 할 질문이다). "
     "session_title 필드가 있으면 이 대화의 주제를 나타내는 15자 내외의 한국어 명사구 제목을 쓴다."
 )
 
 
 def _response_schema(want_title: bool) -> types.Schema:
-    """구조화 출력 스키마. session_title은 필요할 때만 **스키마에 존재**한다.
+    """구조화 출력 스키마. session_title·follow_ups는 필요할 때만 **스키마에 존재**한다.
 
     제목이 이미 있는 세션에서 "제목을 만들지 마라"를 프롬프트 문구로 부탁하는 대신
-    필드 자체를 스키마에서 빼 생성을 구조로 차단한다(문구보다 구조 원칙).
+    필드 자체를 스키마에서 빼 생성을 구조로 차단한다(문구보다 구조 원칙). 후속 질문의
+    개수도 같은 이유로 프롬프트가 아니라 min_items/max_items가 정한다 — "3개 써라"는
+    문구는 지켜지지 않을 때 조용히 어긋나지만 스키마는 어긋날 수 없다.
     """
+    settings = get_settings()
     properties: dict[str, types.Schema] = {
         # 선행 판정 필드 — 프롬프트 문구 대신 스키마가 "권유인가"의 명시 판정을 강제한다.
         # 출구(_validated_meta)가 false면 recommendations를 통째로 버린다.
@@ -76,6 +84,15 @@ def _response_schema(want_title: bool) -> types.Schema:
         ),
     }
     required = ["is_recommendation", "recommendations"]
+    # 후속 질문은 추천·판정을 **본 뒤** 쓰도록 뒤에 둔다(property_ordering = required 순서).
+    if settings.enrichment_follow_ups > 0:
+        properties["follow_ups"] = types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(type=types.Type.STRING),
+            min_items=settings.enrichment_follow_ups,
+            max_items=settings.enrichment_follow_ups,
+        )
+        required.append("follow_ups")
     if want_title:
         properties["session_title"] = types.Schema(type=types.Type.STRING)
         required.append("session_title")
@@ -131,6 +148,16 @@ def _validated_meta(raw: dict, cited_ids: list[int], want_title: bool) -> dict |
     meta: dict = {}
     if recommendations:
         meta["recommendations"] = recommendations
+    # 후속 질문: 스키마가 개수를 강제하지만 출구도 한 번 더 본다 — 모델이 빈 문자열이나
+    # 같은 질문을 반복해 칸을 채우면 개수만 맞고 화면엔 빈 칩·중복 칩이 선다.
+    follow_ups: list[str] = []
+    for item in raw.get("follow_ups") or []:
+        question = " ".join(str(item or "").split())
+        if not question or question in follow_ups:
+            continue
+        follow_ups.append(_clip_title(question, settings.follow_up_max_chars))
+    if follow_ups:
+        meta["follow_ups"] = follow_ups[: settings.enrichment_follow_ups]
     if want_title:
         title = _clip_title(str(raw.get("session_title") or ""), settings.session_title_max_chars)
         if title:
@@ -188,6 +215,7 @@ async def extract_turn_meta(
         # done 지연 비용의 관측 지점 — 추출이 done 직전에 실행되므로 이 시간만큼 done이 늦는다.
         logger.info(
             f"턴 meta 추출: recommendations={len((meta or {}).get('recommendations', []))} "
+            f"follow_ups={len((meta or {}).get('follow_ups', []))} "
             f"title={bool((meta or {}).get('session_title'))} "
             f"elapsed={time.monotonic() - started:.2f}s"
         )

@@ -28,7 +28,7 @@ data: <JSON>
 | `delta` | `{text, round?}` | 본문 조각. **이어 붙이면 본문이 된다** |
 | `source` | `{source}` | 인용된 출처 1건(제목·url·가격·평점 등) |
 | `reset` | `{}` | **이미 받은 본문을 버려라.** 인용 검증이 본문을 바꿨을 때만 온다 |
-| `meta` | `{recommendations?, session_title?}` | `done` **직전**의 부가 정보(선택적) |
+| `meta` | `{recommendations?, follow_ups?, session_title?}` | `done` **직전**의 부가 정보(선택적) |
 | `done` | `{text, sources, cited_ids, session_id, turn_id, rbti_applied, process}` | 종료·1회 |
 | `error` | `{message}` | 사용자에게 보여줄 실패 문구 |
 

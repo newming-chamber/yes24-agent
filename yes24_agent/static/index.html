@@ -229,6 +229,17 @@
       content: ""; position: absolute; left: 0; top: calc(0.8em - var(--proc-dot) / 2);
       width: var(--proc-dot); height: var(--proc-dot); border-radius: 50%; background: var(--accent);
     }
+    /* 후속 질문 — 답변 아래 한 줄씩 세운다(칩이 아니라 목록 행이다. 질문이 길어 가로로
+       늘어놓으면 줄바꿈이 지저분하고, 세로 목록이 눌러야 할 것임을 더 잘 말한다). */
+    .follow-ups { margin-top: 10px; border-top: 1px solid var(--border); }
+    .follow-up {
+      display: flex; align-items: flex-start; gap: 8px; width: 100%; text-align: left;
+      background: none; border: none; border-bottom: 1px solid var(--border);
+      color: var(--text); font: inherit; font-size: 13.5px; padding: 10px 2px; cursor: pointer;
+    }
+    .follow-up:last-child { border-bottom: none; }
+    .follow-up:hover { color: var(--accent); }
+    .follow-up::before { content: "↳"; color: var(--muted); flex: 0 0 auto; }
     /* 툴 호출·결과 스텝 — 내레이션 텍스트 시작선에 맞춰 들여쓰고 선형 아이콘 + 문구.
        긴 멀티쿼리 검색어는 가로 스크롤이 아니라 줄바꿈으로 흡수한다(스크롤 계약). */
     .step {
@@ -1207,6 +1218,11 @@
       // 맡고, 스텝은 처음부터 이 안에 append된다(사고 요약은 헤더가 싣는다). 본문 블록만은
       // 최종 답일 수 있어 흐름에서 시작했다가 과정이 이어지면 procParent가 흡수한다 — 그때
       // 활자가 튀지 않도록 축소는 .live가 걷힐 때 한다. 최종 답이 시작되면 닫히고 헤더가 요약으로 바뀐다.
+      // 후속 질문은 **마지막 답변에만** 선다. 턴마다 쌓이면 눌러야 할 곳이 여러 군데가 되고,
+      // 위쪽 것은 그 사이 대화가 지나가 더 이상 이어지는 질문이 아니다(대화의 끝이 하나이듯
+      // 다음 질문 제안도 하나다). 새 답변이 열리는 이 시점이 그 경계다.
+      document.querySelectorAll(".follow-ups").forEach((el) => el.remove());
+
       const fold = document.createElement("details");
       fold.className = "process-fold live";
       fold.open = true;
@@ -1808,12 +1824,30 @@
           else { meta.textContent = `응답 ${elapsedSec.toFixed(1)}초`; meta.title = modelTip; }
         },
         // meta 이벤트(done 뒤 가법 채널): 추천 이유를 **해당 출처 카드 안에** 몇 줄로 얹고,
-        // 세션 제목을 브라우저 탭 제목으로 표시한다(내장 UI엔 대화 목록이 없어 탭이 유일한
-        // 노출면). 항목의 id는 done.sources와 같은 공개 번호 공간이라 cardMap이 바로 잡힌다.
-        // 카드가 이미 화면에 있으므로 재호출(복원 경로)에도 안전하게 기존 이유를 교체한다.
+        // 후속 질문을 답변 아래 목록으로 세우고, 세션 제목을 브라우저 탭 제목으로 표시한다
+        // (내장 UI엔 대화 목록이 없어 탭이 유일한 노출면). 항목의 id는 done.sources와 같은
+        // 공개 번호 공간이라 cardMap이 바로 잡힌다. 카드가 이미 화면에 있으므로 재호출
+        // (복원 경로)에도 안전하게 기존 이유·목록을 교체한다.
         showMeta(data) {
           if (!data) return;
           metaSaved = data;
+          const followUps = Array.isArray(data.follow_ups) ? data.follow_ups : [];
+          // 복원·재호출에서 겹치지 않도록 통째로 다시 그린다(누적 금지).
+          flow.querySelector(".follow-ups")?.remove();
+          if (followUps.length) {
+            const box = document.createElement("div");
+            box.className = "follow-ups";
+            for (const q of followUps) {
+              const row = document.createElement("button");
+              row.type = "button";
+              row.className = "follow-up";
+              row.textContent = q;
+              // 시드 칩과 같은 결 — 누르면 그대로 보낸다(전송 중이면 무시).
+              row.addEventListener("click", () => { if (!sending) submit(q); });
+              box.appendChild(row);
+            }
+            flow.appendChild(box);
+          }
           if (data.session_title) {
             document.title = `${data.session_title} · ${baseDocTitle}`;
           }

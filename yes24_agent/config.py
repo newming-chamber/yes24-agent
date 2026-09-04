@@ -92,6 +92,12 @@ class Settings(BaseSettings):
     # meta 추천 항목 수 상한(출구에서 초과 꼬리 제거). crema-ai의 카드 5권 계약 이식 —
     # 프론트 카드 줄과 1:1이 보장되는 폭이다. 정렬은 본문 인용 등장 순서(출구 검증이 소유).
     enrichment_max_recommendations: int = 5
+    # meta 후속 질문(follow_ups) 개수. 프롬프트 문구가 아니라 스키마 min_items/max_items로
+    # 강제하고, 출구에서 한 번 더 자른다. 0이면 필드 자체가 스키마에서 빠진다(구조적 off —
+    # want_title과 같은 관례). 프론트가 답변 아래 한 줄씩 칩으로 세우는 폭이다.
+    enrichment_follow_ups: int = 3
+    # 후속 질문 한 건의 표시 상한(문자). 칩 한 줄에 담기는 길이 — 제목·상태와 다른 축이다.
+    follow_up_max_chars: int = 40
     # 세션 제목 표시 상한(문자). 목록 한 줄에 담기는 길이 — status_detail_max_chars와는
     # 다른 축이라 따로 둔다(우연히 비슷해도 서로 따라가면 안 된다).
     session_title_max_chars: int = 60
