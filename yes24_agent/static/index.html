@@ -174,7 +174,7 @@
     .msg.user .bubble { background: var(--user-bg); color: var(--user-text); border-bottom-right-radius: 4px; }
     .msg.assistant .bubble { background: var(--assistant-bg); color: var(--text); border-bottom-left-radius: 4px; }
     .bubble.empty { color: var(--muted); }
-    /* 점 3개 스켈레톤 — 오버뷰 패널 전용(채팅의 첫 반응은 사고과정 헤더 "생각하고 있어요"가 맡는다). */
+    /* 점 3개 스켈레톤 — 오버뷰 패널 전용(채팅의 첫 반응은 사고과정 헤더의 경과 초가 맡는다). */
     .typing { display: inline-flex; gap: 4px; align-items: center; height: 1.25em; }
     .typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: typing 1.2s infinite ease-in-out; }
     .typing i:nth-child(2) { animation-delay: 0.15s; }
@@ -217,19 +217,17 @@
     .process-fold.err > summary { display: none; }
     .process-fold.live > summary { animation: pulse 1.6s ease-in-out infinite; }
     .process-fold > :not(summary) { margin-top: 4px; }
-    /* 내레이션 블록 = 파란 점 불릿 + muted 본문(마크다운 렌더는 그대로, 블록 하나에 점 하나). */
+    /* 내레이션 블록 = 파란 점 불릿 + 본문(마크다운 렌더는 그대로, 블록 하나에 점 하나).
+       생성 중(.live)엔 활자를 낮추지 않는다 — 흐름에 흐르던 본문이 접힘에 흡수되는 순간
+       쪼그라들어 보이기 때문이다. 낮추기는 .live가 걷히는 시점(최종 답 시작 = 접히는 순간)에
+       하므로 축소가 화면에 보이지 않고, 나중에 펼쳐 보면 과정임이 활자로 드러난다. */
     .msg.assistant .process-fold .bubble {
       position: relative; padding: 0 0 0 calc(var(--proc-dot) + var(--proc-gap));
-      color: var(--muted); font-size: 13px;
     }
+    .msg.assistant .process-fold:not(.live) .bubble { color: var(--muted); font-size: 13px; }
     .msg.assistant .process-fold .bubble::before {
       content: ""; position: absolute; left: 0; top: calc(0.8em - var(--proc-dot) / 2);
       width: var(--proc-dot); height: var(--proc-dot); border-radius: 50%; background: var(--accent);
-    }
-    /* 살아있는 사고 한 줄 — 점 없이 내레이션 시작선에 맞춘다. 실텍스트가 오면 물러난다. */
-    .think-live {
-      font-size: 13px; color: var(--muted); padding-left: calc(var(--proc-dot) + var(--proc-gap));
-      animation: pulse 1.6s ease-in-out infinite;
     }
     /* 툴 호출·결과 스텝 — 내레이션 텍스트 시작선에 맞춰 들여쓰고 선형 아이콘 + 문구.
        긴 멀티쿼리 검색어는 가로 스크롤이 아니라 줄바꿈으로 흡수한다(스크롤 계약). */
@@ -1205,16 +1203,16 @@
       // 담으므로, 여기 걸면 토큰이 붙을 때마다 본문 전체가 반복 낭독된다(낭독 폭주).
       // 대신 진행 단계 행 각각에 건다 — 짧고 한 번만 바뀌는 텍스트라 안전하다.
 
-      // 사고과정 접힘(피그마 01·11): 턴 시작부터 열린 <details>가 "생각하고 있어요"로 첫 반응을
-      // 맡고, 과정 요소(스텝·내레이션 블록·사고 한 줄)는 처음부터 이 안에 append된다 —
-      // 쌓았다가 옮기는 이동 리플로우가 없다. 최종 답이 시작되면 닫히고 헤더가 요약으로 바뀐다.
+      // 사고과정 접힘(피그마 01·11): 턴 시작부터 열린 <details>가 경과 초로 첫 반응을
+      // 맡고, 스텝은 처음부터 이 안에 append된다(사고 요약은 헤더가 싣는다). 본문 블록만은
+      // 최종 답일 수 있어 흐름에서 시작했다가 과정이 이어지면 procParent가 흡수한다 — 그때
+      // 활자가 튀지 않도록 축소는 .live가 걷힐 때 한다. 최종 답이 시작되면 닫히고 헤더가 요약으로 바뀐다.
       const fold = document.createElement("details");
       fold.className = "process-fold live";
       fold.open = true;
       const head = document.createElement("summary");
       head.className = "process-head";
       const headText = document.createElement("span");
-      headText.textContent = "생각하고 있어요";
       head.append(headText, makeIcon("chevron", "chev"));
       fold.appendChild(head);
       flow.appendChild(fold);
@@ -1267,23 +1265,32 @@
       let activeStep = null;   // 현재 진행 중(스핀) 단계 요소
       let lastStepKey = null;  // 직전 단계 키(연속 중복 방지)
 
-      // 사고 요약은 "살아있는 한 줄"(think-live)로 과정 끝에서 갱신되다 실텍스트가 오면 사라진다.
-      let thinkLive = null;   // 진행 중 사고 한 줄(완료·본문 도착 시 제거)
+      // 진행 헤더는 "{N}초 · {최신 사고 요약}" — 서버가 준 모델 산출물만 싣는다.
+      // 고정 문구를 두지 않는 이유는 status.detail과 같다(sse.py: "문장은 서버가 만들지 않는다") —
+      // 사고 요약이 아직 없는 첫 몇 초는 경과 초만 뜬다(빈 서술보다 정직하다).
+      let liveThought = "";   // 최신 사고 요약(없으면 빈 문자열)
+      let headTick = null;    // 경과 초 갱신 타이머(마감·실패·중지에서 정지)
       const turnStart = performance.now();
       let processSecs = 0;    // 조사 구간(최종 답 스트리밍 시작 전까지) — 접힘 헤더의 N초
 
+      function renderLiveHead() {
+        const secs = Math.max(1, Math.round((performance.now() - turnStart) / 1000));
+        headText.textContent = `${secs}초` + (liveThought ? ` · ${liveThought}` : "");
+      }
+      // 턴 시작부터 마감까지 매초 갱신. 헤더가 살아있음은 .live의 pulse가 이미 말하므로
+      // "생각하고 있어요" 류의 서술을 서버 없이 지어내지 않는다.
+      renderLiveHead();
+      headTick = setInterval(renderLiveHead, 1000);
+
       function setThinkLive(text) {
-        if (!thinkLive) {
-          thinkLive = document.createElement("div");
-          thinkLive.className = "think-live";
-          thinkLive.setAttribute("aria-live", "polite");
-        }
-        thinkLive.textContent = text;
-        procParent().appendChild(thinkLive);  // 항상 끝 = 지금 일어나는 일
+        liveThought = text;
+        if (headTick) renderLiveHead();  // 마감 뒤 늦게 온 사고는 요약 헤더를 덮지 않는다
       }
 
+      // 진행 헤더 정지 — 이후 헤더는 settleFold의 요약(또는 실패·중지 문구)이 소유한다.
       function clearThinkLive() {
-        if (thinkLive) { thinkLive.remove(); thinkLive = null; }
+        if (headTick) { clearInterval(headTick); headTick = null; }
+        liveThought = "";
       }
 
       // 최종 답 시작 = 과정 종료(2026-07-29 계약: "think들 나열되다가 final_text 스트리밍이
@@ -1319,6 +1326,7 @@
       // 생성 중(.live)에서 처음 마감될 때만 접는다 — 사용자가 다시 펼친 것을 finalize가 도로
       // 닫지 않는다.
       function settleFold(elapsedSec, label) {
+        clearThinkLive();  // 요약 헤더를 경과 초 틱이 덮어쓰지 않게 먼저 멈춘다
         if (!hasProcess()) { fold.remove(); return false; }
         if (fold.classList.contains("live")) {
           fold.classList.remove("live");
@@ -1692,7 +1700,6 @@
           step.classList.add("active");
           const parent = procParent();
           parent.appendChild(step);
-          if (thinkLive) parent.appendChild(thinkLive);  // 사고 줄은 항상 맨 끝
           activeStep = step;
           // 도구 단계가 끼어들었다 = 직전 라운드의 본문은 완결됐다. 다음 delta는 새
           // 블록으로 연다(문단 분리 — done.text는 블록 연결과 무관해 4b 무영향).
@@ -1721,7 +1728,6 @@
             // 내레이션일 수 있고, 최종 답 판정(maybeLeaveAtFinalText)·마감(finalize)이 닫는다.
             completeActiveStep();
           }
-          clearThinkLive();  // 실텍스트가 흐르면 사고 줄은 물러난다
           const block = blockForDelta();
           pendingSplit = false;
           block.text += chunk;
@@ -2020,7 +2026,7 @@
       input.value = "";
       input.style.height = "auto";
 
-      // 제출 직후의 즉시 반응은 사고과정 헤더("생각하고 있어요")가 담당한다.
+      // 제출 직후의 즉시 반응은 사고과정 헤더(경과 초)가 담당한다.
       const asst = createAssistantMessage(message);
       pinTurnTop(userEl, asst.el); // 질문을 상단 고정선으로 — 이 턴의 유일한 프로그램 스크롤
       setSending(true);
