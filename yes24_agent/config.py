@@ -98,6 +98,9 @@ class Settings(BaseSettings):
     enrichment_follow_ups: int = 3
     # 후속 질문 한 건의 표시 상한(문자). 칩 한 줄에 담기는 길이 — 제목·상태와 다른 축이다.
     follow_up_max_chars: int = 40
+    # meta 서브콜에 싣는 직전 턴 답변의 앞부분 길이. 맥락 힌트라 전문이 필요 없고, 본문
+    # 전량을 실으면 서브콜 토큰이 턴마다 답변 길이만큼 는다. 배터리 재생은 600으로 돌렸다.
+    enrichment_prior_answer_chars: int = 600
     # 세션 제목 표시 상한(문자). 목록 한 줄에 담기는 길이 — status_detail_max_chars와는
     # 다른 축이라 따로 둔다(우연히 비슷해도 서로 따라가면 안 된다).
     session_title_max_chars: int = 60

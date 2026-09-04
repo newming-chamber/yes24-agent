@@ -49,11 +49,15 @@ _EXTRACT_INSTRUCTION = (
     "책의 매력과 질문에 맞는 이유에 집중하고, 줄거리 나열이나 본문에 없는 이유 창작, "
     "검색·출처·시스템 동작 언급은 하지 않는다. "
     "한 항목이 여러 출처로 인용됐으면 대표 출처 id 하나만 쓴다. "
-    "follow_ups는 사용자가 이 답변을 읽고 이어서 물을 법한 질문이다. 방금 답한 것을 "
-    "되묻지 않고 한 걸음 더 나아가며, 서로 다른 방향을 향한다. 사용자가 그대로 눌러 "
-    "보낼 수 있도록 사용자의 말투로 쓴 완결된 한국어 질문이고, 답변에 근거가 없어도 "
-    "대화에서 자연스럽게 이어지면 된다(창작 금지는 recommendations에만 걸린다 — 이쪽은 "
-    "사실 주장이 아니라 사용자가 할 질문이다). "
+    "follow_ups는 사용자가 이 답변을 읽고 이어서 물을 법한 질문이다. 사용자가 그대로 눌러 "
+    "보낼 수 있도록 사용자의 말투로 쓴 완결된 한국어 질문이다. "
+    "적어도 하나는 답변이 이름만 대고 지나간 구체적인 항목(작품·인물·사건·수치·조건 중 "
+    "본문에 실제로 등장한 것)을 집어 그것을 더 파는 질문이고, 나머지는 같은 주제의 다른 "
+    "각도로 넓힌다. prior_turn이 있으면 그 대화의 흐름을 이어받는다. "
+    "세 질문 모두 검색으로 확인할 수 있는 사실을 묻는다 — 아직 일어나지 않은 일의 예측, "
+    "의견이나 감상 요구, 이 어시스턴트나 서비스의 사용법 자체는 묻지 않는다. 방금 답한 것을 "
+    "되묻지 않고, 어느 답변에나 붙일 수 있는 일반적인 질문은 쓰지 않는다(창작 금지는 "
+    "recommendations에만 걸린다 — 이쪽은 사실 주장이 아니라 사용자가 할 질문이다). "
     "session_title 필드가 있으면 이 대화의 주제를 나타내는 15자 내외의 한국어 명사구 제목을 쓴다."
 )
 
@@ -171,8 +175,12 @@ async def extract_turn_meta(
     cited_sources: list[dict],
     *,
     want_title: bool,
+    prior_turn: dict | None = None,
 ) -> dict | None:
     """최종 본문·인용 출처에서 부가 정보를 뽑는다. 실패·빈 결과는 None(예외 전파 없음).
+
+    prior_turn은 `{question, answer}`(직전 턴)로, 후속 질문이 대화 흐름을 이어받는 재료다 —
+    없으면(첫 턴) 키 자체를 싣지 않는다.
 
     cited_sources는 done.sources의 공개 DTO다 — 추천 id는 본문 마커·출처 카드와 같은
     공개 표시 번호 공간을 쓴다. 호출 조건(추출할 재료가 있는가)은 호출부가 판단한다.
@@ -191,6 +199,8 @@ async def extract_turn_meta(
                 for s in cited_sources
             ],
         }
+        if prior_turn:
+            payload["prior_turn"] = prior_turn
         response = await asyncio.wait_for(
             get_genai_client().aio.models.generate_content(
                 model=settings.enrichment_model,

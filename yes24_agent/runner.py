@@ -178,6 +178,29 @@ def _display_frames(
     return frames
 
 
+def _prior_turn(events) -> dict | None:
+    """세션 이력의 **직전 턴**(마지막 사용자 발화와 그 뒤 모델 본문) — meta 후속 질문의 재료.
+
+    턴 시작 시점의 session.events는 이번 턴 전 이력이라, 뒤에서부터 첫 user 이벤트가 직전
+    질문이고 그 뒤 모델 텍스트가 직전 답변이다. 재료가 없으면(첫 턴) None. 본문은 표시용이
+    아니라 맥락 힌트라 앞부분만 싣는다(enrichment_prior_answer_chars).
+    """
+    settings = get_settings()
+    answer: list[str] = []
+    for event in reversed(events):
+        if event.partial:
+            continue
+        text = _event_text(event)
+        if event.author == "user":
+            if not text:
+                continue
+            body = "".join(reversed(answer))
+            return {"question": text, "answer": body[: settings.enrichment_prior_answer_chars]}
+        if text:
+            answer.append(text)
+    return None
+
+
 def _event_thought_text(event) -> str:
     """ADK 이벤트에서 **사고 요약** 파트만 이어붙인다(_event_text의 여집합).
 
@@ -543,6 +566,10 @@ async def run_agent_stream(
             # 이 세션에 제목이 아직 없는가 — meta 파이프라인의 제목 생성 여부(구조 판정).
             # 턴 시작에 잡아 두어, 이번 턴이 직접 영속한 제목을 같은 턴이 다시 만들지 않는다.
             want_title = enrich and not session.state.get(SESSION_TITLE_STATE_KEY)
+            # 직전 턴은 후속 질문의 맥락 재료다(2026-09-04 눈가림 배터리 — 직전 턴 있는 턴에서
+            # 세트 구체성 57%→86%). 이번 턴의 user 이벤트가 붙기 전인 지금 잡아야 "직전"이다.
+            # 부가 채널 재료가 세션 준비를 죽이면 안 된다 — 이력 객체가 없으면 그냥 없는 것.
+            prior_turn = _prior_turn(getattr(session, "events", None) or []) if enrich else None
         except Exception as exc:  # noqa: BLE001 — 스트림 시작 전 방어선(done 1회 불변식 보장)
             logger.exception(f"세션 준비 실패: {exc}")
             error_text = "대화 세션을 준비하지 못했어요. 잠시 후 다시 시도해 주세요."
@@ -958,6 +985,7 @@ async def run_agent_stream(
                             final_done.get("text", ""),
                             final_done.get("sources", []),
                             want_title=want_title,
+                            prior_turn=prior_turn,
                         )
                         if meta:
                             yield sse_meta({**meta, "session_id": resolved_session_id})
