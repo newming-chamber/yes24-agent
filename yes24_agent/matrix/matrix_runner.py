@@ -44,15 +44,19 @@ from yes24_agent.sse import (
     sse_status,
 )
 from yes24_agent.tools.yes24_search import high_throughput_client
-from yes24_agent.toolsets import TOOLSET_SOURCE_TYPES
+from yes24_agent.toolsets import TOOLSET_PUBLIC_SOURCE_TYPE, TOOLSET_SOURCE_TYPES
 
 logger = logging.getLogger(__name__)
 
 # 대표책 줄에서 제외할 출처 타입 — 도구 레지스트리(toolsets.TOOLSET_SOURCE_TYPES)의 web
-# toolset 선언에서 파생한다(손 사본 금지). 프론트 static/lib/sources.js WEB_TYPES는 런타임이
-# 달라 불가피한 JS 사본이다. 웹 출처는 책이 아니라 하단 인용 칩으로만 표시되므로
-# picks(고른 책)에서 뺀다.
-_WEB_TYPES = frozenset(TOOLSET_SOURCE_TYPES["web"])
+# toolset 선언에서 파생한다(손 사본 금지). 비교 대상은 셀의 **공개** done.sources라 공개 이름으로
+# 접는다(TOOLSET_PUBLIC_SOURCE_TYPE — web은 접히지 않아 오늘은 내부 이름과 같지만, 선언이
+# 바뀌어도 여기는 따라온다). 프론트 static/lib/sources.js WEB_TYPES는 런타임이 달라 불가피한
+# JS 사본이다. 웹 출처는 책이 아니라 하단 인용 칩으로만 표시되므로 picks(고른 책)에서 뺀다.
+_WEB_TYPES = frozenset(
+    TOOLSET_PUBLIC_SOURCE_TYPE.get("web", source_type)
+    for source_type in TOOLSET_SOURCE_TYPES["web"]
+)
 
 # 셀 로컬 id → 매트릭스 전역 유일 id의 네임스페이스 폭. 각 셀은 독립 세션이라 로컬 id가
 # 1,2,3…으로 재시작(sources.py register_source)해, 전역 디둡·프론트 레지스트리(String(id))에서

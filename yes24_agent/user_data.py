@@ -1,17 +1,22 @@
-"""우리 DB가 소유하는 **사용자별 대화 부가 데이터** — `turn_feedback`·`session_ui` 두 테이블.
+"""우리 DB가 소유하는 **사용자별 대화 부가 데이터** — `turn_feedback`·`turn_click`·`session_ui`.
 
 경계가 이 모듈의 존재 이유다: **대화 내용은 ADK가, 사용자가 대화에 남긴 것은 우리가** 소유한다.
 - `turn_feedback` — 턴 좋아요/싫어요 + 코멘트. 턴의 열쇠는 ADK invocation_id(`done.turn_id`).
   세션 state JSON이 아니라 전용 테이블인 이유는 집계다 — state에 넣으면 "싫어요 상위 턴"이
   전 세션 스캔이 된다(usage 계측이 events 재사용을 기각하고 usage_log로 간 판단의 반복).
+- `turn_click` — 답변 안의 링크(상품·공지·웹·판형 무엇이든) 클릭. 열쇠는 **URL**이다 — crema
+  시절의 goods_no·판형 열거형 스키마를 복제하지 않는다(2026-09-08): 대상이 늘어도 URL은 항상
+  있으므로 스키마가 안 바뀐다. 피드백과 달리 **append-only**다(같은 URL 재클릭 = 행 추가).
+  **purge 대상이 아니다** — 사용자 상태(피드백·제목)가 아니라 usage_log 같은 제품 분석 이벤트
+  로그라, 대화 삭제와 함께 지우면 집계에 구멍이 난다(2026-09-08 사용자 결정).
 - `session_ui` — 읽음 시각·사용자가 지은 제목. ADK 세션 state에 두면 안 되는 이유는 그 테이블의
   `update_time`에 `onupdate=func.now()`가 걸려 있어서다: state를 쓰는 순간 활동 시각이 현재로
   밀려 "읽으면 다시 안 읽음"이 되고 목록 순서가 튄다. `event.timestamp`에 현재 값을 그대로
   실어 고정하려던 초안은 **값이 같아 SQLAlchemy가 컬럼을 dirty로 보지 않아 UPDATE에서 빠지고
   그 자리를 onupdate가 채워** 오히려 실패했다(2026-09-01 라이브 실측).
 
-**두 테이블이 한 서비스인 이유**: 같은 DB·같은 사용자 스코프·같은 실패 정책이라 풀·활성 판정·
-마감을 두 벌 둘 근거가 없다(처음엔 나눠 뒀다가 커넥션 풀만 두 개가 됐다). 대화 삭제가 두
+**세 테이블이 한 서비스인 이유**: 같은 DB·같은 사용자 스코프·같은 실패 정책이라 풀·활성 판정·
+마감을 여러 벌 둘 근거가 없다(처음엔 나눠 뒀다가 커넥션 풀만 두 개가 됐다). 대화 삭제가 전
 테이블을 함께 비우는 것도 여기서 한 메서드로 성립한다.
 
 접속 정보는 인증·사용량과 같은 단일 출처 — `config.session_db_url`을 파싱한다. 세션 DB가
@@ -22,7 +27,8 @@ mysql이 아니면(로컬 sqlite) 스택이 자연 비활성이다(구조 분기
 단 **읽기는 비활성 구성에서 빈 값으로 내려간다**: 저장소가 없으면 상태도 없는 것이 사실이라
 (전부 unread·자동 제목) 목록·복원이 그대로 동작한다.
 
-DDL은 `scripts/turn_feedback.sql`·`scripts/session_ui.sql` 수동 적용(usage_log 관례).
+DDL은 `scripts/turn_feedback.sql`·`scripts/turn_click.sql`·`scripts/session_ui.sql` 수동 적용
+(usage_log 관례).
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ from yes24_agent.session_service import mysql_pool_kwargs
 
 
 class UserDataService(MysqlBackedService):
-    """turn_feedback·session_ui 읽기/쓰기 서비스(프로세스 싱글턴, 풀 1개).
+    """turn_feedback·turn_click·session_ui 읽기/쓰기 서비스(프로세스 싱글턴, 풀 1개).
 
     풀 보유·활성 판정·질의·마감은 db.MysqlBackedService가 소유한다 — 여기 남는 것은 SQL뿐이다.
     풀 팩토리를 주입할 수 있어 테스트는 실 DB 없이 전 경로를 돈다(AuthService·UsageLogger 패턴).
@@ -101,6 +107,27 @@ class UserDataService(MysqlBackedService):
         )
         return {row[0]: {"rating": row[1], "comment": row[2]} for row in rows or ()}
 
+    # ── turn_click ─────────────────────────────────────────────────────────
+
+    async def record_click(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        turn_id: str,
+        url: str,
+        source_id: int | None,
+        source_type: str | None,
+        label: str | None,
+    ) -> None:
+        """링크 클릭 1건 기록 — 행 추가만 한다(같은 URL 재클릭은 행이 늘어난다, upsert 아님)."""
+        await self._run(
+            "INSERT INTO turn_click "
+            "(user_id, session_id, turn_id, url, source_id, source_type, label) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (user_id, session_id, turn_id, url, source_id, source_type, label),
+        )
+
     # ── session_ui ─────────────────────────────────────────────────────────
 
     async def ui_for_user(self, *, user_id: str) -> dict[str, tuple[str | None, float | None]]:
@@ -153,7 +180,8 @@ class UserDataService(MysqlBackedService):
         세션만 지우고 이 행들을 남기면 사용자가 쓴 코멘트·제목이 session_id·user_id와 함께
         남는다. 삭제 API의 존재 이유가 프라이버시인데 그게 남으면 삭제가 아니다(2026-09-01
         라이브 검증에서 고아 행으로 관측 — 결정론 테스트는 DB가 없어 못 잡았다).
-        두 테이블이 한 서비스라 **빠뜨릴 수 있는 자리가 없다**(테이블이 늘면 여기만 는다).
+        사용자 상태 테이블(turn_feedback·session_ui)이 대상이다 — turn_click은 분석 로그라
+        남긴다(모듈 독스트링). 사용자 상태 테이블이 늘면 여기만 는다.
 
         **한 트랜잭션**으로 묶는다 — 문장을 따로 보내면 풀이 autocommit이라 앞 테이블만 지워진
         채 실패할 수 있고, 그러면 "삭제 실패"라고 알린 뒤에 코멘트만 사라진 상태가 남는다.

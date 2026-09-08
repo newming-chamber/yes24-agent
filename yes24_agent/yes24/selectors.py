@@ -8,6 +8,11 @@ HTML 구조가 바뀌면 이 파일만 수정하면 되도록, 파싱에 쓰이�
 ``cremaclub_best_sample.html``(docs/browse-scout-report.md 정찰 기준)로 검증했다.
 """
 
+# 상품 상세 경로 조각 — 조립(urls.product_url)·페이지 유형 판정(yes24_fetch)·링크 판별
+# (LINK_PRODUCT_PATH_RE)·목록 판형 링크 스코프(ITEM_FORMAT_LINK)의 단일 출처. 무의존 최하층인
+# 이 모듈에 둔다(urls는 이미 selectors를 import).
+GOODS_PATH = "/product/goods/"
+
 # 검색 결과 아이템 컨테이너 (없으면 HTML 구조 변경으로 간주 — ParseError 트리거)
 SEARCH_LIST_CONTAINER = "ul#yesSchList"
 
@@ -30,6 +35,12 @@ ITEM_EBOOK_LABEL = "[eBook]"
 # 라벨의 대괄호는 마크업 장식이다 — kind(라벨 원형) 관측은 이 장식을 벗긴 값을 쓰며,
 # 그 표기 규약은 ITEM_EBOOK_LABEL(대괄호 포함 원문 비교용)과 함께 이 파일이 소유한다.
 ITEM_FORMAT_LABEL_DECORATION = "[]"
+
+# 목록·상세의 주문 JSON은 같은 사이트 상품 유형(resource_key)을 싣는다. 관측한 도서 유형:
+# 국내 01, 외서 02, 만화 07, 전자책/오디오북 13, 직수입양서 35, 직수입일서 36.
+# category는 클래스도 국내도서 아래에 있어 도서 신호로 쓸 수 없다.
+GOODS_ORDER_OPTIONS = "input[name='ORD_GOODS_OPT']"
+BOOK_RESOURCE_KEYS = frozenset({"01", "02", "07", "13", "35", "36"})
 
 # 표지 이미지. lazy-load라 실제 커버 URL은 `src`(Noimg 플레이스홀더)가 아니라 `data-original`
 # 속성에 든다(실측: 24개 상품 전부 data-original에 image 서브도메인의 goods 커버 경로, src는
@@ -105,6 +116,18 @@ ITEM_PREORDER_BADGE = "span.iconC.reserv"
 # gd_feature의 대괄호는 컨테이너 직계 텍스트 장식이라 span.feature 선택만으로 배제된다.
 ITEM_FEATURE = "span.gd_feature span.feature"
 
+# 다른 판형 링크(목록판). 행마다 관련상품 줄 `div.info_row.info_relG` 안에 `span.relG > a`로
+# "eBook <span class=relG_num>13,600원</span>"이 SSR된다(실측 2026-09-08 search fixture:
+# goods 108422348 → /product/goods/176969341 13,600원). 같은 줄에 중고상품 허브 링크
+# ("중고상품 <span class=relG_num>110개</span>", 외부 허브 절대 URL)도 같은 클래스로 오는데
+# 숫자가 금액이 아니라 개수라, href를 상품 페이지 경로(GOODS_PATH)로 스코프해 판형 링크만
+# 잡는다 — 숫자 단위("원"/"개")를 읽는 문구 판정 대신 링크 목적지 구조로 가른다. 줄이 비어
+# 있거나(검색) 줄 자체가 없는 행(베스트셀러 13/24)은 "판형 없음"(빈 목록)이고, 줄이 없는
+# 마크업(크레마클럽)은 관측 불가(키 생략)다. 항목 스키마·가격 파서는 상세 위젯
+# (PRODUCT_FORMAT_LINK)과 공유한다.
+ITEM_FORMAT_LINK = f"div.info_relG span.relG > a[href^='{GOODS_PATH}']"
+ITEM_FORMAT_PRICE = "span.relG_num"
+
 # 검색 결과 0건(HTML 구조 파손이 아닌 진짜 "결과 없음") 신호.
 # 실측(tests/fixtures/search_empty.html, "보라색코끼리의은하수여행기xyz" 무결과 쿼리)
 # 기준: `ul#yesSchList` 컨테이너 자체가 없는 대신 `div.noData`가 나타난다.
@@ -124,6 +147,13 @@ PRODUCT_AUTHOR = ".gd_auth"
 PRODUCT_PUBLISHER = ".gd_pub"
 PRODUCT_PUB_DATE = ".gd_date"
 PRODUCT_RATING = ".gd_lnkRate em.yes_b"
+
+# 표지 이미지. 목록(ITEM_IMAGE)과 달리 상세는 lazy-load가 아니라 `src`에 실제 커버 URL이
+# 든다(실측: 종이책·eBook·클래스·굿즈 fixture 4종 모두 img.gImg 1개, src=image 서브도메인의
+# goods 커버 경로). og:image 메타도 같은 커버를 가리키지만, 목록 파서와 같은 <img> 속성 관측
+# 규약(_image_url_or_none 하나로 처리)을 유지하려고 본문 img를 정본으로 쓴다.
+PRODUCT_IMAGE = "img.gImg"
+PRODUCT_IMAGE_ATTR = "src"
 
 # 종이책 쪽수는 품목정보 표의 이름/값 행에 있다. 목록 페이지에는 이 표가 없으므로 상세
 # 열람에서만 채우고, 해당 행이 없는 eBook은 None으로 둔다.
@@ -173,9 +203,11 @@ PRODUCT_LIST_PRICE_JS_RE = r"g_GoodsShopPrice\s*=\s*([\d.]+)"
 # 컨테이너로 잡는 이유: 이 값을 범용 관련상품 링크로 흘리면 앵커 텍스트에 금액만 남고
 # 임자가 사라져, 모델이 열람 중인 상품의 출처에 그 금액을 건다(실측 2026-08-03 —
 # links[0].title="eBook 12,000원 이동"을 종이책 출처 [1]에 인용). 가격은 판형 링크마다
-# em.txC_blue 하나로, 없는 판형(중고상품)도 있으므로 없으면 None으로 둔다.
+# em.txC_blue 하나로, 없는 판형(중고상품)도 있으므로 없으면 None으로 둔다. 링크 셀렉터는
+# 컨테이너로 스코프된 한 줄이다 — 목록판(ITEM_FORMAT_LINK)과 같은 꼴이라 파서가 헬퍼 하나로
+# 두 마크업을 읽는다. 컨테이너 상수는 extract_links가 위젯을 통째로 걷어낼 때 따로 쓴다.
 PRODUCT_FORMAT_CONTAINER = "#divFormatInfo"
-PRODUCT_FORMAT_LINK = "a.formatLnk"
+PRODUCT_FORMAT_LINK = f"{PRODUCT_FORMAT_CONTAINER} a.formatLnk"
 PRODUCT_FORMAT_PRICE = "em.txC_blue"
 
 # 책소개/목차/출판사리뷰 블록. 실제 본문은
@@ -231,10 +263,6 @@ CREMACLUB_RATING = ".rating_grade em.yes_b"
 # ============================================================
 # 링크 추출(extract_links) 상수 — M6 링크 팔로우
 # ============================================================
-
-# 상품 상세 경로 조각 — 조립(urls.product_url)·페이지 유형 판정(yes24_fetch)·링크 판별
-# (아래 정규식)의 단일 출처. 무의존 최하층인 이 모듈에 둔다(urls는 이미 selectors를 import).
-GOODS_PATH = "/product/goods/"
 
 # 상품 상세 링크 판별 패턴(경로만 대상, 쿼리스트링 제외하고 매칭).
 # 실측 결과 대소문자가 페이지마다 혼용된다 — 검색/베스트셀러/신간은 소문자

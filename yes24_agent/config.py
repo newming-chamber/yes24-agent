@@ -597,6 +597,10 @@ class Settings(BaseSettings):
     # 절단 계약(truncated·total_chars·find)은 yes24_fetch와 동일하다(같은 함수를 공유).
     web_fetch_max_chars: int = 6000
     web_fetch_find_lead_chars: int = 500
+    # 공개 출처 카드의 preview(snippet 첫 문단) 표시 상한(문자). 빈 줄 없는 텍스트(FAQ 등)는
+    # 첫 문단이 곧 전체(최대 fetch_max_chars 6000자)라 카드 하나가 그대로 부풀 수 있다 —
+    # "화면은 프론트가 줄 수로 제한, 안전 상한은 서버"로 책임을 나눈다.
+    source_preview_max_chars: int = 200
     perplexity_search_url: str = "https://api.perplexity.ai/search"
     # 웹 열람(web_fetch)은 여전히 Tavily /extract 사용 — 특정 URL 전문 확보용.
     tavily_extract_url: str = "https://api.tavily.com/extract"
@@ -756,6 +760,13 @@ class Settings(BaseSettings):
     # 걸어 초장문 입력을 422로 구조적으로 거절한다(키워드 탐지 아님) — 컨텍스트·토큰 폭발과
     # 악의적 대용량 페이로드를 입구에서 막는다. 정상 대화·질문은 수백 자라 넉넉한 천장이다.
     request_max_chars: int = 4000
+    # 턴 클릭 기록(POST …/turns/{turn_id}/clicks) 입구 상한. url은 사용자 자유 텍스트가 아니라
+    # 링크라 request_max_chars와 축이 다르다 — 브라우저·CDN이 관행적으로 자르는 2K 근처.
+    # 스키마(pydantic UrlConstraints)가 입구에서 422로 거절한다.
+    click_url_max_chars: int = 2048
+    # 클릭한 링크의 표시 제목(label) 상한. 상품 제목은 부제까지 길 수 있어 session_title(60)보다
+    # 넉넉히 두되 scripts/turn_click.sql의 label 컬럼 폭과 같은 값이다(넘치면 저장 실패).
+    click_label_max_chars: int = 255
 
     # 관측성(파일 로깅). log_file_path가 빈 문자열이면 stdout만(로컬 개발 기본), 값이 있으면
     # 그 경로에 RotatingFileHandler를 얹어 stdout+파일 이중 기록해 배포 후 사후 디버깅을 남긴다.

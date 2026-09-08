@@ -4,6 +4,33 @@
 
 export const WEB_TYPES = new Set(["web"]);
 
+export const CARD_LABELS = Object.freeze({ book: "도서", document: "문서", link: "웹" });
+
+export function sourceCardType(src) {
+  return Object.hasOwn(CARD_LABELS, src?.card_type) ? src.card_type
+    : src?.type === "notice" ? "document" : "link";
+}
+
+export function sourceDomain(src) {
+  try { return new URL(src?.url).hostname; } catch { return ""; }
+}
+
+export function sourceTitle(src) {
+  return (typeof src?.title === "string" ? src.title.trim() : "") || sourceDomain(src) || "자료";
+}
+
+export function textOffset(text, offset, unit = "unicode_codepoint") {
+  if (!Number.isInteger(offset) || offset <= 0) return 0;
+  if (unit === "utf16") return Math.min(offset, text.length);
+  let count = 0;
+  let index = 0;
+  for (const point of text) {
+    if (count++ >= offset) break;
+    index += point.length;
+  }
+  return index;
+}
+
 // 신규 공개 DTO는 평면 image_url이고, meta.image_url은 기존 스냅샷 호환 경로다.
 // http(s)만 허용(javascript: 등 위험 스킴 차단).
 export function coverUrl(src) {
@@ -13,7 +40,7 @@ export function coverUrl(src) {
 
 // 출처 링크 열기 — http(s) 스킴만. 외부 url(web_search)에 javascript:가 섞여도 실행되지 않게.
 export function safeOpen(url) {
-  if (typeof url === "string" && /^https?:\/\//i.test(url)) window.open(url, "_blank", "noopener");
+  if (typeof url === "string" && /^https?:\/\//i.test(url)) window.open(url, "_blank", "noopener,noreferrer");
 }
 export function isSafeUrl(url) {
   return typeof url === "string" && /^https?:\/\//i.test(url);
@@ -25,7 +52,7 @@ export function formatPrice(src) {
   const raw = src && [src.sale_price, src.price].find((v) => v != null && v !== "");
   if (raw == null) return null;
   const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n.toLocaleString("ko-KR") + "원" : String(raw);
+  return Number.isFinite(n) && n >= 0 ? n.toLocaleString("ko-KR") + "원" : String(raw);
 }
 
 // 표지 <img> — loading=lazy 금지(스크롤 없는 뷰포트에 JS로 삽입된 이미지는 IntersectionObserver가

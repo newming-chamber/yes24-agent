@@ -266,19 +266,10 @@ NonBlankText = Annotated[
 # 스트리밍 라우트의 OpenAPI 응답 기술. FastAPI는 StreamingResponse의 미디어 타입을 추론하지
 # 못해 기본 `application/json`으로 문서화한다 — 프론트가 그 문서를 믿고 `res.json()`을 쓰면
 # 그냥 멈춘다(2026-09-01 지적). 계약 본문은 sse.py가 소유하고 여기선 싣기만 한다(사본 금지).
-_SSE_EXAMPLE = (
-    'event: status\ndata: {"stage":"searching","ts":1756000000000}\n\n'
-    'event: delta\ndata: {"text":"채식주의자는 ","ts":1756000000100}\n\n'
-    'event: source\ndata: {"source":{"id":1,"title":"채식주의자"},"ts":1756000000200}\n\n'
-    'event: done\ndata: {"text":"채식주의자는 15,300원입니다[1]","sources":[{"id":1}],'
-    '"cited_ids":[1],"session_id":"...","turn_id":"...","ts":1756000000300}\n\n'
-)
 _SSE_RESPONSES: dict = {
     200: {
         "description": "SSE 이벤트 스트림 (application/json 아님)",
-        "content": {
-            "text/event-stream": {"schema": {"type": "string"}, "example": _SSE_EXAMPLE}
-        },
+        "content": {"text/event-stream": {"schema": {"type": "string"}}},
     }
 }
 
@@ -690,8 +681,8 @@ headers.set("x-api-key", decodeURIComponent(key));
 **응답 읽는 법** — 답변은 JSON이 아니라 **SSE 스트림**이다. 이벤트 종류와 지켜지는 계약,
 붙여 쓸 수 있는 예제는 아래 `POST /chat/stream` 설명에 전부 있다. 먼저 읽어라.
 
-**화면 만들기** — 대화 목록·복원·이름 변경·삭제·좋아요는 `/chat/sessions*`(history 태그)에
-있다. 목록의 `unread`는 "답변이 끝났는데 아직 안 본 대화"이고, 그 대화를
+**화면 만들기** — 대화 목록·복원·이름 변경·삭제·좋아요·링크 클릭 기록은 `/chat/sessions*`
+(history 태그)에 있다. 목록의 `unread`는 "답변이 끝났는데 아직 안 본 대화"이고, 그 대화를
 `GET /chat/sessions/{session_id}`로 열면 자동으로 꺼진다(별도 읽음 API는 없다).
 
 **검색결과 오버뷰** — `POST /overview`는 검색어 하나로 상품군을 정리해 주는 별도 기능이다

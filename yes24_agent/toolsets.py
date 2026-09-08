@@ -84,12 +84,18 @@ TOOLSET_SOURCE_TYPES: dict[str, dict[str, tuple[str, ...]]] = {
         "book_detail": GROUNDING_FIELDS,
         # browse만 목록 순위(rank)를 관측한다 — 코너 랭킹이 그 출처의 본질 필드다.
         "browse": (*GROUNDING_FIELDS, "rank"),
-        # 상세가 함께 관측한 다른 판형(eBook·중고 등). 그 페이지를 연 것이 아니라 판형
-        # 위젯이 렌더한 값이라, 관측된 것은 판매가 하나뿐이다.
-        "other_format": ("sale_price",),
     },
     "web": {"web": ()},
 }
+
+# 공개 계약 v2(2026-09-08): 위 레지스트리에 선언된 출처 타입은 **관측 깊이**(목록·상세·코너)라
+# 외부 프론트에겐 구분할 이유가 없는 내부 사정이다 — 밖으로 새자 프론트가 타입별로
+# 분기하다 혼동했다. 그래서 toolset이 선언한 타입 전부를 공개 DTO에서 여기 적은 한 이름으로
+# 접는다(접는 곳은 event_translate.project_public_source 한 군데, 내부 타입·레지스트리·도구
+# 응답은 그대로다 — 모델 접지와 병합 판정은 내부 어휘를 쓴다). 여기 없는 toolset(web)과
+# 레지스트리 밖 타입(`notice` — 공개 메타 필드가 없어 위 선언에 항목이 없다)은 내부 이름
+# 그대로 공개된다. 결과 공개 어휘: product | notice | web.
+TOOLSET_PUBLIC_SOURCE_TYPE: dict[str, str] = {"yes24": "product"}
 
 # 턴 시작 선제 실행 훅. ACLOSE_HOOKS와 같은 병행 레지스트리 관례이며, **활성 toolset의 것만**
 # 실행한다(끈 toolset은 선제 실행도 없다). 러너가 도구 모듈을 직수입하지 않게 하는 것이 목적:

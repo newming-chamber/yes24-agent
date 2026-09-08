@@ -4,6 +4,7 @@
 환각하게 되므로, 구조가 깨진 경우는 명시적으로 ParseError를 발생시켜 fail-loud한다.
 """
 
+import json
 import re
 from collections.abc import Mapping
 from datetime import datetime
@@ -14,6 +15,7 @@ from bs4 import BeautifulSoup, SoupStrainer
 from yes24_agent.sources import KST
 from yes24_agent.yes24.client import allowed_domain, is_allowed_host, is_disallowed_path
 from yes24_agent.yes24.selectors import (
+    BOOK_RESOURCE_KEYS,
     CATEGORY_DISPLAY_HREF_RE,
     CREMACLUB_AUTHOR,
     CREMACLUB_GOODS_NO_LINK,
@@ -25,6 +27,7 @@ from yes24_agent.yes24.selectors import (
     FAQ_ENTRY_LISTS,
     FAQ_QUESTION,
     FAQ_QUESTION_DECORATION,
+    GOODS_ORDER_OPTIONS,
     ITEM_AUTHOR,
     ITEM_AUTHOR_LINK,
     ITEM_AUTHOR_TOGGLE,
@@ -32,6 +35,8 @@ from yes24_agent.yes24.selectors import (
     ITEM_FEATURE,
     ITEM_FORMAT_LABEL,
     ITEM_FORMAT_LABEL_DECORATION,
+    ITEM_FORMAT_LINK,
+    ITEM_FORMAT_PRICE,
     ITEM_GOODS_NO_ATTR,
     ITEM_IMAGE,
     ITEM_IMAGE_ATTR,
@@ -57,6 +62,8 @@ from yes24_agent.yes24.selectors import (
     PRODUCT_FORMAT_PRICE,
     PRODUCT_GOODS_NAME_JS_RE,
     PRODUCT_GOODS_NO_JS_RE,
+    PRODUCT_IMAGE,
+    PRODUCT_IMAGE_ATTR,
     PRODUCT_INFO_TABLE_CAPTION,
     PRODUCT_INFO_TABLE_LABEL,
     PRODUCT_INFO_TABLE_ROW,
@@ -89,11 +96,12 @@ from yes24_agent.yes24.urls import BROWSE_SEED_URLS, product_url
 # 마크업이 같은 검색/베스트셀러/신간은 _parse_item 하나로 뽑고, 마크업이 다른
 # 크레마클럽도 이 키 집합을 그대로 채운다(없는 필드는 None) — 도구가 파서마다 다른 키
 # 집합을 상대하지 않게 하기 위함이다(필드 소실 드리프트 원천 차단).
-# 목록에 구조적으로 없는 필드(page_count·other_formats — 상세에서만 관측된다)도 여기
-# 담는다. 그런 필드는 _item_fields의 키 생략으로 "관측 불가"가 표시되므로, 합집합에
-# 두는 편이 안전하다: 상세 전용 필드를 뺐다가 도구가 손으로 되붙이면(과거 is_ebook이 그랬다)
-# product_fields를 우회해 **출처 레코드(meta)에서만 소실**된다. is_ebook은 목록에도
-# 구조가 있다(ITEM_FORMAT_LABEL — 2026-08-04 실측으로 정정).
+# 목록에 구조적으로 없는 필드(page_count — 상세에서만 관측된다)도 여기 담는다. 그런 필드는
+# _item_fields의 키 생략으로 "관측 불가"가 표시되므로, 합집합에 두는 편이 안전하다: 상세
+# 전용 필드를 뺐다가 도구가 손으로 되붙이면(과거 is_ebook이 그랬다) product_fields를 우회해
+# **출처 레코드(meta)에서만 소실**된다. is_ebook은 목록에도 구조가 있고(ITEM_FORMAT_LABEL —
+# 2026-08-04 실측으로 정정), other_formats도 검색 마크업의 관련상품 줄에 있다(ITEM_FORMAT_LINK
+# — 2026-09-08 실측으로 정정; 크레마클럽만 관측 불가).
 _ITEM_FIELDS = (
     "goods_no",
     "title",
@@ -112,6 +120,7 @@ _ITEM_FIELDS = (
     "features",
     "image_url",
     "is_ebook",
+    "is_book",
     "kind",
     "is_preorder",
     "other_formats",
@@ -289,9 +298,19 @@ def _parse_item(item, base_url: str) -> dict | None:
 
     return _item_fields(
         **observed_format,
+        **_book_fields(item),
         **observed_tags,
         **observed_features,
         **observed_preorder,
+        # 다른 판형(ITEM_FORMAT_LINK 주석)은 상세와 같은 레코드 스키마로 관측한다 — 줄이 비었거나
+        # 없으면 빈 목록("판형 없음", 상세의 위젯 없음과 같은 뜻). 이 마크업엔 줄이 항상 올 수
+        # 있으므로 키는 늘 낸다(크레마클럽 변환기는 호출하지 않아 키가 생략된다).
+        other_formats=_other_formats(
+            item,
+            link_selector=ITEM_FORMAT_LINK,
+            price_selector=ITEM_FORMAT_PRICE,
+            base_url=base_url,
+        ),
         goods_no=item.get(ITEM_GOODS_NO_ATTR),
         title=title,
         url=urljoin(base_url, href),
@@ -327,6 +346,7 @@ def parse_product(html: str, *, base_url: str) -> dict:
 
     반환 dict 키: goods_no, title, url, author, publisher, pub_date, list_price(int|None),
     sale_price(int|None), rating(float|None), page_count(int|None), is_ebook(bool),
+    image_url(str|None),
     other_formats(list[dict]), intro, toc, pub_review, weekly_reviews(list[str]),
     info_tables(dict — 캡션→{라벨: 값}, 표가 없으면 빈 dict).
     텍스트 블록(intro/toc/pub_review)은 없으면 None, weekly_reviews는 없으면 빈 리스트.
@@ -374,13 +394,34 @@ def parse_product(html: str, *, base_url: str) -> dict:
         "rating": _parse_rating(soup.select_one(PRODUCT_RATING)),
         "page_count": _parse_page_count(soup),
         "is_ebook": is_ebook,
-        "other_formats": _extract_other_formats(soup, base_url=base_url),
+        **_book_fields(soup),
+        "image_url": _image_url_or_none(soup, selector=PRODUCT_IMAGE, attr=PRODUCT_IMAGE_ATTR),
+        "other_formats": _other_formats(
+            soup,
+            link_selector=PRODUCT_FORMAT_LINK,
+            price_selector=PRODUCT_FORMAT_PRICE,
+            base_url=base_url,
+        ),
         "intro": _extract_infoset_text(soup, PRODUCT_INTRO),
         "toc": _extract_infoset_text(soup, PRODUCT_TOC),
         "pub_review": _extract_infoset_text(soup, PRODUCT_PUB_REVIEW),
         "weekly_reviews": _extract_weekly_reviews(soup),
         "info_tables": _extract_info_tables(soup),
     }
+
+
+def _book_fields(node) -> dict:
+    options = node.select_one(GOODS_ORDER_OPTIONS)
+    if options is None:
+        return {}
+    try:
+        value = json.loads(options.get("value", ""))
+    except (TypeError, ValueError):
+        return {}
+    resource_key = value.get("resource_key") if isinstance(value, dict) else None
+    if isinstance(resource_key, str) and resource_key.strip():
+        return {"is_book": resource_key in BOOK_RESOURCE_KEYS}
+    return {}
 
 
 def _extract_info_tables(soup: BeautifulSoup) -> dict[str, dict[str, str]]:
@@ -407,10 +448,13 @@ def _extract_info_tables(soup: BeautifulSoup) -> dict[str, dict[str, str]]:
     return tables
 
 
-def _extract_other_formats(soup: BeautifulSoup, *, base_url: str) -> list[dict]:
+def _other_formats(scope, *, link_selector: str, price_selector: str, base_url: str) -> list[dict]:
     """같은 작품의 다른 판형(eBook·중고 등)과 그 판매가를 레코드로 뽑는다.
 
-    Yes24 상세는 다른 판형을 링크로 싣고 라벨에 금액을 함께 렌더한다("eBook 12,000원 이동").
+    상세(PRODUCT_FORMAT_LINK — 위젯 "eBook 12,000원 이동")와 목록 행(ITEM_FORMAT_LINK — 관련상품
+    줄 "eBook 13,600원")이 같은 꼴(판형 이름 = 앵커 직계 텍스트, 금액 = 자손 요소 하나)이라
+    셀렉터만 바뀌는 한 함수다. 두 벌로 두면 항목 스키마가 갈라진다.
+
     이걸 범용 관련상품 링크로 흘리면 앵커 텍스트에 금액만 남고 **그 금액의 임자**가 사라져,
     모델이 열람 중인 상품의 출처에 다른 판형의 가격을 건다(실측 2026-08-03
     multiturn-reference: 종이책 출처 [1]에 "eBook 판매가 12,000원" 인용 — 값 자체는 참이고
@@ -418,14 +462,10 @@ def _extract_other_formats(soup: BeautifulSoup, *, base_url: str) -> list[dict]:
     묶어 임자를 되돌려준다.
 
     가격 없는 판형(중고상품 판매 신청 링크)은 sale_price=None으로 둔다 — 형제 파서와 같은
-    degrade 규약이다. 위젯이 아예 없는 상품은 빈 리스트(관측했으나 다른 판형 없음).
+    degrade 규약이다. 위젯·줄이 아예 없는 상품은 빈 리스트(관측했으나 다른 판형 없음).
     """
-    container = soup.select_one(PRODUCT_FORMAT_CONTAINER)
-    if container is None:
-        return []
-
     formats: list[dict] = []
-    for anchor in container.select(PRODUCT_FORMAT_LINK):
+    for anchor in scope.select(link_selector):
         # 판형 이름은 앵커의 **직계** 텍스트다 — 자손(가격 em·"이동" 아이콘)까지 긁으면
         # 이름과 금액이 도로 한 문자열로 붙는다. 이 함수가 없애려는 바로 그 형태다.
         name = _normalize_whitespace(" ".join(anchor.find_all(string=True, recursive=False)))
@@ -435,7 +475,7 @@ def _extract_other_formats(soup: BeautifulSoup, *, base_url: str) -> list[dict]:
         formats.append(
             {
                 "format": name,
-                "sale_price": _parse_grouped_int(anchor.select_one(PRODUCT_FORMAT_PRICE)),
+                "sale_price": _parse_grouped_int(anchor.select_one(price_selector)),
                 "url": urljoin(base_url, href) if href else None,
             }
         )
@@ -845,16 +885,19 @@ def _author_text_or_none(el) -> str | None:
     return text or None
 
 
-def _image_url_or_none(item) -> str | None:
-    """검색 결과 아이템의 표지 이미지 URL을 추출한다(없으면 None — 빈 성공 위장 금지).
+def _image_url_or_none(
+    item, *, selector: str = ITEM_IMAGE, attr: str = ITEM_IMAGE_ATTR
+) -> str | None:
+    """표지 이미지 URL을 추출한다(없으면 None — 빈 성공 위장 금지).
 
-    lazy-load라 실제 커버는 `src`(placeholder)가 아니라 `data-original`(ITEM_IMAGE_ATTR)에
-    든다. URL은 HTML 속성값을 그대로 쓰며 파생 패턴을 조립하지 않는다.
+    기본값은 목록 아이템용이다: lazy-load라 실제 커버는 `src`(placeholder)가 아니라
+    `data-original`(ITEM_IMAGE_ATTR)에 든다. 상세는 셀렉터·속성이 다르므로(PRODUCT_IMAGE·
+    PRODUCT_IMAGE_ATTR) 인자로 넘긴다. URL은 HTML 속성값을 그대로 쓰며 파생 패턴을 조립하지 않는다.
     """
-    img = item.select_one(ITEM_IMAGE)
+    img = item.select_one(selector)
     if img is None:
         return None
-    url = (img.get(ITEM_IMAGE_ATTR) or "").strip()
+    url = (img.get(attr) or "").strip()
     return url or None
 
 
