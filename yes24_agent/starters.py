@@ -65,12 +65,14 @@ from yes24_agent.yes24.parsers import (
     ParseError,
     parse_browse_list,
     parse_category_links,
+    parse_search,
 )
 from yes24_agent.yes24.urls import (
     BROWSE_SEED_URLS,
     browse_category_prefix,
     browse_url,
     product_url,
+    search_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,6 +86,8 @@ _STALE_RUN_FACTOR = 10
 # 골라주기 슬롯의 키 접미사. 슬롯 이름을 코드에 열거하지 않고 **시드 키에서 파생**한다
 # (bestseller → bestseller-pick) — 새 코너를 골라주기 대상으로 바꿔도 열거를 고칠 일이 없다.
 _PICK_SUFFIX = "-pick"
+# 오늘의 화제 슬롯. 재료가 시드 코너가 아니라 **바깥 세상**(웹 그라운딩)이라 키를 따로 둔다.
+_TREND_SLOT = "trend"
 
 
 def pick_slot(section: str) -> str:
@@ -97,7 +101,7 @@ def pick_base(slot: str) -> str | None:
 
 
 def auto_slots(settings: Settings) -> list[str]:
-    """자동 생성 대상 슬롯 — 상품 지목형(시드 키) + 골라주기형 1개(설정 시).
+    """자동 생성 대상 슬롯 — 상품 지목형(시드 키) + 골라주기 + 오늘의 화제(설정 시).
 
     서빙의 lazy 트리거·활성 풀 필터·어드민 생성이 **같은 목록**을 본다. 목록이 여러 벌이면
     코너를 바꿨을 때 한쪽만 고쳐 옛 슬롯이 고아로 남는다.
@@ -105,6 +109,8 @@ def auto_slots(settings: Settings) -> list[str]:
     slots = list(settings.starter_sections)
     if settings.starter_pick_from:
         slots.append(pick_slot(settings.starter_pick_from))
+    if settings.starter_trend_topics > 0:
+        slots.append(_TREND_SLOT)
     return slots
 
 
@@ -163,6 +169,30 @@ _PICK_INSTRUCTION = (
     "명절·새해처럼 오늘이 언제인지 모르고 쓰면 어긋나는 말이 그렇다(상황을 얹을 때는 시기가 "
     "아니라 사람·기분·장소·목적으로 얹는다). 특정 책 제목·저자·가격·평점은 문장에 넣지 않는다 "
     "— 무엇을 고를지는 답변이 정한다. 같은 세트 안에서는 서로 다른 분야를 다룬다."
+)
+
+# 오늘의 화제 재료를 모으는 질문. 그라운딩 콜이라 구조화 출력을 못 쓴다(빌트인 검색과
+# 함수 선언은 한 요청에 못 섞는다 — web_search 도구 주석) → 한 줄에 하나씩 받아 자른다.
+_TREND_PROMPT = (
+    "오늘 한국에서 사람들이 많이 이야기하는 화제를 {count}개 알려줘. "
+    "방송·영화·공연·인물·유행·계절 무엇이든 좋지만, **책과 이어질 만한 것**을 고른다"
+    "(원작이 있거나, 그 분야를 더 알고 싶어질 만한 것). "
+    "설명·번호·기호 없이 **한 줄에 하나씩 짧은 명사구만** 쓴다."
+)
+
+# 화제 문구의 계약. 지목형이 상품을, 골라주기가 분야를 가리킨다면 이쪽은 **바깥 화제**를
+# 가리키고 그것을 책으로 잇는다 — 첫 화면에서 "오늘"이 보이는 자리다.
+_TREND_INSTRUCTION = (
+    "오늘 사람들이 이야기하는 화제(topics)를 재료로, 빈 화면의 초기 질문 칩에 실릴 문장을 "
+    "만든다. 각 문장은 사용자가 그대로 눌러 보낼 완결된 질문이고, 사람이 입으로 말하듯 "
+    "반말로 끝맺는다('~있어?'·'~골라줘'·'~뭐야?'). 청하는 꼴이면 물음표를 붙이지 않는다. "
+    "**화제 하나를 골라 topic에 그 이름을 그대로 적고, 그 화제를 책으로 잇는 질문을 쓴다** "
+    "— 원작이나 관련 책을 찾거나, 그 주제를 더 알고 싶다는 꼴이다. 목록에 없는 화제를 "
+    "만들지 않는다. 화제 이름은 문장에서 알아볼 수 있게 쓰되 사람이 말하듯 줄여도 된다. "
+    "각 화제에는 그것으로 Yes24를 검색했을 때 실제로 나온 책 몇 권(found)이 딸려 있다 — "
+    "화제가 책과 이어진다는 증거이지 문장에 넣을 재료가 아니다. 특정 책 제목·저자·가격·"
+    "평점은 문장에 넣지 않는다(무엇을 권할지는 답변이 정한다). "
+    "날짜·요일을 지어내지 않는다. 같은 세트 안에서는 서로 다른 화제를 다룬다."
 )
 
 # 활성 풀 SELECT의 컬럼 순서 — dict 변환이 이 튜플로 하므로 SQL과 여기가 같이 움직인다.
@@ -262,6 +292,41 @@ def validate_items(
             continue
         seen_texts.add(text)
         kept[slot].append({"slot": slot, "goods_no": goods_no, "text": text})
+    return kept, dropped
+
+
+def validate_trend_items(
+    raw_items: list, topics: list[dict], *, max_chars: int
+) -> tuple[list[dict], int]:
+    """화제 문구의 출구 검증 — 오늘 모은 화제 목록과 대조한다(분야 검증과 같은 자리).
+
+    화제 이름을 통째로 요구하지 않는다. 사람이 말할 때는 줄여 쓰기 때문이다("크리스토퍼
+    놀란 감독 영화 오디세이" → "오디세이"). 이름의 조각 중 두 글자 이상인 것이 하나라도
+    문장에 있으면 그 화제를 가리킨 것으로 본다 — 관측본과의 대조이지 허용 단어 목록이 아니다.
+    """
+    by_name = {_squash(t["topic"]): t for t in topics}
+    kept: list[dict] = []
+    dropped = 0
+    seen: set[str] = set()
+    for item in raw_items:
+        name = _squash(item.get("topic"))
+        text = _squash(item.get("text"))
+        words = name.replace("·", " ").split()
+        parts = [w for w in words if len(w) >= 2] if name in by_name else []
+        reason = (
+            "unobserved_topic" if name not in by_name
+            else "topic_not_in_text" if not any(part in text for part in parts)
+            else "empty_text" if not text
+            else "over_max_chars" if len(text) > max_chars
+            else "duplicate_text" if text in seen
+            else None
+        )
+        if reason:
+            dropped += 1
+            logger.warning(f"starters 폐기(화제): topic={name!r} reason={reason} text={text!r}")
+            continue
+        seen.add(text)
+        kept.append({"topic": name, "text": text})
     return kept, dropped
 
 
@@ -450,6 +515,118 @@ async def _observe_categories(section: str, settings: Settings, client) -> list[
     return [c for c in links if c["number"].startswith(prefix) and c["number"] != prefix]
 
 
+async def _observe_trends(settings: Settings, client, genai_client) -> list[dict]:
+    """오늘의 화제 → **Yes24에 실제로 책이 있는 것만** 남긴다.
+
+    바깥 세상 신호(웹 그라운딩)를 재료로 쓰지만, 접지는 여전히 Yes24가 한다 — 화제 하나로
+    검색해 결과가 0건이면 그 화제는 재료에서 빠진다. "그 화제로 책 이야기를 할 수 있는가"를
+    문구 규칙이 아니라 **검색 결과의 유무**로 판정하는 자리다(억지 연결을 구조로 막는다).
+    """
+    response = await asyncio.wait_for(
+        genai_client.aio.models.generate_content(
+            model=settings.web_grounding_model,
+            contents=_TREND_PROMPT.format(count=settings.starter_trend_topics),
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())], temperature=0.3
+            ),
+        ),
+        timeout=settings.starter_timeout_s,
+    )
+    record_usage("starter_trend", response.usage_metadata, model=settings.web_grounding_model)
+    # 그라운딩 응답은 자유 텍스트다 — 줄을 잘라 앞머리 기호만 벗긴다(파싱이 새도 아래
+    # 검색 단계가 걸러내므로 무해하다).
+    topics = []
+    for line in (response.text or "").splitlines():
+        name = _squash(line).lstrip("-*•0123456789.) ").strip("*")
+        if name and name not in topics:
+            topics.append(name)
+    topics = topics[: settings.starter_trend_topics]
+    if not topics:
+        return []
+
+    async def _found(topic: str) -> list[dict]:
+        try:
+            html = await client.get_text(search_url(settings.yes24_base_url, topic))
+            rows = await asyncio.to_thread(
+                parse_search, html, base_url=settings.yes24_base_url, limit=3
+            )
+        except (Yes24FetchError, ParseError):
+            return []
+        return [row["title"] for row in rows if row.get("title")]
+
+    found = await asyncio.gather(*(_found(topic) for topic in topics))
+    return [
+        {"topic": topic, "found": titles} for topic, titles in zip(topics, found) if titles
+    ]
+
+
+async def _generate_trends(
+    settings: Settings, *, client, genai_client
+) -> dict:
+    """오늘의 화제 슬롯의 재료 수집 → 생성(1콜) → 검증. 골라주기와 같은 결과 모양이다."""
+    try:
+        topics = await _observe_trends(settings, client, genai_client)
+    except Exception as exc:  # noqa: BLE001 — 바깥 신호는 없을 수 있다: 슬롯만 failed
+        return _failed(f"화제 수집 실패: {type(exc).__name__}: {exc}")
+    if not topics:
+        return _failed("화제 0건(웹 신호 없음 또는 Yes24 검색 결과 없음)")
+
+    count = min(settings.starter_per_slot, len(topics))
+    order = ["topic", "text"]
+    schema = types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "items": types.Schema(
+                type=types.Type.ARRAY,
+                min_items=count,
+                max_items=count,
+                items=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "topic": types.Schema(
+                            type=types.Type.STRING, enum=[t["topic"] for t in topics]
+                        ),
+                        "text": types.Schema(type=types.Type.STRING),
+                    },
+                    required=order,
+                    property_ordering=order,
+                ),
+            )
+        },
+        required=["items"],
+    )
+    try:
+        response = await asyncio.wait_for(
+            genai_client.aio.models.generate_content(
+                model=settings.starter_model,
+                contents=json.dumps({"topics": topics}, ensure_ascii=False),
+                config=types.GenerateContentConfig(
+                    system_instruction=_TREND_INSTRUCTION
+                    + f" 문장 전체는 {settings.starter_max_chars}자를 넘기지 않는다.",
+                    temperature=1.0,
+                    response_mime_type="application/json",
+                    response_schema=schema,
+                ),
+            ),
+            timeout=settings.starter_timeout_s,
+        )
+        record_usage("starter", response.usage_metadata, model=settings.starter_model)
+        raw_items = json.loads(response.text or "{}").get("items") or []
+    except Exception as exc:  # noqa: BLE001 — 백그라운드 생성: 실패는 슬롯 failed로 접는다
+        return _failed(f"생성 실패: {type(exc).__name__}: {exc}")
+
+    kept, dropped = validate_trend_items(
+        raw_items, topics, max_chars=settings.starter_max_chars
+    )
+    if not kept:
+        return _failed("출구 검증에서 전부 폐기(관측 밖 화제·빈 문장·중복·상한 초과)", dropped)
+    items = [
+        {"slot": _TREND_SLOT, "goods_no": None, "text": item["text"], "source_url": None}
+        for item in kept
+    ]
+    return {"status": "ok", "items": items, "dropped": dropped, "detail": ""}
+
+
 async def _generate_picks(
     section: str, settings: Settings, *, today: dt.date, client, genai_client
 ) -> dict:
@@ -559,11 +736,15 @@ async def build_candidates(
     observed: dict[str, list[dict]] = {}
     # 골라주기 슬롯은 재료(분야 목록)도 스키마도 달라 **자기 콜**을 쓴다. 한 스키마에
     # 상품 칸과 분야 칸을 섞으면 안 쓰는 칸을 채우려는 편향이 생긴다.
+    if _TREND_SLOT in slots:
+        results[_TREND_SLOT] = await _generate_trends(
+            settings, client=client, genai_client=genai_client
+        )
     for slot in [s for s in slots if pick_base(s)]:
         results[slot] = await _generate_picks(
             pick_base(slot), settings, today=today, client=client, genai_client=genai_client
         )
-    for slot in [s for s in slots if not pick_base(s)]:
+    for slot in [s for s in slots if not pick_base(s) and s != _TREND_SLOT]:
         try:
             rows = await _observe(slot, settings, client, today)
         except (Yes24FetchError, ParseError) as exc:

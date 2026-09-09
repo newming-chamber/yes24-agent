@@ -724,6 +724,10 @@ class Settings(BaseSettings):
     starter_pick_from: str = "bestseller"
     # 코너 내비에서 읽을 링크 수 상한. 60이면 국내도서 트리 32개 분야가 전부 들어온다(실측).
     starter_pick_category_limit: int = 60
+    # 오늘의 화제 슬롯이 모을 화제 수(0이면 그 슬롯을 만들지 않는다). 재료는 웹 그라운딩이지만
+    # 각 화제를 Yes24에서 검색해 **책이 나온 것만** 남긴다 — 억지 연결은 문구 규칙이 아니라
+    # 검색 결과의 유무로 막는다. 첫 화면에서 "오늘"이 보이는 유일한 자리다.
+    starter_trend_topics: int = 8
     # 슬롯당 하루 생성 개수. 회전 폭(요청마다 슬롯별 1개 무작위)의 재료 수이자 구조화 출력의
     # min_items=max_items(슬롯 수 × 이 값) — 개수는 프롬프트 문구가 아니라 스키마가 강제한다.
     starter_per_slot: int = 5
@@ -745,6 +749,7 @@ class Settings(BaseSettings):
         "bestseller": "베스트셀러",
         "attentionnewproduct": "신간",
         "bestseller-pick": "책 추천",
+        "trend": "요즘 화제",
         "policy": "이용 안내",
         "general": "무엇이든",
     }
