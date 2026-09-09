@@ -174,6 +174,16 @@ BROWSE_SEED_URLS: dict[str, dict] = {
         "item": NEWPRODUCT_ITEM,
         "has_rank": False,
     },
+    "attentionnewproduct": {
+        "url": (
+            "https://www.yes24.com/product/category/attentionnewproduct?categoryNumber=001"
+        ),
+        "label": "주목할 신상품(국내도서)",
+        "markup": "search",
+        "list_container": NEWPRODUCT_LIST_CONTAINER,
+        "item": NEWPRODUCT_ITEM,
+        "has_rank": False,
+    },
     "cremaclub": {
         "url": "https://cremaclub.yes24.com/BookClub/Best",
         "label": "크레마클럽 인기(eBook 구독)",

@@ -29,11 +29,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, StringConstraints
 from starlette.routing import Match
 
-from yes24_agent.admin import client_ip, register_admin
+from yes24_agent.admin import client_ip, register_admin, require_admin
 from yes24_agent.auth import (
     AuthenticatedUser,
     AuthService,
     close_auth_service,
+    enforce_rate_limit,
     get_authenticated_user,
     signed_access_token,
     token_matches,
@@ -53,6 +54,7 @@ from yes24_agent.rbti.profile import fetch_user_rbti
 from yes24_agent.runner import run_agent_stream
 from yes24_agent.session_service import SQLITE_DIALECT, db_dialect, persistence_mode
 from yes24_agent.sse import OVERVIEW_EVENT_CONTRACT, SSE_EVENT_CONTRACT
+from yes24_agent.starters import close_starter_service, register_starters
 from yes24_agent.thought_translation import warmup_translation
 from yes24_agent.toolsets import TOOLSETS, get_resolved_app, resolve_app_for
 from yes24_agent.usage import close_usage_logger
@@ -99,8 +101,8 @@ _ACCESS_EXEMPT_PATHS = frozenset(
 )
 
 
-def _key_checking_routes(app: FastAPI) -> list:
-    """x-api-key로 월을 대신할 수 있는 **라우트 객체** 목록 — 라우터에서 파생한다(손목록 금지).
+def _delegating_routes(app: FastAPI, judge) -> list:
+    """`judge`를 의존성으로 가진 **라우트 객체** 목록 — 라우터에서 파생한다(손목록 금지).
 
     월 통과는 면제가 아니라 **판정 위임**이다. 그러므로 위임받을 판정자, 즉
     `get_authenticated_user` 의존성을 실제로 가진 라우트만 열 수 있다.
@@ -131,13 +133,16 @@ def _key_checking_routes(app: FastAPI) -> list:
                 found.extend(_walk(inner.routes))
                 continue
             dependant = getattr(route, "dependant", None)
-            if dependant is not None and any(
-                d.call is get_authenticated_user for d in dependant.dependencies
-            ):
+            if dependant is not None and any(d.call is judge for d in dependant.dependencies):
                 found.append(route)
         return found
 
     return _walk(app.routes)
+
+
+def _key_checking_routes(app: FastAPI) -> list:
+    """x-api-key로 월을 대신할 수 있는 라우트 — 판정자는 get_authenticated_user다."""
+    return _delegating_routes(app, get_authenticated_user)
 
 
 def _key_route_matches(routes: list, request: Request) -> bool:
@@ -450,6 +455,8 @@ async def lifespan(app: FastAPI):
     await close_auth_service()
     # 사용자별 대화 데이터(피드백·읽음·제목) 풀도 같은 방식으로 닫는다(만들어진 적 없으면 no-op).
     await close_user_data_service()
+    # 초기 질문 풀 서비스도 같은 방식으로 닫는다(만들어진 적 없으면 no-op).
+    await close_starter_service()
     # 토큰 사용량 기록 풀도 나란히 정리한다 — 진행 중인 fire-and-forget INSERT를
     # 배수한 뒤 닫는다(만들어진 적 없으면 no-op).
     await close_usage_logger()
@@ -513,18 +520,27 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
             if request.method == "OPTIONS" and "access-control-request-method" in request.headers:
                 return await call_next(request)
 
-            has_api_key = bool(request.headers.get("x-api-key"))
             key_routes = route_cache.get("routes")
             if key_routes is None:
                 key_routes = route_cache["routes"] = _key_checking_routes(app)
+                route_cache["admin"] = _delegating_routes(app, require_admin)
                 logger.info(
                     "로그인월: x-api-key 통과 허용 경로 "
-                    f"{sorted(r.path for r in key_routes)}"
+                    f"{sorted(r.path for r in key_routes)} / x-admin-key 통과 허용 경로 "
+                    f"{sorted(r.path for r in route_cache['admin'])}"
                 )
             if (
-                has_api_key
+                request.headers.get("x-api-key")
                 and _key_route_matches(key_routes, request)
                 and AuthService.get_instance().enabled
+            ):
+                return await call_next(request)
+            # 운영자 헤더도 같은 규칙이다 — 판정자(require_admin)를 가진 라우트만 열고, 키의
+            # 유효성은 그 판정자가 그대로 검사한다(무효 헤더는 401). 월이 이것을 막으면 배포
+            # 환경에서 어드민 API에 닿을 길이 없어진다(쿠키를 발급하는 /admin 로그인은 sqlite
+            # 구성에서만 등록된다).
+            if request.headers.get("x-admin-key") and _key_route_matches(
+                route_cache["admin"], request
             ):
                 return await call_next(request)
             if path in _ACCESS_EXEMPT_PATHS or any(
@@ -813,6 +829,8 @@ def create_app() -> FastAPI:
 
     @app.post(
         "/chat/stream",
+        # 한도는 LLM 호출에만 건다 — 조회 라우트는 세지 않는다(auth.enforce_rate_limit).
+        dependencies=[Depends(enforce_rate_limit)],
         responses=_SSE_RESPONSES,
         response_class=StreamingResponse,
         response_description="SSE 이벤트 스트림",
@@ -885,6 +903,8 @@ def create_app() -> FastAPI:
 
         @app.post(
             "/overview",
+            # 오버뷰는 LLM을 부른다 — 한도 대상. warm(검색만)·continue(캐시 시딩)는 아니다.
+            dependencies=[Depends(enforce_rate_limit)],
             responses=_SSE_RESPONSES,
             response_class=StreamingResponse,
             response_description="SSE 이벤트 스트림",
@@ -976,6 +996,10 @@ def create_app() -> FastAPI:
     # 집합에 자동으로 파생된다(_key_checking_routes). include_router가 아니라 직접 등록인
     # 이유는 history.py 라우트 절 주석 참조(지연 프록시가 통과 집합 파생을 가린다).
     register_history(app)
+
+    # 초기 질문 회전 풀(GET /chat/starters·/admin/starters/*). starter_model이 빈 값이면 미등록
+    # (404 — overview_model 관례). 라우트·풀·생성의 소유자는 starters.py다.
+    register_starters(app, settings)
 
     # 매트릭스 스트리밍 엔드포인트도 배포 게이팅(matrix_enabled) 대상 — off면 미등록(404).
     if settings.matrix_enabled:

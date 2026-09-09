@@ -687,8 +687,11 @@ class Settings(BaseSettings):
     mysql_connect_timeout_s: float = 5.0
     # 신규 자동등록 사용자에게 부여하는 기본 rate limit(분당·일당). 기존 사용자는 users
     # 행의 값이 우선한다 — 여기 값은 등록 시점의 초기값이자 행이 비었을 때의 폴백이다.
+    # 한도는 **LLM을 호출하는 라우트에만** 걸린다(auth.enforce_rate_limit) — 세션 목록·읽음
+    # 표시 같은 조회는 세지 않는다. 조회까지 세던 때는 하루 500 중 실제 대화가 205회인데
+    # 한도가 찼다(실측 2026-09-09: 조회가 295회로 60%).
     rate_limit_rpm: int = 20
-    rate_limit_rpd: int = 500
+    rate_limit_rpd: int = 1000
 
     # 사용자별 대화 부가 데이터(user_data.py → turn_feedback·session_ui) 커넥션 풀 상한.
     # 두 테이블이 한 서비스·한 풀인 이유는 같은 DB·같은 사용자 스코프·같은 실패 정책이기
@@ -698,6 +701,57 @@ class Settings(BaseSettings):
     # auth·usage와는 풀을 나눈 채로 둔다 — auth는 전 요청의 임계 경로이고 usage는 폭주할 수
     # 있는 백그라운드 기록이라, 한쪽의 고갈이 다른 쪽을 굶기지 않게 격벽을 둔다(의도된 분리).
     user_data_pool_max: int = 2
+    # ── 초기 질문(스타터) 회전 풀(starters.py, docs/starters-design.md) ─────────────────
+    # 생성 모델. 관측된 목록을 질문 문장으로 옮기는 구조화 출력 1콜이라 깊은 추론이 불필요하다
+    # — enrichment·overview와 같은 경량 유틸 모델 관례. **빈 문자열이면 기능 전체 off**:
+    # GET /chat/starters·/admin/starters/* 라우트를 등록하지 않는다(404 — overview_model 관례의
+    # 구조적 off 스위치). 프론트는 404·503 모두 자체 폴백(BRANDING.examples)이다.
+    starter_model: str = "gemini-3.1-flash-lite"
+    # 자동 생성 슬롯 = 관측할 코너(yes24/urls.py BROWSE_SEED_URLS의 키). 시드 키가 곧 슬롯이라
+    # 코드에 슬롯 열거가 없고, 표에 없는 키는 기동 시 ValueError(fail-loud). 타입이 list[str]인
+    # 이유는 enabled_toolsets와 같다(config는 레지스트리를 모른다).
+    # env: STARTER_SECTIONS='["bestseller","new"]'
+    starter_sections: list[str] = ["bestseller", "attentionnewproduct"]
+    # 같은 상품을 다시 쓰기까지 비우는 날 수. 종합 베스트셀러는 **주간 집계**라 한 주 동안
+    # 관측 행이 그대로다 — 매일 생성해도 모델이 상위권을 골라 같은 책이 반복된다(실측: 하루
+    # 6라운드에서 같은 5권). 최근 이 창 안에 쓴 goods_no를 payload에서 빼 재료 자체를 굴린다.
+    # 3일 = per_slot(5) × 3 = 15건으로 코너 한 페이지(24행)를 다 비우지 않는 폭. 창이 길면
+    # 누적 제외가 행 수를 넘어 슬롯이 굶는다(7일로 두었더니 베스트셀러가 세 라운드 비었다).
+    starter_repeat_window_days: int = 3
+    # 골라주기 슬롯의 재료 코너(BROWSE_SEED_URLS 키). 빈 문자열이면 그 슬롯을 만들지 않는다.
+    # 상품 지목형 문장만 있으면 "골라준다"는 능력이 첫 화면에 안 보인다 — 심사 실측에서
+    # 현행 3칩이 갖고 있던 목록형 시연이 사라졌다는 지적을 받은 자리다.
+    starter_pick_from: str = "bestseller"
+    # 코너 내비에서 읽을 링크 수 상한. 60이면 국내도서 트리 32개 분야가 전부 들어온다(실측).
+    starter_pick_category_limit: int = 60
+    # 슬롯당 하루 생성 개수. 회전 폭(요청마다 슬롯별 1개 무작위)의 재료 수이자 구조화 출력의
+    # min_items=max_items(슬롯 수 × 이 값) — 개수는 프롬프트 문구가 아니라 스키마가 강제한다.
+    starter_per_slot: int = 5
+    # 한 번에 서빙하는 칩 수의 기본값(GET /chat/starters의 n 기본). NN/g 2024/2025: 3~5개.
+    starter_count: int = 4
+    # 문장 길이 상한(문자). 자동 생성분은 출구에서 초과분을 **폐기**하고(절단 금지 — 누르면 그대로
+    # 전송되는 문장이다), 수동 추가는 422로 거절한다. 이 값은 문장이 담아야 할 것들의 합이다:
+    # 순위(7자)+『제목』(2자+제목)+사람이 말하듯 끝맺는 질문. 좁히면 그 셋이 서로를 밀어낸다 —
+    # 40에서는 "…수록 범위는?"처럼 명사로 끊었고, 45에서 순위를 필수로 만들자 "판형은 어떻게
+    # 돼?"처럼 질문이 사양 확인으로 밀렸다(둘 다 실측). 52에서 순위 5/5·폐기 0·32~49자다.
+    starter_max_chars: int = 52
+    # 생성 서브콜 상한(초). 관측(Yes24 2페이지)과 별개로 모델 콜 하나에 적용된다 — 백그라운드
+    # 태스크라 서빙 지연에는 얹히지 않지만, 매달린 콜이 오늘자 잠금을 running으로 붙들지 않게 한다.
+    starter_timeout_s: float = 15.0
+    # 칩에 표시할 **사용자 언어** 라벨(슬롯 → 문구). 시드 표의 label("베스트셀러(국내도서)")은
+    # 모델이 코너를 식별하는 도구용 이름이라 UI에 그대로 쓰면 데이터 소스 이름이 노출된다 —
+    # 원래 프론트 칩은 "도서 추천"처럼 짧은 카테고리였다. 여기 없는 슬롯은 시드 label로 폴백.
+    starter_labels: dict[str, str] = {
+        "bestseller": "베스트셀러",
+        "attentionnewproduct": "신간",
+        "bestseller-pick": "책 추천",
+        "policy": "이용 안내",
+        "general": "무엇이든",
+    }
+    # 스타터 서비스 커넥션 풀 상한. 서빙은 요청당 SELECT 2건, 생성은 하루 1회 트랜잭션이라
+    # user_data와 같은 최소 크기다(격벽 근거도 같다 — user_data_pool_max 주석).
+    starter_pool_max: int = 2
+
     # 대화 목록(GET /chat/sessions) 응답 세션 수 상한(최근 갱신순 앞에서 자름). ADK
     # list_sessions는 사용자 전체를 돌려주므로 장수 사용자의 목록 한 장이 무한히 크지 않게
     # 천장을 둔다 — admin_page_size(운영 조회 페이지)와는 다른 축의 값이라 따로 둔다.

@@ -1241,13 +1241,27 @@
     } catch (e) {}
     updateBadge();
 
+    // 초기 질문 칩 — 정본은 서버 회전 풀(GET /chat/starters, 진입 시 1회·폴링 금지). 404(기능
+    // off)·503(저장소 없음)·네트워크 실패·빈 배열이면 BRANDING.examples로 폴백한다(외부 프론트와
+    // 같은 계약). 배열 길이를 가정하지 않고, text는 절단·편집 없이 그대로 전송한다.
+    let starters = null;
+    async function loadStarters() {
+      try {
+        const r = await fetch("/chat/starters");
+        if (!r.ok) return;
+        const list = (await r.json()).starters;
+        if (Array.isArray(list) && list.length) starters = list;
+      } catch (e) { /* 폴백 */ }
+    }
     function renderChipsInto(target) {
       target.textContent = "";
-      for (const ex of BRANDING?.examples ?? []) {
+      const items = starters ?? (BRANDING?.examples ?? []).map((text) => ({ text }));
+      for (const item of items) {
         const chip = document.createElement("button");
         chip.className = "chip";
-        chip.textContent = ex;
-        chip.addEventListener("click", () => { if (!sending) submit(ex); });
+        if (item.slot) chip.dataset.slot = item.slot; // 아이콘·스타일 매핑 축은 slot
+        chip.textContent = item.text;
+        chip.addEventListener("click", () => { if (!sending) submit(item.text); });
         target.appendChild(chip);
       }
     }
@@ -2537,7 +2551,8 @@
       input.dispatchEvent(new Event("input")); // 높이·전송버튼 상태 갱신
     })();
 
-    renderChipsInto(chipsEl);
+    renderChipsInto(chipsEl); // 폴백을 먼저 그리고, 서버 풀이 오면 같은 자리에 다시 그린다.
+    loadStarters().then(() => { if (starters) renderChipsInto(chipsEl); });
     // 재방문 복원: 세션이 살아 있으면 그 대화를 화면에 되살린다. 핸드오프(위)는 세션을 비우므로
     // 여기서 옛 기록이 폐기돼 "새 대화 + 프리필"이 된다 — 경로별 분기 없이 불변식이 처리한다.
     restoreTranscript();

@@ -136,7 +136,12 @@ class MysqlBackedService:
             raise HTTPException(status_code=503, detail=self._failure_detail) from exc
 
     async def _run(self, sql: str, params: tuple, *, fetch_all: bool = False):
-        """질의 1건 실행(필요하면 전 행 반환). DB 오류는 삼키지 않고 503으로 올린다."""
+        """질의 1건 실행. fetch_all이면 전 행, 아니면 `(rowcount, lastrowid)`를 돌려준다.
+
+        쓰기가 rowcount·lastrowid를 돌려주는 이유: 선점형 잠금(`INSERT IGNORE`의 rowcount 0 =
+        다른 워커가 먼저 잡았다)과 새 행의 id가 필요한 호출자가 있다. DB 오류는 삼키지 않고
+        503으로 올린다.
+        """
         if self._db is None:
             raise HTTPException(status_code=503, detail=self._unavailable_detail)
         try:
@@ -144,7 +149,7 @@ class MysqlBackedService:
             async with pool.acquire() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(sql, params)
-                    return await cur.fetchall() if fetch_all else None
+                    return await cur.fetchall() if fetch_all else (cur.rowcount, cur.lastrowid)
         except HTTPException:
             raise
         except Exception as exc:  # noqa: BLE001 — 저장 실패를 200으로 숨기지 않는다(fail-loud)

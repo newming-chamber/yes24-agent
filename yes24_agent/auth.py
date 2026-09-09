@@ -25,10 +25,10 @@ import time
 from dataclasses import dataclass
 from hashlib import sha256
 from secrets import compare_digest
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
-from fastapi import HTTPException, Request, Security
+from fastapi import Depends, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
 
 from yes24_agent.config import get_settings
@@ -375,12 +375,17 @@ async def get_authenticated_user(
     request: Request,
     x_api_key: str | None = Security(API_KEY_HEADER),
 ) -> AuthenticatedUser | None:
-    """FastAPI 의존성: `x-api-key` 검증 + rate limit 기록.
+    """FastAPI 의존성: `x-api-key` 검증(**한도는 세지 않는다**).
 
     헤더가 없으면 None(익명 허용 — 내장 UI·로컬 개발 경로가 그대로 돈다). 헤더가 있는데
-    키가 비활성이면 401, 한도를 넘으면 429, 인증 DB가 죽었으면 503이다. 예외를 삼켜
-    익명으로 강등하지 않는다 — 조용한 강등은 "인증됐다고 믿는 익명 세션"을 만든다.
+    키가 비활성이면 401, 인증 DB가 죽었으면 503이다. 예외를 삼켜 익명으로 강등하지
+    않는다 — 조용한 강등은 "인증됐다고 믿는 익명 세션"을 만든다.
+
+    **요청 한도는 여기가 아니라 `enforce_rate_limit`이 센다.** 둘을 한 의존성에 묶었더니
+    인증만 필요한 조회 라우트(세션 목록·읽음 표시·초기 질문)까지 한도를 깎았다 — 하루 500
+    중 실제 대화가 205회인데 한도가 찬 실측이 그것이다(2026-09-09).
     """
+    del request  # 라우트 템플릿은 한도 기록 쪽에서 쓴다
     if not x_api_key:
         return None
 
@@ -389,10 +394,33 @@ async def get_authenticated_user(
         # 세션 DB가 mysql이 아닌 환경(로컬 sqlite): 인증 테이블 자체가 없다 — 익명으로 흘린다.
         return None
 
-    user = await service.authenticate(x_api_key)
+    return await service.authenticate(x_api_key)
+
+
+async def enforce_rate_limit(
+    request: Request,
+    user: Annotated[AuthenticatedUser | None, Depends(get_authenticated_user)] = None,
+) -> None:
+    """FastAPI 의존성: 요청 한도 검사 + 기록. **LLM을 호출하는 라우트에만** 붙인다.
+
+    한도의 목적은 LLM 호출 비용 방어이므로 세는 대상도 그것이어야 한다 — 조회는 같은
+    무게로 세면 안 된다. 익명(헤더 없음)·인증 스택 없는 구성에서는 셀 대상이 없어 무동작.
+
+    `get_authenticated_user`를 의존성으로 받으므로 FastAPI가 요청당 한 번만 실행하고(의존성
+    캐시) 라우트가 받는 user와 같은 객체다. 라우트 시그니처에도 그 의존성이 그대로 남아
+    로그인월의 x-api-key 통과 집합 파생(main._key_checking_routes)은 영향받지 않는다.
+    """
+    # 셀 대상이 없으면 무동작. 익명(헤더 없음)이면 **서비스에 손대기 전에** 빠진다 —
+    # get_instance()는 전역 싱글턴을 만들어 뒤따르는 테스트가 그것을 물려받는다.
+    if user is None:
+        return
+    service = AuthService.get_instance()
+    # 인증 테이블이 없는 구성(로컬 sqlite)에서도 셀 대상이 없다. 인증 의존성과 **같은
+    # 방어**를 둔다 — 한쪽만 방어하면 스택 없는 구성에서 여기만 터진다.
+    if not service.enabled:
+        return
     await service.check_rate_limit(user)
-    await service.record_request(x_api_key, _route_template(request))
-    return user
+    await service.record_request(user.api_key, _route_template(request))
 
 
 def _route_template(request: Request) -> str:

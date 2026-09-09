@@ -20,11 +20,11 @@ from pathlib import Path
 from secrets import compare_digest
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from yes24_agent.auth import signed_access_token, token_matches
-from yes24_agent.config import Settings
+from yes24_agent.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -302,6 +302,24 @@ def fetch_session_detail(
         "sources": state.get("sources", []),
         "metrics": _session_metrics(events),
     }
+
+
+def require_admin(request: Request) -> None:
+    """운영자 자격 판정자 — admin 쿠키(로컬 /admin 로그인) 또는 헤더 `x-admin-key`.
+
+    헤더를 함께 받는 이유: 배포(MySQL)에는 /admin 로그인 라우트가 등록되지 않아(세션 sqlite
+    조회기라 sqlite 구성에서만 등록) 쿠키를 얻을 길이 없다 — 외부 운영 도구가 붙을 자리다.
+    로그인월(main.access_gate)은 이 함수를 **의존성으로 가진 라우트만** x-admin-key로 열어
+    준다(판정 위임, get_authenticated_user와 같은 규칙).
+    """
+    password = get_settings().admin_password
+    header = request.headers.get("x-admin-key", "")
+    if password and (
+        _authorized(request, password)
+        or compare_digest(header.encode("utf-8"), password.encode("utf-8"))
+    ):
+        return
+    raise HTTPException(status_code=401, detail="인증이 필요합니다.")
 
 
 # ── 라우터 ─────────────────────────────────────────────────────────────────
