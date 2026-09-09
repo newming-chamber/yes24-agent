@@ -728,6 +728,10 @@ class Settings(BaseSettings):
     # 각 화제를 Yes24에서 검색해 **책이 나온 것만** 남긴다 — 억지 연결은 문구 규칙이 아니라
     # 검색 결과의 유무로 막는다. 첫 화면에서 "오늘"이 보이는 유일한 자리다.
     starter_trend_topics: int = 8
+    # 이용 안내 슬롯의 재료(POLICY_SEEDS 키). 빈 문자열이면 그 슬롯을 만들지 않는다.
+    # FAQ 입구는 "고객센터가 실제로 답하고 있는 질문"을 SSR로 실어, 그것을 사용자 말투로
+    # 옮기면 답이 있다는 것이 재료 자체로 보장된다.
+    starter_policy_source: str = "faq"
     # 슬롯당 하루 생성 개수. 회전 폭(요청마다 슬롯별 1개 무작위)의 재료 수이자 구조화 출력의
     # min_items=max_items(슬롯 수 × 이 값) — 개수는 프롬프트 문구가 아니라 스키마가 강제한다.
     starter_per_slot: int = 5

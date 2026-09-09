@@ -42,11 +42,12 @@ import datetime as dt
 import json
 import logging
 import random
-import time
 import unicodedata
 import uuid
+from dataclasses import dataclass, field
 from typing import Annotated, Any
 
+from bs4 import BeautifulSoup
 from fastapi import Depends, FastAPI, HTTPException, Query
 from google.genai import types
 from pydantic import AfterValidator, BaseModel, Field, StringConstraints, model_validator
@@ -63,12 +64,14 @@ from yes24_agent.yes24.client import Yes24FetchError
 from yes24_agent.yes24.parsers import (
     _PUBLICATION_DATE_RE,
     ParseError,
+    extract_faq_entries,
     parse_browse_list,
     parse_category_links,
     parse_search,
 )
 from yes24_agent.yes24.urls import (
     BROWSE_SEED_URLS,
+    POLICY_SEEDS,
     browse_category_prefix,
     browse_url,
     product_url,
@@ -86,114 +89,13 @@ _STALE_RUN_FACTOR = 10
 # 골라주기 슬롯의 키 접미사. 슬롯 이름을 코드에 열거하지 않고 **시드 키에서 파생**한다
 # (bestseller → bestseller-pick) — 새 코너를 골라주기 대상으로 바꿔도 열거를 고칠 일이 없다.
 _PICK_SUFFIX = "-pick"
-# 오늘의 화제 슬롯. 재료가 시드 코너가 아니라 **바깥 세상**(웹 그라운딩)이라 키를 따로 둔다.
+# 재료가 시드 코너가 아닌 슬롯들 — 키를 파생할 곳이 없어 이름을 여기서 정한다.
 _TREND_SLOT = "trend"
+_GENERAL_SLOT = "general"
+_POLICY_SLOT = "policy"
+# 재료 참조키의 상한(FAQ 질문처럼 긴 문자열을 ref로 쓸 때 스키마 enum이 비대해지지 않게).
+_REF_MAX_CHARS = 80
 
-
-def pick_slot(section: str) -> str:
-    return f"{section}{_PICK_SUFFIX}"
-
-
-def pick_base(slot: str) -> str | None:
-    """골라주기 슬롯이면 그 재료 코너, 아니면 None."""
-    base = slot.removesuffix(_PICK_SUFFIX)
-    return base if base != slot and base in BROWSE_SEED_URLS else None
-
-
-def auto_slots(settings: Settings) -> list[str]:
-    """자동 생성 대상 슬롯 — 상품 지목형(시드 키) + 골라주기 + 오늘의 화제(설정 시).
-
-    서빙의 lazy 트리거·활성 풀 필터·어드민 생성이 **같은 목록**을 본다. 목록이 여러 벌이면
-    코너를 바꿨을 때 한쪽만 고쳐 옛 슬롯이 고아로 남는다.
-    """
-    slots = list(settings.starter_sections)
-    if settings.starter_pick_from:
-        slots.append(pick_slot(settings.starter_pick_from))
-    if settings.starter_trend_topics > 0:
-        slots.append(_TREND_SLOT)
-    return slots
-
-
-def _instruction(max_chars: int) -> str:
-    """생성 지시문. 길이 상한을 문구에 실어야 모델이 **제목이 긴 상품을 피해** 고른다 —
-    상한은 출구가 어차피 잡지만, 모르고 쓰면 긴 제목의 상품이 통째로 폐기돼 재료가 준다."""
-    return _GENERATE_INSTRUCTION + (
-        f" 문장 전체는 {max_chars}자를 넘기지 않는다 — 제목이 길어 넘칠 것 같으면 그 상품은 "
-        "고르지 말고 제목이 짧은 다른 상품을 고른다."
-    )
-
-
-# 문구 계약은 프롬프트에 두고, 개수·참조·순서는 스키마가 강제한다(enrichment 관례). 완성 문장
-# 예시는 넣지 않는다 — 예시 문장은 내용까지 복사된다(빈 꼴 틀만).
-_GENERATE_INSTRUCTION = (
-    "오늘 Yes24에서 관측된 코너 목록(sections)을 재료로, 빈 화면의 초기 질문 칩에 실릴 문장을 "
-    "만든다. 각 문장은 사용자가 이 AI 어시스턴트에게 그대로 눌러 보낼 완결된 질문이다 — "
-    "사람이 입으로 말하듯 반말로 끝맺는 한국어 한 문장이다('~야?'·'~어?'·'~돼?'·'~알려줘'). "
-    "'~는?'·'~내용은?'처럼 명사로 끊거나 '~무엇인가?' 같은 문어체로 쓰지 않는다. "
-    "문장 부호는 문장 꼴을 따른다 — 묻는 꼴이면 물음표로, 청하는 꼴('~알려줘'·'~골라줘')이면 "
-    "물음표 없이 끝낸다. "
-    "한 문장은 그 슬롯의 rows에 실제로 있는 상품 하나를 가리킨다. goods_no에 그 상품의 번호를, "
-    "title에 그 상품의 제목을 **글자 하나 바꾸지 않고** 옮겨 적고, 그 제목을 문장 안에도 "
-    "그대로 넣되 『』로 감싼다 — 감싸지 않으면 제목이 문장의 서술어로 읽혀 어디까지가 책 "
-    "이름인지 알 수 없다. 번호가 목록에 없거나 제목이 원문과 다르면 그 문장은 폐기된다. "
-    "같은 슬롯 안에서는 서로 다른 상품, 서로 다른 각도를 다룬다. "
-    "rows에 rank가 있는 상품은 그 순위를 문장에 반드시 넣는다('5위' 꼴) — 넣지 않으면 "
-    "폐기된다. 출간월도 넣을 수 있고, 역시 rows에 있는 값 그대로다. "
-    "코너 이름과 집계 기간은 칩 라벨이 이미 보여주므로 문장에 다시 쓰지 않는다 — 문장이 "
-    "쓸 수 있는 관측 표현은 그 섹션의 anchor 문구(글자 그대로)와 순위 숫자뿐이고, 날짜·요일·"
-    "주차를 따로 지어내지 않는다. 가격·평점 같은 숫자는 문장에 박지 않고 묻게 한다. "
-    "문장의 꼴은 '〔관측된 제목과 그 곁의 관측값〕 … 〔묻는 것〕?'처럼 관측 재료와 질문이 한 "
-    "문장에 붙는 형태다(꼴만 따르고 내용은 전부 rows에서 가져온다). "
-    "마지막으로, 위의 모든 규칙보다 앞서는 기준이 하나 있다. "
-    "**눌러서 나온 답이 그 책을 읽을지 정하는 데 도움이 되는가.** 그러려면 상품 페이지를 "
-    "열어야 알 수 있는 것을 물어야 한다. 값·평점·쪽수·두께·배송·할인처럼 **사양 한 줄로 "
-    "끝나는 것**, rows에 이미 있는 값(제목·순위·출간월), 공개되지 않는 판매 수치, 순위에 "
-    "오른 이유 같은 해석, 예측, 감상 요구, 이 서비스의 사용법 — 이 가운데 어느 하나라도 "
-    "묻고 있다면 그 문장은 버리고 다시 쓴다."
-)
-
-# 골라주기 문구의 계약. 상품 하나를 지목하는 문장과 달리 **분야**를 가리키고, 답은 목록이
-# 된다 — 첫 화면에서 "골라준다"는 능력을 보여주는 자리다.
-_PICK_INSTRUCTION = (
-    "오늘 Yes24 코너의 분야 목록(categories)을 재료로, 빈 화면의 초기 질문 칩에 실릴 문장을 "
-    "만든다. 각 문장은 사용자가 그대로 눌러 보낼 완결된 질문이고, 사람이 입으로 말하듯 "
-    "반말로 끝맺는다('~골라줘'·'~추천해줘'·'~있어?'). 청하는 꼴이면 물음표를 붙이지 않는다. "
-    "상품 하나를 지목하지 않는다 — 목록에 있는 **분야 하나**를 골라 category에 그 이름을 "
-    "그대로 적는다(목록에 없는 분야를 만들지 않는다). 다만 문장 안에서는 그 이름을 사람이 "
-    "말하듯 쓴다 — '소설/시/희곡'처럼 여러 갈래가 묶인 이름은 한 갈래만 골라 쓴다. "
-    "**여기서만 할 수 있는 일은 '골라주기'다.** 그러니 조건이나 상황을 하나 얹어 고르게 "
-    "한다 — 어떤 사람에게 맞는지, 어떤 때 읽는지, 무엇을 처음 접하는지 같은 것이다. "
-    "조건 없이 '무슨 책 있어?'처럼 넓게 묻지 않는다. "
-    "코너 이름과 집계 기간은 칩 라벨이 이미 보여주므로 문장에 다시 쓰지 않는다. **시기를 "
-    "가리키는 말은 anchor에 있는 것만 쓰고, anchor에 없으면 시기를 말하지 않는다** — 계절·"
-    "명절·새해처럼 오늘이 언제인지 모르고 쓰면 어긋나는 말이 그렇다(상황을 얹을 때는 시기가 "
-    "아니라 사람·기분·장소·목적으로 얹는다). 특정 책 제목·저자·가격·평점은 문장에 넣지 않는다 "
-    "— 무엇을 고를지는 답변이 정한다. 같은 세트 안에서는 서로 다른 분야를 다룬다."
-)
-
-# 오늘의 화제 재료를 모으는 질문. 그라운딩 콜이라 구조화 출력을 못 쓴다(빌트인 검색과
-# 함수 선언은 한 요청에 못 섞는다 — web_search 도구 주석) → 한 줄에 하나씩 받아 자른다.
-_TREND_PROMPT = (
-    "오늘 한국에서 사람들이 많이 이야기하는 화제를 {count}개 알려줘. "
-    "방송·영화·공연·인물·유행·계절 무엇이든 좋지만, **책과 이어질 만한 것**을 고른다"
-    "(원작이 있거나, 그 분야를 더 알고 싶어질 만한 것). "
-    "설명·번호·기호 없이 **한 줄에 하나씩 짧은 명사구만** 쓴다."
-)
-
-# 화제 문구의 계약. 지목형이 상품을, 골라주기가 분야를 가리킨다면 이쪽은 **바깥 화제**를
-# 가리키고 그것을 책으로 잇는다 — 첫 화면에서 "오늘"이 보이는 자리다.
-_TREND_INSTRUCTION = (
-    "오늘 사람들이 이야기하는 화제(topics)를 재료로, 빈 화면의 초기 질문 칩에 실릴 문장을 "
-    "만든다. 각 문장은 사용자가 그대로 눌러 보낼 완결된 질문이고, 사람이 입으로 말하듯 "
-    "반말로 끝맺는다('~있어?'·'~골라줘'·'~뭐야?'). 청하는 꼴이면 물음표를 붙이지 않는다. "
-    "**화제 하나를 골라 topic에 그 이름을 그대로 적고, 그 화제를 책으로 잇는 질문을 쓴다** "
-    "— 원작이나 관련 책을 찾거나, 그 주제를 더 알고 싶다는 꼴이다. 목록에 없는 화제를 "
-    "만들지 않는다. 화제 이름은 문장에서 알아볼 수 있게 쓰되 사람이 말하듯 줄여도 된다. "
-    "각 화제에는 그것으로 Yes24를 검색했을 때 실제로 나온 책 몇 권(found)이 딸려 있다 — "
-    "화제가 책과 이어진다는 증거이지 문장에 넣을 재료가 아니다. 특정 책 제목·저자·가격·"
-    "평점은 문장에 넣지 않는다(무엇을 권할지는 답변이 정한다). "
-    "날짜·요일을 지어내지 않는다. 같은 세트 안에서는 서로 다른 화제를 다룬다."
-)
 
 # 활성 풀 SELECT의 컬럼 순서 — dict 변환이 이 튜플로 하므로 SQL과 여기가 같이 움직인다.
 _POOL_COLUMNS = ("id", "slot", "text", "source", "goods_no", "run_date", "pinned")
@@ -214,19 +116,6 @@ def _year_month(pub_date: str | None) -> tuple[int, int] | None:
     return (int(match.group("year")), int(match.group("month"))) if match else None
 
 
-def observe_rows(rows: list[dict], section: str, today: dt.date) -> list[dict]:
-    """코너 목록의 파싱 행 중 생성 재료가 되는 관측본을 고른다(구조 필터).
-
-    순위가 있는 목록(has_rank)은 순위 자체가 시간 앵커(집계 기간)라 전량이 재료다. 순위가
-    없는 목록(신간)은 앵커가 출간월뿐이라 **당월 출간분만** 남긴다 — 신간 코너에는 이전 달·
-    이후 달 행이 섞여 있어(fixture 실측 4개 월) 걸러야 "9월 신간"이라는 문장이 참이 된다.
-    """
-    if BROWSE_SEED_URLS[section]["has_rank"]:
-        return list(rows)
-    this_month = (today.year, today.month)
-    return [row for row in rows if _year_month(row.get("pub_date")) == this_month]
-
-
 def _squash(value: Any) -> str:
     """문장·제목 비교의 단일 정규화 — 공백 종류·연속 공백·제로폭 문자를 없앤다.
 
@@ -237,134 +126,6 @@ def _squash(value: Any) -> str:
         return ""
     stripped = "".join(ch for ch in str(value) if unicodedata.category(ch) != "Cf")
     return " ".join(stripped.split())
-
-
-def validate_items(
-    raw_items: list, observed: dict[str, dict[int, dict]], *, max_chars: int
-) -> tuple[dict[str, list[dict]], dict[str, int]]:
-    """모델 출력의 출구 검증 — 관측본과 대조해 참조가 어긋난 문장을 버린다.
-
-    버리는 것: 관측 밖 goods_no, **관측 제목이 문장에 그대로 들어 있지 않은 text**, 순위가
-    있는 상품인데 **그 순위가 문장에 없는 text**, 빈 문장, 상한 초과, 중복. **문구를 보는
-    필터가 아니라 이번 관측본과의 대조**다(인용 검증이 본문의 [n]을 이번 턴 출처와 대조하는
-    것과 같은 자리). 제목을 대조하는 이유는 goods_no만 맞고 제목이 틀린 문장("그랬다고
-    적어다")이 통과했기 때문이고, 순위를 대조하는 이유는 순위가 **라벨이 대신할 수 없는
-    유일한 실시간 신호**여서다 — 선택 사항으로 두었더니 10건 중 7건이 순위 없이 나왔고 그
-    문장들은 클릭 유인 채점에서 전부 최하였다(종합 1위 상품이 1위라는 말 없이 나갔다).
-
-    모델이 따로 declare하는 `title` 필드는 여기서 다시 대조하지 않는다 — 그 필드의 일은
-    문장을 쓰기 전에 상품을 확정시키는 것(property_ordering)이고, 문장이 맞는지는 관측 제목이
-    문장 안에 있는지로 결정된다. 두 판정을 다 두면 같은 것을 두 번 재는 것이다.
-
-    반환은 (슬롯별 생존 항목, 슬롯별 폐기 수). 생존 항목은 `{slot, goods_no, text}`이고 문장은
-    공백 정규화만 한다(절단 금지 — 누르면 그대로 전송되는 문장이라 상한 초과는 잘라 살리지
-    않고 버린다). 중복 판정은 슬롯을 가로질러 정규화 문장 기준이다.
-    """
-    kept: dict[str, list[dict]] = {slot: [] for slot in observed}
-    dropped: dict[str, int] = {}
-    seen_texts: set[str] = set()
-    for item in raw_items:
-        slot = item.get("slot")
-        slot_key = slot if slot else "?"
-        text = _squash(item.get("text"))
-        goods_no = item.get("goods_no")
-        row = (observed.get(slot) or {}).get(goods_no, {})
-        observed_title = _squash(row.get("title"))
-        rank = row.get("rank")
-        reason = (
-            "unknown_slot" if slot not in observed
-            else "unobserved_goods_no" if goods_no not in observed[slot]
-            else "title_not_in_text" if observed_title not in text
-            else "rank_not_in_text" if rank and f"{rank}위" not in text
-            else "empty_text" if not text
-            else "over_max_chars" if len(text) > max_chars
-            else "duplicate_text" if text in seen_texts
-            else None
-        )
-        if reason:
-            dropped[slot_key] = dropped.get(slot_key, 0) + 1
-            # 폐기 사유를 남긴다 — 어느 슬롯이 왜 말라붙는지(관측 밖 참조인지 상한인지)는
-            # 데이터 소스 기각 판정(설계 "판정 게이트")의 재료다.
-            logger.warning(
-                f"starters 폐기: slot={slot_key} goods_no={goods_no} reason={reason} "
-                f"text={text[:max_chars]!r}"
-            )
-            continue
-        seen_texts.add(text)
-        kept[slot].append({"slot": slot, "goods_no": goods_no, "text": text})
-    return kept, dropped
-
-
-def validate_trend_items(
-    raw_items: list, topics: list[dict], *, max_chars: int
-) -> tuple[list[dict], int]:
-    """화제 문구의 출구 검증 — 오늘 모은 화제 목록과 대조한다(분야 검증과 같은 자리).
-
-    화제 이름을 통째로 요구하지 않는다. 사람이 말할 때는 줄여 쓰기 때문이다("크리스토퍼
-    놀란 감독 영화 오디세이" → "오디세이"). 이름의 조각 중 두 글자 이상인 것이 하나라도
-    문장에 있으면 그 화제를 가리킨 것으로 본다 — 관측본과의 대조이지 허용 단어 목록이 아니다.
-    """
-    by_name = {_squash(t["topic"]): t for t in topics}
-    kept: list[dict] = []
-    dropped = 0
-    seen: set[str] = set()
-    for item in raw_items:
-        name = _squash(item.get("topic"))
-        text = _squash(item.get("text"))
-        words = name.replace("·", " ").split()
-        parts = [w for w in words if len(w) >= 2] if name in by_name else []
-        reason = (
-            "unobserved_topic" if name not in by_name
-            else "topic_not_in_text" if not any(part in text for part in parts)
-            else "empty_text" if not text
-            else "over_max_chars" if len(text) > max_chars
-            else "duplicate_text" if text in seen
-            else None
-        )
-        if reason:
-            dropped += 1
-            logger.warning(f"starters 폐기(화제): topic={name!r} reason={reason} text={text!r}")
-            continue
-        seen.add(text)
-        kept.append({"topic": name, "text": text})
-    return kept, dropped
-
-
-def validate_pick_items(
-    raw_items: list, categories: list[dict], *, max_chars: int
-) -> tuple[list[dict], int]:
-    """골라주기 출력의 출구 검증 — 관측된 분야 목록과 대조한다(상품 검증과 같은 자리).
-
-    분야 이름이 문장에 **통째로** 들어 있기를 요구하지 않는다. 사이트의 분야명은
-    "소설/시/희곡"처럼 슬래시로 묶인 복합명이 있어 그대로 넣으면 문장이 어색해진다 —
-    구성 조각 중 하나라도 문장에 있으면 그 분야를 가리킨 것으로 본다(관측본과의 대조이지
-    허용 단어 목록이 아니다).
-    """
-    by_name = {_squash(c["name"]): c for c in categories}
-    kept: list[dict] = []
-    dropped = 0
-    seen: set[str] = set()
-    for item in raw_items:
-        name = _squash(item.get("category"))
-        text = _squash(item.get("text"))
-        parts = [p for p in name.split("/") if p] if name in by_name else []
-        reason = (
-            "unobserved_category" if name not in by_name
-            else "category_not_in_text" if not any(part in text for part in parts)
-            else "empty_text" if not text
-            else "over_max_chars" if len(text) > max_chars
-            else "duplicate_text" if text in seen
-            else None
-        )
-        if reason:
-            dropped += 1
-            logger.warning(
-                f"starters 폐기(골라주기): category={name!r} reason={reason} text={text!r}"
-            )
-            continue
-        seen.add(text)
-        kept.append({"category": name, "text": text})
-    return kept, dropped
 
 
 def pick_starters(pool: list[dict], n: int, rng: random.Random | Any) -> list[dict]:
@@ -403,189 +164,110 @@ def _failed(detail: str, dropped: int = 0) -> dict:
     return {"status": "failed", "items": [], "dropped": dropped, "detail": detail}
 
 
-# ── 생성 파이프라인(관측 → 구조화 출력 → 출구 검증, DB 없음) ─────────────────
+# ── 슬롯 명세 ────────────────────────────────────────────────────────────────
+#
+# **모든 슬롯이 같은 일을 한다**: 재료 목록에서 하나를 골라, 그것을 가리키는 질문을 쓰고,
+# 고른 것이 문장에 실제로 드러나는지 대조한다. 슬롯마다 다른 것은 두 가지뿐이다 —
+# 재료를 **어디서** 가져오는가(observe)와 그것으로 **무엇을 묻는가**(ask).
+#
+# 그래서 프롬프트도 검증도 생성도 한 벌이다. 슬롯을 늘릴 때 늘어나는 것은 명세 한 줄이고,
+# 재료가 새로운 종류일 때만 관측기가 하나 는다. 종전엔 슬롯마다 프롬프트·검증·생성을
+# 따로 두어 슬롯 수만큼 코드가 늘었다(사례 패치).
 
 
-def _response_schema(slots: list[str], count: int) -> types.Schema:
-    """구조화 출력 스키마. 슬롯은 관측된 것만 enum으로, 개수는 min/max_items로 강제한다.
+@dataclass(frozen=True)
+class Material:
+    """재료 하나 — 문구가 가리킬 수 있는 대상.
 
-    property_ordering이 계약이다 — 참조(slot·goods_no·title)를 먼저 확정하고 문장을 쓰게 해야
-    문장을 먼저 짓고 번호를 끼워 맞추는 쏠림이 줄어든다(enrichment의 선행 판정 필드와 같은 이유).
-    title을 따로 받는 이유는 출구가 **문장 안의 제목까지** 관측본과 대조할 수 있게 하기
-    위해서다 — goods_no만 보면 참조는 맞는데 제목이 틀린 문장(오기·축약)이 통과했다.
+    `evidence`는 "이 재료를 가리켰다"의 판정 기준이다. 바깥 리스트는 AND, 안쪽은 OR —
+    상품이면 [[제목], ["5위"]](둘 다 필요), 분야·화제면 [[조각들]](하나면 충분)이다.
+    이름을 통째로 요구하지 않는 이유는 사람이 줄여 말하기 때문이고, 그래도 **관측본과의
+    대조**이지 허용 단어 목록이 아니다.
     """
-    order = ["slot", "goods_no", "title", "text"]
-    item = types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "slot": types.Schema(type=types.Type.STRING, enum=list(slots)),
-            "goods_no": types.Schema(type=types.Type.INTEGER),
-            "title": types.Schema(type=types.Type.STRING),
-            "text": types.Schema(type=types.Type.STRING),
-        },
-        required=order,
-        property_ordering=order,
-    )
+
+    ref: str
+    evidence: list[list[str]]
+    hint: dict
+
+
+@dataclass(frozen=True)
+class Observed:
+    """관측 결과 — 재료와, 모델이 쓸 수 있는 시간 표현 한 줄."""
+
+    materials: list[Material]
+    note: str | None = None
+
+
+@dataclass(frozen=True)
+class SlotSpec:
+    """슬롯 하나의 정의. 새 슬롯은 여기 한 줄이 늘 뿐이다."""
+
+    key: str
+    ask: str
+    observe: Any  # async (SlotSpec, ObserveContext) -> Observed
+
+
+@dataclass(frozen=True)
+class ObserveContext:
+    settings: Settings
+    client: Any
+    genai_client: Any
+    today: dt.date
+    exclude: set[int] = field(default_factory=set)
+    param: str = ""
+    # 같은 바깥 신호를 나눠 쓰는 슬롯들의 공동 저장소(한 번 모아 여럿이 본다).
+    shared: dict = field(default_factory=dict)
+
+
+# 문구 계약. 앞머리는 모든 슬롯이 공유하고 슬롯별 ask 한 줄이 가운데 들어가며, **핵심
+# 기준은 맨 뒤**다 — 규칙이 쌓이면 중간에 놓인 원칙이 묻혀 문장이 사양 확인으로 무너졌다
+# (2026-09-09 실측). 완성 문장 예시는 넣지 않는다: 예시는 내용까지 복사된다.
+_HEAD = (
+    "빈 화면의 초기 질문 칩에 실릴 문장을 만든다. 각 문장은 사용자가 이 AI 어시스턴트에게 "
+    "그대로 눌러 보낼 완결된 질문이고, 사람이 입으로 말하듯 반말로 끝맺는 한국어 한 문장이다. "
+    "'~는?'처럼 명사로 끊거나 문어체로 쓰지 않는다. 문장 부호는 문장 꼴을 따른다 — 묻는 "
+    "꼴이면 물음표로, 청하는 꼴이면 물음표 없이 끝낸다. "
+    "재료(materials) 가운데 **하나**를 골라 ref에 그 값을 그대로 적는다. 목록 밖의 것을 "
+    "만들지 않는다. 고른 재료에 must가 있으면 **그 값을 하나도 빠짐없이 문장에 그대로 "
+    "넣는다** — 빠지면 그 문장은 폐기된다. must가 없으면 그 재료를 가리킨다는 것이 문장에서 "
+    "드러나기만 하면 되고, 이름은 사람이 말하듯 줄여 써도 된다. "
+    "note가 있으면 **그 문구를 문장에 그대로 넣는다** — 재료가 어디서 왔는지를 읽는 사람이 "
+    "알아야 한다(순위만 있으면 무슨 순위인지 모른다). note에 없는 날짜·요일·계절은 지어내지 "
+    "않고, note가 없으면 시기를 말하지 않는다. 같은 세트 안에서는 서로 다른 재료를 다룬다. "
+)
+_TAIL = (
+    " 마지막으로, 위의 모든 규칙보다 앞서는 기준이 하나 있다. "
+    "**눌러서 나온 답이 사용자에게 쓸모가 있는가.** 목록만 봐도 아는 것, 사양 한 줄로 끝나는 "
+    "것, 공개되지 않아 답할 수 없는 것, 예측이나 감상 요구, 이 서비스의 사용법 — 이 가운데 "
+    "어느 하나라도 묻고 있다면 그 문장은 버리고 다시 쓴다."
+)
+
+
+def _instruction(spec: SlotSpec, max_chars: int) -> str:
+    """공통 계약 + 이 슬롯이 묻는 것 + 길이. 길이를 문구에 실어야 모델이 **긴 이름의 재료를
+    피해** 고른다 — 상한은 출구가 어차피 잡지만, 모르고 쓰면 통째로 폐기돼 재료가 준다."""
+    return f"{_HEAD}{spec.ask} 문장 전체는 {max_chars}자를 넘기지 않는다.{_TAIL}"
+
+
+def _response_schema(refs: list[str], count: int) -> types.Schema:
+    """구조화 출력 스키마 — 모든 슬롯이 같은 모양이다.
+
+    property_ordering이 계약이다: **참조(ref)를 먼저 확정하고 문장을 쓰게** 해야 문장을
+    먼저 짓고 대상을 끼워 맞추는 쏠림이 줄어든다(enrichment의 선행 판정 필드와 같은 이유).
+    ref를 enum으로 두어 목록 밖 대상은 애초에 만들 수 없다.
+    """
+    order = ["ref", "text"]
     return types.Schema(
         type=types.Type.OBJECT,
         properties={
             "items": types.Schema(
-                type=types.Type.ARRAY, items=item, min_items=count, max_items=count
-            )
-        },
-        required=["items"],
-    )
-
-
-def _anchor(seed: dict, today: dt.date) -> str:
-    """문장이 쓸 수 있는 유일한 시간 표현. 코너 이름·집계 기간은 칩 라벨이 보여준다."""
-    return "베스트셀러" if seed["has_rank"] else f"{today.month}월 신간"
-
-
-def _payload(
-    observed: dict[str, list[dict]],
-    today: dt.date,
-    exclude: dict[str, set[int]] | None = None,
-    min_rows: int = 0,
-) -> dict:
-    """모델에 싣는 관측본. **목록에 보이는 것은 재료로만 주고, 물을 거리는 주지 않는다.**
-
-    싣지 않는 것과 이유:
-    - 가격·평점·판매지수: 문장에 박힐 숫자의 재료를 없앤다(문구 계약 5).
-    - 저자·출판사: 실으면 모델이 그 값을 **되묻는** 문장을 쓴다("…의 저자는 누구야?").
-      목록에 이미 있는 값을 묻는 질문은 상품 페이지를 열 이유가 없어 칩으로서 시시하고,
-      도구 호출도 부르지 못한다(실측 10건 중 8건이 이 꼴이었다). 남기는 것은 그 상품을
-      **가리키는** 데 필요한 것(제목·순위·출간월)뿐이다.
-    값이 None인 키는 뺀다(칸 채우기 유혹 방지).
-
-    관측일(today)은 싣지 않는다. 실으면 모델이 그 날짜를 시간 표현으로 베껴 "9월 8일
-    베스트셀러 1위"처럼 **집계 기준과 어긋난 앵커**를 쓴다(실측) — 순위는 주간 집계고 일자
-    순위가 아니다. 각 섹션이 쓸 수 있는 시간 표현은 anchor 한 줄로만 준다("이번 주"라고
-    부르지 않는 이유도 같다 — 종합 탭의 집계 기간은 어제 끝난 한 주다).
-
-    `exclude`에 든 goods_no는 rows에서 뺀다 — 최근에 이미 쓴 상품이다. 재료가 같으면 모델은
-    같은 책을 다시 고른다(주간 집계 페이지를 매일 관측하니 필연). 무엇을 물을 수 있는가와
-    마찬가지로 **무엇이 반복되지 않는가도 payload가 정한다**.
-
-    단 제외가 재료를 `min_rows` 미만으로 만들면 그 슬롯은 **제외를 통째로 포기한다**. 반복을
-    피하려다 슬롯을 굶기면 어제 세트가 그대로 남아 더 심하게 반복된다(제외 창이 길수록
-    누적 제외가 한 페이지 행 수를 넘는다 — 실측으로 베스트셀러가 세 라운드 굶었다).
-    """
-    sections = {}
-    for slot, rows in observed.items():
-        seed = BROWSE_SEED_URLS[slot]
-        anchor = _anchor(seed, today)
-        skip = (exclude or {}).get(slot, set())
-        fresh = [row for row in rows if int(row["goods_no"]) not in skip]
-        if len(fresh) < min_rows:
-            logger.info(
-                f"starters 제외 포기: slot={slot} 남은행={len(fresh)} < {min_rows} "
-                f"(최근 사용 {len(skip)}건) — 반복보다 굶는 쪽이 나쁘다"
-            )
-            fresh = list(rows)
-        sections[slot] = {
-            "label": seed["label"],
-            "anchor": anchor,
-            "rows": [
-                {
-                    "goods_no": int(row["goods_no"]),
-                    **{
-                        key: row[key]
-                        for key in ("rank", "title", "pub_date")
-                        if row.get(key) is not None
-                    },
-                }
-                for row in fresh
-            ],
-        }
-    return {"sections": sections}
-
-
-async def _observe_categories(section: str, settings: Settings, client) -> list[dict]:
-    """코너 페이지 내비의 분야 목록 — 시드와 **같은 트리**만 남긴다.
-
-    내비에는 국내도서·외국도서·eBook의 동명 분야가 섞여 있어(파서 주석) 트리 접두로 걸러야
-    "소설"이 다른 매장으로 새지 않는다. 접두 자신(코너 전체)은 분야가 아니라 뺀다.
-    """
-    html = await client.get_text(browse_url(section))
-    prefix = browse_category_prefix(section)
-    links = await asyncio.to_thread(
-        parse_category_links, html, limit=settings.starter_pick_category_limit
-    )
-    return [c for c in links if c["number"].startswith(prefix) and c["number"] != prefix]
-
-
-async def _observe_trends(settings: Settings, client, genai_client) -> list[dict]:
-    """오늘의 화제 → **Yes24에 실제로 책이 있는 것만** 남긴다.
-
-    바깥 세상 신호(웹 그라운딩)를 재료로 쓰지만, 접지는 여전히 Yes24가 한다 — 화제 하나로
-    검색해 결과가 0건이면 그 화제는 재료에서 빠진다. "그 화제로 책 이야기를 할 수 있는가"를
-    문구 규칙이 아니라 **검색 결과의 유무**로 판정하는 자리다(억지 연결을 구조로 막는다).
-    """
-    response = await asyncio.wait_for(
-        genai_client.aio.models.generate_content(
-            model=settings.web_grounding_model,
-            contents=_TREND_PROMPT.format(count=settings.starter_trend_topics),
-            config=types.GenerateContentConfig(
-                tools=[types.Tool(google_search=types.GoogleSearch())], temperature=0.3
-            ),
-        ),
-        timeout=settings.starter_timeout_s,
-    )
-    record_usage("starter_trend", response.usage_metadata, model=settings.web_grounding_model)
-    # 그라운딩 응답은 자유 텍스트다 — 줄을 잘라 앞머리 기호만 벗긴다(파싱이 새도 아래
-    # 검색 단계가 걸러내므로 무해하다).
-    topics = []
-    for line in (response.text or "").splitlines():
-        name = _squash(line).lstrip("-*•0123456789.) ").strip("*")
-        if name and name not in topics:
-            topics.append(name)
-    topics = topics[: settings.starter_trend_topics]
-    if not topics:
-        return []
-
-    async def _found(topic: str) -> list[dict]:
-        try:
-            html = await client.get_text(search_url(settings.yes24_base_url, topic))
-            rows = await asyncio.to_thread(
-                parse_search, html, base_url=settings.yes24_base_url, limit=3
-            )
-        except (Yes24FetchError, ParseError):
-            return []
-        return [row["title"] for row in rows if row.get("title")]
-
-    found = await asyncio.gather(*(_found(topic) for topic in topics))
-    return [
-        {"topic": topic, "found": titles} for topic, titles in zip(topics, found) if titles
-    ]
-
-
-async def _generate_trends(
-    settings: Settings, *, client, genai_client
-) -> dict:
-    """오늘의 화제 슬롯의 재료 수집 → 생성(1콜) → 검증. 골라주기와 같은 결과 모양이다."""
-    try:
-        topics = await _observe_trends(settings, client, genai_client)
-    except Exception as exc:  # noqa: BLE001 — 바깥 신호는 없을 수 있다: 슬롯만 failed
-        return _failed(f"화제 수집 실패: {type(exc).__name__}: {exc}")
-    if not topics:
-        return _failed("화제 0건(웹 신호 없음 또는 Yes24 검색 결과 없음)")
-
-    count = min(settings.starter_per_slot, len(topics))
-    order = ["topic", "text"]
-    schema = types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "items": types.Schema(
                 type=types.Type.ARRAY,
                 min_items=count,
                 max_items=count,
                 items=types.Schema(
                     type=types.Type.OBJECT,
                     properties={
-                        "topic": types.Schema(
-                            type=types.Type.STRING, enum=[t["topic"] for t in topics]
-                        ),
+                        "ref": types.Schema(type=types.Type.STRING, enum=refs),
                         "text": types.Schema(type=types.Type.STRING),
                     },
                     required=order,
@@ -595,91 +277,386 @@ async def _generate_trends(
         },
         required=["items"],
     )
-    try:
+
+
+def validate_items(
+    raw_items: list, materials: list[Material], *, max_chars: int
+) -> tuple[list[dict], dict[str, int]]:
+    """출구 검증 — 관측본과의 대조. 슬롯이 무엇이든 판정은 하나다.
+
+    버리는 것: 목록 밖 ref, 고른 재료가 문장에 드러나지 않는 text(evidence 미충족),
+    빈 문장, 상한 초과, 중복. **문구를 보는 필터가 아니라 이번 관측본과의 대조**다
+    (인용 검증이 본문의 [n]을 이번 턴 출처와 대조하는 것과 같은 자리).
+
+    반환은 (생존 항목, 사유별 폐기 수) — 어느 슬롯이 왜 말라붙는지는 데이터 소스 기각
+    판정의 재료라 사유를 세어 남긴다.
+    """
+    by_ref = {str(m.ref): m for m in materials}
+    kept: list[dict] = []
+    dropped: dict[str, int] = {}
+    seen: set[str] = set()
+    for item in raw_items:
+        ref = str(item.get("ref") or "")
+        text = _squash(item.get("text"))
+        material = by_ref.get(ref)
+        reason = (
+            "unobserved_ref" if material is None
+            else "not_in_text" if not _shows(material, text)
+            else "empty_text" if not text
+            else "over_max_chars" if len(text) > max_chars
+            else "duplicate_text" if text in seen
+            else None
+        )
+        if reason:
+            dropped[reason] = dropped.get(reason, 0) + 1
+            logger.warning(f"starters 폐기: ref={ref!r} reason={reason} text={text!r}")
+            continue
+        seen.add(text)
+        kept.append({"ref": ref, "text": text, "hint": material.hint})
+    return kept, dropped
+
+
+def _material_payload(material: Material) -> dict:
+    """모델에 싣는 재료 한 건 — **검증이 요구하는 것(must)을 함께 보여준다**.
+
+    must는 evidence의 각 그룹 대표값이라 프롬프트와 출구가 **한 데이터에서 나온다**. 종전엔
+    검증만 순위를 요구하고 프롬프트는 말해 주지 않아, 순위 없는 문장이 만들어졌다가 통째로
+    폐기됐다(슬롯이 굶었다). 요구할 것이 없는 재료는 must를 싣지 않는다.
+    """
+    item = {"ref": material.ref, **material.hint}
+    must = [group[0] for group in material.evidence if len(group) == 1 and group[0]]
+    if must:
+        item["must"] = must
+    return item
+
+
+def _shows(material: Material, text: str) -> bool:
+    """고른 재료가 문장에 드러나는가 — 바깥은 AND, 안쪽은 OR."""
+    return all(any(part and part in text for part in group) for group in material.evidence)
+
+
+# ── 재료 관측기 ──────────────────────────────────────────────────────────────
+#
+# 재료의 종류만큼만 있다. 슬롯이 늘어도 재료가 같은 종류면 관측기는 늘지 않는다.
+
+
+async def observe_corner_products(spec: SlotSpec, ctx: ObserveContext) -> Observed:
+    """코너 한 페이지의 상품 — 그 페이지가 곧 오늘의 재료다.
+
+    순위가 있는 목록은 순위 자체가 시간 앵커라 전량이 재료다. 순위가 없는 목록(신간)은
+    앵커가 출간월뿐이라 **당월 출간분만** 남긴다 — 코너에 이전 달·이후 달 행이 섞여 있어
+    걸러야 "N월 신간"이라는 문장이 참이 된다.
+
+    `exclude`(최근에 이미 쓴 상품)는 여기서 빠지되, 그것이 재료를 `starter_per_slot`
+    미만으로 만들면 **제외를 통째로 포기한다** — 반복을 피하려다 슬롯을 굶기면 어제 세트가
+    그대로 남아 더 심하게 반복된다.
+    """
+    section = spec.key
+    seed = BROWSE_SEED_URLS[section]
+    html = await ctx.client.get_text(browse_url(section))
+    rows = await asyncio.to_thread(
+        parse_browse_list, html, base_url=ctx.settings.yes24_base_url, section=section
+    )
+    if not seed["has_rank"]:
+        this_month = (ctx.today.year, ctx.today.month)
+        rows = [r for r in rows if _year_month(r.get("pub_date")) == this_month]
+
+    fresh = [r for r in rows if int(r["goods_no"]) not in ctx.exclude]
+    if len(fresh) < ctx.settings.starter_per_slot:
+        logger.info(
+            f"starters 제외 포기: slot={section} 남은행={len(fresh)} "
+            f"(최근 사용 {len(ctx.exclude)}건) — 반복보다 굶는 쪽이 나쁘다"
+        )
+        fresh = rows
+
+    materials = []
+    for row in fresh:
+        rank = row.get("rank")
+        title = _squash(row.get("title"))
+        if not title:
+            continue
+        # 가격·평점·저자·출판사는 싣지 않는다. 실은 값은 **되묻는 질문**이 되고(목록만 봐도
+        # 아는 것이라 도구 호출도 못 부른다), 숫자는 문장에 박힌다. 남기는 것은 그 상품을
+        # 가리키는 데 필요한 것뿐이다.
+        hint = {"title": title}
+        evidence = [[title]]
+        if rank:
+            hint["rank"] = rank
+            # 순위는 **라벨이 대신할 수 없는 유일한 실시간 신호**라 문장에 반드시 있어야 한다.
+            evidence.append([f"{rank}위"])
+        if row.get("pub_date"):
+            hint["pub_date"] = row["pub_date"]
+        materials.append(Material(ref=str(row["goods_no"]), evidence=evidence, hint=hint))
+    note = "베스트셀러" if seed["has_rank"] else f"{ctx.today.month}월 신간"
+    # note도 문장에 있어야 한다 — 칩 라벨은 코너를 말해 주지만 **눌러서 전송되는 문장**은
+    # 라벨 없이 홀로 채팅에 간다. "5위인 『…』"만으로는 무슨 순위인지 알 수 없다(실측).
+    for material in materials:
+        material.evidence.append([note])
+    return Observed(materials=materials, note=note)
+
+
+async def observe_corner_categories(spec: SlotSpec, ctx: ObserveContext) -> Observed:
+    """코너 내비의 분야 목록 — 시드와 **같은 트리**만 남긴다.
+
+    내비에는 국내도서·외국도서·eBook의 동명 분야가 섞여 있어 트리 접두로 걸러야 한 매장
+    안에 머문다. 접두 자신(코너 전체)은 분야가 아니라 뺀다.
+    """
+    section = ctx.param
+    html = await ctx.client.get_text(browse_url(section))
+    prefix = browse_category_prefix(section)
+    links = await asyncio.to_thread(
+        parse_category_links, html, limit=ctx.settings.starter_pick_category_limit
+    )
+    materials = []
+    for link in links:
+        if not link["number"].startswith(prefix) or link["number"] == prefix:
+            continue
+        name = _squash(link["name"])
+        # 복합 분야명("소설/시/희곡")은 조각 하나만 문장에 있어도 통과한다 — 통째로 요구하면
+        # 문장이 어색해진다.
+        parts = [p for p in name.split("/") if p]
+        materials.append(Material(ref=name, evidence=[parts], hint={"category": name}))
+    return Observed(materials=materials)
+
+
+async def observe_web_topics(spec: SlotSpec, ctx: ObserveContext) -> Observed:
+    """오늘의 화제 — 웹에서 모아 **Yes24 검색 결과의 유무로 두 갈래**로 가른다.
+
+    `param`이 "books"면 책이 나온 화제만, "plain"이면 안 나온 화제만 남긴다. 한 신호가 두
+    슬롯을 먹이는 셈이라 웹 호출은 하루 한 번이다.
+
+    책이 나온 것만 책 슬롯에 주는 이유: 억지 연결("파병 관련 책 있어?")을 문구 규칙이
+    아니라 **검색 결과**로 막는다. 재료가 바깥에서 와도 접지는 Yes24가 한다.
+
+    단 "결과가 있다"로는 부족하다 — Yes24 검색은 부분 일치로 무엇이든 돌려주어 배우 이름에
+    무관한 책이 붙었다(실측: 인명 검색 3건 중 3건이 무관). 그래서 **결과 제목이 화제 이름을
+    통째로 담고 있는지**까지 본다.
+
+    문구 검증(evidence)이 이름 조각 하나로 만족하는 것과 달리 여기는 이름 전체를 요구한다.
+    두 판정은 목적이 다르기 때문이다 — 저쪽은 "사용자가 이 화제를 알아보는가"라 관대해야
+    하고(사람은 줄여 말한다), 이쪽은 "이 책이 그 화제의 책인가"라 엄격해야 한다. 조각으로
+    재면 흔한 말 하나가 무관한 책을 끌어온다(실측: "누가"가 든 제목이 통과했다).
+    """
+    settings = ctx.settings
+    pairs = ctx.shared.get("web_topics")
+    if pairs is None:
         response = await asyncio.wait_for(
-            genai_client.aio.models.generate_content(
-                model=settings.starter_model,
-                contents=json.dumps({"topics": topics}, ensure_ascii=False),
+            ctx.genai_client.aio.models.generate_content(
+                model=settings.web_grounding_model,
+                contents=_TOPIC_PROMPT.format(count=settings.starter_trend_topics),
                 config=types.GenerateContentConfig(
-                    system_instruction=_TREND_INSTRUCTION
-                    + f" 문장 전체는 {settings.starter_max_chars}자를 넘기지 않는다.",
-                    temperature=1.0,
-                    response_mime_type="application/json",
-                    response_schema=schema,
+                    tools=[types.Tool(google_search=types.GoogleSearch())], temperature=0.3
                 ),
             ),
             timeout=settings.starter_timeout_s,
         )
-        record_usage("starter", response.usage_metadata, model=settings.starter_model)
-        raw_items = json.loads(response.text or "{}").get("items") or []
-    except Exception as exc:  # noqa: BLE001 — 백그라운드 생성: 실패는 슬롯 failed로 접는다
-        return _failed(f"생성 실패: {type(exc).__name__}: {exc}")
+        record_usage(
+            "starter_topics", response.usage_metadata, model=settings.web_grounding_model
+        )
+        # 그라운딩 응답은 자유 텍스트다(빌트인 검색과 구조화 출력은 한 요청에 못 섞는다) —
+        # 줄을 잘라 앞머리 기호만 벗긴다. 파싱이 새도 아래 검색 단계가 걸러내므로 무해하다.
+        topics: list[str] = []
+        for line in (response.text or "").splitlines():
+            name = _squash(line).lstrip("-*•0123456789.) ").strip("*")
+            if name and name not in topics:
+                topics.append(name)
+        topics = topics[: settings.starter_trend_topics]
 
-    kept, dropped = validate_trend_items(
-        raw_items, topics, max_chars=settings.starter_max_chars
-    )
-    if not kept:
-        return _failed("출구 검증에서 전부 폐기(관측 밖 화제·빈 문장·중복·상한 초과)", dropped)
-    items = [
-        {"slot": _TREND_SLOT, "goods_no": None, "text": item["text"], "source_url": None}
-        for item in kept
-    ]
-    return {"status": "ok", "items": items, "dropped": dropped, "detail": ""}
+        async def _titles(topic: str) -> list[str]:
+            try:
+                html = await ctx.client.get_text(search_url(settings.yes24_base_url, topic))
+                rows = await asyncio.to_thread(
+                    parse_search, html, base_url=settings.yes24_base_url, limit=3
+                )
+            except (Yes24FetchError, ParseError):
+                return []
+            return [r["title"] for r in rows if r.get("title")]
+
+        found = await asyncio.gather(*(_titles(t) for t in topics))
+        pairs = ctx.shared["web_topics"] = list(zip(topics, found))
+        logger.info(
+            f"starters 화제 수집: {len(pairs)}건 중 책 있음 {sum(1 for _, t in pairs if t)}건"
+        )
+
+    materials = []
+    for topic, titles in pairs:
+        # 화제 이름은 사람이 줄여 말하므로 두 글자 이상 조각 중 하나만 있어도 통과한다.
+        parts = [w for w in topic.replace("·", " ").split() if len(w) >= 2] or [topic]
+        related = [t for t in titles if topic in t]
+        if bool(related) != (ctx.param == "books"):
+            continue
+        hint = {"topic": topic}
+        if related:
+            # 이 책들은 "화제가 책과 이어진다"는 증거이지 문장에 넣을 재료가 아니다.
+            hint["found"] = related
+        materials.append(Material(ref=topic, evidence=[parts], hint=hint))
+    return Observed(materials=materials)
 
 
-async def _generate_picks(
-    section: str, settings: Settings, *, today: dt.date, client, genai_client
-) -> dict:
-    """골라주기 한 슬롯의 관측→생성(1콜)→검증. 상품 경로와 같은 결과 모양을 돌려준다."""
-    try:
-        categories = await _observe_categories(section, settings, client)
-    except (Yes24FetchError, ParseError) as exc:
-        return _failed(f"분야 관측 실패: {exc}")
-    if not categories:
-        return _failed("분야 관측 0건(내비 파싱 결과 없음)")
+async def observe_faq(spec: SlotSpec, ctx: ObserveContext) -> Observed:
+    """고객센터 FAQ 입구가 SSR로 싣는 **실제 질문 목록**.
 
-    count = min(settings.starter_per_slot, len(categories))
-    order = ["category", "text"]
-    schema = types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "items": types.Schema(
-                type=types.Type.ARRAY,
-                min_items=count,
-                max_items=count,
-                items=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "category": types.Schema(
-                            type=types.Type.STRING, enum=[c["name"] for c in categories]
-                        ),
-                        "text": types.Schema(type=types.Type.STRING),
-                    },
-                    required=order,
-                    property_ordering=order,
+    이 슬롯의 접지는 재료에서 끝난다 — 이미 "고객센터가 답하고 있는 질문"이라, 그것을
+    사용자 말투로 옮기면 답이 있다는 것이 보장된다(상품 슬롯이 관측 상품으로 보장받는 것과
+    같은 자리).
+    """
+    seed = POLICY_SEEDS[ctx.param]
+    html = await ctx.client.get_text(seed["url"])
+    soup = await asyncio.to_thread(BeautifulSoup, html, "lxml")
+    entries = await asyncio.to_thread(extract_faq_entries, soup)
+    materials = []
+    for entry in entries:
+        question = _squash(entry.get("question"))
+        if not question:
+            continue
+        # 대괄호 분류표([eBook]·[국내도서])를 떼고 남은 말 중 두 글자 이상이 주제어다.
+        # 증거를 두지 않는다: 이 재료는 이미 "고객센터가 답하고 있는 질문"이라 접지가
+        # 재료에서 끝났고, 문구는 그것을 **사용자 말투로 바꿔** 쓰는 일이다("중고도서" →
+        # "중고책"). 원문 단어를 요구하면 바꿔 쓰라는 지시와 모순된다.
+        materials.append(
+            Material(ref=question[:_REF_MAX_CHARS], evidence=[], hint={"question": question})
+        )
+    return Observed(materials=materials)
+
+
+# 오늘의 화제를 모으는 질문. 책과 이어지는지는 여기서 가리지 않는다 — 그 판정은 Yes24
+# 검색이 하고, 이 프롬프트는 재료를 넓게 모으기만 한다(한 신호가 두 슬롯을 먹인다).
+_TOPIC_PROMPT = (
+    "오늘 한국에서 사람들이 많이 이야기하는 화제를 {count}개 알려줘. "
+    "**갈래를 고르게 섞는다** — 시사·사건만으로 채우지 말고 방송·영화·공연·책·인물·유행·"
+    "계절·스포츠에서 나눠 고른다(한 갈래에 쏠리면 그 갈래를 쓰는 자리만 채워지고 나머지는 "
+    "빈다). 각 항목은 **검색창에 넣어 찾을 수 있는 이름 그 자체**로 쓴다 — 작품·인물·"
+    "행사의 이름만 남기고 갈래·설명·수식을 붙이지 않는다(이름이 길면 검색이 빗나간다). "
+    "번호·기호 없이 한 줄에 하나씩만 쓴다."
+)
+
+
+def build_slots(settings: Settings) -> list[SlotSpec]:
+    """설정에서 오늘의 슬롯 목록을 만든다 — 자동 생성 대상의 단일 출처.
+
+    서빙의 lazy 트리거·활성 풀 필터·어드민 생성이 **같은 목록**을 본다. 목록이 여러 벌이면
+    구성을 바꿨을 때 한쪽만 고쳐 옛 슬롯이 고아로 남는다.
+    """
+    specs: list[SlotSpec] = []
+    for section in settings.starter_sections:
+        specs.append(
+            SlotSpec(
+                key=section,
+                ask=(
+                    "재료는 오늘 그 코너에 실제로 오른 상품이다. 그 책 한 권을 가리켜, "
+                    "**상품 페이지를 열어야 알 수 있는 것**을 묻는다 — 어떤 내용인지, 어떤 "
+                    "이야기인지, 누구에게 맞는지 같은 것이다. 제목은 『』로 감싼다."
                 ),
+                observe=observe_corner_products,
             )
-        },
-        required=["items"],
-    )
-    seed = BROWSE_SEED_URLS[section]
-    payload = {
-        "label": seed["label"],
-        "anchor": _anchor(seed, today),
-        "categories": [c["name"] for c in categories],
-    }
+        )
+    if settings.starter_pick_from:
+        specs.append(
+            SlotSpec(
+                key=f"{settings.starter_pick_from}{_PICK_SUFFIX}",
+                ask=(
+                    "재료는 그 코너의 분야 목록이다. 상품 하나를 지목하지 말고 **분야 하나를 "
+                    "골라 골라 달라고** 한다 — 여기서만 할 수 있는 일이 '골라주기'이므로 "
+                    "조건이나 상황을 하나 얹어 고르게 한다(어떤 사람에게 맞는지, 어떤 때 "
+                    "읽는지 같은 것). 특정 책 제목·저자·가격은 문장에 넣지 않는다."
+                ),
+                observe=observe_corner_categories,
+            )
+        )
+    if settings.starter_trend_topics > 0:
+        specs.append(
+            SlotSpec(
+                key=_TREND_SLOT,
+                ask=(
+                    "재료는 오늘 사람들이 이야기하는 화제 가운데 **Yes24에 관련 책이 있는** "
+                    "것들이다. 화제 하나를 골라 그것을 책으로 잇는다 — 원작이나 관련 책을 "
+                    "찾거나, 그 주제를 더 알고 싶다는 꼴이다. 화제 이름은 그것이 "
+                    "**무엇인지 알 수 있게 갈래를 붙여** 쓴다(방송·영화·인물처럼) — 이름만 "
+                    "덩그러니 두면 읽는 사람이 무엇을 가리키는지 모른다. "
+                    "특정 책 제목은 넣지 않는다."
+                ),
+                observe=observe_web_topics,
+            )
+        )
+        specs.append(
+            SlotSpec(
+                key=_GENERAL_SLOT,
+                ask=(
+                    "재료는 오늘 사람들이 이야기하는 화제 가운데 **책과 이어지지 않는** "
+                    "것들이다. 화제 하나를 골라 그 화제 자체를 묻는다 — 무슨 일인지, 지금 "
+                    "어떤 상황인지다. 책·독서를 끌어들이지 않는다(그 일은 다른 칩이 한다). "
+                    "화제 이름은 그것이 **무엇인지 알 수 있게 갈래를 붙여** 쓴다(방송·영화·"
+                    "인물처럼) — 이름만 덩그러니 두면 읽는 사람이 무엇을 가리키는지 모른다. "
+                    "확인되지 않은 사실을 단정하지 않는다 — 묻는 문장이지 주장이 아니다."
+                ),
+                observe=observe_web_topics,
+            )
+        )
+    if settings.starter_policy_source:
+        specs.append(
+            SlotSpec(
+                key=_POLICY_SLOT,
+                ask=(
+                    "재료는 Yes24 고객센터가 실제로 답하고 있는 질문이다. 항목 하나를 골라 "
+                    "그것이 다루는 것을 묻되, 고객센터 말투를 그대로 옮기지 말고 사람이 "
+                    "말하듯 바꿔 쓴다. **여러 사람이 겪을 법한 것**을 고른다 — 판매자 전용· "
+                    "특정 기기 설정처럼 좁은 쪽은 피한다. 답을 쓰지 않고 묻기만 한다."
+                ),
+                observe=observe_faq,
+            )
+        )
+    return specs
+
+
+def auto_slots(settings: Settings) -> list[str]:
+    return [spec.key for spec in build_slots(settings)]
+
+
+def _observe_param(spec: SlotSpec, settings: Settings) -> str:
+    """관측기가 슬롯마다 달리 볼 대상 — 명세 키에서 파생한다(코드에 슬롯 열거를 두지 않는다)."""
+    if spec.observe is observe_corner_categories:
+        return settings.starter_pick_from
+    if spec.observe is observe_web_topics:
+        return "books" if spec.key == _TREND_SLOT else "plain"
+    if spec.observe is observe_faq:
+        return settings.starter_policy_source
+    return ""
+
+
+async def generate_slot(
+    spec: SlotSpec, ctx: ObserveContext, *, shared: dict | None = None
+) -> dict:
+    """한 슬롯의 관측 → 생성(1콜) → 출구 검증. 슬롯이 무엇이든 절차는 같다.
+
+    `shared`는 같은 관측기를 쓰는 슬롯끼리 바깥 호출을 나눠 쓰기 위한 자리다(웹 화제는
+    한 번 모아 두 슬롯이 나눈다). 관측 0건은 모델 콜 없이 failed다 — 빈 성공으로 위장하지
+    않는다(원칙 7).
+    """
+    settings = ctx.settings
+    try:
+        observed = await spec.observe(spec, ctx)
+    except Exception as exc:  # noqa: BLE001 — 관측 실패는 그 슬롯만 접는다
+        return _failed(f"관측 실패: {type(exc).__name__}: {exc}")
+    if not observed.materials:
+        return _failed("관측 0건(재료 없음)")
+
+    materials = observed.materials
+    # 재료보다 많이 요구하지 않는다 — min_items가 재료 수를 넘으면 모델은 같은 것을
+    # 되풀이해 채우고 그 문장들은 중복으로 폐기된다(슬롯이 통째로 비는 실제 경로였다).
+    count = min(settings.starter_per_slot, len(materials))
+    payload: dict = {"materials": [_material_payload(m) for m in materials]}
+    if observed.note:
+        payload["note"] = observed.note
     try:
         response = await asyncio.wait_for(
-            genai_client.aio.models.generate_content(
+            ctx.genai_client.aio.models.generate_content(
                 model=settings.starter_model,
                 contents=json.dumps(payload, ensure_ascii=False),
                 config=types.GenerateContentConfig(
-                    system_instruction=_PICK_INSTRUCTION + (
-                        f" 문장 전체는 {settings.starter_max_chars}자를 넘기지 않는다."
-                    ),
+                    system_instruction=_instruction(spec, settings.starter_max_chars),
                     temperature=1.0,
                     response_mime_type="application/json",
-                    response_schema=schema,
+                    response_schema=_response_schema([m.ref for m in materials], count),
                 ),
             ),
             timeout=settings.starter_timeout_s,
@@ -689,27 +666,25 @@ async def _generate_picks(
     except Exception as exc:  # noqa: BLE001 — 백그라운드 생성: 실패는 슬롯 failed로 접는다
         return _failed(f"생성 실패: {type(exc).__name__}: {exc}")
 
-    kept, dropped = validate_pick_items(
-        raw_items, categories, max_chars=settings.starter_max_chars
-    )
+    kept, dropped = validate_items(raw_items, materials, max_chars=settings.starter_max_chars)
+    total_dropped = sum(dropped.values())
     if not kept:
-        return _failed("출구 검증에서 전부 폐기(관측 밖 분야·빈 문장·중복·상한 초과)", dropped)
+        return _failed(f"출구 검증에서 전부 폐기({dropped})", total_dropped)
     items = [
-        {"slot": pick_slot(section), "goods_no": None, "text": item["text"],
-         "source_url": browse_url(section)}
+        {
+            "slot": spec.key,
+            # 상품을 가리킨 문구만 상품 번호를 남긴다 — 반복 회피와 링크가 그것을 쓴다.
+            "goods_no": int(item["ref"]) if item["ref"].isdigit() else None,
+            "text": item["text"],
+            "source_url": None,
+        }
         for item in kept
     ]
-    return {"status": "ok", "items": items, "dropped": dropped, "detail": ""}
-
-
-async def _observe(slot: str, settings: Settings, client, today: dt.date) -> list[dict]:
-    """코너 1페이지 관측 → 파싱 → 구조 필터. 실패는 예외 그대로(호출부가 슬롯 failed로 접는다)."""
-    html = await client.get_text(browse_url(slot))
-    # limit은 주지 않는다 — 코너 한 페이지가 곧 관측 단위이고, 파서 기본값이 그 페이지 크기다.
-    rows = await asyncio.to_thread(
-        parse_browse_list, html, base_url=settings.yes24_base_url, section=slot
+    logger.info(
+        f"starters 생성: slot={spec.key} 재료={len(materials)} 요청={count} "
+        f"생존={len(items)} 폐기={dropped}"
     )
-    return observe_rows(rows, slot, today)
+    return {"status": "ok", "items": items, "dropped": total_dropped, "detail": ""}
 
 
 async def build_candidates(
@@ -721,87 +696,31 @@ async def build_candidates(
     genai_client=None,
     exclude: dict[str, set[int]] | None = None,
 ) -> dict[str, dict]:
-    """슬롯들의 관측→생성(1콜)→출구 검증. 저장은 하지 않는다(서비스·라이브 스모크가 공유).
+    """슬롯들의 관측→생성→검증. 저장은 하지 않는다(서비스·라이브 점검이 공유).
 
-    반환: `{slot: {status: "ok"|"failed", items: [{slot, goods_no, text, source_url}],
-    dropped, detail}}`.
-    관측 0건인 슬롯은 모델 콜 없이 failed(빈 성공 위장 금지, 원칙 7). 모델 콜은 관측된 슬롯
-    전체에 1회이고, 실패하면 그 슬롯 전부 failed다. `exclude`(최근에 이미 쓴 goods_no)는
-    payload에서만 빠진다 — 관측·검증은 페이지 전량을 그대로 본다(제외분이 재료를 다 비우면
-    그 슬롯은 폐기로 접힌다).
+    반환: `{slot: {status, items, dropped, detail}}`. 슬롯 하나가 실패해도 다른 슬롯은
+    그대로 간다 — 실패한 슬롯은 어제 세트를 유지한다.
     """
     client = client or get_client(settings)
     genai_client = genai_client or get_genai_client()
+    by_key = {spec.key: spec for spec in build_slots(settings)}
     results: dict[str, dict] = {}
-    observed: dict[str, list[dict]] = {}
-    # 골라주기 슬롯은 재료(분야 목록)도 스키마도 달라 **자기 콜**을 쓴다. 한 스키마에
-    # 상품 칸과 분야 칸을 섞으면 안 쓰는 칸을 채우려는 편향이 생긴다.
-    if _TREND_SLOT in slots:
-        results[_TREND_SLOT] = await _generate_trends(
-            settings, client=client, genai_client=genai_client
-        )
-    for slot in [s for s in slots if pick_base(s)]:
-        results[slot] = await _generate_picks(
-            pick_base(slot), settings, today=today, client=client, genai_client=genai_client
-        )
-    for slot in [s for s in slots if not pick_base(s) and s != _TREND_SLOT]:
-        try:
-            rows = await _observe(slot, settings, client, today)
-        except (Yes24FetchError, ParseError) as exc:
-            results[slot] = _failed(f"관측 실패: {exc}")
+    shared: dict = {}
+    for key in slots:
+        spec = by_key.get(key)
+        if spec is None:
+            results[key] = _failed(f"자동 생성 슬롯이 아닙니다: {key!r}")
             continue
-        if not rows:
-            results[slot] = _failed("관측 0건(파싱 결과 없음 또는 당월 출간분 없음)")
-            continue
-        observed[slot] = rows
-    if not observed:
-        return results
-
-    started = time.monotonic()
-    per_slot = settings.starter_per_slot
-    payload = _payload(observed, today, exclude, min_rows=per_slot)
-    # 재료보다 많이 요구하지 않는다 — min_items가 행 수를 넘으면 모델은 같은 상품을 되풀이해
-    # 채우고 그 문장들은 중복으로 폐기된다(슬롯이 통째로 비는 실제 경로였다).
-    count = sum(min(per_slot, len(section["rows"])) for section in payload["sections"].values())
-    try:
-        response = await asyncio.wait_for(
-            genai_client.aio.models.generate_content(
-                model=settings.starter_model,
-                contents=json.dumps(payload, ensure_ascii=False),
-                config=types.GenerateContentConfig(
-                    system_instruction=_instruction(settings.starter_max_chars),
-                    temperature=1.0,
-                    response_mime_type="application/json",
-                    response_schema=_response_schema(list(observed), count),
-                ),
-            ),
-            timeout=settings.starter_timeout_s,
+        ctx = ObserveContext(
+            settings=settings,
+            client=client,
+            genai_client=genai_client,
+            today=today,
+            exclude=(exclude or {}).get(key, set()),
+            param=_observe_param(spec, settings),
+            shared=shared,
         )
-        record_usage("starter", response.usage_metadata, model=settings.starter_model)
-        raw_items = json.loads(response.text or "{}").get("items") or []
-    except Exception as exc:  # noqa: BLE001 — 백그라운드 생성: 실패는 슬롯 failed로 접는다
-        for slot in observed:
-            results[slot] = _failed(f"생성 실패: {type(exc).__name__}: {exc}")
-        return results
-
-    observed_sets = {slot: {int(r["goods_no"]): r for r in rows} for slot, rows in observed.items()}
-    kept, dropped = validate_items(raw_items, observed_sets, max_chars=settings.starter_max_chars)
-    for slot in observed:
-        items = [{**item, "source_url": browse_url(slot)} for item in kept[slot]]
-        if items:
-            results[slot] = {
-                "status": "ok", "items": items, "dropped": dropped.get(slot, 0), "detail": ""
-            }
-        else:
-            results[slot] = _failed(
-                "출구 검증에서 전부 폐기(관측 밖 goods_no·빈 문장·중복·상한 초과)",
-                dropped.get(slot, 0),
-            )
-    logger.info(
-        f"starters 생성: slots={list(observed)} raw={len(raw_items)} "
-        f"kept={ {s: len(r['items']) for s, r in results.items()} } dropped={dropped} "
-        f"elapsed={time.monotonic() - started:.2f}s"
-    )
+        results[key] = await generate_slot(spec, ctx)
     return results
 
 
