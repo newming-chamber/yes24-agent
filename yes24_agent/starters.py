@@ -56,7 +56,7 @@ from yes24_agent.admin import require_admin
 from yes24_agent.auth import AuthenticatedUser, get_authenticated_user
 from yes24_agent.config import Settings, get_genai_client, get_settings
 from yes24_agent.db import MysqlBackedService
-from yes24_agent.session_service import mysql_pool_kwargs
+from yes24_agent.session_service import SQLITE_DIALECT, db_dialect, mysql_pool_kwargs
 from yes24_agent.sources import KST
 from yes24_agent.tools.yes24_search import get_client
 from yes24_agent.usage import record_usage
@@ -225,11 +225,12 @@ _HEAD = (
     "꼴이면 물음표로, 청하는 꼴이면 물음표 없이 끝낸다. "
     "재료(materials) 가운데 **하나**를 골라 ref에 그 값을 그대로 적는다. 목록 밖의 것을 "
     "만들지 않는다. 고른 재료에 must가 있으면 **그 값을 하나도 빠짐없이 문장에 그대로 "
-    "넣는다** — 빠지면 그 문장은 폐기된다. must가 없으면 그 재료를 가리킨다는 것이 문장에서 "
-    "드러나기만 하면 되고, 이름은 사람이 말하듯 줄여 써도 된다. "
-    "note가 있으면 **그 문구를 문장에 그대로 넣는다** — 재료가 어디서 왔는지를 읽는 사람이 "
-    "알아야 한다(순위만 있으면 무슨 순위인지 모른다). note에 없는 날짜·요일·계절은 지어내지 "
-    "않고, note가 없으면 시기를 말하지 않는다. 같은 세트 안에서는 서로 다른 재료를 다룬다. "
+    "넣는다** — 하나라도 빠지면 그 문장은 버려진다. 재료가 어디서 왔는지(코너 이름·순위·"
+    "출간월)가 거기 들어 있고, 그것 없이는 읽는 사람이 무엇을 가리키는지 모른다. must가 "
+    "없는 재료는 그것을 가리킨다는 것이 문장에서 드러나기만 하면 되고, 이름은 사람이 말하듯 "
+    "줄여 써도 된다. "
+    "재료에 없는 날짜·요일·계절은 지어내지 않는다. 같은 세트 안에서는 서로 다른 재료를 "
+    "다룬다. "
 )
 _TAIL = (
     " 마지막으로, 위의 모든 규칙보다 앞서는 기준이 하나 있다. "
@@ -460,14 +461,20 @@ async def observe_web_topics(spec: SlotSpec, ctx: ObserveContext) -> Observed:
         topics = topics[: settings.starter_trend_topics]
 
         async def _titles(topic: str) -> list[str]:
+            """그 화제를 **통째로 담은** 상품의 제목들. 제목이든 저자든 이름이 들어야 한다 —
+            인물 화제는 그 사람이 쓴 책이나 그 사람을 다룬 책 둘 다 관련이다."""
             try:
                 html = await ctx.client.get_text(search_url(settings.yes24_base_url, topic))
                 rows = await asyncio.to_thread(
-                    parse_search, html, base_url=settings.yes24_base_url, limit=3
+                    parse_search, html, base_url=settings.yes24_base_url, limit=5
                 )
             except (Yes24FetchError, ParseError):
                 return []
-            return [r["title"] for r in rows if r.get("title")]
+            return [
+                r["title"]
+                for r in rows
+                if r.get("title") and topic in f"{r['title']} {r.get('author') or ''}"
+            ]
 
         found = await asyncio.gather(*(_titles(t) for t in topics))
         pairs = ctx.shared["web_topics"] = list(zip(topics, found))
@@ -482,7 +489,7 @@ async def observe_web_topics(spec: SlotSpec, ctx: ObserveContext) -> Observed:
     for topic, titles in pairs:
         # 화제 이름은 사람이 줄여 말하므로 두 글자 이상 조각 중 하나만 있어도 통과한다.
         parts = [w for w in topic.replace("·", " ").split() if len(w) >= 2] or [topic]
-        related = [t for t in titles if topic in t]
+        related = titles
         if bool(related) != (ctx.param == "books"):
             continue
         hint = {"topic": topic}
@@ -828,6 +835,33 @@ class StarterService(MysqlBackedService):
             self.ensure_generation(missing, today)
         return {"set_id": set_id, "starters": [Starter.of(p, settings) for p in picked]}
 
+    async def refresh_loop(self) -> None:
+        """오늘자 생성이 없으면 만들고 다음 주기까지 잔다 — 첫 방문자도 오늘 것을 본다.
+
+        서빙 경로의 lazy 트리거와 **같은 판정**을 쓴다(오늘자 run이 없는 자동 슬롯). 그래서
+        루프가 꺼져 있어도(interval 0) 동작이 사라지지 않고 트리거가 첫 요청으로 돌아갈
+        뿐이다. 여러 워커가 함께 돌아도 실제 생성은 하루 한 번 — 선점은 DB PK가 가른다.
+
+        **첫 동작은 한 주기 뒤**다. 기동 직후는 서빙 경로의 lazy 트리거가 담당하므로 여기서
+        서두를 이유가 없고, 그래야 짧게 떴다 지는 프로세스(테스트·헬스체크)가 아무 일도
+        하지 않는다. 이 루프의 몫은 "트래픽이 없는 시간대에도 오늘 것이 준비되는 것"이다.
+
+        실패는 삼키고 다음 주기에 다시 본다. 이 루프가 서빙을 막아서는 안 된다.
+        """
+        interval = get_settings().starter_refresh_interval_s
+        while interval > 0:
+            try:
+                today = _today()
+                missing = [s for s in auto_slots(get_settings()) if s not in
+                           await self.slots_run_today(today)]
+                if missing:
+                    await self.run_generation(missing, today)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — 주기 작업: 다음 주기에 다시 본다
+                logger.warning(f"starters 주기 갱신 실패(다음 주기 재시도): {exc}")
+            await asyncio.sleep(interval)
+
     def ensure_generation(self, slots: list[str], today: dt.date) -> None:
         """생성 태스크를 프로세스당 하나만 띄운다(진행 중이면 무동작 — single-flight)."""
         if self._generation is not None and not self._generation.done():
@@ -1035,6 +1069,31 @@ class StarterService(MysqlBackedService):
             fetch_all=True,
         )
         return [dict(zip(_RUN_COLUMNS, row)) for row in rows or ()]
+
+
+def start_starter_refresh(app, settings: Settings) -> None:
+    """주기 갱신 루프를 앱에 띄운다 — 기능이 꺼져 있거나 주기가 0이면 무동작.
+
+    참조를 app.state에 잡아 GC 취소를 막고, 종료 훅이 그것을 취소한다.
+    """
+    # 저장소가 없는 구성(로컬 sqlite)에서는 띄우지 않는다. 설정만 보고 판단하는 이유:
+    # 서비스 인스턴스를 만들어 확인하면 그 전역 싱글턴이 남아, 뒤따르는 테스트의 종료 훅이
+    # 그것을 닫다 터진다(실측).
+    if (
+        not settings.starter_model
+        or settings.starter_refresh_interval_s <= 0
+        or db_dialect(settings.session_db_url) == SQLITE_DIALECT
+    ):
+        return
+
+    async def _delayed_loop() -> None:
+        # **첫 동작은 한 주기 뒤**다. 기동 직후는 서빙 경로의 lazy 트리거가 담당하므로 여기서
+        # 서두를 이유가 없고, 그래야 짧게 떴다 지는 프로세스(테스트·헬스체크)가 서비스
+        # 싱글턴조차 만들지 않는다 — 만들어 두면 그것을 물려받은 다른 종료 훅이 터진다.
+        await asyncio.sleep(settings.starter_refresh_interval_s)
+        await StarterService.get_instance().refresh_loop()
+
+    app.state.starter_refresh = asyncio.create_task(_delayed_loop())
 
 
 async def close_starter_service() -> None:

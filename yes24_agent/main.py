@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -54,7 +55,11 @@ from yes24_agent.rbti.profile import fetch_user_rbti
 from yes24_agent.runner import run_agent_stream
 from yes24_agent.session_service import SQLITE_DIALECT, db_dialect, persistence_mode
 from yes24_agent.sse import OVERVIEW_EVENT_CONTRACT, SSE_EVENT_CONTRACT
-from yes24_agent.starters import close_starter_service, register_starters
+from yes24_agent.starters import (
+    close_starter_service,
+    register_starters,
+    start_starter_refresh,
+)
 from yes24_agent.thought_translation import warmup_translation
 from yes24_agent.toolsets import TOOLSETS, get_resolved_app, resolve_app_for
 from yes24_agent.usage import close_usage_logger
@@ -446,6 +451,8 @@ async def lifespan(app: FastAPI):
     # 사고 라벨 번역 경로를 백그라운드로 데운다(첫 채팅의 첫 한국어 라벨 ~0.3초 단축).
     # 기동을 막지 않도록 task로만 띄우고, 참조를 잡아 GC 취소를 막는다.
     app.state.translation_warmup = asyncio.create_task(warmup_translation())
+    # 초기 질문을 그날 것으로 유지하는 주기 갱신(설정이 0이면 무동작 — 첫 요청이 트리거).
+    start_starter_refresh(app, get_settings())
     yield
     # 공유 HTTP 클라이언트를 정리해 열린 커넥션을 닫는다 — 훅 목록은 toolset 레지스트리
     # 파생이라 새 toolset이 생겨도 여기는 무수정이다(미생성 클라이언트는 no-op).
@@ -455,7 +462,13 @@ async def lifespan(app: FastAPI):
     await close_auth_service()
     # 사용자별 대화 데이터(피드백·읽음·제목) 풀도 같은 방식으로 닫는다(만들어진 적 없으면 no-op).
     await close_user_data_service()
-    # 초기 질문 풀 서비스도 같은 방식으로 닫는다(만들어진 적 없으면 no-op).
+    # 초기 질문: 주기 갱신 루프를 먼저 멈추고(안 멈추면 풀이 닫힌 뒤에도 질의를 시도한다)
+    # 풀을 닫는다. 만들어진 적 없으면 둘 다 no-op.
+    refresh = getattr(app.state, "starter_refresh", None)
+    if refresh is not None and not refresh.done():
+        refresh.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await refresh
     await close_starter_service()
     # 토큰 사용량 기록 풀도 나란히 정리한다 — 진행 중인 fire-and-forget INSERT를
     # 배수한 뒤 닫는다(만들어진 적 없으면 no-op).
