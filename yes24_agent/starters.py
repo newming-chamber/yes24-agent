@@ -184,6 +184,9 @@ class Material:
     ref: str
     evidence: list[list[str]]
     hint: dict
+    # 상품을 가리키는 재료만 채운다. **ref 문자열로 추론하지 않는다** — FAQ 참조키를 인덱스로
+    # 바꾸자 "10"이 상품 번호로 읽혀 정책 칩에 없는 상품 링크가 붙었다(실측).
+    goods_no: int | None = None
 
 
 @dataclass(frozen=True)
@@ -309,7 +312,7 @@ def validate_items(
             logger.warning(f"starters 폐기: ref={ref!r} reason={reason} text={text!r}")
             continue
         seen.add(text)
-        kept.append({"ref": ref, "text": text, "hint": material.hint})
+        kept.append({"ref": ref, "text": text, "goods_no": material.goods_no})
     return kept, dropped
 
 
@@ -383,7 +386,14 @@ async def observe_corner_products(spec: SlotSpec, ctx: ObserveContext) -> Observ
             evidence.append([f"{rank}위"])
         if row.get("pub_date"):
             hint["pub_date"] = row["pub_date"]
-        materials.append(Material(ref=str(row["goods_no"]), evidence=evidence, hint=hint))
+        materials.append(
+            Material(
+                ref=str(row["goods_no"]),
+                evidence=evidence,
+                hint=hint,
+                goods_no=int(row["goods_no"]),
+            )
+        )
     note = "베스트셀러" if seed["has_rank"] else f"{ctx.today.month}월 신간"
     # note도 문장에 있어야 한다 — 칩 라벨은 코너를 말해 주지만 **눌러서 전송되는 문장**은
     # 라벨 없이 홀로 채팅에 간다. "5위인 『…』"만으로는 무슨 순위인지 알 수 없다(실측).
@@ -686,7 +696,8 @@ async def generate_slot(
         {
             "slot": spec.key,
             # 상품을 가리킨 문구만 상품 번호를 남긴다 — 반복 회피와 링크가 그것을 쓴다.
-            "goods_no": int(item["ref"]) if item["ref"].isdigit() else None,
+            # 재료가 선언한 값을 그대로 쓴다(ref 문자열을 해석하지 않는다).
+            "goods_no": item["goods_no"],
             "text": item["text"],
             "source_url": None,
         }
