@@ -14,6 +14,8 @@
   인용 출처 집합 밖의 id·빈 이유를 코드로 걸러낸다(원칙 4의 부가 채널판 — 마커 검증이
   본문에 하는 일을 여기서는 id 대조가 한다).
 - 추출 결과가 전부 비면 None — 호출부가 meta 이벤트 자체를 내지 않는다(빈 프레임 금지).
+- **추천 이유는 세션에 이월된다**: `carry_recommendation_reasons`가 이번 턴 추출분과 세션
+  state의 `{url: reason}` 저장소를 합성한다(RECOMMENDATION_REASONS_STATE_KEY 주석 참조).
 """
 
 import asyncio
@@ -30,6 +32,15 @@ logger = logging.getLogger(__name__)
 
 # 세션 제목의 세션 state 키. runner가 턴 시작에 존재 여부를 보고(want_title) 추출 후 영속한다.
 SESSION_TITLE_STATE_KEY = "session_title"
+# 추천 이유 이월 저장소의 세션 state 키 — `{url: reason}` (2026-09-09 사용자 결정:
+# recommendations[].reason은 "이번 턴이 권한 항목"이 아니라 "이 세션에서 그 책을 추천한
+# 이유"이고, 한 번 이유가 붙은 책은 이후 턴에 다시 인용될 때도 그 이유를 실어 내려준다).
+# **키가 url인 이유**: 공개 `source.id`는 턴마다 본문 인용 순서로 재부여된다(실측: 같은 url
+# 3건이 턴1 `1,2,3` → 턴2 `3,1,2`). id로 캐싱하면 다른 책에 다른 이유가 붙는다. url은 세션
+# 내내 같은 책을 가리킨다(레지스트리도 url 동일성으로 id를 유지한다 — 원칙 4).
+# **서버가 드는 이유**: 붙는 클라이언트마다 이 함정을 각자 피하게 하는 대신 구조로 닫고,
+# 히스토리 복원이 한 턴만 렌더·페이지네이션해도 턴 스냅샷이 자족적이어야 하기 때문이다.
+RECOMMENDATION_REASONS_STATE_KEY = "recommendation_reasons"
 
 # 추출기는 판정하지 않는다 — 본문에 이미 서술된 것을 구조로 옮기기만 한다(창작 금지).
 # 사례 열거 없이 일반 원칙만 둔다(no-case-patch). 단위는 **출처가 아니라 추천 항목**이다 —
@@ -121,12 +132,11 @@ def _clip_title(title: str, max_chars: int) -> str:
 def _validated_meta(raw: dict, cited_ids: list[int], want_title: bool) -> dict | None:
     """모델 출력의 출구 검증 — 인용 집합 밖 id·빈 이유·중복을 버리고, 전부 비면 None.
 
-    cited_ids는 **본문 인용 등장 순서**다(done.sources 순서 그대로). 추천도 그 순서로
-    정렬하고 상한(enrichment_max_recommendations)을 넘는 꼬리는 버린다 — 프론트 카드
-    줄과 어긋나지 않는 정렬·폭 규약(crema-ai 카드 계약 이식, 2026-08-20).
+    추천의 정렬·상한은 여기서 하지 않는다 — 이월 합성(`carry_recommendation_reasons`)이
+    저장소에서 채운 항목까지 합친 뒤 한 곳에서 정한다(같은 판정의 중복 구현 금지).
     """
     settings = get_settings()
-    order = {source_id: rank for rank, source_id in enumerate(cited_ids)}
+    order = set(cited_ids)
     by_id: dict[int, dict] = {}
     dropped: list[object] = []
     # 권유 답변이 아니라고 스스로 판정했으면 항목을 보지도 않는다 — 정보 조회 턴의 판본
@@ -141,17 +151,10 @@ def _validated_meta(raw: dict, cited_ids: list[int], want_title: bool) -> dict |
         by_id[source_id] = {"id": source_id, "reason": reason}
     if dropped:
         logger.warning(f"meta 추천에서 인용 밖 id·빈 이유·중복 {len(dropped)}건 제거: {dropped}")
-    recommendations = sorted(by_id.values(), key=lambda r: order[r["id"]])
-    if len(recommendations) > settings.enrichment_max_recommendations:
-        logger.warning(
-            f"meta 추천 {len(recommendations)}건이 상한을 넘어 "
-            f"{settings.enrichment_max_recommendations}건으로 자릅니다."
-        )
-        recommendations = recommendations[: settings.enrichment_max_recommendations]
 
     meta: dict = {}
-    if recommendations:
-        meta["recommendations"] = recommendations
+    if by_id:
+        meta["recommendations"] = list(by_id.values())
     # 후속 질문: 스키마가 개수를 강제하지만 출구도 한 번 더 본다 — 모델이 빈 문자열이나
     # 같은 질문을 반복해 칸을 채우면 개수만 맞고 화면엔 빈 칩·중복 칩이 선다.
     # 길이는 자르지 않는다 — 이 문자열은 표시용이 아니라 **누르면 그대로 전송되는 질문**이라
@@ -172,6 +175,51 @@ def _validated_meta(raw: dict, cited_ids: list[int], want_title: bool) -> dict |
         if title:
             meta["session_title"] = title
     return meta or None
+
+
+def carry_recommendation_reasons(
+    cited_sources: list[dict],
+    fresh: list[dict],
+    remembered: dict[str, str],
+) -> tuple[list[dict], dict[str, str]]:
+    """인용 출처에 추천 이유를 합성한다 — 이번 턴 이유가 이기고, 없으면 저장소(url)에서 채운다.
+
+    돌려주는 것은 `(recommendations, 갱신된 저장소)`다. 저장소는 입력을 변이하지 않은 새 dict이며
+    삽입 순서가 곧 최근 순서다: 이번 턴에 이유가 붙은(새로 또는 갱신된) 책은 끝으로 옮기고,
+    `enrichment_reason_memory_max`를 넘으면 앞(가장 오래된 것)부터 버린다. 상한 근거: 세션이
+    길어져도 state 행이 무한히 크지 않게 하는 안전 상한일 뿐 의미 경계가 아니다 — 카드 폭
+    (max_recommendations)의 10배면 한 세션의 추천 회전을 넉넉히 덮는다.
+
+    결과 정렬은 **본문 인용 등장 순서**(cited_sources 순서 = done.sources 순서)이고 상한은
+    `enrichment_max_recommendations`다 — 프론트 카드 줄과 어긋나지 않는 정렬·폭 규약(crema-ai
+    카드 계약 이식, 2026-08-20). 이월은 enrichment 성공 여부와 독립이다: `fresh`가 비어도
+    (실패·None·비권유 판정) 저장소에 있는 책은 실린다.
+    """
+    settings = get_settings()
+    fresh_by_id = {item["id"]: item["reason"] for item in fresh}
+    memory = dict(remembered)
+    recommendations: list[dict] = []
+    for source in cited_sources:
+        source_id, url = source.get("id"), source.get("url")
+        reason = fresh_by_id.get(source_id)
+        if reason is not None and url:
+            memory.pop(url, None)  # 끝으로 옮겨 "최근"으로 친다
+            memory[url] = reason
+        elif reason is None:
+            reason = memory.get(url)
+        if reason:
+            recommendations.append({"id": source_id, "reason": reason})
+    if len(recommendations) > settings.enrichment_max_recommendations:
+        logger.warning(
+            f"meta 추천 {len(recommendations)}건이 상한을 넘어 "
+            f"{settings.enrichment_max_recommendations}건으로 자릅니다."
+        )
+        recommendations = recommendations[: settings.enrichment_max_recommendations]
+    overflow = len(memory) - settings.enrichment_reason_memory_max
+    if overflow > 0:
+        for url in list(memory)[:overflow]:
+            del memory[url]
+    return recommendations, memory
 
 
 async def extract_turn_meta(

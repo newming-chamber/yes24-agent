@@ -27,7 +27,12 @@ from google.genai.errors import APIError
 from yes24_agent.adk_stream import iter_adk_events
 from yes24_agent.agent import get_agent
 from yes24_agent.config import get_settings
-from yes24_agent.enrichment import SESSION_TITLE_STATE_KEY, extract_turn_meta
+from yes24_agent.enrichment import (
+    RECOMMENDATION_REASONS_STATE_KEY,
+    SESSION_TITLE_STATE_KEY,
+    carry_recommendation_reasons,
+    extract_turn_meta,
+)
 from yes24_agent.event_translate import (
     TurnProcess,
     project_public_source,
@@ -564,6 +569,9 @@ async def run_agent_stream(
             # 이 세션에 제목이 아직 없는가 — meta 파이프라인의 제목 생성 여부(구조 판정).
             # 턴 시작에 잡아 두어, 이번 턴이 직접 영속한 제목을 같은 턴이 다시 만들지 않는다.
             want_title = enrich and not session.state.get(SESSION_TITLE_STATE_KEY)
+            # 추천 이유 이월 저장소(`{url: reason}`) — 세션 락이 같은 세션의 턴을 순차화하므로
+            # 턴 시작 스냅샷으로 충분하다(이번 턴 외엔 아무도 쓰지 않는다).
+            remembered_reasons = dict(session.state.get(RECOMMENDATION_REASONS_STATE_KEY) or {})
             # 직전 턴은 후속 질문의 맥락 재료다(2026-09-04 눈가림 배터리 — 직전 턴 있는 턴에서
             # 세트 구체성 57%→86%). 이번 턴의 user 이벤트가 붙기 전인 지금 잡아야 "직전"이다.
             # 부가 채널 재료가 세션 준비를 죽이면 안 된다 — 이력 객체가 없으면 그냥 없는 것.
@@ -1001,41 +1009,57 @@ async def run_agent_stream(
                 # extract_turn_meta가 예외를 삼키지만, 프레임 방출·제목 영속까지 한 번 더
                 # 감싼다 — 부가 채널 실패가 정상 답변의 done 마감을 오염시키면 안 된다.
                 want_follow_ups = settings.enrichment_follow_ups > 0
-                if enrich and (final_done.get("sources") or want_title or want_follow_ups):
+                if enrich:
                     try:
-                        meta = await extract_turn_meta(
-                            message,
-                            final_done.get("text", ""),
-                            final_done.get("sources", []),
-                            want_title=want_title,
-                            prior_turn=prior_turn,
-                        )
+                        meta = None
+                        if final_done.get("sources") or want_title or want_follow_ups:
+                            meta = await extract_turn_meta(
+                                message,
+                                final_done.get("text", ""),
+                                final_done.get("sources", []),
+                                want_title=want_title,
+                                prior_turn=prior_turn,
+                            )
                         if meta:
                             final_done["meta"].update(meta)
+                        # 추천 이유 이월 — enrichment 성공 여부와 독립이다. 이번 턴 추출분이
+                        # 이기고, 없으면 세션 저장소에서 url로 채운다(비권유 턴이어도 저장소에
+                        # 이유가 있는 책은 실린다 — 2026-09-09 결정). 정렬·상한도 여기서 확정.
+                        recommendations, reasons = carry_recommendation_reasons(
+                            final_done.get("sources", []),
+                            final_done["meta"]["recommendations"],
+                            remembered_reasons,
+                        )
+                        final_done["meta"]["recommendations"] = recommendations
+                        if meta or recommendations:
                             yield sse_meta({
                                 **final_done["meta"], "session_id": resolved_session_id
                             })
-                            title = meta.get("session_title")
-                            if title:
-                                # append는 **재조회한 최신 세션**으로 한다 — 턴 시작 스냅샷
-                                # `session`은 Runner가 턴 동안 이벤트를 영속한 순간 stale이
-                                # 되어 DatabaseSessionService 낙관적 락이 매 턴 거부한다
-                                # ("modified in storage", 2026-08-19 라이브 QA 실측 — 제목이
-                                # 영영 저장되지 않아 잡담 턴에도 재생성됐다). rbti 저장이
-                                # 스냅샷으로 되는 이유는 그 시점 세션이 방금 로드된 것이기
-                                # 때문. _settle_turn_sources의 재조회와 같은 패턴이다.
-                                fresh = await _resolve_session(
-                                    service, resolved_session_id, session_user_id
-                                )
-                                await service.append_event(
-                                    fresh,
-                                    Event(
-                                        author="system",
-                                        actions=EventActions(
-                                            state_delta={SESSION_TITLE_STATE_KEY: title}
-                                        ),
-                                    ),
-                                )
+                        state_delta: dict = {}
+                        title = (meta or {}).get("session_title")
+                        if title:
+                            state_delta[SESSION_TITLE_STATE_KEY] = title
+                        if reasons != remembered_reasons:
+                            state_delta[RECOMMENDATION_REASONS_STATE_KEY] = reasons
+                        if state_delta:
+                            # 제목·이유가 같은 턴에 나오면 state_delta 하나로 합쳐 쓰기를 한 번만
+                            # 한다. append는 **재조회한 최신 세션**으로 한다 — 턴 시작 스냅샷
+                            # `session`은 Runner가 턴 동안 이벤트를 영속한 순간 stale이
+                            # 되어 DatabaseSessionService 낙관적 락이 매 턴 거부한다
+                            # ("modified in storage", 2026-08-19 라이브 QA 실측 — 제목이
+                            # 영영 저장되지 않아 잡담 턴에도 재생성됐다). rbti 저장이
+                            # 스냅샷으로 되는 이유는 그 시점 세션이 방금 로드된 것이기
+                            # 때문. _settle_turn_sources의 재조회와 같은 패턴이다.
+                            fresh = await _resolve_session(
+                                service, resolved_session_id, session_user_id
+                            )
+                            await service.append_event(
+                                fresh,
+                                Event(
+                                    author="system",
+                                    actions=EventActions(state_delta=state_delta),
+                                ),
+                            )
                     except Exception as exc:  # noqa: BLE001 — 부가 채널(정상 done 마감 보호)
                         logger.warning(f"meta 파이프라인 마감 실패(생략): {exc}")
                 logger.info(

@@ -240,7 +240,7 @@ class TurnRecommendation(BaseModel):
     """인용 자료와 별개인 추천 대상·이유."""
 
     id: int = Field(description="이 턴 sources[].id를 참조한다")
-    reason: str = Field(description="답변에서 추출한 추천 이유")
+    reason: str = Field(description="이 세션에서 그 책을 추천한 이유(이전 턴에서 이월될 수 있다)")
 
 
 class TurnMeta(BaseModel):
