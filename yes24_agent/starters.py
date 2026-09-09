@@ -93,10 +93,6 @@ _PICK_SUFFIX = "-pick"
 _TREND_SLOT = "trend"
 _GENERAL_SLOT = "general"
 _POLICY_SLOT = "policy"
-# 재료 참조키의 상한(FAQ 질문처럼 긴 문자열을 ref로 쓸 때 스키마 enum이 비대해지지 않게).
-_REF_MAX_CHARS = 80
-
-
 # 활성 풀 SELECT의 컬럼 순서 — dict 변환이 이 튜플로 하므로 SQL과 여기가 같이 움직인다.
 _POOL_COLUMNS = ("id", "slot", "text", "source", "goods_no", "run_date", "pinned")
 # 어드민 목록 SELECT의 컬럼 순서(DDL 전 컬럼).
@@ -442,7 +438,7 @@ async def observe_web_topics(spec: SlotSpec, ctx: ObserveContext) -> Observed:
     if pairs is None:
         response = await asyncio.wait_for(
             ctx.genai_client.aio.models.generate_content(
-                model=settings.web_grounding_model,
+                model=settings.model_name,
                 contents=_TOPIC_PROMPT.format(count=settings.starter_trend_topics),
                 config=types.GenerateContentConfig(
                     tools=[types.Tool(google_search=types.GoogleSearch())], temperature=0.3
@@ -450,9 +446,10 @@ async def observe_web_topics(spec: SlotSpec, ctx: ObserveContext) -> Observed:
             ),
             timeout=settings.starter_timeout_s,
         )
-        record_usage(
-            "starter_topics", response.usage_metadata, model=settings.web_grounding_model
-        )
+        # 경량 모델(web_grounding_model)이 아니라 **주 대화 모델**을 쓴다 — 하루 한 번이라
+        # 비용이 무의미한 반면, 경량 모델은 "오늘의 화제"로 네팔 수력발전소·숙련기술인의 날
+        # 같은 것을 뽑아 첫 화면이 엉뚱해졌다(실측).
+        record_usage("starter_topics", response.usage_metadata, model=settings.model_name)
         # 그라운딩 응답은 자유 텍스트다(빌트인 검색과 구조화 출력은 한 요청에 못 섞는다) —
         # 줄을 잘라 앞머리 기호만 벗긴다. 파싱이 새도 아래 검색 단계가 걸러내므로 무해하다.
         topics: list[str] = []
@@ -474,8 +471,11 @@ async def observe_web_topics(spec: SlotSpec, ctx: ObserveContext) -> Observed:
 
         found = await asyncio.gather(*(_titles(t) for t in topics))
         pairs = ctx.shared["web_topics"] = list(zip(topics, found))
+        # "검색 결과 있음"이지 "관련 책 있음"이 아니다 — 관련성은 아래에서 제목 대조로
+        # 다시 가른다(둘을 같은 말로 적으면 계측이 사람 판단과 어긋난다).
         logger.info(
-            f"starters 화제 수집: {len(pairs)}건 중 책 있음 {sum(1 for _, t in pairs if t)}건"
+            f"starters 화제 수집: {len(pairs)}건 중 검색 결과 있음 "
+            f"{sum(1 for _, t in pairs if t)}건"
         )
 
     materials = []
@@ -505,7 +505,7 @@ async def observe_faq(spec: SlotSpec, ctx: ObserveContext) -> Observed:
     soup = await asyncio.to_thread(BeautifulSoup, html, "lxml")
     entries = await asyncio.to_thread(extract_faq_entries, soup)
     materials = []
-    for entry in entries:
+    for index, entry in enumerate(entries):
         question = _squash(entry.get("question"))
         if not question:
             continue
@@ -513,8 +513,10 @@ async def observe_faq(spec: SlotSpec, ctx: ObserveContext) -> Observed:
         # 증거를 두지 않는다: 이 재료는 이미 "고객센터가 답하고 있는 질문"이라 접지가
         # 재료에서 끝났고, 문구는 그것을 **사용자 말투로 바꿔** 쓰는 일이다("중고도서" →
         # "중고책"). 원문 단어를 요구하면 바꿔 쓰라는 지시와 모순된다.
+        # ref는 **짧은 식별자**다. 긴 자연어를 그대로 쓰면 스키마 enum이 비대해져 요청이
+        # 거부된다(실측 400 INVALID_ARGUMENT). 무엇을 고르는지는 payload의 question이 말한다.
         materials.append(
-            Material(ref=question[:_REF_MAX_CHARS], evidence=[], hint={"question": question})
+            Material(ref=str(index), evidence=[], hint={"question": question})
         )
     return Observed(materials=materials)
 
@@ -569,8 +571,11 @@ def build_slots(settings: Settings) -> list[SlotSpec]:
                 key=_TREND_SLOT,
                 ask=(
                     "재료는 오늘 사람들이 이야기하는 화제 가운데 **Yes24에 관련 책이 있는** "
-                    "것들이다. 화제 하나를 골라 그것을 책으로 잇는다 — 원작이나 관련 책을 "
-                    "찾거나, 그 주제를 더 알고 싶다는 꼴이다. 화제 이름은 그것이 "
+                    "것들이다. 화제 하나를 골라 그것을 책으로 잇되, **그런 책이 있다고 "
+                    "단정하지 않는다** — '있어?'·'뭐가 있어?'처럼 찾아 달라고 묻는다. "
+                    "검색으로 찾은 책이 그 화제와 정말 이어지는지는 알 수 없고(같은 이름의 "
+                    "다른 책일 수 있다), 단정한 문장은 답이 빈약할 때 어긋난 질문이 된다. "
+                    "화제 이름은 그것이 "
                     "**무엇인지 알 수 있게 갈래를 붙여** 쓴다(방송·영화·인물처럼) — 이름만 "
                     "덩그러니 두면 읽는 사람이 무엇을 가리키는지 모른다. "
                     "특정 책 제목은 넣지 않는다."
