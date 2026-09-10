@@ -75,16 +75,6 @@ def _connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def json_escaped(term: str) -> str:
-    """검색어를 events.event_data에 저장된 표기로 바꾼다.
-
-    ADK는 event_data를 `ensure_ascii=True` JSON으로 저장해 한글이 `\\uXXXX` 이스케이프로
-    들어간다(실측: 원문 '채식주의자' LIKE는 0건, 이스케이프형은 386건). 원문 그대로 LIKE를
-    걸면 한글 본문 검색이 **조용히 0건**을 반환하므로, 저장 표기로 변환해 질의한다.
-    """
-    return json.dumps(term, ensure_ascii=True)[1:-1]
-
-
 # ── event_data 렌더 ────────────────────────────────────────────────────────
 
 
@@ -200,10 +190,12 @@ def fetch_overview(conn: sqlite3.Connection, db_file: Path) -> dict[str, Any]:
 
 
 def _matching_session_ids(conn: sqlite3.Connection, query: str, limit: int) -> list[str]:
-    """본문(event_data)에 검색어가 든 세션 id를 찾는다(저장 표기로 변환해 LIKE)."""
+    """JSON 문자열 값을 검색해 이스케이프·리터럴 저장 표기에 관계없이 세션을 찾는다."""
     rows = conn.execute(
-        "SELECT DISTINCT session_id FROM events WHERE event_data LIKE ? LIMIT ?",
-        (f"%{json_escaped(query)}%", limit),
+        "SELECT DISTINCT session_id FROM events WHERE EXISTS ("
+        "SELECT 1 FROM json_tree(events.event_data) "
+        "WHERE type = 'text' AND value LIKE ?) LIMIT ?",
+        (f"%{query}%", limit),
     )
     return [row["session_id"] for row in rows]
 

@@ -7,6 +7,7 @@ InMemorySessionService로 폴백해 서버 기동을 항상 보장하고(폴백�
 """
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -14,11 +15,12 @@ from weakref import WeakValueDictionary
 
 from google.adk.sessions import (
     BaseSessionService,
-    DatabaseSessionService,
     InMemorySessionService,
 )
+from google.adk.sessions.schemas.shared import DynamicJSON
 from google.adk.sessions.session import Session
 
+from yes24_agent.adk_utc import UtcDatabaseSessionService
 from yes24_agent.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,7 @@ SQLITE_DIALECT = "sqlite"
 # usage.py)의 활성 판정이 이 값 하나를 공유한다 — 키워드 분기가 아니라 접속 가능성에서
 # 나오는 구조 분기다.
 MYSQL_DIALECT = "mysql"
+_MYSQL_UTC_INIT_COMMAND = "SET time_zone = '+00:00'"
 
 # 세션 서비스 싱글턴(lazy). 프로세스 전체가 하나의 DB 연결 풀을 공유한다.
 _session_service: BaseSessionService | None = None
@@ -46,6 +49,42 @@ _session_service: BaseSessionService | None = None
 # 실행 중이거나 대기 중인 코루틴이 lock을 강하게 참조하며, 사용이 끝난 lock은
 # 레지스트리에서 자동 제거된다.
 _session_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+
+# ADK `DynamicJSON.process_bind_param` 벤더 원본(패치 전 참조). 카나리아 테스트가 시그니처를
+# 대조하고, 패치는 None·JSONB 분기를 이 원본에 위임한다. 이미 패치된 상태(모듈 reload)면
+# `__wrapped__`로 원본을 되찾는다 — 패치 위에 패치를 겹치지 않는다.
+_VENDOR_BIND_PARAM = getattr(
+    DynamicJSON.process_bind_param, "__wrapped__", DynamicJSON.process_bind_param
+)
+
+
+def _bind_json_literal(self: DynamicJSON, value, dialect):
+    """`DynamicJSON.process_bind_param` 대체 — TEXT 경로의 JSON을 비ASCII 리터럴로 직렬화한다.
+
+    ADK는 sessions.state·events.event_data·app_states·user_states를 sqlite·MySQL에서
+    `json.dumps(value)`(ensure_ascii 기본 True)로 쓴다. 그래서 한글이 전부 `\\uXXXX`로
+    저장됐다(라이브 RDS 2026-09-09 실측: escape 포함 sessions 1313행·events 10544행, 리터럴
+    한글 0행; 모지바케 0행이라 charset 문제가 아니다). 비용은 저장량(해제 시 state −36%·
+    event_data −33%)과 원문 LIKE 검색이 조용히 0건이 되는 하류 워크어라운드였다. None과
+    postgresql(JSONB가 dict를 직접 받음)은 벤더 원본에 그대로 위임한다.
+
+    고립 서로게이트 폴백은 두지 않는다 — 판정 근거: ① 입구가 막혀 있다. 요청 본문은
+    pydantic(jiter)이 파싱하며 고립 서로게이트 escape(`"\\ud83d"`)를 파싱 오류로 거부한다
+    (stdlib json.loads와 달리, 2026-09-09 실측). ② 모델 응답·도구 결과는 유효 UTF-8 텍스트
+    에서 온다(protobuf 문자열은 유효 UTF-8만 담는다). ③ 라이브 전수 12,532행 중 utf-8 인코딩
+    실패 0행. 그래도 들어온다면 그것은 상류 버그이며 드라이버의 UnicodeEncodeError로 크게
+    실패해야지, 옛 표기로 조용히 저장돼 버그를 감추면 안 된다.
+    """
+    if value is None or dialect.name == "postgresql":
+        return _VENDOR_BIND_PARAM(self, value, dialect)
+    return json.dumps(value, ensure_ascii=False)
+
+
+# 임포트 시점 설치. DynamicJSON은 프로세스 전역 클래스라 서비스 생성 순서와 무관하게
+# 한 번만 갈아끼우면 되고, `_get_session_service`를 거치지 않는 경로(테스트가 직접 만든
+# DatabaseSessionService 등)도 같은 표기를 쓴다. 대입은 멱등이다(reload 시 원본 보존은 위).
+_bind_json_literal.__wrapped__ = _VENDOR_BIND_PARAM
+DynamicJSON.process_bind_param = _bind_json_literal
 
 
 def _get_session_lock(session_id: str) -> asyncio.Lock:
@@ -91,6 +130,7 @@ def mysql_pool_kwargs(db_url: str, *, maxsize: int) -> dict | None:
         "autocommit": True,
         "minsize": 1,
         "maxsize": maxsize,
+        "init_command": _MYSQL_UTC_INIT_COMMAND,
         # 접속 수립 상한. aiomysql 기본은 None = OS TCP 타임아웃(~75s+)이라, RDS가
         # TCP 블랙홀(SG 오설정 등)이면 실패 **판정 자체**가 분 단위로 늘어진다 —
         # auth의 503도 usage의 무시 판정·종료 배수도 전부 이 값에 물리므로, 장애를
@@ -150,7 +190,10 @@ def _get_session_service() -> BaseSessionService:
             return _session_service
 
     try:
-        _session_service = DatabaseSessionService(db_url=db_url)
+        engine_kwargs = {}
+        if db_dialect(db_url) == MYSQL_DIALECT:
+            engine_kwargs["connect_args"] = {"init_command": _MYSQL_UTC_INIT_COMMAND}
+        _session_service = UtcDatabaseSessionService(db_url=db_url, **engine_kwargs)
     except (ValueError, ImportError) as exc:
         # DatabaseSessionService는 드라이버 미설치·URL 오류를 ValueError/ImportError로
         # 감싸 던진다. 영속을 포기하고 인메모리로 폴백한다.
@@ -195,24 +238,8 @@ async def _resolve_session(
         if existing is not None:
             return existing
 
-    created = await service.create_session(
+    return await service.create_session(
         app_name=get_settings().app_name,
         user_id=user_id or _POC_USER_ID,
         session_id=session_id,
-    )
-    # **만들자마자 다시 읽는다**(2026-08-31 실측 결함): ADK DatabaseSessionService의
-    # create_session이 돌려주는 객체는 last_update_time이 스토리지 값과 어긋나 있어, 곧바로
-    # append_event하면 "The session has been modified in storage since it was loaded"로
-    # 거부된다(최소 재현으로 확정 — create 직후 실패, 재조회 후 성공). runner는 유효 RBTI
-    # 코드가 오면 세션 상태에 그것을 기록하므로, 이 어긋남이 **신규 세션의 첫 턴 + RBTI**를
-    # 통째로 막고 있었다(RBTI 없는 턴은 None == None이라 그 분기를 안 타 멀쩡했다).
-    # 16유형 매트릭스는 전 셀이 session_id=None + rbti라 전부 이 경로였다.
-    # 재조회가 실패하면 생성본을 그대로 쓴다 — 상태를 안 쓰는 경로는 종전과 동일하다.
-    return (
-        await service.get_session(
-            app_name=get_settings().app_name,
-            user_id=user_id or _POC_USER_ID,
-            session_id=created.id,
-        )
-        or created
     )

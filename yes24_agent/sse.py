@@ -64,7 +64,7 @@ data: <JSON>
 - `searching` — 툴 호출(yes24_search). detail = 검색 각도들(` · ` 구분).
 - `searching_web` — 툴 호출(web_search). detail = 검색 각도들(` · ` 구분).
 - `reading` — 툴 호출(yes24_fetch·fetch_many·web_fetch). detail = 관측한 제목, 없으면 빈 문자열.
-- `browsing` — 툴 호출(yes24_browse). detail = 코너명.
+- `browsing` — 툴 호출(yes24_browse). detail = 코너명들(` · ` 구분).
 - `working` — 표시용 분류가 선언되지 않은 도구의 호출. detail은 빈 문자열이다.
 - `found` — 툴 완료. 명시된 건수가 있으면 detail = `"N건 찾았어요"`(0건도 보냄).
   건수가 없는 상세 성공은 detail이 비어 있고 `result_count`는 관측 출처 수다.

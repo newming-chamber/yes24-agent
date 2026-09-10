@@ -14,14 +14,17 @@ session_service.mysql_pool_kwargs로 파싱한다. 세션 DB가 mysql이 아니�
 - 어떤 실패도 예외를 밖으로 던지지 않는다. 인증은 답변의 전제 조건이라 실패가 요청을
   끊어야 정직하지만, 사용량 기록은 관측/과금 재료라 실패가 턴을 막으면 안 된다 —
   warning 로그 후 무시한다(풀 생성 실패 포함).
-- INSERT는 fire-and-forget task로 띄워 턴·서브콜 지연에 얹히지 않는다. created_at은
-  DB DEFAULT에 위임한다(naive timestamp는 DB 시계끼리만 비교 — auth 관례).
+- 부가 호출은 요청의 최종 turn_id가 확정될 때 모아 fire-and-forget으로 쓴다.
+  created_at은 호출 당시 UTC를 보존한다. 늦게 끝나는 공유 prefetch도 최초 요청에 귀속한다.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from yes24_agent.config import get_settings
@@ -29,6 +32,50 @@ from yes24_agent.db import LazyAiomysqlPool
 from yes24_agent.session_service import mysql_pool_kwargs
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class UsageScope:
+    user_id: str
+    endpoint: str
+    session_id: str | None = None
+    turn_id: str | None = None
+    closed: bool = False
+    pending: list[tuple[str, Any, dict]] = field(default_factory=list)
+
+    def record(self, component: str, usage: Any, fields: dict) -> None:
+        if not self.closed:
+            self.pending.append((component, usage, fields))
+            return
+        for name in ("session_id", "user_id", "endpoint", "turn_id"):
+            if fields.get(name) is None:
+                fields[name] = getattr(self, name)
+        UsageLogger.get_instance().record(component, usage, **fields)
+
+    def finish(self, turn_id: str | None) -> None:
+        self.turn_id = turn_id
+        self.closed = True
+        pending, self.pending = self.pending, []
+        for component, usage, fields in pending:
+            self.record(component, usage, fields)
+
+
+_usage_scope: ContextVar[UsageScope | None] = ContextVar("usage_scope", default=None)
+
+
+def begin_usage_scope(user_id: str, endpoint: str) -> tuple[UsageScope, Token]:
+    scope = UsageScope(user_id=user_id, endpoint=endpoint)
+    return scope, _usage_scope.set(scope)
+
+
+def finish_usage_scope(scope: UsageScope, token: Token, turn_id: str | None) -> None:
+    scope.finish(turn_id)
+    try:
+        _usage_scope.reset(token)
+    except ValueError:
+        # aclose가 다른 task에서 실행되는 경우에도 원래 요청의 문맥을 재사용하지 않는다.
+        if _usage_scope.get() is scope:
+            _usage_scope.set(None)
 
 
 class UsageLogger:
@@ -80,6 +127,7 @@ class UsageLogger:
         llm_calls: int | None = None,
         tool_calls: int | None = None,
         cited_sources: int | None = None,
+        created_at: datetime | None = None,
     ) -> None:
         """사용량 1행 기록을 예약한다(fire-and-forget) — 어떤 실패도 밖으로 던지지 않는다.
 
@@ -92,6 +140,7 @@ class UsageLogger:
             if usage is None or not self.enabled:
                 return
             row = (
+                get_settings().app_name,
                 session_id,
                 user_id,
                 endpoint,
@@ -112,6 +161,7 @@ class UsageLogger:
                 llm_calls,
                 tool_calls,
                 cited_sources,
+                created_at or datetime.now(timezone.utc).replace(tzinfo=None),
             )
             # 본류(스트리밍·서브콜)와 분리된 task로 쓴다 — DB 왕복이 턴 지연에 얹히지 않는다.
             task = asyncio.get_running_loop().create_task(self._insert(row))
@@ -127,11 +177,12 @@ class UsageLogger:
             async with pool.acquire() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "INSERT INTO usage_log (session_id, user_id, endpoint, component, "
-                        "model, prompt_tokens, response_tokens, total_tokens, "
+                        "INSERT INTO usage_log (app_name, session_id, user_id, endpoint, "
+                        "component, model, prompt_tokens, response_tokens, total_tokens, "
                         "thinking_tokens, cached_tokens, latency_ms, turn_id, outcome, "
-                        "llm_calls, tool_calls, cited_sources) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        "llm_calls, tool_calls, cited_sources, created_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                        "%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                         row,
                     )
         except Exception as exc:  # noqa: BLE001 — 부가 채널: 기록 실패가 턴을 막으면 안 된다
@@ -178,9 +229,9 @@ def record_usage(
     서브콜에는 세션 문맥이 없을 수 있어 session_id·user_id·endpoint·latency_ms 전부
     선택이다(테이블도 NULL 허용).
     """
-    UsageLogger.get_instance().record(
-        component,
-        usage,
+    if usage is None or not UsageLogger.get_instance().enabled:
+        return
+    fields = dict(
         model=model,
         session_id=session_id,
         user_id=user_id,
@@ -191,7 +242,13 @@ def record_usage(
         llm_calls=llm_calls,
         tool_calls=tool_calls,
         cited_sources=cited_sources,
+        created_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
+    scope = _usage_scope.get()
+    if scope is not None:
+        scope.record(component, usage, fields)
+    else:
+        UsageLogger.get_instance().record(component, usage, **fields)
 
 
 async def close_usage_logger() -> None:

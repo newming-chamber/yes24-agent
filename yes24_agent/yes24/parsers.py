@@ -173,9 +173,11 @@ def _parse_list(
     아이템 컨테이너 자체가 없으면 기본적으로 HTML 구조 변경으로 보고 ParseError를
     발생시킨다. 단, Yes24는 결과가 실제로 0건일 때 이 컨테이너 대신 "결과가 없습니다"
     안내 블록(NO_RESULTS_MARKER)을 렌더링하므로, 컨테이너가 없어도 이 신호가 있으면
-    정상적인 빈 결과로 보고 빈 리스트를 반환한다. 컨테이너는 있지만 아이템이 0개인
-    경우도 마찬가지로 빈 리스트. 컨테이너와 아이템이 있는데도 전부 변환 실패하면 역시
-    ParseError(부분적 구조 변경 감지 — 빈 성공 위장 금지).
+    정상적인 빈 결과로 보고 빈 리스트를 반환한다. 무결과의 실측 형태는 목록 넷 모두
+    "컨테이너 없음 + noData"다(search_empty.html·cremaclub_best_empty.html) — 컨테이너를
+    렌더하면서 아이템만 0개인 응답은 관측된 적 없으므로, **컨테이너는 있는데 아이템이
+    0개면 아이템 셀렉터가 썩은 것**으로 보고 ParseError. 컨테이너와 아이템이 있는데도
+    전부 변환 실패하면 역시 ParseError(부분적 구조 변경 감지 — 빈 성공 위장 금지).
     """
     soup = _container_soup(html, container_selector)
 
@@ -194,7 +196,10 @@ def _parse_list(
 
     items = soup.select(item_selector)
     if not items:
-        return []
+        raise ParseError(
+            f"목록 컨테이너({container_selector})는 있는데 아이템({item_selector})이 0개 — "
+            "아이템 셀렉터 구조 변경 의심"
+        )
 
     results: list[dict] = []
     for item in items:
@@ -511,13 +516,15 @@ def parse_browse_list(html: str, *, base_url: str, section: str, limit: int = 24
     파싱 스펙(마크업 종류·셀렉터·순위 마커 유무)은 **urls.BROWSE_SEED_URLS 레코드에서 읽는다**
     — 섹션 열거를 여기 복제하지 않으므로 시드를 늘려도 파서가 갈라지지 않는다.
       - markup="search"   : 검색 결과와 동일한 마크업(베스트셀러·신간).
-      - markup="cremaclub": 별도 마크업(cremaclub.yes24.com). URL은 `/BookClub/Detail/{id}`가
+      - markup="cremaclub": 별도 마크업(cremaclub.yes24.com의 목록 조각 — 코너 페이지는
+        상품을 SSR로 싣지 않는다, urls.BROWSE_SEED_URLS 주석). URL은 `/BookClub/Detail/{id}`가
         아니라 항상 product_url(base_url, goods_no)로 조립한 www.yes24.com 상품 페이지를
         반환한다. publisher·pub_date·sale_price·sale_index는 이 섹션에 필드 자체가 없어 항상 None.
 
     표에 없는 section은 ValueError(도구는 같은 표로 사전 검증하므로 실제로는 프로그래머
-    오류만 잡는다). 목록 컨테이너 자체가 없으면(무결과 신호도 없으면) HTML 구조 변경으로
-    보고 ParseError(parse_search와 동일 원칙).
+    오류만 잡는다). 무결과·구조 파손 판정은 _parse_list(parse_search와 같은 골격)가 한다 —
+    컨테이너 없음+무결과 신호만 0건 성공이고, 컨테이너 없음·아이템 0개·전부 변환 실패는
+    ParseError.
     """
     try:
         spec = BROWSE_SEED_URLS[section]

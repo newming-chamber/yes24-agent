@@ -70,9 +70,10 @@ from yes24_agent.sse import (
     sse_status,
 )
 from yes24_agent.thought_translation import translate_thought_label
+from yes24_agent.tool_progress import ToolProgress
 from yes24_agent.toolsets import get_resolved_app
 from yes24_agent.turn_snapshot import persist_turn_snapshot
-from yes24_agent.usage import record_usage
+from yes24_agent.usage import begin_usage_scope, finish_usage_scope, record_usage
 
 logger = logging.getLogger(__name__)
 
@@ -418,6 +419,8 @@ async def _closeout_error_frames(
     session_id: str,
     user_id: str,
     turn_id: str | None,
+    user_text: str,
+    started_at: float,
     rbti_applied: str | None,
     process: TurnProcess,
     elapsed_ms: int,
@@ -479,7 +482,8 @@ async def _closeout_error_frames(
     for frame in frames:
         yield frame
     error_done["history_saved"] = await persist_turn_snapshot(
-        service, session_id, user_id, turn_id, error_done
+        service, session_id, user_id, turn_id, error_done,
+        user_text=user_text, started_at=started_at,
     )
     completion.update(saved=error_done["history_saved"], sent=True)
     yield sse_done(error_done)
@@ -529,6 +533,8 @@ async def run_agent_stream(
     # usage_log latency_ms의 기준점(락 대기 포함 요청 처리 전체 벽시계). 토큰 누적과
     # 함께 턴 마감(아래 inner finally)에서 1행으로 기록된다.
     turn_started = time.monotonic()
+    request_started_at = time.time()
+    turn_id: str | None = None
 
     def _elapsed_ms() -> int:
         """턴 시작부터 지금까지(ms) — done.process.elapsed_ms·usage latency_ms·완료 로그의 한 식."""
@@ -541,23 +547,27 @@ async def run_agent_stream(
     # 힌트 오판·실패·미소비 전부 정상 경로 폴백이라 답 내용·도구 선택에 영향이 없다
     # (계약·격리·매트릭스 공유는 web_search.py의 프리페치 절 참조).
     app = app if app is not None else get_resolved_app()
-    for prefetch in app.prefetch_hooks:
-        prefetch(message, app.active)
     # 같은 session_id 동시 요청을 순차화한다(입력 id 기준). 신규 세션(None)은 create가
     # 고유 id를 부여하고 세션 쓰기(제목 영속 포함)가 전부 done 앞에서 끝나므로 락이
     # 불필요하다 — 후속 턴은 done의 session_id를 봐야 시작할 수 있다(다른 프레임에는
     # session_id가 없다). meta가 done 뒤에 있던 동안엔 이 전제가 깨져 신규 세션도 락을
     # 잡았었다(2026-08-20 레이스 실측) — done 앞 이동으로 근거가 소멸해 삭제했다.
     lock = _get_session_lock(session_id) if session_id else None
-    if lock is not None:
-        await lock.acquire()
+    lock_acquired = False
+    usage_scope, usage_token = begin_usage_scope(session_user_id, endpoint)
     try:
+        for prefetch in app.prefetch_hooks:
+            prefetch(message, app.active)
+        if lock is not None:
+            await lock.acquire()
+            lock_acquired = True
         # 세션 서비스 생성(디렉토리 실패 등)과 세션 조회/생성 실패는 스트림을 시작조차
         # 못 하는 상황 — error+done으로 알리고 종료한다. DB 락(OperationalError)·디렉토리
         # 오류(OSError) 등 어떤 예외가 나도 "done 정확히 1회" 불변식을 지킨다.
         try:
             service = session_service if session_service is not None else _get_session_service()
             session = await _resolve_session(service, session_id, session_user_id)
+            usage_scope.session_id = session.id
             # 현재 UI 요청을 RBTI state의 정본으로 본다. 유효 코드는 저장하고 None·무효 코드는
             # 기존 값을 명시적으로 지워, 이전 요청의 페르소나가 다음 기본 채팅에 남지 않게 한다.
             code = rbti if is_valid_code(rbti) else None
@@ -669,8 +679,6 @@ async def run_agent_stream(
         # 컬럼과 같은 값이라 피드백(turn_feedback)·admin 턴 집계가 한 열쇠를 쓴다. Runner에
         # **주입하지 않고 읽는다** — 주입은 ADK의 재개(resume) 분기를 켠다. 과부하 재시도는
         # 새 invocation을 받으므로 매 이벤트 갱신이 자연스럽게 최종 시도의 id를 남긴다.
-        turn_id: str | None = None
-
         try:
             # 이전 턴들이 남긴 출처 레지스트리(멀티턴 영속). 마감 화해가 실패할 때의
             # 폴백 base다(_settle_turn_sources). 공개 채널은 원칙 4대로 인용분만.
@@ -792,6 +800,13 @@ async def run_agent_stream(
                             continue
                         raise
 
+                    if isinstance(event, ToolProgress):
+                        step = process.tool_progress(event)
+                        if step is not None:
+                            emitted_output = True
+                            yield _step_frame(step)
+                        continue
+
                     if event.invocation_id:
                         turn_id = event.invocation_id
 
@@ -806,6 +821,10 @@ async def run_agent_stream(
                         usage_cached += (
                             event.usage_metadata.cached_content_token_count or 0
                         )
+
+                    if not event.partial and event.error_code:
+                        final_text = _event_text(event) or final_text
+                        raise RuntimeError(f"ADK model error: {event.error_code}")
 
                     responses = event.get_function_responses()
                     if not responses:
@@ -838,7 +857,7 @@ async def run_agent_stream(
                         if phase is not None:
                             yield sse_content(phase)
                         for call in event.get_function_calls():
-                            step = process.tool_call(call)
+                            step = process.tool_call(call, split_progress=True)
                             emitted_output = True
                             yield _step_frame(step)
                         continue
@@ -1071,7 +1090,8 @@ async def run_agent_stream(
                 )
                 final_done["process"]["elapsed_ms"] = _elapsed_ms()
                 final_done["history_saved"] = await persist_turn_snapshot(
-                    service, resolved_session_id, session_user_id, turn_id, final_done
+                    service, resolved_session_id, session_user_id, turn_id, final_done,
+                    user_text=message, started_at=request_started_at,
                 )
                 completion.update(saved=final_done["history_saved"], sent=True)
                 yield sse_done(final_done)
@@ -1101,6 +1121,8 @@ async def run_agent_stream(
                 session_id=resolved_session_id,
                 user_id=session_user_id,
                 turn_id=turn_id,
+                user_text=message,
+                started_at=request_started_at,
                 rbti_applied=code,
                 process=process,
                 elapsed_ms=_elapsed_ms(),
@@ -1133,6 +1155,8 @@ async def run_agent_stream(
                 session_id=resolved_session_id,
                 user_id=session_user_id,
                 turn_id=turn_id,
+                user_text=message,
+                started_at=request_started_at,
                 rbti_applied=code,
                 process=process,
                 elapsed_ms=_elapsed_ms(),
@@ -1181,7 +1205,8 @@ async def run_agent_stream(
                             elapsed_ms=_elapsed_ms(),
                         )
                         await persist_turn_snapshot(
-                            service, resolved_session_id, session_user_id, turn_id, interrupted
+                            service, resolved_session_id, session_user_id, turn_id, interrupted,
+                            user_text=message, started_at=request_started_at,
                         )
                     except Exception as exc:  # noqa: BLE001 — 중단은 완료 프레임을 약속하지 않는다
                         logger.warning(f"중단된 턴 스냅샷 영속 실패: {exc}")
@@ -1211,5 +1236,6 @@ async def run_agent_stream(
                 cited_sources=len(final_done.get("cited_ids", [])) if final_done else None,
             )
     finally:
-        if lock is not None:
+        finish_usage_scope(usage_scope, usage_token, turn_id)
+        if lock is not None and lock_acquired:
             lock.release()

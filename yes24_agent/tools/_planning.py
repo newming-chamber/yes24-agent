@@ -1,9 +1,10 @@
-"""검색 각도 계획 공용 헬퍼 — yes24_search·web_search가 공유한다.
+"""검색 각도 계획 공용 헬퍼 — yes24_search·web_search·yes24_browse가 공유한다.
 
 각도 계획(문자열 관용 변환→빈/비문자 제거→중복 제거→상한 cap→dropped 수집)과
 각도별 실패 요약 dict, 상한 초과 안내 메시지는 두 검색 도구가 문자 단위로 같아야
 한다(반환 계약이 프론트·에이전트에서 동일하게 해석된다). 같은 로직을 도구마다
-복제하면 한쪽만 고치는 실수가 생기므로 여기 한 곳에만 둔다.
+복제하면 한쪽만 고치는 실수가 생기므로 여기 한 곳에만 둔다. yes24_browse는 코너
+리스트(sections)에 같은 계획을 쓴다 — 단위 명사만 다르고 규칙은 같다.
 
 fetch_many는 제외 — duplicate 자리표시(None)·상이한 메시지·all_failed 병합 때문에
 같은 계약이 아니다(강제 통합 시 주입 인자만 늘어난다).
@@ -51,10 +52,16 @@ def angle_error_summary(query: str, error_type: str) -> dict:
     }
 
 
-def dropped_queries_message(max_count: int, dropped_count: int) -> str:
-    """상한 초과로 검색하지 않은 각도가 있음을 알리는 안내 메시지를 조립한다."""
+def dropped_queries_message(
+    max_count: int, dropped_count: int, *, unit: str = "각도", action: str = "검색"
+) -> str:
+    """상한 초과로 처리하지 않은 각도(코너)가 있음을 알리는 안내 메시지를 조립한다.
+
+    기본값은 검색 도구의 문구 그대로다. yes24_browse는 unit="코너"·action="열람"으로 부른다
+    — 열람한 것을 "검색했다"고 적으면 모델에게 거짓 문구가 된다.
+    """
     return (
-        f"한 번에 검색할 수 있는 각도 상한({max_count}개)을 넘어 "
-        f"{dropped_count}개 각도는 검색하지 않았습니다. "
-        "필요하면 남은 각도로 한 번 더 호출하세요."
+        f"한 번에 {action}할 수 있는 {unit} 상한({max_count}개)을 넘어 "
+        f"{dropped_count}개 {unit}는 {action}하지 않았습니다. "
+        f"필요하면 남은 {unit}로 한 번 더 호출하세요."
     )

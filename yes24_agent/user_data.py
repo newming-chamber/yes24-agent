@@ -1,6 +1,6 @@
-"""우리 DB가 소유하는 **사용자별 대화 부가 데이터** — `turn_feedback`·`turn_click`·`session_ui`.
+"""공개 대화 확정본과 사용자별 피드백·클릭·UI 상태를 같은 DB 풀로 관리한다.
 
-경계가 이 모듈의 존재 이유다: **대화 내용은 ADK가, 사용자가 대화에 남긴 것은 우리가** 소유한다.
+ADK는 LLM 원시 이벤트를, chat_turn은 사용자에게 공개한 확정본을 소유한다.
 - `turn_feedback` — 턴 좋아요/싫어요 + 코멘트. 턴의 열쇠는 ADK invocation_id(`done.turn_id`).
   세션 state JSON이 아니라 전용 테이블인 이유는 집계다 — state에 넣으면 "싫어요 상위 턴"이
   전 세션 스캔이 된다(usage 계측이 events 재사용을 기각하고 usage_log로 간 판단의 반복).
@@ -15,9 +15,7 @@
   실어 고정하려던 초안은 **값이 같아 SQLAlchemy가 컬럼을 dirty로 보지 않아 UPDATE에서 빠지고
   그 자리를 onupdate가 채워** 오히려 실패했다(2026-09-01 라이브 실측).
 
-**세 테이블이 한 서비스인 이유**: 같은 DB·같은 사용자 스코프·같은 실패 정책이라 풀·활성 판정·
-마감을 여러 벌 둘 근거가 없다(처음엔 나눠 뒀다가 커넥션 풀만 두 개가 됐다). 대화 삭제가 전
-테이블을 함께 비우는 것도 여기서 한 메서드로 성립한다.
+동일한 DB·앱·사용자·세션 스코프를 공유하므로 풀과 삭제 트랜잭션을 한 서비스에 둔다.
 
 접속 정보는 인증·사용량과 같은 단일 출처 — `config.session_db_url`을 파싱한다. 세션 DB가
 mysql이 아니면(로컬 sqlite) 스택이 자연 비활성이다(구조 분기).
@@ -27,21 +25,29 @@ mysql이 아니면(로컬 sqlite) 스택이 자연 비활성이다(구조 분기
 단 **읽기는 비활성 구성에서 빈 값으로 내려간다**: 저장소가 없으면 상태도 없는 것이 사실이라
 (전부 unread·자동 제목) 목록·복원이 그대로 동작한다.
 
-DDL은 `scripts/turn_feedback.sql`·`scripts/turn_click.sql`·`scripts/session_ui.sql` 수동 적용
+DDL은 `scripts/chat_turn.sql`·`scripts/turn_feedback.sql`·`scripts/turn_click.sql`·
+`scripts/session_ui.sql`
 (usage_log 관례).
 """
 
 from __future__ import annotations
 
+import json
+import logging
+from datetime import datetime, timezone
 from typing import Any
+
+from fastapi import HTTPException
 
 from yes24_agent.config import get_settings
 from yes24_agent.db import MysqlBackedService
 from yes24_agent.session_service import mysql_pool_kwargs
 
+logger = logging.getLogger(__name__)
+
 
 class UserDataService(MysqlBackedService):
-    """turn_feedback·turn_click·session_ui 읽기/쓰기 서비스(프로세스 싱글턴, 풀 1개).
+    """chat_turn·turn_feedback·turn_click·session_ui 서비스(프로세스 싱글턴, 풀 1개).
 
     풀 보유·활성 판정·질의·마감은 db.MysqlBackedService가 소유한다 — 여기 남는 것은 SQL뿐이다.
     풀 팩토리를 주입할 수 있어 테스트는 실 DB 없이 전 경로를 돈다(AuthService·UsageLogger 패턴).
@@ -65,24 +71,220 @@ class UserDataService(MysqlBackedService):
             cls._instance = cls()
         return cls._instance
 
+    async def verify_schema(self) -> None:
+        """필수 저장 계약이 준비되지 않은 MySQL 인스턴스는 요청 수신 전에 실패한다."""
+        if not self.enabled:
+            return
+        await self._run(
+            "SELECT u.user_no, a.key_hash, t.id, t.app_name, t.user_id, t.session_id, "
+            "t.turn_id, t.started_at, t.completed_at, t.user_text, t.text, t.status, "
+            "t.sources, t.process, t.meta, t.error, t.rbti_applied, t.history_saved, "
+            "f.app_name, c.app_name, s.app_name, l.app_name "
+            "FROM users u, auth_keys a, chat_turn t, turn_feedback f, turn_click c, "
+            "session_ui s, usage_log l WHERE 1 = 0",
+            (),
+            fetch_all=True,
+        )
+
+    async def _run_owned(
+        self,
+        statements: list[tuple[str, tuple]],
+        *,
+        owner: tuple[str, str, str],
+        missing_ok: bool = False,
+    ):
+        """부모 세션 잠금 안에서 쓰고 삭제한다. 삭제 뒤 UI·확정본이 다시 생기지 않는다."""
+        if self._db is None:
+            raise HTTPException(status_code=503, detail=self._unavailable_detail)
+        try:
+            pool = await self._db.get()
+            async with pool.acquire() as conn:
+                await conn.begin()
+                try:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "SELECT id FROM sessions WHERE app_name = %s "
+                            "AND user_id = %s AND id = %s FOR UPDATE",
+                            owner,
+                        )
+                        if not await cur.fetchone():
+                            if missing_ok:
+                                await conn.rollback()
+                                return None
+                            raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
+                        result = None
+                        for sql, params in statements:
+                            await cur.execute(sql, params)
+                            result = await cur.fetchall() if cur.description else cur.rowcount
+                    await conn.commit()
+                    return result
+                except BaseException:
+                    await conn.rollback()
+                    raise
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(f"대화 데이터 트랜잭션 실패: {type(exc).__name__}")
+            raise HTTPException(status_code=503, detail=self._failure_detail) from exc
+
+    async def _write_owned(self, sql: str, params: tuple) -> None:
+        """소유권 열(app_name,user_id,session_id)을 먼저 받는 단일 쓰기 문장."""
+        app_name, user_id, session_id, *_ = params
+        await self._run_owned([(sql, params)], owner=(app_name, user_id, session_id))
+
+    async def turns_for_session(
+        self, *, app_name: str, user_id: str, session_id: str
+    ) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        rows = await self._run(
+            "SELECT turn_id, user_text, started_at, completed_at, status, text, "
+            "sources, process, meta, error, rbti_applied, history_saved FROM chat_turn "
+            "WHERE app_name = %s AND user_id = %s AND session_id = %s "
+            "ORDER BY started_at, completed_at, id",
+            (app_name, user_id, session_id),
+            fetch_all=True,
+        )
+        return [self._turn_record(row, session_id) for row in rows or ()]
+
+    async def has_turn(self, *, app_name: str, user_id: str, session_id: str, turn_id: str) -> bool:
+        if not self.enabled:
+            return False
+        return bool(
+            await self._run(
+                "SELECT 1 FROM chat_turn WHERE app_name = %s AND user_id = %s "
+                "AND session_id = %s AND turn_id = %s",
+                (app_name, user_id, session_id, turn_id),
+                fetch_all=True,
+            )
+        )
+
+    @staticmethod
+    def _turn_record(row: tuple, session_id: str) -> dict[str, Any]:
+        def decoded(value):
+            return json.loads(value) if isinstance(value, (str, bytes)) else value
+
+        sources, process, meta, error = map(decoded, row[6:10])
+        return {
+            "turn_id": row[0],
+            "user_text": row[1],
+            "started_at": row[2].replace(tzinfo=timezone.utc).timestamp(),
+            "completed_at": row[3].replace(tzinfo=timezone.utc).timestamp(),
+            "snapshot": {
+                "session_id": session_id,
+                "turn_id": row[0],
+                "status": row[4],
+                "text": row[5],
+                "sources": sources,
+                "cited_ids": [source["id"] for source in sources],
+                "process": process,
+                "meta": meta,
+                "error": error,
+                "rbti_applied": row[10],
+                "history_saved": bool(row[11]),
+            },
+        }
+
+    async def save_turn(
+        self,
+        *,
+        app_name: str,
+        user_id: str,
+        session_id: str,
+        turn_id: str,
+        user_text: str,
+        started_at: float,
+        completed_at: float,
+        payload: dict,
+        verify_completed_at: bool = False,
+    ) -> bool:
+        """최초 확정본만 저장한다. 재전송은 값이 같을 때만 성공으로 인정한다."""
+        if type(payload["history_saved"]) is not bool:
+            raise ValueError("history_saved는 boolean이어야 합니다.")
+        if payload["cited_ids"] != [source["id"] for source in payload["sources"]]:
+            raise ValueError("인용 번호와 출처 순서가 일치하지 않습니다.")
+        start = datetime.fromtimestamp(started_at, timezone.utc).replace(tzinfo=None)
+        end = datetime.fromtimestamp(completed_at, timezone.utc).replace(tzinfo=None)
+        encoded = tuple(
+            json.dumps(payload[key], ensure_ascii=False) if payload[key] is not None else None
+            for key in ("sources", "process", "meta", "error")
+        )
+        rows = await self._run_owned(
+            [
+                (
+                    "INSERT INTO chat_turn (app_name, user_id, session_id, turn_id, "
+                    "user_text, started_at, completed_at, status, text, "
+                    "sources, process, meta, error, "
+                    "rbti_applied, history_saved) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "ON DUPLICATE KEY UPDATE id = id",
+                    (
+                        app_name,
+                        user_id,
+                        session_id,
+                        turn_id,
+                        user_text,
+                        start,
+                        end,
+                        payload["status"],
+                        payload["text"],
+                        *encoded,
+                        payload["rbti_applied"],
+                        payload["history_saved"],
+                    ),
+                ),
+                (
+                    "SELECT turn_id, user_text, started_at, completed_at, status, text, "
+                    "sources, process, meta, error, rbti_applied, history_saved FROM chat_turn "
+                    "WHERE app_name = %s AND user_id = %s AND session_id = %s AND turn_id = %s",
+                    (app_name, user_id, session_id, turn_id),
+                ),
+            ],
+            owner=(app_name, user_id, session_id),
+            missing_ok=True,
+        )
+        if not rows:
+            return False
+        existing = self._turn_record(rows[0], session_id)
+        return (
+            existing["user_text"] == user_text
+            and rows[0][2] == start
+            and (not verify_completed_at or rows[0][3] == end)
+            and all(
+                existing["snapshot"][key] == payload[key]
+                for key in (
+                    "status",
+                    "text",
+                    "sources",
+                    "cited_ids",
+                    "process",
+                    "meta",
+                    "error",
+                    "rbti_applied",
+                    "history_saved",
+                )
+            )
+        )
+
     # ── turn_feedback ──────────────────────────────────────────────────────
 
     async def upsert_feedback(
         self, *, user_id: str, session_id: str, turn_id: str, rating: str, comment: str | None
     ) -> None:
         """턴 피드백 저장 — 같은 (사용자, 세션, 턴)의 재전송은 최신값으로 덮는다(PUT 멱등)."""
-        await self._run(
-            "INSERT INTO turn_feedback (user_id, session_id, turn_id, rating, comment) "
-            "VALUES (%s, %s, %s, %s, %s) "
+        await self._write_owned(
+            "INSERT INTO turn_feedback (app_name, user_id, session_id, turn_id, rating, comment) "
+            "VALUES (%s, %s, %s, %s, %s, %s) "
             "ON DUPLICATE KEY UPDATE rating = VALUES(rating), comment = VALUES(comment)",
-            (user_id, session_id, turn_id, rating, comment),
+            (get_settings().app_name, user_id, session_id, turn_id, rating, comment),
         )
 
     async def withdraw_feedback(self, *, user_id: str, session_id: str, turn_id: str) -> None:
         """피드백 철회 — 행을 지운다(집계에 '철회됨' 상태를 남기지 않는다). 없던 행이면 no-op."""
-        await self._run(
-            "DELETE FROM turn_feedback WHERE user_id = %s AND session_id = %s AND turn_id = %s",
-            (user_id, session_id, turn_id),
+        await self._write_owned(
+            "DELETE FROM turn_feedback "
+            "WHERE app_name = %s AND user_id = %s AND session_id = %s AND turn_id = %s",
+            (get_settings().app_name, user_id, session_id, turn_id),
         )
 
     async def feedback_for_session(
@@ -101,8 +303,8 @@ class UserDataService(MysqlBackedService):
             return {}
         rows = await self._run(
             "SELECT turn_id, rating, comment FROM turn_feedback "
-            "WHERE user_id = %s AND session_id = %s",
-            (user_id, session_id),
+            "WHERE app_name = %s AND user_id = %s AND session_id = %s",
+            (get_settings().app_name, user_id, session_id),
             fetch_all=True,
         )
         return {row[0]: {"rating": row[1], "comment": row[2]} for row in rows or ()}
@@ -123,9 +325,18 @@ class UserDataService(MysqlBackedService):
         """링크 클릭 1건 기록 — 행 추가만 한다(같은 URL 재클릭은 행이 늘어난다, upsert 아님)."""
         await self._run(
             "INSERT INTO turn_click "
-            "(user_id, session_id, turn_id, url, source_id, source_type, label) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (user_id, session_id, turn_id, url, source_id, source_type, label),
+            "(app_name, user_id, session_id, turn_id, url, source_id, source_type, label) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                get_settings().app_name,
+                user_id,
+                session_id,
+                turn_id,
+                url,
+                source_id,
+                source_type,
+                label,
+            ),
         )
 
     # ── session_ui ─────────────────────────────────────────────────────────
@@ -138,8 +349,9 @@ class UserDataService(MysqlBackedService):
         if not self.enabled:
             return {}
         rows = await self._run(
-            "SELECT session_id, title, last_read_at FROM session_ui WHERE user_id = %s",
-            (user_id,),
+            "SELECT session_id, title, last_read_at FROM session_ui "
+            "WHERE app_name = %s AND user_id = %s",
+            (get_settings().app_name, user_id),
             fetch_all=True,
         )
         return {row[0]: (row[1], row[2]) for row in rows or ()}
@@ -149,8 +361,9 @@ class UserDataService(MysqlBackedService):
         if not self.enabled:
             return (None, None)
         rows = await self._run(
-            "SELECT title, last_read_at FROM session_ui WHERE user_id = %s AND session_id = %s",
-            (user_id, session_id),
+            "SELECT title, last_read_at FROM session_ui "
+            "WHERE app_name = %s AND user_id = %s AND session_id = %s",
+            (get_settings().app_name, user_id, session_id),
             fetch_all=True,
         )
         return (rows[0][0], rows[0][1]) if rows else (None, None)
@@ -158,45 +371,51 @@ class UserDataService(MysqlBackedService):
     async def mark_read(self, *, user_id: str, session_id: str, read_at: float) -> None:
         """읽음 기록. `read_at`은 세션의 `last_update_time`을 그대로 싣는다 — 벽시계가 아니라
         **비교 대상과 같은 값**을 저장해야 부동소수·시계 오차로 unread가 되살아나지 않는다."""
-        await self._run(
-            "INSERT INTO session_ui (user_id, session_id, last_read_at) VALUES (%s, %s, %s) "
-            "ON DUPLICATE KEY UPDATE last_read_at = VALUES(last_read_at)",
-            (user_id, session_id, read_at),
+        await self._write_owned(
+            "INSERT INTO session_ui (app_name, user_id, session_id, last_read_at) "
+            "VALUES (%s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE last_read_at = "
+            "GREATEST(COALESCE(last_read_at, VALUES(last_read_at)), VALUES(last_read_at))",
+            (get_settings().app_name, user_id, session_id, read_at),
         )
 
     async def set_title(self, *, user_id: str, session_id: str, title: str) -> None:
         """사용자 제목 저장(이름 변경). ADK 세션에는 쓰지 않으므로 목록 순서가 밀리지 않는다."""
-        await self._run(
-            "INSERT INTO session_ui (user_id, session_id, title) VALUES (%s, %s, %s) "
+        await self._write_owned(
+            "INSERT INTO session_ui (app_name, user_id, session_id, title) VALUES (%s, %s, %s, %s) "
             "ON DUPLICATE KEY UPDATE title = VALUES(title)",
-            (user_id, session_id, title),
+            (get_settings().app_name, user_id, session_id, title),
         )
 
     # ── 대화 삭제 ──────────────────────────────────────────────────────────
 
     async def purge_session(self, *, user_id: str, session_id: str) -> None:
-        """세션이 남긴 **우리 쪽 데이터 전부**를 지운다 — 대화 삭제와 함께 불린다.
+        """부모 행락 안에서 공개 턴·사용자 상태·ADK 세션을 함께 삭제한다.
 
-        세션만 지우고 이 행들을 남기면 사용자가 쓴 코멘트·제목이 session_id·user_id와 함께
-        남는다. 삭제 API의 존재 이유가 프라이버시인데 그게 남으면 삭제가 아니다(2026-09-01
-        라이브 검증에서 고아 행으로 관측 — 결정론 테스트는 DB가 없어 못 잡았다).
-        사용자 상태 테이블(turn_feedback·session_ui)이 대상이다 — turn_click은 분석 로그라
-        남긴다(모듈 독스트링). 사용자 상태 테이블이 늘면 여기만 는다.
-
-        **한 트랜잭션**으로 묶는다 — 문장을 따로 보내면 풀이 autocommit이라 앞 테이블만 지워진
-        채 실패할 수 있고, 그러면 "삭제 실패"라고 알린 뒤에 코멘트만 사라진 상태가 남는다.
+        events는 sessions FK의 CASCADE로 지워진다. 같은 부모 잠금을 사용하는 저장은
+        삭제 후 존재 검사를 통과하지 못한다. 분석 로그(turn_click·usage_log)는 보존한다.
         """
-        await self._run_all(
+        owner = (get_settings().app_name, user_id, session_id)
+        await self._run_owned(
             [
                 (
-                    "DELETE FROM turn_feedback WHERE user_id = %s AND session_id = %s",
-                    (user_id, session_id),
+                    "DELETE FROM chat_turn WHERE app_name = %s "
+                    "AND user_id = %s AND session_id = %s",
+                    owner,
                 ),
                 (
-                    "DELETE FROM session_ui WHERE user_id = %s AND session_id = %s",
-                    (user_id, session_id),
+                    "DELETE FROM turn_feedback WHERE app_name = %s "
+                    "AND user_id = %s AND session_id = %s",
+                    owner,
                 ),
-            ]
+                (
+                    "DELETE FROM session_ui WHERE app_name = %s "
+                    "AND user_id = %s AND session_id = %s",
+                    owner,
+                ),
+                ("DELETE FROM sessions WHERE app_name = %s AND user_id = %s AND id = %s", owner),
+            ],
+            owner=owner,
         )
 
 

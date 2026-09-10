@@ -1,28 +1,12 @@
-"""`x-api-key` 인증 + rate limiting (crema-ai 계약 이식).
-
-프론트는 crema-ai와 같은 계약으로 붙는다: 헤더 `x-api-key`의 값이 곧 **Yes24
-service_cookie**이고, 그 값으로 Yes24 회원 API를 조회하면 userNo가 나온다. userNo는
-ADK 세션 키 `(app_name, user_id, session_id)`의 user_id가 되어 대화 기록이 사람 단위로
-갈린다(다른 사용자의 session_id로 요청해도 자기 user_id 밑에서만 조회되므로 세션 탈취가
-구조적으로 성립하지 않는다).
-
-인증 DB(`users`·`rate_limit_log`)는 세션 DB와 **같은 계정·database**를 쓴다 — 접속 정보를
-따로 두지 않고 `config.session_db_url`을 파싱한다(설정 단일 출처). 그래서 세션 DB가 mysql이
-아니면(로컬 sqlite 개발) 인증 스택이 통째로 비활성이 되어 모든 요청이 익명으로 흐른다.
-키워드 분기가 아니라 접속 가능성에서 나오는 구조 분기다.
-
-테이블은 배포 환경에 이미 만들어져 있다고 전제한다. 없거나 DB가 죽었으면 조용히 익명으로
-떨어지지 않고 503으로 끊는다 — "인증된 줄 알았는데 익명으로 답하고 있었다"가 조용히
-성립하면 안 된다(fail-loud).
-"""
+"""ServiceCookies 인증: 사용자 정본과 해시 자격증명을 분리하고 사용자별 한도를 센다."""
 
 from __future__ import annotations
 
 import hmac
 import json
 import logging
-import time
-from dataclasses import dataclass
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from hashlib import sha256
 from secrets import compare_digest
 from typing import Annotated, Any
@@ -40,89 +24,71 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class AuthenticatedUser:
-    """인증된 요청 컨텍스트."""
-
-    api_key: str
+    api_key: str = field(repr=False)
     user_no: str | None
     user_login_id: str | None
     rate_limit_rpm: int
     rate_limit_rpd: int
+    user_id: int | None = None
+    auth_key_id: int | None = None
 
 
-async def fetch_yes24_user_info(service_cookie: str) -> dict[str, Any] | None:
-    """service_cookie로 Yes24 회원 정보를 조회한다 — 실패·비정상 응답이면 None.
+def _unidentified() -> HTTPException:
+    return HTTPException(
+        status_code=403, detail="Yes24 회원 식별이 완료되지 않은 키입니다. 다시 로그인해 주세요."
+    )
 
-    성공 응답: `{"success": True, "userNo": …, "userId": …, "SelfCert": …,
-    "userId": …}`. 회원 정보 조회 실패는 인증 실패가 아니다(키는 유효한데
-    Yes24가 잠깐 죽은 경우) — 호출부가 user_no 없는 사용자로 진행한다.
-    """
+
+async def fetch_yes24_user_info(service_cookie: str) -> dict[str, Any]:
+    """명시적인 인증 거절은 403, 회원 서비스 장애는 503으로 구별한다."""
     settings = get_settings()
     try:
         async with httpx.AsyncClient(timeout=settings.yes24_user_info_timeout_s) as client:
-            resp = await client.post(
-                settings.yes24_user_info_url,
-                json={"serviceCookies": service_cookie},
+            response = await client.post(
+                settings.yes24_user_info_url, json={"serviceCookies": service_cookie}
             )
-        if resp.status_code != 200:
-            # 응답 본문에는 회원 정보가 들어 있다 — 상태코드만 남긴다
-            # (로그는 오래 남고 열람 범위가 넓다).
-            logger.warning(f"Yes24 회원 API status={resp.status_code}")
-            return None
-        data = resp.json()
-        if not data.get("success"):
-            logger.warning(f"Yes24 회원 API success=false: {data}")
-            return None
+        if response.status_code in (401, 403):
+            raise _unidentified()
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict) or "success" not in data:
+            raise ValueError("invalid member response")
+        if data["success"] is False:
+            raise _unidentified()
+        if data["success"] is not True:
+            raise ValueError("invalid member response")
         return data
-    except Exception as exc:  # noqa: BLE001 — 회원 조회 실패는 인증을 막지 않는다
-        logger.warning(f"Yes24 회원 API 호출 실패: {exc}")
-        return None
+    except HTTPException:
+        raise
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Yes24 회원 API 실패: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=503, detail="Yes24 회원 정보를 확인할 수 없습니다."
+        ) from exc
 
 
 def _pool_kwargs(db_url: str) -> dict[str, Any] | None:
-    """인증 풀 접속 kwargs — 파싱은 session_service.mysql_pool_kwargs 단일 출처.
-
-    mysql이 아니면 None(인증 비활성). 풀 크기만 인증 용도의 config 필드를 쓴다.
-    """
     return mysql_pool_kwargs(db_url, maxsize=get_settings().auth_pool_max)
 
 
-def _user_fields(data: dict[str, Any]) -> tuple[str | None, str | None]:
-    """Yes24 회원 응답에서 (user_no, user_login_id)를 뽑는다.
-
-    `canUseCremaclubAI`는 **뽑지 않는다**(2026-09-02 삭제). crema club AI 이용 자격 플래그라
-    이 서비스의 판정에 쓰인 적이 없고(게이트 사용 0건), 응답 원본이 통째로 `raw_user_info`에
-    저장되므로 전용 필드는 같은 값의 사본이었다. 필요해지면 그 JSON에서 읽으면 된다.
-    """
+def _user_fields(data: dict[str, Any]) -> tuple[str, str | None]:
     user_no = data.get("userNo")
-    return (str(user_no) if user_no is not None else None, data.get("userId"))
+    if user_no is None or isinstance(user_no, (bool, dict, list)) or not str(user_no).strip():
+        raise _unidentified()
+    return str(user_no), data.get("userId")
 
 
 class AuthService:
-    """API key 검증 + rate limiting 서비스(프로세스 싱글턴).
-
-    풀·Yes24 클라이언트를 생성자로 주입할 수 있다 — 테스트는 실 DB·실 네트워크 없이
-    스텁을 넣어 전 경로를 돈다.
-    """
-
     _instance: AuthService | None = None
 
-    def __init__(
-        self,
-        pool_factory=None,
-        fetch_user_info=fetch_yes24_user_info,
-    ) -> None:
+    def __init__(self, pool_factory=None, fetch_user_info=fetch_yes24_user_info) -> None:
         self._pool_kwargs = _pool_kwargs(get_settings().session_db_url)
-        # 풀 생성 기계(지연 생성·태스크 공유·shield)는 db.LazyAiomysqlPool 단일 구현이다 —
-        # 여기 남는 것은 실패 정책(503 fail-loud)뿐이다. mysql이 아니면 풀 자체가 없다.
         self._db = (
             LazyAiomysqlPool(self._pool_kwargs, pool_factory)
             if self._pool_kwargs is not None
             else None
         )
         self._fetch_user_info = fetch_user_info
-        # api_key → (사용자, 캐시 시각). TTL 안에서는 users 조회를 건너뛴다.
-        # is_active 회수도 최대 TTL만큼 늦게 반영된다(rate limit은 캐시와 무관하게 매번 DB).
-        self._cache: dict[str, tuple[AuthenticatedUser, float]] = {}
 
     @classmethod
     def get_instance(cls) -> AuthService:
@@ -132,222 +98,179 @@ class AuthService:
 
     @property
     def enabled(self) -> bool:
-        """인증 스택이 성립하는가 — 세션 DB가 mysql일 때만 True."""
         return self._pool_kwargs is not None
 
     async def close(self) -> None:
-        """커넥션 풀을 정리한다(앱 종료 훅) — 마감은 공유 풀 구현이 소유한다."""
         if self._db is not None:
             await self._db.close()
 
-    # ----- DB -----
-
-    async def _get_pool(self):
-        """풀 획득 — 생성 기계는 db.LazyAiomysqlPool, 여기는 실패 정책(503)만 얹는다."""
+    @asynccontextmanager
+    async def _cursor(self, *, transaction: bool = False):
         try:
-            return await self._db.get()
-        except Exception as exc:  # noqa: BLE001 — 어떤 드라이버 오류든 503으로 정직하게
-            logger.error(f"인증 DB 풀 생성 실패: {exc}")
-            raise HTTPException(status_code=503, detail="인증 DB에 연결할 수 없습니다.") from exc
+            pool = await self._db.get()
+            async with pool.acquire() as connection:
+                if transaction:
+                    await connection.begin()
+                try:
+                    async with connection.cursor() as cursor:
+                        yield cursor
+                    if transaction:
+                        await connection.commit()
+                except BaseException:
+                    if transaction:
+                        await connection.rollback()
+                    raise
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error("인증 DB 실패: %s", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="인증 DB 요청에 실패했습니다.") from exc
 
     async def _run(self, sql: str, params: tuple, *, fetch: bool = False):
-        """질의 1건 실행(필요하면 1행 반환). DB 오류는 삼키지 않고 503으로 올린다."""
-        pool = await self._get_pool()
-        try:
-            async with pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(sql, params)
-                    return await cur.fetchone() if fetch else None
-        except Exception as exc:  # noqa: BLE001 — 테이블 부재·연결 끊김 전부 정직하게 노출
-            logger.error(f"인증 DB 질의 실패: {exc}")
-            raise HTTPException(status_code=503, detail="인증 DB 질의에 실패했습니다.") from exc
+        async with self._cursor() as cursor:
+            await cursor.execute(sql, params)
+            return await cursor.fetchone() if fetch else None
 
-    # ----- 인증 -----
+    @staticmethod
+    def _is_dev_key(api_key: str) -> bool:
+        configured = get_settings().dev_api_key
+        return bool(configured) and compare_digest(api_key.encode(), configured.encode())
+
+    async def _member_info(self, api_key: str) -> dict[str, Any]:
+        data = await self._fetch_user_info(api_key)
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=503, detail="Yes24 회원 정보를 확인할 수 없습니다.")
+        if data.get("success") is False:
+            raise _unidentified()
+        return data
+
+    async def _lock_identity(self, cursor, user_id: int, key_id: int) -> tuple[int, int]:
+        await cursor.execute(
+            "SELECT rate_limit_rpm, rate_limit_rpd, is_active FROM users WHERE id = %s FOR UPDATE",
+            (user_id,),
+        )
+        limits = await cursor.fetchone()
+        if limits is None or not limits[2]:
+            raise HTTPException(status_code=401, detail="사용할 수 없는 API 키입니다.")
+        await cursor.execute(
+            "SELECT is_active FROM auth_keys WHERE id = %s AND user_id = %s FOR UPDATE",
+            (key_id, user_id),
+        )
+        key = await cursor.fetchone()
+        if key is None or not key[0]:
+            raise HTTPException(status_code=401, detail="사용할 수 없는 API 키입니다.")
+        return limits[0], limits[1]
 
     async def authenticate(self, api_key: str) -> AuthenticatedUser:
-        """API key → AuthenticatedUser. 캐시 히트면 DB를 보지 않는다."""
-        cached = self._cache.get(api_key)
-        if cached and (time.time() - cached[1]) < get_settings().auth_cache_ttl_s:
-            return cached[0]
-
-        # 회원 정보 만료 판정을 DB에서 한다 — timestamp 컬럼은 타임존 없는 값이라
-        # 파이썬 로컬 시각과 빼면 서버 타임존 차이만큼 통째로 어긋난다(같은 DB 시계끼리 비교).
+        key_hash = sha256(api_key.encode()).digest()
         row = await self._run(
-            "SELECT user_no, user_login_id, is_active, "
-            "rate_limit_rpm, rate_limit_rpd, "
-            "(user_cached_at IS NULL OR user_cached_at < NOW() - INTERVAL %s HOUR) "
-            "FROM users WHERE api_key = %s",
-            (get_settings().yes24_user_cache_hours, api_key),
+            "SELECT u.id, k.id, u.user_no, u.user_login_id, u.rate_limit_rpm, "
+            "u.rate_limit_rpd, u.is_active, k.is_active, k.kind, "
+            "(k.user_cached_at IS NULL OR k.user_cached_at < NOW() - INTERVAL %s HOUR) "
+            "FROM auth_keys k JOIN users u ON u.id = k.user_id WHERE k.key_hash = %s",
+            (get_settings().yes24_user_cache_hours, key_hash),
             fetch=True,
         )
         if row is None:
-            return await self._register(api_key)
-
-        user_no, login_id, is_active, rpm, rpd, stale = row
-        if not is_active:
+            return await self._register(api_key, key_hash)
+        user_id, key_id, user_no, login_id, rpm, rpd, active, key_active, kind, stale = row
+        if not active or not key_active:
             raise HTTPException(status_code=401, detail="사용할 수 없는 API 키입니다.")
-
-        if user_no is None or stale:
-            data = await self._refresh_yes24_user(api_key)
-            if data is not None:
-                user_no, login_id = _user_fields(data)
-        if user_no is None:
-            # 행은 있는데 한 번도 식별된 적 없는 키(옛 자동등록이 남긴 NULL 행). 신규 키와
-            # 같은 상태이므로 같게 끊는다 — 이 분기가 없으면 옛 행이 영구 우회로가 된다.
-            self._reject_unidentified(api_key, "저장된 user_no 없음")
-
-        return self._remember(
-            AuthenticatedUser(
-                api_key=api_key,
-                user_no=user_no,
-                user_login_id=login_id,
-                rate_limit_rpm=rpm,
-                rate_limit_rpd=rpd,
-            )
-        )
-
-    async def _register(self, api_key: str) -> AuthenticatedUser:
-        """미등록 키를 등록한다 — **Yes24 회원으로 식별될 때만**.
-
-        헤더 값이 곧 service_cookie라 그 값으로 회원 API를 조회한다. 조회를 **등록보다
-        먼저** 하는 이유가 둘이다(2026-09-02 전수 점검):
-
-        1. **아무 문자열이나 키가 되면 안 된다.** 종전에는 조회 실패도 `user_no=None`인
-           사용자로 통과시켜, 임의 문자열로 `/chat/stream`·`/overview`를 호출해 LLM 비용을
-           태울 수 있었다(히스토리만 `_require_identified`가 막고 있었다). 식별을 한 번도
-           못 한 키는 여기서 끊는다. **이미 식별된 키는 영향이 없다** — 그 키는 users에
-           user_no가 있어 이 경로로 오지 않으므로, Yes24 API가 일시적으로 죽어도 기존
-           사용자의 대화는 계속된다(fail-open은 그쪽에 그대로 남는다).
-        2. 실패한 키로 users에 행을 만들지 않는다 — 임의 문자열마다 행이 생기면 테이블이
-           무한히 부푼다.
-        """
-        settings = get_settings()
-        if settings.dev_api_key and api_key == settings.dev_api_key:
-            # 개발 키: Yes24 조회만 건너뛰고 나머지는 일반 키와 같은 경로다(행 등록·레이트리밋·
-            # is_active). 설정이 비어 있으면 이 분기 자체가 없다(구조적 off 스위치).
-            data = {"userNo": settings.dev_api_user_no, "userId": "dev"}
-            logger.info("개발 키 사용(Yes24 조회 생략)")
+        if kind == "dev":
+            if not self._is_dev_key(api_key) or user_no != get_settings().dev_api_user_no:
+                raise _unidentified()
+        elif kind == "member":
+            if stale:
+                data = await self._member_info(api_key)
+                refreshed_no, login_id = _user_fields(data)
+                if refreshed_no != user_no:
+                    raise _unidentified()
+                async with self._cursor(transaction=True) as cursor:
+                    rpm, rpd = await self._lock_identity(cursor, user_id, key_id)
+                    await cursor.execute(
+                        "UPDATE users SET user_login_id = %s WHERE id = %s",
+                        (login_id, user_id),
+                    )
+                    await cursor.execute(
+                        "UPDATE auth_keys SET raw_user_info = %s, user_cached_at = NOW() "
+                        "WHERE id = %s",
+                        (json.dumps(data, ensure_ascii=False), key_id),
+                    )
         else:
-            data = await self._fetch_user_info(api_key)
-        if data is None:
-            self._reject_unidentified(api_key, "신규 키 조회 실패")
-        await self._run(
-            "INSERT INTO users (api_key, rate_limit_rpm, rate_limit_rpd) VALUES (%s, %s, %s) "
-            "ON DUPLICATE KEY UPDATE updated_at = NOW()",
-            (api_key, settings.rate_limit_rpm, settings.rate_limit_rpd),
-        )
-        await self._store_user_info(api_key, data)
-        logger.info(f"신규 api_key 등록: {api_key[:8]}…")
+            raise _unidentified()
+        return AuthenticatedUser(api_key, user_no, login_id, rpm, rpd, user_id, key_id)
 
+    async def _register(self, api_key: str, key_hash: bytes) -> AuthenticatedUser:
+        settings = get_settings()
+        kind = "dev" if self._is_dev_key(api_key) else "member"
+        data = (
+            {"userNo": settings.dev_api_user_no, "userId": "dev"}
+            if kind == "dev"
+            else await self._member_info(api_key)
+        )
         user_no, login_id = _user_fields(data)
-        return self._remember(
-            AuthenticatedUser(
-                api_key=api_key,
-                user_no=user_no,
-                user_login_id=login_id,
-                rate_limit_rpm=settings.rate_limit_rpm,
-                rate_limit_rpd=settings.rate_limit_rpd,
+        async with self._cursor(transaction=True) as cursor:
+            await cursor.execute(
+                "INSERT INTO users (user_no, user_login_id, rate_limit_rpm, rate_limit_rpd) "
+                "VALUES (%s, %s, %s, %s) ON DUPLICATE KEY UPDATE id = id",
+                (user_no, login_id, settings.rate_limit_rpm, settings.rate_limit_rpd),
             )
-        )
-
-    def _reject_unidentified(self, api_key: str, why: str) -> None:
-        """Yes24 회원으로 **한 번도 식별되지 않은** 키를 거절한다(403) — 판정의 단일 소유자.
-
-        신규 키(조회 실패)와 레거시 행(user_no가 NULL인 채 남은 행) 두 경로가 같은 상태이므로
-        같은 문구·같은 코드로 끊는다. 이미 식별된 키는 여기 오지 않으므로 Yes24 API 장애가
-        기존 사용자를 끊지 않는다(fail-open은 그쪽에 남는다).
-        """
-        logger.warning(f"미식별 키 거절({why}): key={api_key[:8]}…")
-        raise HTTPException(
-            status_code=403,
-            detail="Yes24 회원 식별이 완료되지 않은 키입니다. 잠시 후 다시 시도해 주세요.",
-        )
-
-    async def _refresh_yes24_user(self, api_key: str) -> dict[str, Any] | None:
-        """Yes24 회원 정보를 조회해 users에 캐시하고 그 응답을 돌려준다(실패면 None).
-
-        조회 결과를 그대로 반환하므로 호출부가 users를 다시 SELECT하지 않는다.
-        """
-        data = await self._fetch_user_info(api_key)
-        if data is None:
-            logger.warning(f"Yes24 회원 정보 갱신 실패: key={api_key[:8]}…")
-            return None
-        await self._store_user_info(api_key, data)
-        return data
-
-    async def _store_user_info(self, api_key: str, data: dict[str, Any]) -> None:
-        """조회된 회원 정보를 users에 캐시한다(갱신·최초 등록 공용)."""
-        user_no, login_id = _user_fields(data)
-        await self._run(
-            "UPDATE users SET user_no = %s, user_login_id = %s, self_cert = %s, "
-            "raw_user_info = %s, user_cached_at = NOW() "
-            "WHERE api_key = %s",
-            (
-                user_no,
-                login_id,
-                1 if data.get("SelfCert") else 0,
-                json.dumps(data, ensure_ascii=False),
-                api_key,
-            ),
-        )
-        # 로그인 ID는 개인정보다 — userNo(내부 식별자)만 남긴다.
-        logger.info(f"Yes24 회원 정보 캐시: userNo={user_no}")
-        return data
-
-    def _remember(self, user: AuthenticatedUser) -> AuthenticatedUser:
-        self._cache[user.api_key] = (user, time.time())
-        return user
-
-    # ----- Rate limiting -----
-
-    async def check_rate_limit(self, user: AuthenticatedUser) -> None:
-        """슬라이딩 윈도우(분·일) 요청 수를 세고 초과면 429.
-
-        두 창을 한 질의로 센다 — 일 단위 행을 이미 훑으므로 분 단위는 그 안의 조건 합이다.
-        """
-        row = await self._run(
-            "SELECT COALESCE(SUM(requested_at > NOW(3) - INTERVAL 1 MINUTE), 0), COUNT(*) "
-            "FROM rate_limit_log WHERE api_key = %s AND requested_at > NOW(3) - INTERVAL 1 DAY",
-            (user.api_key,),
-            fetch=True,
-        )
-        minute_count, day_count = (int(value) for value in row)
-        if minute_count >= user.rate_limit_rpm:
-            raise HTTPException(
-                status_code=429,
-                detail=f"분당 요청 한도({user.rate_limit_rpm}회)를 초과했습니다.",
+            await cursor.execute(
+                "SELECT id, is_active, rate_limit_rpm, rate_limit_rpd FROM users "
+                "WHERE user_no = %s FOR UPDATE",
+                (user_no,),
             )
-        if day_count >= user.rate_limit_rpd:
-            raise HTTPException(
-                status_code=429,
-                detail=f"일일 요청 한도({user.rate_limit_rpd}회)를 초과했습니다.",
+            user_id, active, rpm, rpd = await cursor.fetchone()
+            if not active:
+                raise HTTPException(status_code=401, detail="사용할 수 없는 API 키입니다.")
+            await cursor.execute(
+                "INSERT INTO auth_keys (key_hash, user_id, kind, raw_user_info, user_cached_at) "
+                "VALUES (%s, %s, %s, %s, NOW()) ON DUPLICATE KEY UPDATE id = id",
+                (key_hash, user_id, kind, json.dumps(data, ensure_ascii=False)),
+            )
+            await cursor.execute(
+                "SELECT id, user_id, is_active, kind FROM auth_keys WHERE key_hash = %s FOR UPDATE",
+                (key_hash,),
+            )
+            key_id, key_user_id, key_active, key_kind = await cursor.fetchone()
+            if key_user_id != user_id or key_kind != kind:
+                raise _unidentified()
+            if not key_active:
+                raise HTTPException(status_code=401, detail="사용할 수 없는 API 키입니다.")
+            await cursor.execute(
+                "UPDATE users SET user_login_id = %s WHERE id = %s", (login_id, user_id)
+            )
+        return AuthenticatedUser(api_key, user_no, login_id, rpm, rpd, user_id, key_id)
+
+    async def consume_request(self, user: AuthenticatedUser, endpoint: str) -> None:
+        """사용자 행 잠금 안에서 한도 확인과 기록을 원자적으로 처리한다."""
+        async with self._cursor(transaction=True) as cursor:
+            rpm, rpd = await self._lock_identity(cursor, user.user_id, user.auth_key_id)
+            await cursor.execute(
+                "SELECT COALESCE(SUM(requested_at > NOW(3) - INTERVAL 1 MINUTE), 0), COUNT(*) "
+                "FROM rate_limit_log WHERE user_id = %s AND requested_at > NOW(3) - INTERVAL 1 DAY",
+                (user.user_id,),
+            )
+            minute_count, day_count = (int(value) for value in await cursor.fetchone())
+            if minute_count >= rpm:
+                raise HTTPException(
+                    status_code=429, detail=f"분당 요청 한도({rpm}회)를 초과했습니다."
+                )
+            if day_count >= rpd:
+                raise HTTPException(
+                    status_code=429, detail=f"일일 요청 한도({rpd}회)를 초과했습니다."
+                )
+            await cursor.execute(
+                "INSERT INTO rate_limit_log (user_id, auth_key_id, endpoint) VALUES (%s, %s, %s)",
+                (user.user_id, user.auth_key_id, endpoint),
             )
 
     async def read_rbti(self, user_no: str) -> str | None:
-        """저장된 RBTI 코드를 읽는다(없으면 None).
-
-        `users`는 이 서비스가 소유한 테이블이라 여기 둔다. 유효성은 호출부(persona.is_valid_code)가
-        보므로 형식을 보증하지 않는다 — 저장 경로가 이미 유효 코드만 넣는다.
-        """
-        row = await self._run(
-            "SELECT rbti FROM users WHERE user_no = %s AND rbti IS NOT NULL LIMIT 1",
-            (user_no,),
-            fetch=True,
-        )
+        row = await self._run("SELECT rbti FROM users WHERE user_no = %s", (user_no,), fetch=True)
         return row[0] if row else None
 
     async def write_rbti(self, user_no: str, code: str | None) -> None:
-        """RBTI 코드를 저장한다(None이면 해제). 같은 사람의 키가 여럿이면 전부 갱신한다 —
-        유형은 키가 아니라 **사람**에게 붙는 값이기 때문이다."""
         await self._run("UPDATE users SET rbti = %s WHERE user_no = %s", (code, user_no))
-        self._cache.clear()  # 캐시된 사용자 레코드가 낡지 않게 한다(다음 요청이 다시 읽는다)
-
-    async def record_request(self, api_key: str, endpoint: str) -> None:
-        """요청을 rate_limit_log에 남긴다(다음 요청의 슬라이딩 윈도우 재료)."""
-        await self._run(
-            "INSERT INTO rate_limit_log (api_key, endpoint) VALUES (%s, %s)",
-            (api_key, endpoint),
-        )
 
 
 async def close_auth_service() -> None:
@@ -419,8 +342,7 @@ async def enforce_rate_limit(
     # 방어**를 둔다 — 한쪽만 방어하면 스택 없는 구성에서 여기만 터진다.
     if not service.enabled:
         return
-    await service.check_rate_limit(user)
-    await service.record_request(user.api_key, _route_template(request))
+    await service.consume_request(user, _route_template(request))
 
 
 def _route_template(request: Request) -> str:
@@ -429,7 +351,7 @@ def _route_template(request: Request) -> str:
     구체 경로(`request.url.path`)를 그대로 남기면 rate_limit_log의 endpoint가 세션·턴 id마다
     고유해져 ① 엔드포인트별 집계가 불가능해지고(대화 수만큼 서로 다른 값) ② 컬럼 상한에서
     잘리며 ③ 식별자가 로그 테이블에 복제된다. 판정에는 쓰이지 않는 컬럼이라(일일 카운트는
-    api_key만 본다) 동작은 그대로다 — 바뀌는 것은 기록의 쓸모뿐이다.
+    user_id만 본다) 동작은 그대로다 — 바뀌는 것은 기록의 쓸모뿐이다.
 
     매칭 라우트는 FastAPI가 scope에 심는다(fastapi.routing에서 child_scope["route"]).
     없으면(미들웨어 단계·404) 구체 경로로 떨어진다 — 기록이 비는 것보다 낫다.

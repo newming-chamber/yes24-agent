@@ -58,7 +58,7 @@ from yes24_agent.starters import close_starter_service, register_starters
 from yes24_agent.thought_translation import warmup_translation
 from yes24_agent.toolsets import TOOLSETS, get_resolved_app, resolve_app_for
 from yes24_agent.usage import close_usage_logger
-from yes24_agent.user_data import close_user_data_service
+from yes24_agent.user_data import UserDataService, close_user_data_service
 
 logger = logging.getLogger(__name__)
 
@@ -443,6 +443,7 @@ async def lifespan(app: FastAPI):
     # ADK는 GOOGLE_API_KEY를 기대한다 — GEMINI_API_KEY를 매핑해 둔다.
     if not ensure_google_api_key_env():
         logger.warning("GEMINI/GOOGLE API 키가 설정되지 않았습니다. LLM 호출이 실패할 수 있어요.")
+    await UserDataService.get_instance().verify_schema()
     # 사고 라벨 번역 경로를 백그라운드로 데운다(첫 채팅의 첫 한국어 라벨 ~0.3초 단축).
     # 기동을 막지 않도록 task로만 띄우고, 참조를 잡아 GC 취소를 막는다.
     app.state.translation_warmup = asyncio.create_task(warmup_translation())

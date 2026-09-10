@@ -243,7 +243,9 @@ ITEM_RANK = "em.ico.rank"
 NEWPRODUCT_LIST_CONTAINER = "ul#yesNewList"
 NEWPRODUCT_ITEM = f"{NEWPRODUCT_LIST_CONTAINER} li[data-goods-no]"
 
-# 크레마클럽 인기(eBook 구독 서비스)는 검색/베스트셀러/신간과 마크업이 다르다:
+# 크레마클럽 인기(eBook 구독 서비스)는 검색/베스트셀러/신간과 마크업이 다르다. 값은 코너
+# 페이지가 아니라 **목록 조각**(urls.BROWSE_SEED_URLS["cremaclub"] — AJAX 엔드포인트,
+# 2026-09-09 실측 fixture)에서 확인한 것이며 조각의 마크업은 개편 전 페이지와 같다:
 #   - li 자체에는 data-goods-no가 없다. 대신 "내서재에 추가" 버튼
 #     (a.btn_addBC)의 data-goods-no 속성에서 뽑아야 한다.
 #   - 상세 링크(a.gd_name의 href)는 `/BookClub/Detail/{id}`라 구매 가능한

@@ -510,6 +510,13 @@ class Settings(BaseSettings):
     # 공유 Yes24Client의 동시성 Semaphore(http_concurrency=5) 안에 들어가는 폭이기도 하다.
     # 초과분은 조용히 버리지 않고 dropped_queries로 명시한다(fail-loud).
     yes24_search_max_queries: int = 4
+    # 한 번의 yes24_browse 호출에서 동시에 열람할 코너(sections) 수 상한 — 위 검색 각도
+    # 상한과 같은 축(호출 1회의 Yes24 요청 폭, http_concurrency=5 안)이라 같은 기본값을 쓴다.
+    # 코너를 갈아탈 때마다 모델 왕복이 끼어 스텝 사이 2.3~3.9초씩 비던 것(2026-09-09 실측:
+    # 3코너 질의 34.1초 중 9.0초)을 한 호출로 닫는 구조의 천장이다. 허용 코너가 4종
+    # (BROWSE_SEED_URLS)이라 유효·중복 제거된 요청은 이 값에 닿지 않고, 초과분은 조용히
+    # 버리지 않고 dropped_sections로 명시한다(fail-loud).
+    yes24_browse_max_sections: int = 4
     # 코너 목록 반환 상한. **초기값·근거 미기록**(e9cf930). 위 search_result_limit는 24→10
     # 되돌림 A/B가 있는데 이쪽은 그 검토를 받은 적이 없다.
     browse_result_limit: int = 10

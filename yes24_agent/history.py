@@ -1,8 +1,8 @@
 """대화 히스토리 API — 목록(검색·unread)·복원(=읽음)·이름 변경·삭제·턴 피드백·클릭 기록
 (`/chat/sessions*`).
 
-**새 저장소가 없다.** 히스토리는 ADK 세션 서비스가 이미 영속한 `events`에서 투영하고
-(sessions·events의 소유자는 ADK다), 턴 경계는 ADK가 턴마다 부여하는 `invocation_id`다 —
+히스토리는 MySQL `chat_turn` 확정본을 우선 읽고, 없는 턴은 ADK `events`에서 투영한다.
+SQLite는 ADK 이벤트 스냅샷을 유지한다. 턴 경계는 ADK가 부여하는 `invocation_id`다 —
 `/chat/stream` done의 `turn_id`, admin 턴 집계와 같은 열쇠. 이 모듈이 이력 투영의 단일
 소유자다(같은 판정 두 곳 금지 — 본문 재조립·인용 마감은 runner·postprocess의 그 함수를
 그대로 빌려 쓴다).
@@ -25,6 +25,7 @@ from functools import partial
 from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from google.adk.sessions import DatabaseSessionService
 from pydantic import (
     AnyHttpUrl,
     BaseModel,
@@ -42,7 +43,7 @@ from yes24_agent.enrichment import SESSION_TITLE_STATE_KEY
 from yes24_agent.event_translate import PROCESS_TIMING_KEY, TurnProcess
 from yes24_agent.postprocess import finalize_answer, finalize_text
 from yes24_agent.runner import _event_text, _round_boundary_prefix
-from yes24_agent.session_service import _POC_USER_ID, _get_session_service
+from yes24_agent.session_service import _POC_USER_ID, _get_session_lock, _get_session_service
 from yes24_agent.sources import get_sources
 from yes24_agent.toolsets import TOOLSET_PUBLIC_SOURCE_TYPE, TOOLSET_SOURCE_TYPES
 from yes24_agent.turn_snapshot import TURN_SNAPSHOT_KEY
@@ -275,15 +276,15 @@ class TurnView(BaseModel):
     )
     sources: list[SourceCard] = Field(
         description="이 턴이 인용한 공개 출처(등장 순서). history_saved=true면 완료 당시 값."
-        " false인 구 턴만 현재 레지스트리 최신 관측이므로 과거 가격·평점을 보장하지 않는다."
+        " false인 구 턴은 재조립본이므로 과거 가격·평점을 보장하지 않는다."
         " type은 기존 분류, card_type은 카드 렌더링 분류이며 other_formats 등의 목록을 보존한다"
     )
     cited_ids: list[int] = Field(description="본문 마커와 sources를 잇는 인용 id(등장 순서)")
     meta: TurnMeta = Field(default_factory=TurnMeta, description="완료 당시 부가 정보")
     status: Literal["completed", "failed", "interrupted", "unknown"] = Field(
         default="unknown",
-        description="서버가 확정한 종료 상태. 스냅샷 없는 구 턴·비정상 종료는 unknown이며"
-        " completed로 추측하지 않는다",
+        description="확인된 종료 상태. 구 턴은 명시적인 오류·중단 기록이 있으면 해당 상태를"
+        " 표시하고, 최종 종료를 확인할 수 없으면 unknown이다. 본문만으로 완료를 추측하지 않는다",
     )
     error: TurnError | None = Field(default=None, description="실패 정보. 없거나 알 수 없으면 null")
     rbti_applied: str | None = Field(
@@ -292,11 +293,9 @@ class TurnView(BaseModel):
     history_saved: bool = Field(
         default=False,
         description="true면 완료 당시 공개 턴 스냅샷에서 복원했다. false면 구 이벤트"
-        " 기반 복원이라 출처의 당시 값·부가 정보·정확한 종료 상태를 보장하지 않는다",
+        " 기반 복원이다. 종료 상태와 별개이며 출처의 당시 값·부가 정보를 보장하지 않는다",
     )
-    feedback: TurnFeedbackState | None = Field(
-        description="내가 이 턴에 남긴 피드백(없으면 null)"
-    )
+    feedback: TurnFeedbackState | None = Field(description="내가 이 턴에 남긴 피드백(없으면 null)")
     process: TurnProcessView = Field(
         description="턴 과정 요약(접힌 사고과정 헤더 재료) — 라이브 done.process와 같은 모양"
     )
@@ -370,9 +369,9 @@ class TurnClickRequest(BaseModel):
     pydantic이 URL을 정규화한다(빈 경로에 `/` 부여, 앞뒤 공백 제거) — 그 정규형이 저장값이다.
     """
 
-    url: Annotated[
-        AnyHttpUrl, UrlConstraints(max_length=get_settings().click_url_max_chars)
-    ] = Field(description="클릭한 링크(http/https). 상한은 config click_url_max_chars")
+    url: Annotated[AnyHttpUrl, UrlConstraints(max_length=get_settings().click_url_max_chars)] = (
+        Field(description="클릭한 링크(http/https). 상한은 config click_url_max_chars")
+    )
     source_id: int | None = Field(
         default=None, description="본문 [n] 마커 번호(출처 카드에서 눌렀으면). 없으면 null"
     )
@@ -434,11 +433,13 @@ async def _owned_session(user_no: str, session_id: str):
 async def _owned_turn(user_no: str, session_id: str, turn_id: str):
     """소유 세션 + 그 안에 실재하는 턴 — 턴에 무언가를 남기는 라우트(피드백·클릭)의 공통 입구.
 
-    턴 실재 검증은 존재하지 않는 turn_id로 쓰레기 행이 쌓이지 않게 한다. 열쇠는 이벤트에
-    이미 있는 invocation_id뿐이라 별도 인덱스·스캔 구조가 필요 없다.
+    공개 턴 행을 먼저 확인하며, 아직 저장되지 않은 턴은 원시 이벤트로 확인한다.
     """
     _, session = await _owned_session(user_no, session_id)
-    if not any(event.invocation_id == turn_id for event in session.events):
+    saved = await UserDataService.get_instance().has_turn(
+        app_name=get_settings().app_name, user_id=user_no, session_id=session_id, turn_id=turn_id
+    )
+    if not saved and not any(event.invocation_id == turn_id for event in session.events):
         raise HTTPException(status_code=404, detail="해당 턴을 찾을 수 없습니다.")
     return session
 
@@ -561,7 +562,10 @@ def _title_of(session, user_title: str | None) -> str | None:
 
 
 def _project_session_detail(
-    session, feedback_by_turn: dict[str, dict[str, Any]], user_title: str | None = None
+    session,
+    feedback_by_turn: dict[str, dict[str, Any]],
+    user_title: str | None = None,
+    saved_turns: list[dict[str, Any]] | None = None,
 ) -> SessionDetailResponse:
     """세션 이벤트·레지스트리·피드백을 복원 응답으로 투영한다.
 
@@ -569,26 +573,28 @@ def _project_session_detail(
     사용하며, 그 경우 현재 세션 레지스트리를 참조하므로 당시 출처 값은 보장할 수 없다.
     """
     registry = None
-    turns: list[TurnView] = []
-    for raw in _assemble_turns(session.events):
+    turns = [
+        TurnView(
+            **row["snapshot"],
+            started_at=row["started_at"],
+            user_text=row["user_text"],
+            feedback=TurnFeedbackState(**feedback_by_turn[row["turn_id"]])
+            if row["turn_id"] in feedback_by_turn
+            else None,
+        )
+        for row in saved_turns or ()
+    ]
+    saved_ids = {turn.turn_id for turn in turns}
+    for raw in _assemble_turns(
+        [event for event in session.events if event.invocation_id not in saved_ids]
+    ):
         snapshot = raw["snapshot"]
         if snapshot is not None:
             payload = dict(snapshot)
         else:
             if registry is None:
                 registry = get_sources(session.state)
-            body = "".join(raw["body"])
-            _, payload = finalize_answer(body, registry, session.id)
-            if not raw["body"]:
-                payload["text"] = ""
-            process = raw["process"].payload(
-                raw_body=body,
-                text=payload["text"],
-                finalize_text=partial(finalize_text, sources=registry, session_id=session.id),
-                elapsed_ms=int((raw["ended_at"] - raw["started_at"]) * 1000),
-            )
-            process.update(raw["timing"] or {})
-            payload["process"] = process
+            payload = _restore_turn_payload(raw, registry, session.id)
         payload.update(session_id=session.id, turn_id=raw["turn_id"])
         feedback = feedback_by_turn.get(raw["turn_id"])
         turns.append(
@@ -602,8 +608,32 @@ def _project_session_detail(
     return SessionDetailResponse(
         session_id=session.id,
         title=_title_of(session, user_title),
-        turns=turns,
+        turns=sorted(turns, key=lambda turn: turn.started_at or 0),
     )
+
+
+def _restore_turn_payload(raw: dict, registry: list[dict], session_id: str) -> dict:
+    """구 이벤트 복원의 본문·과정·불확실성 계약. API와 백필이 함께 사용한다."""
+    body = "".join(raw["body"])
+    _, payload = finalize_answer(body, registry, session_id)
+    if not raw["body"]:
+        payload["text"] = ""
+    process = raw["process"].payload(
+        raw_body=body,
+        text=payload["text"],
+        finalize_text=partial(finalize_text, sources=registry, session_id=session_id),
+        elapsed_ms=int((raw["ended_at"] - raw["started_at"]) * 1000),
+    )
+    process.update(raw["timing"] or {})
+    payload.update(
+        process=process,
+        status="unknown",
+        history_saved=False,
+        meta={"recommendations": [], "follow_ups": []},
+        error=None,
+        rbti_applied=None,
+    )
+    return payload
 
 
 # ── 라우트 ─────────────────────────────────────────────────────────────────
@@ -684,11 +714,12 @@ def register_history(app: FastAPI) -> None:
         user_no = _require_identified(user)
         service, session = await _owned_session(user_no, session_id)
         data = UserDataService.get_instance()
-        feedback_by_turn = await data.feedback_for_session(
-            user_id=user_no, session_id=session.id
-        )
+        feedback_by_turn = await data.feedback_for_session(user_id=user_no, session_id=session.id)
         user_title, last_read_at = await data.ui_get(user_id=user_no, session_id=session.id)
-        detail = _project_session_detail(session, feedback_by_turn, user_title)
+        saved_turns = await data.turns_for_session(
+            app_name=get_settings().app_name, user_id=user_no, session_id=session.id
+        )
+        detail = _project_session_detail(session, feedback_by_turn, user_title, saved_turns)
         await _mark_read_best_effort(data, user_no, session, last_read_at)
         return detail
 
@@ -761,28 +792,23 @@ def register_history(app: FastAPI) -> None:
     )
     async def delete_session(session_id: str, user: _UserDep = None) -> None:
         user_no = _require_identified(user)
-        service, session = await _owned_session(user_no, session_id)
-        # **피드백을 먼저 지운다.** 세션만 지우면 사용자가 쓴 코멘트가 session_id·user_id와
-        # 함께 남는다 — 이 API의 존재 이유가 프라이버시인데 그러면 삭제가 아니다(2026-09-01
-        # 라이브 검증에서 고아 행 관측). 순서가 이쪽인 이유: 피드백 삭제가 실패하면 5xx로
-        # 끊겨 세션이 남고 사용자가 다시 누를 수 있다. 반대로 하면 세션은 사라졌는데 코멘트만
-        # 남아 되지울 방법이 없어진다(soft-fail보다 재시도 가능한 실패가 낫다).
-        data = UserDataService.get_instance()
-        if data.enabled:
-            await data.purge_session(user_id=user_no, session_id=session.id)
-        try:
-            await service.delete_session(
-                app_name=get_settings().app_name, user_id=user_no, session_id=session.id
-            )
-        except Exception as exc:  # noqa: BLE001 — 500이 아니라 **재시도 가능한** 실패로 알린다
-            # 여기까지 왔으면 우리 쪽 데이터는 이미 지워졌다. 그대로 500을 내면 프론트는
-            # 재시도 가능한 실패인지 알 수 없다 — 다시 누르면 세션까지 지워져 최종 상태가
-            # 맞으므로(우리 쪽 삭제는 멱등) 503으로 정직하게 알린다.
-            logger.error(f"세션 삭제 실패(session_id={session.id}): {exc}")
-            raise HTTPException(
-                status_code=503, detail="대화를 지우지 못했습니다. 잠시 후 다시 시도해 주세요."
-            ) from exc
-        logger.info(f"세션 삭제: session_id={session.id} user_no={user_no}")
+        async with _get_session_lock(session_id):
+            service, session = await _owned_session(user_no, session_id)
+            data = UserDataService.get_instance()
+            if data.enabled and isinstance(service, DatabaseSessionService):
+                await data.purge_session(user_id=user_no, session_id=session.id)
+            else:
+                try:
+                    await service.delete_session(
+                        app_name=get_settings().app_name, user_id=user_no, session_id=session.id
+                    )
+                except Exception as exc:
+                    logger.error(f"세션 삭제 실패(session_id={session.id}): {type(exc).__name__}")
+                    raise HTTPException(
+                        status_code=503,
+                        detail="대화를 지우지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                    ) from exc
+            logger.info(f"세션 삭제: session_id={session.id} user_no={user_no}")
 
     @app.put(
         "/chat/sessions/{session_id}/turns/{turn_id}/feedback",
@@ -815,9 +841,7 @@ def register_history(app: FastAPI) -> None:
         data = UserDataService.get_instance()
         comment = request.comment or None
         if request.rating == "none":
-            await data.withdraw_feedback(
-                user_id=user_no, session_id=session.id, turn_id=turn_id
-            )
+            await data.withdraw_feedback(user_id=user_no, session_id=session.id, turn_id=turn_id)
             return TurnFeedbackState(rating=None, comment=None)
         await data.upsert_feedback(
             user_id=user_no,

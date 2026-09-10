@@ -13,7 +13,7 @@
 ALTER TABLE usage_log
   ADD COLUMN thinking_tokens INT NULL COMMENT 'thoughts_token_count — 과금 출력에 포함되나 종전 미기록',
   ADD COLUMN cached_tokens   INT NULL COMMENT 'cached_content_token_count — 프롬프트 중 할인 단가 대상',
-  ADD COLUMN turn_id         VARCHAR(128) NULL COMMENT 'ADK invocation_id — events·turn_feedback과 같은 키',
+  ADD COLUMN turn_id         VARCHAR(256) NULL COMMENT 'ADK invocation_id — events·turn_feedback과 같은 키',
   ADD COLUMN outcome         VARCHAR(16)  NULL COMMENT 'main 행만: ok|empty|timeout|error|aborted',
   ADD COLUMN llm_calls       SMALLINT     NULL COMMENT '이 행이 합산한 LLM 콜 수(비용의 1차 레버)',
   ADD COLUMN tool_calls      SMALLINT     NULL COMMENT 'main 행만: 이 턴에 돈 도구 수',

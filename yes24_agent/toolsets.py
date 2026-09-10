@@ -82,6 +82,8 @@ TOOLSET_SOURCE_TYPES: dict[str, dict[str, tuple[str, ...]]] = {
     "yes24": {
         "search_result": GROUNDING_FIELDS,
         "book_detail": GROUNDING_FIELDS,
+        # 구 이벤트에 독립 출처로 저장된 판형도 Yes24 상품 공개 계약을 따른다.
+        "other_format": GROUNDING_FIELDS,
         # browse만 목록 순위(rank)를 관측한다 — 코너 랭킹이 그 출처의 본질 필드다.
         "browse": (*GROUNDING_FIELDS, "rank"),
     },
