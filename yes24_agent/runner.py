@@ -65,6 +65,7 @@ from yes24_agent.sse import (
     sse_done,
     sse_error,
     sse_meta,
+    sse_rbti,
     sse_reset,
     sse_sources,
     sse_status,
@@ -525,9 +526,10 @@ async def run_agent_stream(
     호출부가 넘기는 파라미터일 뿐 이 함수 안에 어떤 분기도 만들지 않는다.
 
     use_rbti는 요청이 RBTI 적용을 **요청했는가**다(코드 유무와 별개). 참이면 첫 모델 이벤트
-    전에 `status{stage:"rbti", code, detail}`를 1회 낸다 — 코드가 없으면 code:null·
-    detail:""로 "요청했지만 적용할 유형이 없음"을 알린다(피그마 10-C). 매트릭스는 넘기지
-    않는다(열 카드가 이미 code·axis_label을 받는다 — 중복 금지).
+    전에 `rbti{code, axes}` 이벤트를 1회 낸다 — 코드가 없으면 code:null·axes:""로 "요청했지만
+    적용할 유형이 없음"을 알린다(피그마 10-C). 진행 단계(status)가 아니라 턴 속성이라 별도
+    이벤트다(sse_rbti 주석). 매트릭스는 넘기지 않는다(열 카드가 이미 code·axis_label을
+    받는다 — 중복 금지).
     """
     settings = get_settings()
     # usage_log latency_ms의 기준점(락 대기 포함 요청 처리 전체 벽시계). 토큰 누적과
@@ -709,12 +711,10 @@ async def run_agent_stream(
             new_message = types.Content(role="user", parts=[types.Part(text=message)])
 
             if use_rbti:
-                # 턴 시작 신호(피그마 10) — 첫 모델 이벤트 전 1회. 문장은 프론트 몫이고 서버는
+                # 턴 속성 신호(피그마 10) — 첫 모델 이벤트 전 1회. 문장은 프론트 몫이고 서버는
                 # 코드와 축 라벨(데이터)만 싣는다. emitted_output은 올리지 않는다(본문이
                 # 아니라 과부하 재시도 가능성을 보존한다 — thinking과 같은 규율).
-                yield sse_status(
-                    "rbti", axis_label(code), round=process.round, extra={"code": code}
-                )
+                yield sse_rbti(code, axis_label(code))
 
             # 이벤트 간격에 sse_timeout_s 상한을 건다. ADK 스트림은 하나의 고정 task가 소비해
             # 여러 yield에 걸친 OpenTelemetry context의 소유권을 보존한다.

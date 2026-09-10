@@ -25,6 +25,7 @@ data: <JSON>
 
 | event | data | 뜻 |
 |---|---|---|
+| `rbti` | `{code, axes}` | 턴 속성(RBTI 적용). **턴 시작에 한 번**, 첫 모델 이벤트 전 |
 | `status` | `{stage, detail, round?, ...}` | 아래 진행 계약 참고 |
 | `content` | `{phase, round, answer_start?, round_starts?, offset_unit?}` | 본문 역할·경계 |
 | `delta` | `{text, round?}` | 본문 조각. **이어 붙이면 본문이 된다** |
@@ -35,7 +36,14 @@ data: <JSON>
 | `error` | `{message}` | 사용자에게 보여줄 실패 문구 |
 
 `done` 필드: `text/sources/cited_ids/session_id/turn_id/rbti_applied/process/meta/status/error/`
-`history_saved`. `status`의 선택 필드: `step_id/state/result_count/refs/code/sources`.
+`history_saved`. `status`의 선택 필드: `step_id/state/result_count/refs/sources`.
+
+**`rbti`** — RBTI 적용은 진행 단계가 아니라 **턴 자체의 속성**이라 `status`가 아닌 전용
+이벤트다(조사 스텝 목록을 그리는 소비자가 턴 메타를 골라낼 필요가 없다). `use_rbti`가 참일
+때만(기본 참) 첫 모델 이벤트 전 1회 온다. `code`는 적용된 4자 코드, 요청했지만 적용할 유형이
+없으면 `code: null`·`axes: ""`다 — **`code`가 있으면 그 즉시 배지를 켠다**(`done.rbti_applied`를
+기다리지 않는다; 둘은 같은 값이다). `axes`는 축 라벨(`"완독-분석-깊이-정보"`, `-`로 나눠
+칩)이다. `applied` 같은 불리언은 없다 — `code`의 유무가 곧 적용 여부다.
 
 **출처 스트리밍** — 조사 후보는 `status.sources`에 즉시 나타난다. 본문이 출처를 인용하면
 그 마커의 첫 `delta` 전에 `refs`와 `sources{final:false}`를 보낸다. 이후 같은 자료의
@@ -58,9 +66,6 @@ data: <JSON>
 제목·코너명)이거나 구조 신호(건수)뿐이고, 무엇을 하는 중인지의 동사는 stage가 담당한다.
 - `thinking` — 힌트(사고 요약 헤드라인). detail = 모델 사고 요약의 단계 제목. 본문이 아니며
   `done.process.steps`에도 없다.
-- `rbti` — 턴 시작 신호. **`use_rbti`가 참일 때만**(기본 참) 첫 모델 이벤트 전 1회, `round: 0`.
-  detail = 적용된 RBTI 축 라벨(`"완독-분석-깊이-정보"`, `-`로 나눠 칩), `code`가 함께 실린다 —
-  적용됐으면 코드, 요청했지만 코드가 없으면 `code: null`·`detail: ""`.
 - `searching` — 툴 호출(yes24_search). detail = 검색 각도들(` · ` 구분).
 - `searching_web` — 툴 호출(web_search). detail = 검색 각도들(` · ` 구분).
 - `reading` — 툴 호출(yes24_fetch·fetch_many·web_fetch). detail = 관측한 제목, 없으면 빈 문자열.
@@ -107,7 +112,7 @@ round가 없다.
   "answer_start": 187,      // done.text에서 최종 답(마지막 라운드)이 시작하는 문자 오프셋
   "round_starts": [0, 187], // 라운드 r 텍스트의 done.text 시작 오프셋(마지막 = answer_start)
   "offset_unit": "unicode_codepoint", // JS UTF-16 문자열 인덱스가 아니다
-  "steps": [                // 이번 턴의 툴 status(thinking·refs·rbti 제외), 순서대로
+  "steps": [                // 이번 턴의 툴 status(thinking·refs 제외), 순서대로
     {"round": 0, "step_id": "step-1", "state": "running",
      "stage": "searching", "detail": "에세이 베스트셀러 · 요즘 인기 에세이"},
     {"round": 0, "step_id": "step-1", "state": "completed", "result_count": 2,
@@ -156,8 +161,8 @@ round가 없다.
 - 후속 턴은 `done.session_id`를 요청에 실어 이어간다.
 - `done`에 `model` 키는 **없다**. 모델명은 어드민(데모 로그인) 세션에만 실린다 — 같은 이유로
   요청의 `model`·`toolsets`도 API 키 호출에서는 무시되고 서버 기본 구성으로 고정된다.
-- `done.rbti_applied`는 이 턴에 적용된 RBTI 코드다(미적용이면 `null`) — truthiness가 곧
-  "✦ RBTI 데이터가 활용됨" 배지 여부이고, 값은 어떤 독서 유형이 적용됐는지다.
+- `done.rbti_applied`는 이 턴에 적용된 RBTI 코드다(미적용이면 `null`) — 턴 시작의 `rbti.code`와
+  같은 값이며, 히스토리 복원 배지의 근거다(라이브 배지는 `rbti` 이벤트가 켠다).
 - `done.turn_id`는 이 턴의 서버 식별자다(피드백 API
   `PUT /chat/sessions/{session_id}/turns/{turn_id}/feedback`, 링크 클릭 기록
   `POST /chat/sessions/{session_id}/turns/{turn_id}/clicks`, 히스토리 복원
@@ -254,9 +259,9 @@ def sse_status(
     원칙 4는 그대로다. refs 미지정(기본)이면 페이로드에 키를 넣지 않아 기존 프레임과
     바이트 동일하다(_with와 같은 규율).
 
-    `round`는 이 status가 속한 LLM 라운드(0부터), `extra`는 stage별 구조 데이터(rbti의
-    `code` — 값이 None이어도 **키는 실린다**: "요청했지만 코드 없음"을 프론트가 값으로
-    판정한다 — 와 found의 `sources` = 스텝 출처 `[{url, title}]`). 둘 다 가법이다.
+    `round`는 이 status가 속한 LLM 라운드(0부터), `extra`는 stage별 구조 데이터(found의
+    `sources` = 스텝 출처 `[{url, title}]`, 도구 스텝의 `step_id`·`state`·`result_count`).
+    둘 다 가법이다.
     """
     data = {"stage": stage, "detail": detail}
     if refs:
@@ -279,6 +284,21 @@ def sse_sources(items: list[dict], *, final: bool) -> str:
 def sse_content(payload: dict) -> str:
     """본문을 복제하지 않고 라운드 역할 또는 정본의 답 경계만 알린다."""
     return format_sse("content", payload)
+
+
+def sse_rbti(code: str | None, axes: str) -> str:
+    """턴 속성 이벤트 — 이 턴에 적용된 RBTI 독서 유형(턴 시작에 1회).
+
+    진행 단계(`status`)가 아니라 **별도 이벤트**인 이유: RBTI 적용은 조사 과정의 한 스텝이
+    아니라 턴 전체의 속성이다. status로 내면 진행 UI에 한 단계처럼 끼어들고, 소비자는 스텝
+    스트림에서 턴 메타를 골라내야 한다(2026-09-10 분리). `done.rbti_applied`는 끝나야 알지만
+    배지는 시작에 켜져야 하므로 첫 모델 이벤트 전에 나간다.
+
+    `code`는 None이어도 **키가 실린다** — "요청했지만 적용할 유형 없음"(피그마 10-C)을 프론트가
+    값으로 판정한다. `axes`는 축 라벨(`"완독-분석-깊이-정보"`, 코드 없으면 "")이다. 파생
+    불리언(`applied`)은 두지 않는다 — code의 유무가 곧 적용 여부라 두 진실이 생긴다.
+    """
+    return format_sse("rbti", {"code": code, "axes": axes})
 
 
 def sse_delta(

@@ -438,7 +438,8 @@ class TurnProcess:
     라운드 수는 그 오프셋 목록의 길이다 — `round`는 목록에서 읽는다.
     `text_event(at_ms)`는 본문 청크가 도착한 경과 시각을 받고, 라운드의 **첫 청크만** 남긴다 —
     마지막 라운드의 그 값이 `answer_at_ms`(답이 시작되기까지의 조사 시간)다.
-    스텝은 도구 status(호출·결과)만이다 — thinking·refs·persona는 과정의 재료가 아니다.
+    스텝은 도구 status(호출·결과)만이다 — thinking·refs는 과정의 재료가 아니다(RBTI는 status가
+    아니라 전용 `rbti` 이벤트라 애초에 여길 지나지 않는다).
     스텝 dict는 `{round,stage,detail,step_id,state}`이고 결과는 result_count/sources도 갖는다.
     """
 

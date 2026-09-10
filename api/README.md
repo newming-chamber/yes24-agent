@@ -51,7 +51,7 @@ x-api-key: <사용자별 Yes24 ServiceCookies 값>
 |---|---|---|
 | message | string | 필수, 비어 있지 않은 질문 |
 | session_id | string / null | 선택. 첫 턴 생략 가능, 이후 같은 대화의 ID 전달 |
-| use_rbti | boolean | 선택, 기본 false. 이 턴의 독서 성향 활용 요청 |
+| use_rbti | boolean | 선택, **기본 true**. 안 싣으면 서버가 유형을 조회해 적용한다. 성향을 끄려는 화면만 `false`를 명시 |
 
 - 일반 서비스 인증의 `x-api-key`는 사용자별 Yes24 **ServiceCookies 값**이다. 공용 서버 비밀키가
   아니며 `Bearer `, `ServiceCookies=`, 전체 Cookie 문자열을 붙이지 않는다.
@@ -62,7 +62,8 @@ x-api-key: <사용자별 Yes24 ServiceCookies 값>
 - 중단 후에도 세션 복원 주소가 필요하면 클라이언트에서 생성한 UUID를 첫 요청의
   `session_id`로 보내도 된다. 없으면 해당 ID로 새 세션을 만든다. 최종 ID는 `done`으로 확인한다.
 - `message`는 필수이며 공백·상한 초과는 HTTP 422. 상한은 OpenAPI를 따른다.
-- `use_rbti`는 적용 요청이고, 실제 적용 여부는 `done.rbti_applied` 문자열/null로 판단한다.
+- `use_rbti`는 적용 요청이고, 실제 적용 여부는 턴 첫 프레임 `rbti.code`(스트리밍 중)와
+  `done.rbti_applied`(완료·복원) 문자열/null로 판단한다. 둘은 같은 값이다.
 - 모델·도구 선택은 일반 프론트 계약이 아니다. 어드민 전용 필드를 보내지 않는다.
 - 히스토리·클릭·피드백은 인증으로 확인된 사용자 소유권이 필요하다. 같은 session_id라도 다른
   사용자 대화로 이어지지 않는다. 계정 전환 시 진행 요청을 중단하고 로컬 세션/턴 상태도 분리한다.
@@ -76,6 +77,7 @@ x-api-key: <사용자별 Yes24 ServiceCookies 값>
 아래는 순서를 설명하는 예시다. 도구 횟수·출처 수·라운드는 질문에 따라 달라진다.
 
 ```text
+rbti    code=CADI, axes=완독-분석-깊이-정보  ← 턴 속성. use_rbti일 때 첫 프레임, 진행 스텝 아님
 status  searching, step_id=A, state=running
 status  found, step_id=A, state=completed, result_count=3, sources=[후보 URL·제목]
 content phase=provisional, round=1      ← 다음 텍스트는 즉시 표시, 역할은 잠정
@@ -102,6 +104,7 @@ done    완전한 턴 스냅샷               ← 최종 정본
 
 | 이벤트 | 클라이언트 처리 |
 |---|---|
+| `rbti` | 턴 배지. `code`가 있으면 **그 즉시** 배지를 켠다(done을 기다리지 않음). 과정 UI에 넣지 않음 |
 | `status` | 과정 UI에 반영. `step_id`로 시작/완료/실패 연결. `detail` 문구 파싱 금지 |
 | `content` | 해당 round의 역할을 갱신. provisional은 즉시 표시, narration은 조사 설명, answer는 정본 경계 적용 |
 | `delta` | `text`를 본문 버퍼에 누적. `round`별 블록에 배치하고 역할은 `content`를 따름 |
@@ -117,7 +120,8 @@ done    완전한 턴 스냅샷               ← 최종 정본
 
 | 이벤트 | ts 이외 필드·타입 |
 |---|---|
-| status | stage:string, detail:string, round?:number, step_id?:string, state?:running/completed/failed, result_count?:number, sources?:[{url:string,title:string}], refs?:[{id:number,url:string}], code?:string/null |
+| rbti | code:string/null, axes:string. use_rbti일 때 턴당 1회, 첫 모델 이벤트 전. code null = 요청했지만 적용할 유형 없음(axes ""). `applied` 불리언은 없다 — code 유무가 적용 여부 |
+| status | stage:string, detail:string, round?:number, step_id?:string, state?:running/completed/failed, result_count?:number, sources?:[{url:string,title:string}], refs?:[{id:number,url:string}] |
 | content | phase:provisional/narration/answer, round:number. answer일 때 answer_start:number, round_starts:number[], offset_unit:unicode_codepoint 필수 |
 | delta | text:string, round?:number |
 | sources | items:출처 객체 배열(§5), final:boolean |
@@ -172,7 +176,6 @@ sources.items는 이와 달리 전체 교체다. 완료 후 인용 링크의 최
 | status.stage | 의미 | 표시 정책 |
 |---|---|---|
 | `thinking` | 현재 사고 헤드라인 | 살아 있는 진행 라벨. 답 시작/완료 신호로 사용하지 않음 |
-| `rbti` | RBTI 적용 신호(턴 시작) | code/detail 표시. 최종 적용 배지는 done.rbti_applied 사용 |
 | `searching`, `searching_web` | Yes24 / 웹 검색 | 같은 step_id의 진행 항목 시작 |
 | `reading`, `browsing`, `working` | 열람 / 둘러보기 / 기타 도구 작업 | 진행 항목 시작. detail이 비어도 step_id/state로 처리 |
 | `found` | 도구 결과 수신 | 같은 step_id 갱신, result_count와 후보 sources 표시. 0건도 완료 |
@@ -181,8 +184,9 @@ sources.items는 이와 달리 전체 교체다. 완료 후 인용 링크의 최
 
 도구 단계의 state는 `running/completed/failed`다. 같은 step_id의 running과 completed를
 별개 작업 두 개로 만들지 않는다. step_id가 없으면 없는 ID를 만들어 다른 단계와 억지로 연결하지 않는다.
-thinking/rbti/refs는 done.process.steps에 저장되지 않는다. 복원 시 thinking 문구를 재현하려고
-추측하지 않는다. RBTI 배지는 done.rbti_applied로 복원한다.
+thinking/refs는 done.process.steps에 저장되지 않는다. 복원 시 thinking 문구를 재현하려고
+추측하지 않는다. RBTI는 status가 아니라 별도 `rbti` 이벤트(§3)이며 진행 단계가 아니다 —
+라이브 배지는 그 이벤트가, 복원 배지는 done.rbti_applied가 켠다.
 
 ## 5. 카드와 자료 탭
 
@@ -437,7 +441,7 @@ async function readEventStream(response, onEvent) {
 | meta | 객체 | recommendations 배열, follow_ups 배열, session_title?:string |
 | status | completed / failed | 이 스트림의 최종 결과. interrupted/unknown은 히스토리에서 사용 |
 | error | null / {code:string,message:string} | 정상은 null, 실패는 구조화된 오류 |
-| rbti_applied | string / null | 실제 적용된 독서 성향 코드. 없으면 배지 숨김 |
+| rbti_applied | string / null | 실제 적용된 독서 성향 코드(턴 시작 `rbti.code`와 같은 값). 복원 배지의 근거. 없으면 배지 숨김 |
 | history_saved | boolean | 정확한 턴 스냅샷 저장 성공 여부 |
 | ts | number | 이 SSE 프레임 생성 시각, epoch 밀리초. 히스토리 턴 필드가 아님 |
 

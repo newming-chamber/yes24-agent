@@ -330,7 +330,8 @@ class ChatRequest(BaseModel):
         " 않아도 서버가 그 사용자의 유형을 외부 RBTI API로 조회해 적용한다(2026-09-10 결정)."
         " 유형이 없는 사용자이거나 조회에 실패하면 `done.rbti_applied`가 null이고 답변은 그대로"
         " 나간다(오류 아님). 배지는 `done.rbti_applied`가 null이 아닌지로 판단하고, 스트리밍"
-        " 중에는 `status{stage:'rbti'}`가 턴 시작에 한 번 와서 그전에도 알 수 있다."
+        " 중에는 `rbti` 이벤트가 턴 시작에 한 번 와서 그전에도 알 수 있다(`code`가 있으면 그"
+        " 즉시 배지)."
         " 성향을 끄고 싶은 화면은 `false`를 명시한다.",
     )
     rbti: str | None = Field(
