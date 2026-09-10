@@ -525,7 +525,7 @@ async def run_agent_stream(
     호출부가 넘기는 파라미터일 뿐 이 함수 안에 어떤 분기도 만들지 않는다.
 
     use_rbti는 요청이 RBTI 적용을 **요청했는가**다(코드 유무와 별개). 참이면 첫 모델 이벤트
-    전에 `status{stage:"persona", code, detail}`를 1회 낸다 — 코드가 없으면 code:null·
+    전에 `status{stage:"rbti", code, detail}`를 1회 낸다 — 코드가 없으면 code:null·
     detail:""로 "요청했지만 적용할 유형이 없음"을 알린다(피그마 10-C). 매트릭스는 넘기지
     않는다(열 카드가 이미 code·axis_label을 받는다 — 중복 금지).
     """
@@ -713,7 +713,7 @@ async def run_agent_stream(
                 # 코드와 축 라벨(데이터)만 싣는다. emitted_output은 올리지 않는다(본문이
                 # 아니라 과부하 재시도 가능성을 보존한다 — thinking과 같은 규율).
                 yield sse_status(
-                    "persona", axis_label(code), round=process.round, extra={"code": code}
+                    "rbti", axis_label(code), round=process.round, extra={"code": code}
                 )
 
             # 이벤트 간격에 sse_timeout_s 상한을 건다. ADK 스트림은 하나의 고정 task가 소비해

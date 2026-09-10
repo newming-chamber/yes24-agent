@@ -58,7 +58,7 @@ data: <JSON>
 제목·코너명)이거나 구조 신호(건수)뿐이고, 무엇을 하는 중인지의 동사는 stage가 담당한다.
 - `thinking` — 힌트(사고 요약 헤드라인). detail = 모델 사고 요약의 단계 제목. 본문이 아니며
   `done.process.steps`에도 없다.
-- `persona` — 턴 시작 신호. **`use_rbti: true`일 때만** 첫 모델 이벤트 전 1회, `round: 0`.
+- `rbti` — 턴 시작 신호. **`use_rbti`가 참일 때만**(기본 참) 첫 모델 이벤트 전 1회, `round: 0`.
   detail = 적용된 RBTI 축 라벨(`"완독-분석-깊이-정보"`, `-`로 나눠 칩), `code`가 함께 실린다 —
   적용됐으면 코드, 요청했지만 코드가 없으면 `code: null`·`detail: ""`.
 - `searching` — 툴 호출(yes24_search). detail = 검색 각도들(` · ` 구분).
@@ -107,7 +107,7 @@ round가 없다.
   "answer_start": 187,      // done.text에서 최종 답(마지막 라운드)이 시작하는 문자 오프셋
   "round_starts": [0, 187], // 라운드 r 텍스트의 done.text 시작 오프셋(마지막 = answer_start)
   "offset_unit": "unicode_codepoint", // JS UTF-16 문자열 인덱스가 아니다
-  "steps": [                // 이번 턴의 툴 status(thinking·refs·persona 제외), 순서대로
+  "steps": [                // 이번 턴의 툴 status(thinking·refs·rbti 제외), 순서대로
     {"round": 0, "step_id": "step-1", "state": "running",
      "stage": "searching", "detail": "에세이 베스트셀러 · 요즘 인기 에세이"},
     {"round": 0, "step_id": "step-1", "state": "completed", "result_count": 2,
@@ -254,7 +254,7 @@ def sse_status(
     원칙 4는 그대로다. refs 미지정(기본)이면 페이로드에 키를 넣지 않아 기존 프레임과
     바이트 동일하다(_with와 같은 규율).
 
-    `round`는 이 status가 속한 LLM 라운드(0부터), `extra`는 stage별 구조 데이터(persona의
+    `round`는 이 status가 속한 LLM 라운드(0부터), `extra`는 stage별 구조 데이터(rbti의
     `code` — 값이 None이어도 **키는 실린다**: "요청했지만 코드 없음"을 프론트가 값으로
     판정한다 — 와 found의 `sources` = 스텝 출처 `[{url, title}]`). 둘 다 가법이다.
     """

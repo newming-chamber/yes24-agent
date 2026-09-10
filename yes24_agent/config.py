@@ -672,6 +672,13 @@ class Settings(BaseSettings):
     # 회원 정보(userNo·userId) 재조회 주기(시간). users.user_cached_at이 이보다 오래되면
     # 다음 인증 때 Yes24를 다시 물어 갱신한다.
     yes24_user_cache_hours: int = 24
+    # RBTI(독서 16유형) 조회처 — userNo로 그 사람의 유형 코드를 묻는다(2026-09-10 확정).
+    # 유형은 사람에게 붙는 값이고 **이 API가 정본**이다: 우리 DB에 복제하지 않는다(복제하면
+    # 사용자가 검사를 다시 해도 우리 쪽이 낡은 값을 계속 적용한다). 응답이 30~70ms라
+    # 턴당 1회 조회를 캐시 없이 그대로 탄다 — 캐시는 그 지연을 아끼는 대신 재검사 반영을
+    # 늦추므로, 아낄 것이 없는 지금은 두지 않는다.
+    rbti_api_url: str = "https://yes24-rbti-api.griplabs.io/api/v1/mvp/users/stats"
+    rbti_api_timeout_s: float = 5.0
     # 개발용 API 키 — **비우면 비활성**(배포 기본). 값이 있으면 그 키 하나만 Yes24 회원 조회를
     # 건너뛰고 `dev_api_user_no`로 식별된 것으로 취급한다. 프론트가 로컬에서 개발하려면
     # x-api-key가 필요한데 진짜 ServiceCookies를 꺼내 오게 하는 건 무리라, 그 통로를 하나 연다.

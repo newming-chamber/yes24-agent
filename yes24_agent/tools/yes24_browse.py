@@ -374,5 +374,8 @@ async def yes24_browse(
 # 모듈 임포트 시점에 실행되므로 toolsets가 FunctionTool을 만들기 전에 반영된다.
 yes24_browse.__doc__ = yes24_browse.__doc__.replace(
     "__BROWSE_SECTIONS__",
-    ", ".join(f'"{key}"({seed["label"]})' for key, seed in BROWSE_SEED_URLS.items()),
+    "\n            ".join(
+        f'"{key}" — {seed["label"]}. {seed["blurb"].rstrip(".")}.'
+        for key, seed in BROWSE_SEED_URLS.items()
+    ),
 )

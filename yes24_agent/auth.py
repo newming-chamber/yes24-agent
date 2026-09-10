@@ -265,13 +265,6 @@ class AuthService:
                 (user.user_id, user.auth_key_id, endpoint),
             )
 
-    async def read_rbti(self, user_no: str) -> str | None:
-        row = await self._run("SELECT rbti FROM users WHERE user_no = %s", (user_no,), fetch=True)
-        return row[0] if row else None
-
-    async def write_rbti(self, user_no: str, code: str | None) -> None:
-        await self._run("UPDATE users SET rbti = %s WHERE user_no = %s", (code, user_no))
-
 
 async def close_auth_service() -> None:
     """앱 종료 훅 — 인증 서비스가 실제로 만들어졌을 때만 풀을 닫는다."""

@@ -172,7 +172,7 @@ sources.items는 이와 달리 전체 교체다. 완료 후 인용 링크의 최
 | status.stage | 의미 | 표시 정책 |
 |---|---|---|
 | `thinking` | 현재 사고 헤드라인 | 살아 있는 진행 라벨. 답 시작/완료 신호로 사용하지 않음 |
-| `persona` | 요청한 RBTI 적용 신호 | code/detail 표시. 최종 적용 배지는 done.rbti_applied 사용 |
+| `rbti` | RBTI 적용 신호(턴 시작) | code/detail 표시. 최종 적용 배지는 done.rbti_applied 사용 |
 | `searching`, `searching_web` | Yes24 / 웹 검색 | 같은 step_id의 진행 항목 시작 |
 | `reading`, `browsing`, `working` | 열람 / 둘러보기 / 기타 도구 작업 | 진행 항목 시작. detail이 비어도 step_id/state로 처리 |
 | `found` | 도구 결과 수신 | 같은 step_id 갱신, result_count와 후보 sources 표시. 0건도 완료 |
@@ -181,7 +181,7 @@ sources.items는 이와 달리 전체 교체다. 완료 후 인용 링크의 최
 
 도구 단계의 state는 `running/completed/failed`다. 같은 step_id의 running과 completed를
 별개 작업 두 개로 만들지 않는다. step_id가 없으면 없는 ID를 만들어 다른 단계와 억지로 연결하지 않는다.
-thinking/persona/refs는 done.process.steps에 저장되지 않는다. 복원 시 thinking 문구를 재현하려고
+thinking/rbti/refs는 done.process.steps에 저장되지 않는다. 복원 시 thinking 문구를 재현하려고
 추측하지 않는다. RBTI 배지는 done.rbti_applied로 복원한다.
 
 ## 5. 카드와 자료 탭

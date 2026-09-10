@@ -9,8 +9,7 @@
   (BROWSE_SEED_URLS의 키)와 골라주기 슬롯 `{starter_pick_from}-pick` 하나이고, 그 밖의
   슬롯(정책·범용)은 수동 풀이다 — 코드에 슬롯 열거가 없고, 칩 라벨은 `starter_labels`의
   사용자 언어 문구(없으면 시드 표의 코너 이름)다.
-- **첫 화면은 책만 보여주지 않는다.** 이 제품의 정체성은 "범용 AI가 기본, 책이 강점"이므로
-  수동 슬롯 `general`이 책 밖의 질문을 한 자리 맡는다(CLAUDE.md 정체성 절).
+- **초기 질문은 콘텐츠·책·문화 중심**이다. `general` 슬롯 값은 기존 계약을 유지한다.
 - **골라주기 슬롯**은 상품 하나가 아니라 **분야**를 가리킨다("소설 베스트 중에 처음 읽기
   좋은 거 골라줘"). 재료는 코너 내비의 분야 목록이고 검증은 관측된 분야명과의 대조다 —
   상품 지목형만 있으면 "골라준다"는 능력이 첫 화면에서 보이지 않는다.
@@ -120,11 +119,23 @@ def _instruction(max_chars: int) -> str:
     return _GENERATE_INSTRUCTION + (
         f" 문장 전체는 {max_chars}자를 넘기지 않는다 — 제목이 길어 넘칠 것 같으면 그 상품은 "
         "고르지 말고 제목이 짧은 다른 상품을 고른다."
-    )
+    ) + _EDITORIAL_SCOPE
 
 
 # 문구 계약은 프롬프트에 두고, 개수·참조·순서는 스키마가 강제한다(enrichment 관례). 완성 문장
 # 예시는 넣지 않는다 — 예시 문장은 내용까지 복사된다(빈 꼴 틀만).
+_EDITORIAL_SCOPE = (
+    "마지막 선택 기준이며 앞선 책 연결·문구 지시보다 우선한다. "
+    "초기 질문은 책·독서·영화·드라마·음악·공연·전시·웹툰·게임 등 콘텐츠와 문화 경험을 "
+    "중심으로 한다. 일반 도서의 내용·해석·감상과 Yes24 이용 질문은 허용한다. "
+    "정당·정치인의 활동, 선거·국회, 사회 사건, 경제 시황 등 현안 뉴스 자체를 묻거나 "
+    "관련 책·문화 이야기로 포장하지 않는다. 화제 이름보다 오늘 사건의 성격으로 판단한다. "
+    "적합한 재료만 선택하며 개수를 채울 의무는 없다. 없으면 아무 항목도 선택하지 않는다. "
+    "문장은 AI가 실제 정보·해석·추천으로 답할 수 있는 독립적인 질문이나 부탁이어야 한다. "
+    "기대·소망만 말하거나 동의를 구하는 말, 미래 결과의 예측은 선택하지 않는다. "
+)
+
+
 _GENERATE_INSTRUCTION = (
     "오늘 Yes24에서 관측된 코너 목록(sections)을 재료로, 빈 화면의 초기 질문 칩에 실릴 문장을 "
     "만든다. 각 문장은 사용자가 이 AI 어시스턴트에게 그대로 눌러 보낼 완결된 질문이다 — "
@@ -148,7 +159,7 @@ _GENERATE_INSTRUCTION = (
     "**눌러서 나온 답이 그 책을 읽을지 정하는 데 도움이 되는가.** 그러려면 상품 페이지를 "
     "열어야 알 수 있는 것을 물어야 한다. 값·평점·쪽수·두께·배송·할인처럼 **사양 한 줄로 "
     "끝나는 것**, rows에 이미 있는 값(제목·순위·출간월), 공개되지 않는 판매 수치, 순위에 "
-    "오른 이유 같은 해석, 예측, 감상 요구, 이 서비스의 사용법 — 이 가운데 어느 하나라도 "
+    "오른 이유 같은 해석, 예측, 이 서비스의 사용법 — 이 가운데 어느 하나라도 "
     "묻고 있다면 그 문장은 버리고 다시 쓴다."
 )
 
@@ -173,10 +184,10 @@ _PICK_INSTRUCTION = (
 
 # 오늘의 화제 재료를 모으는 질문. 그라운딩 콜이라 구조화 출력을 못 쓴다(빌트인 검색과
 # 함수 선언은 한 요청에 못 섞는다 — web_search 도구 주석) → 한 줄에 하나씩 받아 자른다.
-_TREND_PROMPT = (
-    "오늘 한국에서 사람들이 많이 이야기하는 화제를 {count}개 알려줘. "
-    "방송·영화·공연·인물·유행·계절 무엇이든 좋지만, **책과 이어질 만한 것**을 고른다"
-    "(원작이 있거나, 그 분야를 더 알고 싶어질 만한 것). "
+_TREND_PROMPT = _EDITORIAL_SCOPE + (
+    "오늘은 한국 시간 {today}이다. Google 검색으로 오늘 한국의 콘텐츠·문화 화제를 "
+    "최대 {count}개 알려줘. 오늘 사건이나 새 보도 근거가 없는 과거 화제는 제외한다. "
+    "작품·창작자·문화 행사 가운데 원작이나 관련 책으로 이어질 만한 것을 고른다. "
     "설명·번호·기호 없이 **한 줄에 하나씩 짧은 명사구만** 쓴다."
 )
 
@@ -430,7 +441,7 @@ def _response_schema(slots: list[str], count: int) -> types.Schema:
         type=types.Type.OBJECT,
         properties={
             "items": types.Schema(
-                type=types.Type.ARRAY, items=item, min_items=count, max_items=count
+                type=types.Type.ARRAY, items=item, min_items=0, max_items=count
             )
         },
         required=["items"],
@@ -525,7 +536,9 @@ async def _observe_trends(settings: Settings, client, genai_client) -> list[dict
     response = await asyncio.wait_for(
         genai_client.aio.models.generate_content(
             model=settings.web_grounding_model,
-            contents=_TREND_PROMPT.format(count=settings.starter_trend_topics),
+            contents=_TREND_PROMPT.format(
+                count=settings.starter_trend_topics, today=_today().isoformat()
+            ),
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())], temperature=0.3
             ),
@@ -578,7 +591,7 @@ async def _generate_trends(
         properties={
             "items": types.Schema(
                 type=types.Type.ARRAY,
-                min_items=count,
+                min_items=0,
                 max_items=count,
                 items=types.Schema(
                     type=types.Type.OBJECT,
@@ -602,7 +615,8 @@ async def _generate_trends(
                 contents=json.dumps({"topics": topics}, ensure_ascii=False),
                 config=types.GenerateContentConfig(
                     system_instruction=_TREND_INSTRUCTION
-                    + f" 문장 전체는 {settings.starter_max_chars}자를 넘기지 않는다.",
+                    + f" 문장 전체는 {settings.starter_max_chars}자를 넘기지 않는다."
+                    + _EDITORIAL_SCOPE,
                     temperature=1.0,
                     response_mime_type="application/json",
                     response_schema=schema,
@@ -645,7 +659,7 @@ async def _generate_picks(
         properties={
             "items": types.Schema(
                 type=types.Type.ARRAY,
-                min_items=count,
+                min_items=0,
                 max_items=count,
                 items=types.Schema(
                     type=types.Type.OBJECT,
@@ -676,7 +690,7 @@ async def _generate_picks(
                 config=types.GenerateContentConfig(
                     system_instruction=_PICK_INSTRUCTION + (
                         f" 문장 전체는 {settings.starter_max_chars}자를 넘기지 않는다."
-                    ),
+                    ) + _EDITORIAL_SCOPE,
                     temperature=1.0,
                     response_mime_type="application/json",
                     response_schema=schema,

@@ -178,6 +178,10 @@ BROWSE_SEED_URLS: dict[str, dict] = {
             "https://www.yes24.com/product/category/bestseller?CategoryNumber=001&sumgb=06"
         ),
         "label": "베스트셀러(국내도서)",
+        # 코너 성격은 모델이 보는 계약이다(도구 docstring으로 조립) — 이름만으로는 무엇이
+        # 담기는지 알 수 없어 엉뚱한 코너를 고른다(2026-09-10 실측: 열린 추천에서 "신간"을
+        # 골라 한 시리즈의 세트 변형 9종을 받았다). 관측한 사실만 적고 추천 규칙은 적지 않는다.
+        "blurb": "판매 순위 상위. 화제작·대표작이 모이고 회전이 느리다.",
         "markup": "search",
         "list_container": BESTSELLER_LIST_CONTAINER,
         "item": BESTSELLER_ITEM,
@@ -186,6 +190,11 @@ BROWSE_SEED_URLS: dict[str, dict] = {
     "new": {
         "url": "https://www.yes24.com/product/category/newproduct?categoryNumber=001",
         "label": "신간(국내도서)",
+        "blurb": (
+            "등록 순서 그대로의 원본 피드. 같은 시리즈의 세트 변형이 연달아 오를 수 있어"
+            " (실측: 상위 10건이 한 시리즈 9종 + 수험서) 폭넓은 추천 후보로는 약하다."
+            " 분야로 좁히면 쓸 만해진다."
+        ),
         "markup": "search",
         "list_container": NEWPRODUCT_LIST_CONTAINER,
         "item": NEWPRODUCT_ITEM,
@@ -196,6 +205,7 @@ BROWSE_SEED_URLS: dict[str, dict] = {
             "https://www.yes24.com/product/category/attentionnewproduct?categoryNumber=001"
         ),
         "label": "주목할 신상품(국내도서)",
+        "blurb": "새로 나온 책 중 골라 놓은 목록. 분야가 고루 섞여 신간 추천엔 이쪽이 낫다.",
         "markup": "search",
         "list_container": NEWPRODUCT_LIST_CONTAINER,
         "item": NEWPRODUCT_ITEM,
@@ -207,6 +217,10 @@ BROWSE_SEED_URLS: dict[str, dict] = {
             "?pageNo=1&pageSize=24&dispNo=&order=20&pageGb=BEST"
         ),
         "label": "크레마클럽 인기(eBook 구독)",
+        "blurb": (
+            "eBook 구독 목록이라 종이책 베스트셀러와 상품 집합이 거의 겹치지 않는다 —"
+            " 다른 결의 후보가 필요할 때 함께 연다. 가격은 구독 상품 기준이다."
+        ),
         "markup": "cremaclub",
         "list_container": CREMACLUB_LIST_CONTAINER,
         "item": CREMACLUB_ITEM,

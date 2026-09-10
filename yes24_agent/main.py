@@ -289,7 +289,7 @@ class ChatRequest(BaseModel):
     """`/chat/stream` 요청 본문 — 설명은 **OpenAPI로 나간다**(주석은 /docs에 안 보인다).
 
     프론트가 채우는 필드는 `message`·`session_id`·`use_rbti` 셋이다. RBTI **코드**는 사람에게
-    붙는 값이라 **서버가 조회**하고(조회처는 미정 — rbti/profile.py), **이번 턴에 쓸지 말지**는
+    붙는 값이라 **서버가 조회**하고(외부 RBTI API — rbti/profile.py), **이번 턴에 쓸지 말지**는
     화면의 선택이므로 프론트가 보낸다. 감춰진 `rbti`는 데모 UI의 선택기가 유형을 일시적으로
     덮어쓰기 위한 것이다.
 
@@ -325,19 +325,20 @@ class ChatRequest(BaseModel):
     }
 
     use_rbti: bool = Field(
-        default=False,
-        description="이 턴에 RBTI 독서 유형을 적용할지. **기본 false**."
-        " ⚠️ 현재는 서버의 유형 조회처가 미정이라 `true`로 보내도 항상 미적용이고"
-        " `done.rbti_applied`가 null이다(오류 아님). 계약은 고정이므로 지금 붙여 두면"
-        " 조회처가 정해지는 순간 프론트 수정 없이 동작한다 — 배지는 `done.rbti_applied`가"
-        " null이 아닌지로 판단한다.",
+        default=True,
+        description="이 턴에 RBTI 독서 유형을 적용할지. **기본 true** — 프론트가 아무것도 싣지"
+        " 않아도 서버가 그 사용자의 유형을 외부 RBTI API로 조회해 적용한다(2026-09-10 결정)."
+        " 유형이 없는 사용자이거나 조회에 실패하면 `done.rbti_applied`가 null이고 답변은 그대로"
+        " 나간다(오류 아님). 배지는 `done.rbti_applied`가 null이 아닌지로 판단하고, 스트리밍"
+        " 중에는 `status{stage:'rbti'}`가 턴 시작에 한 번 와서 그전에도 알 수 있다."
+        " 성향을 끄고 싶은 화면은 `false`를 명시한다.",
     )
     rbti: str | None = Field(
         default=None,
         json_schema_extra={ADMIN_ONLY_MARK: True},
-        description="어드민 전용 — 데모 UI의 페르소나 선택기가 저장된 유형을 일시적으로"
+        description="어드민 전용 — 데모 UI의 페르소나 선택기가 그 사람의 유형을 일시적으로"
         " 덮어쓸 때만 쓴다. 일반 클라이언트는 실을 필요가 없다: 사용자의 유형은"
-        " 서버가 사용자 유형을 조회해 적용한다(조회처 미정 — 현재는 항상 미적용).",
+        " 서버가 외부 RBTI API로 조회해 적용한다.",
     )
     model: str | None = Field(
         default=None,
@@ -683,13 +684,13 @@ headers.set("x-api-key", decodeURIComponent(key));
 키 없이 부르면 **모든 API가 401**이고, 식별되지 않는 키는 **403**이다(임의 문자열은 키가
 되지 않는다). 한도 초과는 429다.
 
-**RBTI 독서 유형** — ⚠️ **현재 미완성이다.** 유형 코드는 프론트가 싣는 값이 아니라 서버가
-사용자(userNo)로 조회할 값인데, **조회처가 아직 정해지지 않았다**. 그래서 `use_rbti: true`를
-보내도 지금은 항상 `done.rbti_applied: null`이고 페르소나가 적용되지 않는다(오류는 아니다).
+**RBTI 독서 유형** — 유형 코드는 프론트가 싣는 값이 아니라 **서버가 사용자(userNo)로 외부
+RBTI API에 조회**하는 값이다. 프론트는 요청에 `use_rbti`(불리언)만 싣고, 응답의
+`done.rbti_applied`가 **null이 아니면** "✦ RBTI 데이터가 활용됨" 배지를 켠다.
 
-계약은 이미 고정돼 있으니 프론트는 지금 붙여도 된다: 요청에 `use_rbti`(불리언)만 싣고,
-응답의 `done.rbti_applied`가 **null이 아니면** "✦ RBTI 데이터가 활용됨" 배지를 켠다.
-조회처가 정해지면 서버만 고치면 되고 **프론트 코드는 그대로**다.
+`use_rbti: true`인데도 null이 나오는 경우가 둘 있고 **둘 다 오류가 아니다**: 그 사용자에게
+아직 유형이 없거나, 조회에 실패한 경우다. 어느 쪽이든 답변 자체는 정상으로 나간다 — 성향은
+답을 더 맞게 만드는 부가 정보이지 답의 전제가 아니다.
 
 **첫 호출** — `POST /chat/stream`에 `{"message": "한강 작가 책 추천해줘"}`만 보내면 된다.
 `session_id`를 비우면 새 대화가 만들어지고, 그 id가 스트림 마지막 `done` 이벤트의
