@@ -27,7 +27,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, field_validator
 from starlette.routing import Match
 
 from yes24_agent.admin import client_ip, register_admin, require_admin
@@ -51,7 +51,9 @@ from yes24_agent.overview import (
     start_overview,
     warm_search,
 )
+from yes24_agent.rbti.persona import is_valid_code
 from yes24_agent.rbti.profile import fetch_user_rbti
+from yes24_agent.rbti.routes import register_rbti
 from yes24_agent.runner import run_agent_stream
 from yes24_agent.session_service import SQLITE_DIALECT, db_dialect, persistence_mode
 from yes24_agent.sse import OVERVIEW_EVENT_CONTRACT, SSE_EVENT_CONTRACT
@@ -293,10 +295,12 @@ ADMIN_ONLY_MARK = "x-admin-only"
 class ChatRequest(BaseModel):
     """`/chat/stream` 요청 본문 — 설명은 **OpenAPI로 나간다**(주석은 /docs에 안 보인다).
 
-    프론트가 채우는 필드는 `message`·`session_id`·`use_rbti` 셋이다. RBTI **코드**는 사람에게
-    붙는 값이라 **서버가 조회**하고(외부 RBTI API — rbti/profile.py), **이번 턴에 쓸지 말지**는
-    화면의 선택이므로 프론트가 보낸다. 감춰진 `rbti`는 데모 UI의 선택기가 유형을 일시적으로
-    덮어쓰기 위한 것이다.
+    프론트가 채우는 필드는 `message`·`session_id`·`use_rbti`·`rbti` 넷이다. RBTI **코드**의
+    기본 정본은 서버다 — 사람에게 붙는 값이라 외부 RBTI API로 조회한다(rbti/profile.py).
+    화면에 유형 선택기가 있는 프론트는 그 선택을 `rbti`로 실어 **이번 턴만** 덮어쓸 수 있고,
+    **이번 턴에 쓸지 말지**(`use_rbti`)는 언제나 화면이 정한다. 2026-09-14 공개: 그전까지
+    `rbti`는 데모 UI 전용이라 감춰 뒀는데, 통합 프론트의 선택기가 서버에 전달될 채널이 없어
+    "유형을 바꿔도 배지가 안 바뀐다"로 관측됐다(그 화면은 서버 반환값으로 배지를 그린다).
 
     나머지 둘은 어드민(데모 로그인) 화면의 모델·도구 토글용이라 API 키 호출에서는
     무시되는데, 효과 없는 필드가 스키마에 보이는 것이 가장 헷갈리므로 `ADMIN_ONLY_MARK`를
@@ -341,10 +345,13 @@ class ChatRequest(BaseModel):
     )
     rbti: str | None = Field(
         default=None,
-        json_schema_extra={ADMIN_ONLY_MARK: True},
-        description="어드민 전용 — 데모 UI의 페르소나 선택기가 그 사람의 유형을 일시적으로"
-        " 덮어쓸 때만 쓴다. 일반 클라이언트는 실을 필요가 없다: 사용자의 유형은"
-        " 서버가 외부 RBTI API로 조회해 적용한다.",
+        description="이번 턴에만 쓸 독서 성향 코드(4글자). **실으면 서버 조회를 이긴다** —"
+        " 화면에 유형 선택기가 있는 프론트가 그 선택을 반영할 때 쓴다. 비우면(또는 안 실으면)"
+        " 서버가 그 사용자의 유형을 외부 RBTI API로 조회해 적용한다. `use_rbti: false`면"
+        " 이 필드를 실어도 적용되지 않는다(끄기가 이긴다). 소문자는 받아 올려 주지만 16코드가"
+        " 아니면 **422**이고, 그 거절은 `use_rbti`와 무관하다 — 조용히 미적용되지 않는다."
+        " 빈 문자열은 '안 실음'과 같다.",
+        examples=["CADI"],
     )
     model: str | None = Field(
         default=None,
@@ -357,6 +364,31 @@ class ChatRequest(BaseModel):
         description="어드민 전용 — 데모 로그인 세션의 도구 토글. API 키 호출에서는 무시된다."
         " 어드민 세션에서 무효 키를 주면 조용히 폴백하지 않고 400이다.",
     )
+
+    @field_validator("rbti")
+    @classmethod
+    def _validate_rbti(cls, value: str | None) -> str | None:
+        """관용은 대소문자 하나뿐: 대문자로 올려 보고, 그래도 무효면 거절한다.
+
+        판정은 `is_valid_code`(persona.py) 하나뿐이고 여기선 대문자로 올려 그것을 부를 뿐이다 —
+        코어(runner)는 계속 엄격한 대문자 코드만 취급한다. 무효를 422로 세우는 이유는
+        이 필드가 공개 채널이 됐기 때문이다: 오타가 200 + 미적용으로 나가면 프론트에는
+        "보냈는데 배지가 안 켜진다"로만 보여 원인을 못 찾는다(조용한 부분 동작 금지).
+        그 판정은 `use_rbti`와 **무관하다** — 끄기가 이기는 것은 페르소나 *적용* 여부이지
+        본문이 말이 되는지가 아니다. 꺼진 요청의 깨진 코드를 통과시키면 켜는 순간 터진다.
+
+        공백을 다듬지 않는 것도 같은 이유다: `" CADI "`를 받아 주면 "무엇이 코드인가"의 판정이
+        `is_valid_code` 밖에 한 벌 더 생긴다. 빈 문자열만 '안 실음'과 같은 뜻으로 접는다 —
+        프론트가 선택 해제를 빈 값으로 보낼 때 필드를 통째로 빼도록 강요하지 않기 위해서다.
+        """
+        if value is None:
+            return None
+        normalized = value.upper()
+        if not normalized:
+            return None
+        if not is_valid_code(normalized):
+            raise ValueError(f"유효한 RBTI 코드가 아니다: {value!r}")
+        return normalized
 
 
 class OverviewRequest(BaseModel):
@@ -698,9 +730,12 @@ headers.set("x-api-key", decodeURIComponent(key));
 키 없이 부르면 **모든 API가 401**이고, 식별되지 않는 키는 **403**이다(임의 문자열은 키가
 되지 않는다). 한도 초과는 429다.
 
-**RBTI 독서 유형** — 유형 코드는 프론트가 싣는 값이 아니라 **서버가 사용자(userNo)로 외부
-RBTI API에 조회**하는 값이다. 프론트는 요청에 `use_rbti`(불리언)만 싣고, 응답의
-`done.rbti_applied`가 **null이 아니면** "✦ RBTI 데이터가 활용됨" 배지를 켠다.
+**RBTI 독서 유형** — 유형 코드의 기본 정본은 **서버**다: 프론트가 `use_rbti`(불리언)만 보내면
+서버가 사용자(userNo)로 외부 RBTI API에 조회해 적용한다. 화면에 유형 선택기가 있으면 고른
+코드를 `rbti`로 함께 실어 **이번 턴만** 덮어쓸 수 있다(`ChatRequest.rbti` 설명 참조 — 안
+실으면 화면에서 무엇을 고르든 서버 조회값이 나간다). 그 선택기를 그릴 축·16유형 데이터는
+`GET /rbti/types`가 준다 — 진입 시 1회 받아 캐시한다. 응답의 `done.rbti_applied`가
+**null이 아니면** "✦ RBTI 데이터가 활용됨" 배지를 켠다.
 
 `use_rbti: true`인데도 null이 나오는 경우가 둘 있고 **둘 다 오류가 아니다**: 그 사용자에게
 아직 유형이 없거나, 조회에 실패한 경우다. 어느 쪽이든 답변 자체는 정상으로 나간다 — 성향은
@@ -880,14 +915,15 @@ def create_app() -> FastAPI:
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-        # RBTI: **코드는 서버가, 켜고 끄기는 프론트가** 소유한다(2026-09-02 사용자 결정).
-        # 유형 자체는 사람에게 붙는 값이라 users.rbti에 저장돼 있고, 이번 턴에 그것을 쓸지는
-        # 화면의 토글이라 요청이 정한다. use_rbti=false면 저장돼 있어도 적용하지 않는다 —
-        # 저장된 유형 자체를 바꾸는 것과는 다른 층위다(이 토글은 이번 턴만).
-        # request.rbti는 데모 UI 전용 덮어쓰기라 토글이 꺼져 있으면 그것도 무시한다(끄기가
-        # 이긴다 — "껐는데 페르소나가 적용됐다"가 성립하면 안 된다). 그래서 데모 UI도 코드를
-        # 실을 때 use_rbti=true를 함께 보낸다(index.html) — 계약을 불리언 하나로 유지하려고
-        # 3상태(미지정/true/false)를 만들지 않고 호출부를 맞췄다.
+        # RBTI: **코드의 기본 정본은 서버가, 켜고 끄기는 프론트가** 소유한다(2026-09-02 결정).
+        # 유형 자체는 사람에게 붙는 값이라 외부 RBTI API가 정본이고(우리 DB에 복제하지 않는다 —
+        # rbti/profile.py), 이번 턴에 그것을 쓸지는 화면의 토글이라 요청이 정한다. use_rbti=false면
+        # 유형이 있어도 적용하지 않는다 — 그 사람의 유형 자체를 바꾸는 것과는 다른 층위다.
+        # request.rbti는 화면의 선택기가 이번 턴만 덮어쓰는 공개 채널이고(2026-09-14 공개),
+        # 토글이 꺼져 있으면 그것도 무시한다(끄기가 이긴다 — "껐는데 페르소나가 적용됐다"가
+        # 성립하면 안 된다). 그래서 코드를 실을 때는 use_rbti=true를 함께 보낸다(index.html).
+        # 출처 3상태(미지정=조회 / 지정=덮어쓰기 / use_rbti:false=미적용)는 이 한 줄이 전부라
+        # use_rbti를 3상태 열거형으로 바꾸지 않았다 — 불리언 하나에 호출부를 맞춘다.
         user_no = str(user.user_no) if user and user.user_no else None
         rbti = (request.rbti or await fetch_user_rbti(user_no)) if request.use_rbti else None
         stream = run_agent_stream(
@@ -1016,6 +1052,11 @@ def create_app() -> FastAPI:
     # 초기 질문 회전 풀(GET /chat/starters·/admin/starters/*). starter_model이 빈 값이면 미등록
     # (404 — overview_model 관례). 라우트·풀·생성의 소유자는 starters.py다.
     register_starters(app, settings)
+
+    # 독서 성향 16유형·축 정의(GET /rbti/types). 화면이 `rbti`에 실을 값을 고르게 하는
+    # 재료이고, matrix_enabled와 무관하다 — 매트릭스는 개발자용 검증 뷰이지만 이 목록은
+    # 프론트가 선택기를 그리는 제품 계약이다.
+    register_rbti(app)
 
     # 매트릭스 스트리밍 엔드포인트도 배포 게이팅(matrix_enabled) 대상 — off면 미등록(404).
     if settings.matrix_enabled:
