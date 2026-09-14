@@ -109,6 +109,7 @@ _ACCESS_EXEMPT_PATHS = frozenset(
         "/health", "/login", "/logout", "/docs", "/redoc", "/openapi.json",
         "/admin", "/admin/", "/admin/api/login", "/admin/api/logout",
         "/static/lib/admin.css", "/static/lib/admin.js", "/static/lib/admin_manage.js",
+        "/static/lib/admin_charts.js",
     }
 )
 
