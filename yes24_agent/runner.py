@@ -75,6 +75,7 @@ from yes24_agent.tool_progress import ToolProgress
 from yes24_agent.toolsets import get_resolved_app
 from yes24_agent.turn_snapshot import persist_turn_snapshot
 from yes24_agent.usage import begin_usage_scope, finish_usage_scope, record_usage
+from yes24_agent.user_data import UserDataService
 
 logger = logging.getLogger(__name__)
 
@@ -568,6 +569,15 @@ async def run_agent_stream(
         # 오류(OSError) 등 어떤 예외가 나도 "done 정확히 1회" 불변식을 지킨다.
         try:
             service = session_service if session_service is not None else _get_session_service()
+            # 사용자가 삭제한 대화는 없는 id와 같은 계약(새 대화)이되 **새 id**로 연다 — 행이
+            # 보존 기간 동안 남아 있어 같은 id로는 그 숨긴 대화에 턴이 쌓인다. 락을 잡은 뒤에
+            # 판정하므로 진행 중 턴을 기다린 삭제가 먼저 끝났으면 여기서 보인다.
+            if session_id and (
+                await UserDataService.get_instance().ui_get(
+                    user_id=session_user_id, session_id=session_id
+                )
+            ).deleted_at is not None:
+                session_id = None
             session = await _resolve_session(service, session_id, session_user_id)
             usage_scope.session_id = session.id
             # 현재 UI 요청을 RBTI state의 정본으로 본다. 유효 코드는 저장하고 None·무효 코드는

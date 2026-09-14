@@ -8,7 +8,7 @@
 -- 복제하지 않는다. 상품·공지·웹·판형 링크 무엇이든 URL은 있으므로 대상이 늘어도 스키마가
 -- 안 바뀐다. turn_feedback과 달리 **append-only**다 — 같은 URL 재클릭은 행이 늘어난다(UNIQUE 없음).
 -- 실패 정책은 turn_feedback과 같다: 저장 실패는 5xx(성공 204 = 실제 저장됨).
--- **purge 대상 아님(분석 로그)**: 대화 삭제(purge_session)는 사용자 상태(turn_feedback·session_ui)만
+-- **파기 대상 아님(분석 로그)**: 대화 파기(FK CASCADE)는 사용자 상태(turn_feedback·session_ui)만
 -- 지운다 — 클릭은 usage_log 같은 제품 분석 이벤트라 지우면 집계에 구멍이 난다(2026-09-08).
 --
 -- turn_id는 ADK가 턴마다 부여하는 invocation_id다(/chat/stream done.turn_id).

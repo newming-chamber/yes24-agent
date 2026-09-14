@@ -62,6 +62,8 @@ x-api-key: <사용자별 Yes24 ServiceCookies 값>
 - 첫 턴은 `session_id` 생략 가능. 후속 턴은 `done.session_id`를 보낸다.
 - 중단 후에도 세션 복원 주소가 필요하면 클라이언트에서 생성한 UUID를 첫 요청의
   `session_id`로 보내도 된다. 없으면 해당 ID로 새 세션을 만든다. 최종 ID는 `done`으로 확인한다.
+- 사용자가 삭제한 대화의 `session_id`를 보내면 새 대화가 **다른 ID**로 시작된다(`done.session_id`가
+  요청 ID와 달라진다). 클라이언트는 항상 `done.session_id`를 다음 턴·히스토리의 정본으로 쓴다.
 - `message`는 필수이며 공백·상한 초과는 HTTP 422. 상한은 OpenAPI를 따른다.
 - `use_rbti`는 적용 요청이고, 실제 적용 여부는 턴 첫 프레임 `rbti.code`(스트리밍 중)와
   `done.rbti_applied`(완료·복원) 문자열/null로 판단한다. 둘은 같은 값이다.
@@ -581,6 +583,7 @@ process의 `*_ms`는 epoch가 아닌 **소요 시간**이다.
 |---|---|
 | `GET /chat/sessions` | 내 세션 목록 |
 | `GET /chat/sessions/{session_id}` | 질문과 턴 스냅샷 복원(읽음 처리 포함) |
+| `DELETE /chat/sessions/{session_id}` | 204. 즉시 전 경로에서 숨김(이후 목록 제외·조회/피드백/클릭 404, 재삭제 404). 서버는 기본 무기한 보존(운영 설정으로 보존 기간을 두면 그 뒤 자동 파기) |
 | `PUT /chat/sessions/{session_id}/turns/{turn_id}/feedback` | `{rating:"up"\|"down"\|"none",comment?}` (`none`은 철회) |
 | `POST /chat/sessions/{session_id}/turns/{turn_id}/clicks` | `{url,source_id?,source_type?,label?}` |
 

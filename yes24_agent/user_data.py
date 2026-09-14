@@ -9,13 +9,22 @@ ADK는 LLM 원시 이벤트를, chat_turn은 사용자에게 공개한 확정본
   있으므로 스키마가 안 바뀐다. 피드백과 달리 **append-only**다(같은 URL 재클릭 = 행 추가).
   **purge 대상이 아니다** — 사용자 상태(피드백·제목)가 아니라 usage_log 같은 제품 분석 이벤트
   로그라, 대화 삭제와 함께 지우면 집계에 구멍이 난다(2026-09-08 사용자 결정).
-- `session_ui` — 읽음 시각·사용자가 지은 제목. ADK 세션 state에 두면 안 되는 이유는 그 테이블의
-  `update_time`에 `onupdate=func.now()`가 걸려 있어서다: state를 쓰는 순간 활동 시각이 현재로
-  밀려 "읽으면 다시 안 읽음"이 되고 목록 순서가 튄다. `event.timestamp`에 현재 값을 그대로
-  실어 고정하려던 초안은 **값이 같아 SQLAlchemy가 컬럼을 dirty로 보지 않아 UPDATE에서 빠지고
-  그 자리를 onupdate가 채워** 오히려 실패했다(2026-09-01 라이브 실측).
+- `session_ui` — 읽음 시각·사용자가 지은 제목·삭제 요청 시각(`deleted_at`). ADK 세션 state에
+  두면 안 되는 이유는 그 테이블의 `update_time`에 `onupdate=func.now()`가 걸려 있어서다:
+  state를 쓰는 순간 활동 시각이 현재로 밀려 "읽으면 다시 안 읽음"이 되고 목록 순서가 튄다.
+  `event.timestamp`에 현재 값을 그대로 실어 고정하려던 초안은 **값이 같아 SQLAlchemy가 컬럼을
+  dirty로 보지 않아 UPDATE에서 빠지고 그 자리를 onupdate가 채워** 오히려 실패했다(2026-09-01
+  라이브 실측).
 
-동일한 DB·앱·사용자·세션 스코프를 공유하므로 풀과 삭제 트랜잭션을 한 서비스에 둔다.
+동일한 DB·앱·사용자·세션 스코프를 공유하므로 풀과 삭제·파기 트랜잭션을 한 서비스에 둔다.
+
+**대화 삭제는 소프트 삭제다**(docs/softdelete-design-20260914.md). DELETE는
+`session_ui.deleted_at`만 찍고, 그 순간부터 사용자 경로 전체에서 부재(404)다 — 읽기는
+`history.owned_session` 한 곳이, 쓰기는 `_run_owned`의 부모 잠금 술어가 막는다. 기본은 무기한
+보존이고, 보존 일수(`session_delete_retention_days`)를 양수로 두면 그 뒤 파기 루프가 부모
+`sessions` 행을 지우고 FK CASCADE가
+events·chat_turn·turn_feedback·session_ui를 함께 지운다. turn_click·usage_log는 FK가 없어
+남는다(분석 로그, 2026-09-08 결정).
 
 접속 정보는 인증·사용량과 같은 단일 출처 — `config.session_db_url`을 파싱한다. 세션 DB가
 mysql이 아니면(로컬 sqlite) 스택이 자연 비활성이다(구조 분기).
@@ -26,24 +35,37 @@ mysql이 아니면(로컬 sqlite) 스택이 자연 비활성이다(구조 분기
 (전부 unread·자동 제목) 목록·복원이 그대로 동작한다.
 
 DDL은 `scripts/chat_turn.sql`·`scripts/turn_feedback.sql`·`scripts/turn_click.sql`·
-`scripts/session_ui.sql`
+`scripts/session_ui.sql`(기존 DB는 `scripts/session_ui_deleted_at.sql`)
 (usage_log 관례).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException
 
+from yes24_agent.admin_auth import AUDIT_INSERT, audit_params
 from yes24_agent.config import get_settings
 from yes24_agent.db import MysqlBackedService
 from yes24_agent.session_service import mysql_pool_kwargs
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SessionUi:
+    """한 사용자의 한 세션에 대한 UI 상태. 행이 없거나 저장소가 없는 구성이면 전부 None이다."""
+
+    title: str | None = None
+    last_read_at: float | None = None
+    deleted_at: datetime | None = None
 
 
 class UserDataService(MysqlBackedService):
@@ -64,6 +86,7 @@ class UserDataService(MysqlBackedService):
             unavailable_detail="대화 데이터 저장소가 없는 구성입니다(세션 DB가 MySQL이 아님).",
             failure_detail="대화 데이터 저장에 실패했습니다.",
         )
+        self._purge_task: asyncio.Task | None = None
 
     @classmethod
     def get_instance(cls) -> UserDataService:
@@ -79,45 +102,58 @@ class UserDataService(MysqlBackedService):
             "SELECT u.user_no, a.key_hash, t.id, t.app_name, t.user_id, t.session_id, "
             "t.turn_id, t.started_at, t.completed_at, t.user_text, t.text, t.status, "
             "t.sources, t.process, t.meta, t.error, t.rbti_applied, t.history_saved, "
-            "f.app_name, c.app_name, s.app_name, l.app_name "
+            "f.app_name, c.app_name, s.app_name, s.deleted_at, l.app_name, d.target_type "
             "FROM users u, auth_keys a, chat_turn t, turn_feedback f, turn_click c, "
-            "session_ui s, usage_log l WHERE 1 = 0",
+            "session_ui s, usage_log l, admin_audit d WHERE 1 = 0",
             (),
             fetch_all=True,
         )
+        # 파기의 삭제 집합은 sessions를 참조하는 FK의 CASCADE 하나다. CASCADE가 아니면 파기가
+        # 부모만 지우거나(FK 없음 — 본문이 고아로 남는데 대장은 "파기됨") 막힌다(RESTRICT).
+        # 판정은 FK 이름이 아니라 참조 테이블과 DELETE_RULE로 한다.
+        rules = dict(
+            await self._run(
+                "SELECT table_name, delete_rule FROM information_schema.referential_constraints "
+                "WHERE constraint_schema = DATABASE() AND referenced_table_name = 'sessions'",
+                (),
+                fetch_all=True,
+            )
+        )
+        missing = [
+            table
+            for table in ("events", "chat_turn", "turn_feedback", "session_ui")
+            if rules.get(table) != "CASCADE"
+        ]
+        if missing:
+            raise RuntimeError(
+                f"sessions FK가 ON DELETE CASCADE가 아닙니다({', '.join(missing)}) — 대화 파기가 "
+                "본문을 남깁니다. migrate_database.py의 session_integrity 단계를 먼저 적용하세요."
+            )
 
-    async def _run_owned(
-        self,
-        statements: list[tuple[str, tuple]],
-        *,
-        owner: tuple[str, str, str],
-        missing_ok: bool = False,
-    ):
-        """부모 세션 잠금 안에서 쓰고 삭제한다. 삭제 뒤 UI·확정본이 다시 생기지 않는다."""
+    @asynccontextmanager
+    async def _transaction(self):
+        """READ COMMITTED 트랜잭션의 커서. 본문이 예외면 되돌리고, DB 오류는 503으로 올린다.
+
+        RC인 이유(격리 MySQL 실측 두 건): 기본 REPEATABLE READ의 잠금 읽기는 **없는 행 자리에
+        갭 잠금**을 건다. ① 소유 쓰기의 부모 잠금(`LEFT JOIN session_ui … FOR UPDATE`)은
+        session_ui 행이 아직 없는 세션에 첫 UI 쓰기가 동시에 오면 서로의 insert intention을
+        막아 교착(1213 → 503, 적대 검증 139/160)이 났고, ② 파기의 만료 스캔은
+        idx_session_ui_deleted의 NULL 구간 끝을 막아 모든 사용자의 첫 읽음·제목 저장을 잠금
+        대기(1205)에 걸었다. RC는 갭 잠금 없이 실제 행만 잠근다. `SET TRANSACTION`은 SESSION
+        없이 **다음 트랜잭션 하나에만** 걸려 풀로 돌아간 접속의 격리 수준을 오염시키지 않는다.
+        """
         if self._db is None:
             raise HTTPException(status_code=503, detail=self._unavailable_detail)
         try:
             pool = await self._db.get()
             async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
                 await conn.begin()
                 try:
                     async with conn.cursor() as cur:
-                        await cur.execute(
-                            "SELECT id FROM sessions WHERE app_name = %s "
-                            "AND user_id = %s AND id = %s FOR UPDATE",
-                            owner,
-                        )
-                        if not await cur.fetchone():
-                            if missing_ok:
-                                await conn.rollback()
-                                return None
-                            raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
-                        result = None
-                        for sql, params in statements:
-                            await cur.execute(sql, params)
-                            result = await cur.fetchall() if cur.description else cur.rowcount
+                        yield cur
                     await conn.commit()
-                    return result
                 except BaseException:
                     await conn.rollback()
                     raise
@@ -126,6 +162,37 @@ class UserDataService(MysqlBackedService):
         except Exception as exc:
             logger.error(f"대화 데이터 트랜잭션 실패: {type(exc).__name__}")
             raise HTTPException(status_code=503, detail=self._failure_detail) from exc
+
+    async def _run_owned(
+        self,
+        statements: list[tuple[str, tuple]],
+        *,
+        owner: tuple[str, str, str],
+        missing_ok: bool = False,
+    ):
+        """살아 있는 부모 세션의 잠금 안에서 쓴다 — 없거나 **삭제된** 세션엔 한 문장도 쓰지 않는다.
+
+        술어의 `deleted_at IS NULL`이 쓰기 층의 백스톱이다: 읽기 층(`history.owned_session`)을
+        우회한 어떤 쓰기(늦게 도착한 턴 확정본·다른 서버에서 진행 중이던 턴 포함)도 삭제된
+        대화에 닿지 않는다. 두 행을 모두 잠그므로 같은 부모를 잡는 삭제 표식과 직렬화된다.
+        """
+        async with self._transaction() as cur:
+            await cur.execute(
+                "SELECT s.id FROM sessions s LEFT JOIN session_ui u "
+                "ON u.app_name = s.app_name AND u.user_id = s.user_id AND u.session_id = s.id "
+                "WHERE s.app_name = %s AND s.user_id = %s AND s.id = %s "
+                "AND u.deleted_at IS NULL FOR UPDATE",
+                owner,
+            )
+            if not await cur.fetchone():
+                if missing_ok:
+                    return None
+                raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
+            result = None
+            for sql, params in statements:
+                await cur.execute(sql, params)
+                result = await cur.fetchall() if cur.description else cur.rowcount
+            return result
 
     async def _write_owned(self, sql: str, params: tuple) -> None:
         """소유권 열(app_name,user_id,session_id)을 먼저 받는 단일 쓰기 문장."""
@@ -341,32 +408,32 @@ class UserDataService(MysqlBackedService):
 
     # ── session_ui ─────────────────────────────────────────────────────────
 
-    async def ui_for_user(self, *, user_id: str) -> dict[str, tuple[str | None, float | None]]:
-        """목록용 일괄 조회 — {session_id: (title, last_read_at)}.
+    async def ui_for_user(self, *, user_id: str) -> dict[str, SessionUi]:
+        """목록용 일괄 조회 — {session_id: SessionUi}.
 
         세션마다 질의하지 않는다(목록 1장에 N+1 질의가 되는 자리다).
         """
         if not self.enabled:
             return {}
         rows = await self._run(
-            "SELECT session_id, title, last_read_at FROM session_ui "
+            "SELECT session_id, title, last_read_at, deleted_at FROM session_ui "
             "WHERE app_name = %s AND user_id = %s",
             (get_settings().app_name, user_id),
             fetch_all=True,
         )
-        return {row[0]: (row[1], row[2]) for row in rows or ()}
+        return {row[0]: SessionUi(*row[1:]) for row in rows or ()}
 
-    async def ui_get(self, *, user_id: str, session_id: str) -> tuple[str | None, float | None]:
-        """단건 조회 — (title, last_read_at). 행이 없거나 비활성 구성이면 (None, None)."""
+    async def ui_get(self, *, user_id: str, session_id: str) -> SessionUi:
+        """단건 조회. 행이 없거나 비활성 구성이면 빈 SessionUi(= 살아 있는 대화)."""
         if not self.enabled:
-            return (None, None)
+            return SessionUi()
         rows = await self._run(
-            "SELECT title, last_read_at FROM session_ui "
+            "SELECT title, last_read_at, deleted_at FROM session_ui "
             "WHERE app_name = %s AND user_id = %s AND session_id = %s",
             (get_settings().app_name, user_id, session_id),
             fetch_all=True,
         )
-        return (rows[0][0], rows[0][1]) if rows else (None, None)
+        return SessionUi(*rows[0]) if rows else SessionUi()
 
     async def mark_read(self, *, user_id: str, session_id: str, read_at: float) -> None:
         """읽음 기록. `read_at`은 세션의 `last_update_time`을 그대로 싣는다 — 벽시계가 아니라
@@ -387,36 +454,122 @@ class UserDataService(MysqlBackedService):
             (get_settings().app_name, user_id, session_id, title),
         )
 
-    # ── 대화 삭제 ──────────────────────────────────────────────────────────
+    # ── 대화 삭제·파기 ─────────────────────────────────────────────────────
 
-    async def purge_session(self, *, user_id: str, session_id: str) -> None:
-        """부모 행락 안에서 공개 턴·사용자 상태·ADK 세션을 함께 삭제한다.
-
-        events는 sessions FK의 CASCADE로 지워진다. 같은 부모 잠금을 사용하는 저장은
-        삭제 후 존재 검사를 통과하지 못한다. 분석 로그(turn_click·usage_log)는 보존한다.
-        """
-        owner = (get_settings().app_name, user_id, session_id)
-        await self._run_owned(
-            [
-                (
-                    "DELETE FROM chat_turn WHERE app_name = %s "
-                    "AND user_id = %s AND session_id = %s",
-                    owner,
-                ),
-                (
-                    "DELETE FROM turn_feedback WHERE app_name = %s "
-                    "AND user_id = %s AND session_id = %s",
-                    owner,
-                ),
-                (
-                    "DELETE FROM session_ui WHERE app_name = %s "
-                    "AND user_id = %s AND session_id = %s",
-                    owner,
-                ),
-                ("DELETE FROM sessions WHERE app_name = %s AND user_id = %s AND id = %s", owner),
-            ],
-            owner=owner,
+    async def mark_deleted(self, *, user_id: str, session_id: str) -> None:
+        """삭제 요청 표식. 부모 잠금 술어(미삭제)를 지나므로 재삭제는 404다 — 첫 삭제 시각이
+        보존 시계로 남는 것은 그 술어가 보장한다(여기서 값을 다시 지키지 않는다)."""
+        await self._write_owned(
+            "INSERT INTO session_ui (app_name, user_id, session_id, deleted_at) "
+            "VALUES (%s, %s, %s, NOW(3)) "
+            "ON DUPLICATE KEY UPDATE deleted_at = VALUES(deleted_at)",
+            (get_settings().app_name, user_id, session_id),
         )
+
+    async def purge_expired_sessions(self) -> int:
+        """보존 기간이 지난 삭제 대화를 물리 파기하고 파기한 세션 수를 돌려준다.
+
+        보존 일수가 0(무기한 보존)이면 아무것도 하지 않는다. 루프는 start_purge_loop가 이미 안
+        띄우지만, 수동 호출(API·스크립트)에서 0이 "삭제분 전부 만료"로 해석되면 되돌릴 수 없는
+        전량 파기라 파괴적 경로의 입구에서 한 번 더 막는다(이중 방어).
+
+        배치(`session_purge_batch_size`)를 가득 채운 동안 반복해 밀린 분량을 한 주기에 비운다.
+        """
+        settings = get_settings()
+        if not self.enabled or settings.session_delete_retention_days <= 0:
+            return 0
+        purged = 0
+        while True:
+            batch = await self._purge_batch(
+                settings.session_delete_retention_days, settings.session_purge_batch_size
+            )
+            purged += batch
+            if batch < settings.session_purge_batch_size:
+                return purged
+
+    # 잠금 순서 session_ui → sessions로 `_run_owned`(sessions → session_ui)와 반대다. 교착 시 DB가
+    # 한쪽을 롤백하며 기록 정합성(감사 행 ↔ sessions 삭제)은 유지된다(적대 검증 실측 9/9). 삭제·
+    # 만료 세션에 `_run_owned`가 닿는 사용자 경로가 없어(owned_session이 먼저 404) 방치한다.
+    # 복구 API 등 sessions를 잠그는 경로를 추가할 때는 순서를 sessions → session_ui로 통일할 것
+    # (검증관 수정안 사본: scratchpad/sdadv/ord/).
+    async def _purge_batch(self, retention_days: int, limit: int) -> int:
+        """만료 행 잠금 → 부모 삭제 → 파기 대장 1행을 **한 트랜잭션**으로.
+
+        두 서버(같은 RDS)가 같은 주기로 돈다. `SKIP LOCKED`라 한쪽이 잡은 행은 다른 쪽 스캔에서
+        빠지고, 잠금부터 커밋까지 그 행은 한 트랜잭션의 것이라 **같은 세션의 파기 감사가 두 번
+        남거나 대장과 실제가 어긋나는 일이 구조적으로 없다**. 감사 행은 DELETE가 실제로 지운
+        경우에만 쓴다. 삭제 집합의 정의는 FK CASCADE 하나다(events·chat_turn·turn_feedback·
+        session_ui). 대장에는 내용이 아니라 "언제 삭제 요청 → 언제 파기, 턴 몇 개"만 남는다.
+        트랜잭션이 RC라 막히는 것은 지금 파기 중인 그 대화뿐이다(`_transaction`).
+        """
+        async with self._transaction() as cur:
+            await cur.execute(
+                "SELECT app_name, user_id, session_id, deleted_at FROM session_ui "
+                "WHERE deleted_at < NOW(3) - INTERVAL %s DAY "
+                "ORDER BY deleted_at LIMIT %s FOR UPDATE SKIP LOCKED",
+                (retention_days, limit),
+            )
+            rows = await cur.fetchall()
+            purged = 0
+            for app_name, user_id, session_id, deleted_at in rows:
+                owner = (app_name, user_id, session_id)
+                await cur.execute(
+                    "SELECT COUNT(*) FROM chat_turn "
+                    "WHERE app_name = %s AND user_id = %s AND session_id = %s",
+                    owner,
+                )
+                (turns,) = await cur.fetchone()
+                await cur.execute(
+                    "DELETE FROM sessions WHERE app_name = %s AND user_id = %s AND id = %s", owner
+                )
+                if not cur.rowcount:
+                    continue
+                await cur.execute(
+                    AUDIT_INSERT,
+                    audit_params(
+                        None,
+                        "session",
+                        session_id,
+                        "purge",
+                        before={
+                            "app_name": app_name,
+                            "user_id": user_id,
+                            "deleted_at": deleted_at,
+                            "turns": turns,
+                        },
+                    ),
+                )
+                purged += 1
+            return purged
+
+    def start_purge_loop(self) -> None:
+        """파기 루프를 띄운다(lifespan). 저장소가 없거나 보존 일수가 0(무기한 보존)이면 태스크를
+        만들지 않는다 — 파기 여부의 판정은 여기 한 곳이다."""
+        retention = get_settings().session_delete_retention_days
+        if self.enabled and retention and self._purge_task is None:
+            self._purge_task = asyncio.get_running_loop().create_task(self._purge_forever())
+
+    async def _purge_forever(self) -> None:
+        """기동 직후 1회, 이후 주기마다. 실패는 다음 주기에 다시 시도한다(서빙을 막지 않는다)."""
+        while True:
+            try:
+                purged = await self.purge_expired_sessions()
+                if purged:
+                    logger.info(f"세션 파기 {purged}건")
+            except Exception as exc:  # noqa: BLE001 — 파기 실패가 서빙 프로세스를 죽이면 안 된다
+                # 드라이버 오류는 503으로 감싸여 온다 — 원인의 MySQL 코드(1213 교착·2003 접속 등)를
+                # 함께 남겨야 교착과 DB 장애를 로그만 보고 가를 수 있다.
+                code = (getattr(exc.__cause__, "args", None) or (None,))[0]
+                logger.warning(f"세션 파기 실패(mysql_code={code}) — 다음 주기에 재시도: {exc}")
+            await asyncio.sleep(get_settings().session_purge_interval_s)
+
+    async def close(self) -> None:
+        """파기 루프를 멈춘 뒤 풀을 닫는다(루프가 닫힌 풀을 잡지 않게 순서가 이렇다)."""
+        if self._purge_task is not None:
+            self._purge_task.cancel()
+            await asyncio.gather(self._purge_task, return_exceptions=True)
+            self._purge_task = None
+        await super().close()
 
 
 async def close_user_data_service() -> None:

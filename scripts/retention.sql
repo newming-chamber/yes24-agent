@@ -1,4 +1,5 @@
 -- 보존 정리 — **외부 스케줄러(cron)로 주기 실행**. 앱은 이 문장을 돌리지 않는다.
+-- (사용자가 지운 대화의 파기는 여기 없다 — 개인정보 파기 의무라 앱이 소유한다: user_data 파기 루프.)
 --
 -- rate_limit_log는 슬라이딩 윈도우 판정에 **1일치만** 쓴다(auth.py: `requested_at >
 -- NOW(3) - INTERVAL 1 DAY`). 그런데 행은 영구히 쌓인다. `idx_rate_key_time

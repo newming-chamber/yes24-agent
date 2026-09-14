@@ -794,6 +794,19 @@ class Settings(BaseSettings):
     # list_sessions는 사용자 전체를 돌려주므로 장수 사용자의 목록 한 장이 무한히 크지 않게
     # 천장을 둔다 — admin_page_size(운영 조회 페이지)와는 다른 축의 값이라 따로 둔다.
     history_sessions_limit: int = 100
+    # 사용자가 지운 대화를 DB에 남겨 두는 기간(일). 삭제 요청 즉시 사용자 경로에서 부재(404)가
+    # 된다. 0 = 파기하지 않음(무기한 보존, 2026-09-14 사용자 결정) — 파기 루프가 시작되지 않는다.
+    # 양수로 두면 그 일수 뒤 파기 루프가 부모 sessions 행을 지운다(FK CASCADE, 재기동 시 적용).
+    # 무기한 보존은 개인정보 파기 의무 관점의 법무 확인 항목이다. 복구 가능 여부는 행의 존재가
+    # 곧 판정이라 기간 비교 코드가 따로 없다.
+    session_delete_retention_days: int = Field(default=0, ge=0)
+    # 파기 루프 주기(초). 기동 직후 1회 돈 뒤 이 간격으로 반복한다.
+    session_purge_interval_s: float = Field(default=3600.0, gt=0)
+    # 파기 트랜잭션 1회가 잠그는 세션 수 상한. 두 서버(같은 RDS)가 동시에 돌아도 행을
+    # `FOR UPDATE SKIP LOCKED`로 나눠 잡으므로 중복 파기·중복 감사가 없고, 상한은 한 트랜잭션의
+    # 잠금 시간(CASCADE로 events까지 지운다)을 짧게 끊는 용도다. 밀린 분량은 같은 주기 안에서
+    # 배치를 반복해 비운다.
+    session_purge_batch_size: int = Field(default=100, ge=1)
 
     # 토큰 사용량 기록(usage.py → usage_log 테이블) 커넥션 풀 상한. 접속 정보는 인증과
     # 같이 session_db_url을 파싱하므로(단일 출처) mysql이 아니면 스택 전체가 비활성이다 —

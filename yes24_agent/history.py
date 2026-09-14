@@ -21,11 +21,12 @@ SQLite는 ADK 이벤트 스냅샷을 유지한다. 턴 경계는 ADK가 부여�
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from functools import partial
 from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from google.adk.sessions import DatabaseSessionService
+from google.adk.sessions import BaseSessionService, DatabaseSessionService, Session
 from pydantic import (
     AnyHttpUrl,
     BaseModel,
@@ -47,7 +48,7 @@ from yes24_agent.session_service import _POC_USER_ID, _get_session_lock, _get_se
 from yes24_agent.sources import get_sources
 from yes24_agent.toolsets import TOOLSET_PUBLIC_SOURCE_TYPE, TOOLSET_SOURCE_TYPES
 from yes24_agent.turn_snapshot import TURN_SNAPSHOT_KEY
-from yes24_agent.user_data import UserDataService
+from yes24_agent.user_data import SessionUi, UserDataService
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,10 @@ _AUTH_RESPONSES: dict[int | str, dict[str, Any]] = {
 }
 _SESSION_RESPONSES: dict[int | str, dict[str, Any]] = {
     **_AUTH_RESPONSES,
-    404: {"model": ErrorDetail, "description": "이 사용자의 세션이 아니거나 존재하지 않음"},
+    404: {
+        "model": ErrorDetail,
+        "description": "이 사용자의 세션이 아니거나 존재하지 않음(삭제한 대화 포함)",
+    },
 }
 
 
@@ -419,29 +423,56 @@ def _require_identified(user: AuthenticatedUser | None) -> str:
     return str(user.user_no)
 
 
-async def _owned_session(user_no: str, session_id: str):
-    """이 사용자 소유의 세션을 조회한다 — 남의 것·없는 것은 같은 404다(존재 노출 금지)."""
+_UserDep = Annotated[AuthenticatedUser | None, Depends(get_authenticated_user)]
+
+
+@dataclass(frozen=True)
+class OwnedSession:
+    """소유·미삭제 세션과 그 판정에 쓴 재료 — 라우트가 같은 조회를 되풀이하지 않는다."""
+
+    user_no: str
+    service: BaseSessionService
+    session: Session
+    ui: SessionUi
+
+
+async def owned_session(session_id: str, user: _UserDep = None) -> OwnedSession:
+    """이 사용자 소유의 **살아 있는** 세션 — 남의 것·없는 것·삭제한 것은 같은 404다.
+
+    `{session_id}`를 경로에 가진 사용자 라우트의 유일한 입구다(FastAPI 의존성). 삭제 판정이
+    여기 한 곳이라 라우트마다 분기를 두지 않고, 새 라우트가 이 의존성을 빠뜨리면 라우터 파생
+    가드(test_history)가 빨강이다. 삭제는 존재를 노출하지 않는다 — 사용자 경로에서 "삭제됨"은
+    "부재"와 같은 규칙 하나다. 인증 의존성을 품어도 로그인월 위임 집합은 추이적으로 파생된다
+    (main._delegating_routes).
+    """
+    user_no = _require_identified(user)
     service = _get_session_service()
     session = await service.get_session(
         app_name=get_settings().app_name, user_id=user_no, session_id=session_id
     )
-    if session is None:
+    ui = await UserDataService.get_instance().ui_get(user_id=user_no, session_id=session_id)
+    if session is None or ui.deleted_at is not None:
         raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
-    return service, session
+    return OwnedSession(user_no, service, session, ui)
 
 
-async def _owned_turn(user_no: str, session_id: str, turn_id: str):
+_OwnedDep = Annotated[OwnedSession, Depends(owned_session)]
+
+
+async def owned_turn(turn_id: str, owned: _OwnedDep) -> OwnedSession:
     """소유 세션 + 그 안에 실재하는 턴 — 턴에 무언가를 남기는 라우트(피드백·클릭)의 공통 입구.
 
     공개 턴 행을 먼저 확인하며, 아직 저장되지 않은 턴은 원시 이벤트로 확인한다.
     """
-    _, session = await _owned_session(user_no, session_id)
     saved = await UserDataService.get_instance().has_turn(
-        app_name=get_settings().app_name, user_id=user_no, session_id=session_id, turn_id=turn_id
+        app_name=get_settings().app_name,
+        user_id=owned.user_no,
+        session_id=owned.session.id,
+        turn_id=turn_id,
     )
-    if not saved and not any(event.invocation_id == turn_id for event in session.events):
+    if not saved and not any(event.invocation_id == turn_id for event in owned.session.events):
         raise HTTPException(status_code=404, detail="해당 턴을 찾을 수 없습니다.")
-    return session
+    return owned
 
 
 def _normalized(text: str) -> str:
@@ -637,15 +668,10 @@ def _restore_turn_payload(raw: dict, registry: list[dict], session_id: str) -> d
 
 
 # ── 라우트 ─────────────────────────────────────────────────────────────────
-# 주의 1: 인증 의존성은 라우트에 **직접** 단다(중첩 의존성 금지) — 로그인월의 x-api-key 통과
-# 집합이 라우트의 1단계 의존성 그래프에서 파생되므로(main._key_checking_routes), 한 겹
-# 감싸면 월이 이 라우트를 영영 열지 않는다.
-# 주의 2: APIRouter + include_router가 아니라 **앱에 직접 등록**한다(register_admin 관례).
+# 주의: APIRouter + include_router가 아니라 **앱에 직접 등록**한다(register_admin 관례).
 # 현행 FastAPI는 include_router를 지연 프록시(_IncludedRouter)로 얹어 app.routes에 APIRoute가
 # 실체화되지 않고, 그러면 월의 통과 집합 파생이 이 라우트들을 영영 못 본다(실측 —
 # test_history의 월 파생 가드가 빨강으로 잡았다). fail-closed라 노출은 아니지만 기능이 죽는다.
-
-_UserDep = Annotated[AuthenticatedUser | None, Depends(get_authenticated_user)]
 
 
 def register_history(app: FastAPI) -> None:
@@ -677,7 +703,13 @@ def register_history(app: FastAPI) -> None:
         recent = sorted(listing.sessions, key=lambda s: s.last_update_time, reverse=True)
         # 사용자 제목·읽음 시각을 **한 번에** 읽는다(세션당 질의는 N+1이 되는 자리다).
         ui = await UserDataService.get_instance().ui_for_user(user_id=user_no)
-        rows = [(s, *ui.get(s.id, (None, None))) for s in recent]
+        # 삭제한 대화는 상한(history_sessions_limit)으로 **자르기 전에** 뺀다 — 자른 뒤에 빼면
+        # 지운 대화 수만큼 목록이 짧아진다. ADK list_sessions는 필터를 열어 주지 않는다.
+        rows = [
+            (s, entry.title, entry.last_read_at)
+            for s in recent
+            if (entry := ui.get(s.id, SessionUi())).deleted_at is None
+        ]
         if q is not None and (needle := _normalized(q)):
             # 제목 없는 세션(title=null)은 어떤 검색어에도 잡히지 않는다 — 보여줄 실마리가
             # 없는 항목을 부분일치로 내주면 목록이 왜 나왔는지 설명 불가능해진다.
@@ -710,17 +742,15 @@ def register_history(app: FastAPI) -> None:
         " 이 조회가 곧 **읽음 처리**다 — 복원해 화면에 그린 것이 '봤다'의 자연스러운 정의다."
         " 대화를 다시 받지 않고 배지만 끄려면 POST /chat/sessions/{session_id}/read를 쓴다.",
     )
-    async def session_detail(session_id: str, user: _UserDep = None) -> SessionDetailResponse:
-        user_no = _require_identified(user)
-        service, session = await _owned_session(user_no, session_id)
+    async def session_detail(owned: _OwnedDep) -> SessionDetailResponse:
+        user_no, session = owned.user_no, owned.session
         data = UserDataService.get_instance()
         feedback_by_turn = await data.feedback_for_session(user_id=user_no, session_id=session.id)
-        user_title, last_read_at = await data.ui_get(user_id=user_no, session_id=session.id)
         saved_turns = await data.turns_for_session(
             app_name=get_settings().app_name, user_id=user_no, session_id=session.id
         )
-        detail = _project_session_detail(session, feedback_by_turn, user_title, saved_turns)
-        await _mark_read_best_effort(data, user_no, session, last_read_at)
+        detail = _project_session_detail(session, feedback_by_turn, owned.ui.title, saved_turns)
+        await _mark_read_best_effort(data, user_no, session, owned.ui.last_read_at)
         return detail
 
     @app.post(
@@ -734,17 +764,16 @@ def register_history(app: FastAPI) -> None:
         " 대화**를 위한 것이다 — 방금 답변을 받아 다 읽은 창에서 배지만 끄려고 대화 전체를"
         " 다시 받아오는 낭비를 없앤다. 응답은 갱신된 목록 항목이라 그대로 목록에 반영하면 된다.",
     )
-    async def mark_session_read(session_id: str, user: _UserDep = None) -> SessionSummary:
-        user_no = _require_identified(user)
-        _, session = await _owned_session(user_no, session_id)
-        data = UserDataService.get_instance()
-        user_title, last_read_at = await data.ui_get(user_id=user_no, session_id=session.id)
+    async def mark_session_read(owned: _OwnedDep) -> SessionSummary:
+        session = owned.session
         # 읽은 시점은 **서버가 정한다**(클라이언트가 보낸 시각을 믿지 않는다). 미래 시각을
         # 실어 보내면 이후 어떤 새 답변도 영영 읽음으로 보이게 만들 수 있기 때문이다.
-        await _mark_read_best_effort(data, user_no, session, last_read_at)
+        await _mark_read_best_effort(
+            UserDataService.get_instance(), owned.user_no, session, owned.ui.last_read_at
+        )
         return SessionSummary(
             session_id=session.id,
-            title=_title_of(session, user_title),
+            title=_title_of(session, owned.ui.title),
             last_update_time=session.last_update_time,
             unread=False,
         )
@@ -760,23 +789,20 @@ def register_history(app: FastAPI) -> None:
         " 빈 문자열·공백만인 제목은 422다(제목을 지우는 경로는 없다)."
         " 이름 변경은 활동이 아니다 — last_update_time(목록 순서)과 unread를 바꾸지 않는다.",
     )
-    async def rename_session(
-        session_id: str, request: SessionRenameRequest, user: _UserDep = None
-    ) -> SessionSummary:
-        user_no = _require_identified(user)
-        _, session = await _owned_session(user_no, session_id)
-        data = UserDataService.get_instance()
+    async def rename_session(request: SessionRenameRequest, owned: _OwnedDep) -> SessionSummary:
+        session = owned.session
         # 사용자 제목은 **우리 테이블에** 쓴다(ADK 세션 state가 아니라). 그래야 이름 변경이
         # 목록의 활동 시각을 밀지 않는다 — ADK 세션은 state를 쓰는 순간 update_time이
         # onupdate로 현재가 된다(user_data.py 독스트링). 자동 제목은 여전히 ADK state에
         # 남고, 표시할 때 사용자 제목이 그것을 덮는다(_title_of).
-        await data.set_title(user_id=user_no, session_id=session.id, title=request.title)
-        _, last_read_at = await data.ui_get(user_id=user_no, session_id=session.id)
+        await UserDataService.get_instance().set_title(
+            user_id=owned.user_no, session_id=session.id, title=request.title
+        )
         return SessionSummary(
             session_id=session.id,
             title=request.title,
             last_update_time=session.last_update_time,
-            unread=_is_unread(session.last_update_time, last_read_at),
+            unread=_is_unread(session.last_update_time, owned.ui.last_read_at),
         )
 
     @app.delete(
@@ -785,18 +811,22 @@ def register_history(app: FastAPI) -> None:
         status_code=204,
         responses={**_SESSION_RESPONSES, 204: {"description": "삭제 완료(응답 본문 없음)"}},
         summary="대화 삭제",
-        description="세션과 그 이벤트, 그리고 **그 대화에 남긴 것 전부**(좋아요/싫어요·코멘트·"
-        "직접 지은 제목)를 지운다. 되돌릴 수 없다. 집계 신호를 잃는 대가는 치른다 — 사용자가"
-        " 지우겠다고 한 것이 우선이다(삭제 API의 존재 이유가 프라이버시인데 코멘트가 남으면"
-        " 삭제가 아니다).",
+        description="대화를 목록·복원·읽음·이름 변경·피드백·클릭 **전 경로에서 즉시 숨긴다**(이후"
+        " 전부 404, 두 번째 DELETE도 404). 서버는 대화와 그 대화에 남긴 것(좋아요/싫어요·코멘트·"
+        "직접 지은 제목)을 **기본적으로 기한 없이 보관**하며, 운영 설정으로 보존 기간이 정해지면"
+        " 그 뒤 자동으로 파기한다(되돌릴 수 없음). 보관 중에는 고객센터 요청으로 복구될 수 있다."
+        " 삭제한 session_id로 /chat/stream을 보내면 새 대화가 **새 session_id**로 시작된다"
+        "(done.session_id가 정본).",
     )
-    async def delete_session(session_id: str, user: _UserDep = None) -> None:
-        user_no = _require_identified(user)
-        async with _get_session_lock(session_id):
-            service, session = await _owned_session(user_no, session_id)
+    async def delete_session(owned: _OwnedDep) -> None:
+        user_no, service, session = owned.user_no, owned.service, owned.session
+        # 진행 중인 턴이 락을 쥐고 있으면 그 턴의 마감(확정본 저장)까지 기다린 뒤 숨긴다.
+        async with _get_session_lock(session.id):
             data = UserDataService.get_instance()
             if data.enabled and isinstance(service, DatabaseSessionService):
-                await data.purge_session(user_id=user_no, session_id=session.id)
+                # 소유 판정은 락 밖(의존성)에서 했다 — 그사이 끼어든 삭제는 부모 잠금 술어가
+                # 404로 막는다(재삭제 = 404).
+                await data.mark_deleted(user_id=user_no, session_id=session.id)
             else:
                 try:
                     await service.delete_session(
@@ -831,13 +861,11 @@ def register_history(app: FastAPI) -> None:
         " 끊는다(성공 응답 = 실제로 저장됨).",
     )
     async def put_turn_feedback(
-        session_id: str,
         turn_id: str,
         request: TurnFeedbackRequest,
-        user: _UserDep = None,
+        owned: Annotated[OwnedSession, Depends(owned_turn)],
     ) -> TurnFeedbackState:
-        user_no = _require_identified(user)
-        session = await _owned_turn(user_no, session_id, turn_id)
+        user_no, session = owned.user_no, owned.session
         data = UserDataService.get_instance()
         comment = request.comment or None
         if request.rating == "none":
@@ -874,16 +902,13 @@ def register_history(app: FastAPI) -> None:
         " 204는 '받았다'가 아니라 '저장됐다'다(저장 실패는 5xx로 정직하게 끊는다).",
     )
     async def post_turn_click(
-        session_id: str,
         turn_id: str,
         request: TurnClickRequest,
-        user: _UserDep = None,
+        owned: Annotated[OwnedSession, Depends(owned_turn)],
     ) -> None:
-        user_no = _require_identified(user)
-        session = await _owned_turn(user_no, session_id, turn_id)
         await UserDataService.get_instance().record_click(
-            user_id=user_no,
-            session_id=session.id,
+            user_id=owned.user_no,
+            session_id=owned.session.id,
             turn_id=turn_id,
             url=str(request.url),
             source_id=request.source_id,
