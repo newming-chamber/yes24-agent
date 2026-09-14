@@ -24,7 +24,7 @@ from dataclasses import dataclass, field, replace
 from typing import Annotated, Any, Literal
 
 from bs4 import BeautifulSoup
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Response
 from google.genai import types
 from pydantic import (
     AfterValidator,
@@ -100,6 +100,11 @@ _SEASON_SLOT = "season"
 _POOL_COLUMNS = (
     "id", "slot", "label", "text", "source", "goods_no", "run_date", "pinned", "source_url",
 )
+_ADMIN_COLUMNS = (
+    "id", "slot", "text", "source", "goods_no", "source_url", "run_date", "pinned", "active",
+    "valid_from", "valid_until", "created_at", "updated_at",
+)
+_RUN_COLUMNS = ("slot", "run_date", "status", "detail", "started_at")
 
 
 # ── 순수 함수(DB·네트워크 없음 — 테스트가 직접 잠근다) ─────────────────────────
@@ -1840,8 +1845,34 @@ _EDITABLE = tuple(_StarterExpected.model_fields)
 _ExpectedBody = Annotated[_StarterExpected | None, Body(embed=True)]
 
 
+class StarterPatch(BaseModel):
+    """부분 갱신 — **실린 필드만** 바꾼다. 빈 본문은 422.
 
+    text·pinned·active에 null을 실으면 422다. DDL이 NOT NULL인 컬럼인데, STRICT가 아닌
+    MySQL은 NULL을 ''·0으로 조용히 강등해 **빈 문장이 그대로 서빙**됐다(실측). 유효기간만
+    null을 받는다 — 그쪽은 "제한 없음"이라는 뜻이다.
+    """
 
+    text: _StarterText | None = None
+    pinned: bool | None = None
+    active: bool | None = None
+    valid_from: dt.date | None = None
+    valid_until: dt.date | None = None
+
+    _range = model_validator(mode="after")(_check_valid_range)
+
+    @model_validator(mode="after")
+    def _fields_present(self) -> StarterPatch:
+        if not self.model_fields_set:
+            raise ValueError("바꿀 필드가 하나도 없습니다")
+        nulled = [
+            name
+            for name in ("text", "pinned", "active")
+            if name in self.model_fields_set and getattr(self, name) is None
+        ]
+        if nulled:
+            raise ValueError(f"null을 받지 않는 필드입니다: {', '.join(nulled)}")
+        return self
 
 
 def register_starters(app: FastAPI, settings: Settings) -> None:
