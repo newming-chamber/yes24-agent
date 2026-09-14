@@ -29,7 +29,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, StringConstraints, field_validator
 from starlette.routing import Match
 
-from yes24_agent.admin import client_ip, register_admin, require_admin
+from yes24_agent.admin import register_admin
+from yes24_agent.admin_auth import (
+    client_ip,
+    close_admin_service,
+    register_admin_auth,
+    require_admin,
+)
 from yes24_agent.auth import (
     AuthenticatedUser,
     AuthService,
@@ -54,7 +60,7 @@ from yes24_agent.rbti.persona import is_valid_code
 from yes24_agent.rbti.profile import fetch_user_rbti
 from yes24_agent.rbti.routes import register_rbti
 from yes24_agent.runner import run_agent_stream
-from yes24_agent.session_service import SQLITE_DIALECT, db_dialect, persistence_mode
+from yes24_agent.session_service import persistence_mode
 from yes24_agent.sse import OVERVIEW_EVENT_CONTRACT, SSE_EVENT_CONTRACT
 from yes24_agent.starters import close_starter_service, register_starters
 from yes24_agent.thought_translation import warmup_translation
@@ -96,10 +102,14 @@ class _NoCacheStaticFiles(StaticFiles):
 # **API 문서 3종을 함께 연다**(2026-09-01 사용자 결정): 프론트 개발자가 클라이언트를 만들려면
 # SSE 이벤트 계약을 봐야 하는데, 그 계약의 정본은 코드에서 생성되는 이 문서다(docs/는
 # gitignore라 clone해도 안 온다). 여는 것은 **스키마이지 데이터가 아니다** — 엔드포인트는
-# 그대로 월 뒤에 있고, admin 라우트는 애초에 OpenAPI에 실리지 않는다.
+# 그대로 월 뒤에 있고, /admin 라우터는 include_in_schema=False라 문서에 실리지 않는다.
 # 실제 호출·테스트에는 여전히 비밀번호가 필요하다(Swagger "Try it out" 포함).
 _ACCESS_EXEMPT_PATHS = frozenset(
-    {"/health", "/login", "/logout", "/docs", "/redoc", "/openapi.json"}
+    {
+        "/health", "/login", "/logout", "/docs", "/redoc", "/openapi.json",
+        "/admin", "/admin/", "/admin/api/login", "/admin/api/logout",
+        "/static/lib/admin.css", "/static/lib/admin.js", "/static/lib/admin_manage.js",
+    }
 )
 
 
@@ -120,7 +130,14 @@ def _delegating_routes(app: FastAPI, judge) -> list:
     (`/chat/sessions/abc`)라 **영원히 일치하지 않는다** — 파라미터 라우트에 인증을 붙이는
     순간 그 라우트가 통째로 월에 막힌다(2026-09-01 적대 검증 5렌즈가 독립으로 같은 결함을
     지적). Starlette의 `route.matches(scope)`가 그 매칭을 소유하므로 그것을 쓴다.
+
+    **위임은 추이적이다** — 판정자를 하위 의존성으로 품은 라우트도 연다. `require_editor`는
+    `Depends(require_admin)`를 받으므로, 최상위만 보면 역할 의존성이 붙은 어드민 쓰기
+    라우트가 전부 월에 막힌다.
     """
+    def _depends_on(dependant) -> bool:
+        return any(d.call is judge or _depends_on(d) for d in dependant.dependencies)
+
     def _walk(routes) -> list:
         found = []
         for route in routes:
@@ -135,7 +152,7 @@ def _delegating_routes(app: FastAPI, judge) -> list:
                 found.extend(_walk(inner.routes))
                 continue
             dependant = getattr(route, "dependant", None)
-            if dependant is not None and any(d.call is judge for d in dependant.dependencies):
+            if dependant is not None and _depends_on(dependant):
                 found.append(route)
         return found
 
@@ -148,8 +165,12 @@ def _key_checking_routes(app: FastAPI) -> list:
 
 
 def _key_route_matches(routes: list, request: Request) -> bool:
-    """이 요청이 위 라우트 중 하나에 실제로 매칭되는가 — 라우팅 규칙은 Starlette가 소유한다."""
-    return any(route.matches(request.scope)[0] != Match.NONE for route in routes)
+    """이 요청이 위 라우트 중 하나에 실제로 매칭되는가 — 라우팅 규칙은 Starlette가 소유한다.
+
+    **FULL(경로+메서드)만 통과다.** PARTIAL(경로만 맞고 메서드가 다름)을 치면 위임이 path
+    단위로 뭉개져, 같은 경로에 판정자 없는 다른 메서드 라우트가 있을 때 그것까지 월 뒤에서 열린다.
+    """
+    return any(route.matches(request.scope)[0] == Match.FULL for route in routes)
 
 
 def _branded_html(path: Path, app_config=None) -> HTMLResponse:
@@ -492,6 +513,8 @@ async def lifespan(app: FastAPI):
     await close_user_data_service()
     # 초기 질문 풀 서비스도 같은 방식으로 닫는다(만들어진 적 없으면 no-op).
     await close_starter_service()
+    # 관리자 세션·감사 풀(만들어진 적 없으면 no-op).
+    await close_admin_service()
     # 토큰 사용량 기록 풀도 나란히 정리한다 — 진행 중인 fire-and-forget INSERT를
     # 배수한 뒤 닫는다(만들어진 적 없으면 no-op).
     await close_usage_logger()
@@ -561,7 +584,7 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
                 route_cache["admin"] = _delegating_routes(app, require_admin)
                 logger.info(
                     "로그인월: x-api-key 통과 허용 경로 "
-                    f"{sorted(r.path for r in key_routes)} / x-admin-key 통과 허용 경로 "
+                    f"{sorted(r.path for r in key_routes)} / 관리자 세션 위임 경로 "
                     f"{sorted(r.path for r in route_cache['admin'])}"
                 )
             if (
@@ -570,13 +593,8 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
                 and AuthService.get_instance().enabled
             ):
                 return await call_next(request)
-            # 운영자 헤더도 같은 규칙이다 — 판정자(require_admin)를 가진 라우트만 열고, 키의
-            # 유효성은 그 판정자가 그대로 검사한다(무효 헤더는 401). 월이 이것을 막으면 배포
-            # 환경에서 어드민 API에 닿을 길이 없어진다(쿠키를 발급하는 /admin 로그인은 sqlite
-            # 구성에서만 등록된다).
-            if request.headers.get("x-admin-key") and _key_route_matches(
-                route_cache["admin"], request
-            ):
+            # 운영자 세션 쿠키의 유효성은 라우트 의존성 체인의 require_admin이 판정한다.
+            if _key_route_matches(route_cache["admin"], request):
                 return await call_next(request)
             if path in _ACCESS_EXEMPT_PATHS or any(
                 token_valid(cookie, pw) for pw in wall_passwords
@@ -818,11 +836,9 @@ def create_app() -> FastAPI:
     if settings.serve_frontend:
         _register_frontend(app, settings)
 
-    # 운영자 데이터 조회(admin). admin_password가 비어 있으면 라우트를 등록하지 않는다(404).
-    # admin은 세션 sqlite 파일을 직접 여는 조회기라(mode=ro) 네트워크 DB에선 동작할 수
-    # 없다 — sqlite일 때만 등록해, 열리지 않는 페이지를 노출하지 않는다.
-    if db_dialect(settings.session_db_url) == SQLITE_DIALECT:
-        register_admin(app, settings)
+    # 관리자 인증(계정·세션·감사) → 데이터 조회 → 초기 질문(아래 register_starters) 순서.
+    register_admin_auth(app, settings)
+    register_admin(app, settings)
 
     @app.get("/health")
     async def health() -> dict:

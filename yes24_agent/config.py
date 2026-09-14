@@ -11,7 +11,7 @@ from functools import lru_cache
 from typing import Literal
 
 from google import genai
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -632,13 +632,13 @@ class Settings(BaseSettings):
     # 공유 패스워드 로그인월. 빈 문자열이면 **비활성**(로컬 개발 기본 — 월 없음), 값이 있으면
     # 활성화돼 미들웨어가 보호 경로(/ ·/matrix ·/chat/*)를 쿠키로 가린다. env `ACCESS_PASSWORD`로
     # 주입한다(하드코딩 대신 env). 진짜 인증이 아니라 데모 접근을 막는 단일 공유 비밀번호 게이트다.
-    access_password: str = ""
+    access_password: str = Field(default="", repr=False)
     # 로그인월의 두 번째 비밀번호(세팅 조정용, env `ADMIN_ACCESS_PASSWORD`). 이 값으로 로그인한
     # 세션만 모델 선택·도구 토글·모델명 노출(/models·/toolsets·done.model)이 허용되고,
     # access_password(데모) 로그인에는 전부 숨긴다. 빈 문자열이면 역할 구분 없음(모든 로그인이
     # 세팅 접근 가능 — 기존 동작). access_password가 켜져 있을 때만 의미가 있으며,
-    # admin_password(/admin 운영 데이터 열람)와는 별개다.
-    admin_access_password: str = ""
+    # /admin 운영자 계정(admin_users, admin_auth.py)과는 별개다.
+    admin_access_password: str = Field(default="", repr=False)
     # 데모 로그인(access_password) 세션에 강제되는 앱 구성(페르소나·도구). 역할 분리가 활성일
     # 때(두 비밀번호 모두 설정) 데모 세션은 서버 기본(agent_persona·enabled_toolsets)·요청
     # 필드와 무관하게 이 구성으로 고정된다 — 브랜딩·프롬프트 정체성·도구가 전부 여기서
@@ -655,7 +655,8 @@ class Settings(BaseSettings):
 
     # 세션 영속
     # sqlite 기본은 **로컬 개발용**이고, 배포는 env `SESSION_DB_URL`(MySQL)로 덮는다.
-    session_db_url: str = "sqlite+aiosqlite:///./data/sessions.db"  # async 드라이버 접미사 필수
+    # async 드라이버 접미사 필수. MySQL URL은 계정·비밀번호를 품어 시크릿이다(repr=False).
+    session_db_url: str = Field(default="sqlite+aiosqlite:///./data/sessions.db", repr=False)
     # 세션 서비스 생성 실패 시 InMemory 폴백을 허용할지. 파일 sqlite에선 폴백이 "그래도 기동"
     # 이지만, 네트워크 DB에선 조용한 폴백이 **영속 중이라 믿는 비영속 서비스**를 만든다 —
     # 대화가 재시작마다 증발하고 admin·집계는 위장 정상이 된다. 배포에선 env
@@ -685,13 +686,10 @@ class Settings(BaseSettings):
     # DB에 손으로 행을 심는 대신 설정으로 두는 이유: 환경마다 켜고 끄기가 구조로 되고(빈 값 =
     # 분기 자체가 없음), 값이 레포에 남지 않으며, 폐기가 env 한 줄이다.
     # 나머지 판정(레이트리밋·is_active·세션 소유권)은 일반 키와 **완전히 같은 경로**를 탄다.
-    dev_api_key: str = ""
+    dev_api_key: str = Field(default="", repr=False)
     # 개발 키가 가장할 사용자 번호. 실 회원과 겹치지 않게 9자리 대역을 쓴다 — 대화·피드백이
     # 이 번호 밑에만 쌓여 실사용자 데이터와 섞이지 않는다.
     dev_api_user_no: str = "990000001"
-    # api_key → 사용자 in-memory 캐시 TTL(초). 이 창 안의 재요청은 users 조회를 건너뛴다
-    # (rate limit 체크는 캐시와 무관하게 매 요청 DB에서 센다).
-    auth_cache_ttl_s: float = 300.0
     # 인증 DB 커넥션 풀 상한. 세션 DB 풀(SQLAlchemy)과 별도로 잡히는 aiomysql 풀이라,
     # 요청당 짧은 조회 몇 건이 전부인 용도에 맞춰 작게 둔다.
     auth_pool_max: int = 5
@@ -786,25 +784,40 @@ class Settings(BaseSettings):
     # 로만 끝난다. 상한 초과분은 취소한다 — 부가 채널이라 기록 유실이 종료 지연보다 싸다.
     usage_close_timeout_s: float = 5.0
 
-    # 운영자 데이터 조회(admin). 빈 문자열이면 **라우트 미등록**(404) — matrix_enabled와 같은
-    # 패턴으로, 설정하지 않은 환경엔 admin이 존재조차 하지 않는다. 값은 env `ADMIN_PASSWORD`로
-    # 주입하며, 채팅 로그인월(access_password)과 별도 비밀번호다(데모 접근 ≠ 운영 데이터 열람).
-    admin_password: str = ""
-    # 세션 목록 한 페이지 크기. 페이지당 세션 수만큼 이벤트 수·미리보기 조회가 따라붙어
+    # 운영자 데이터 조회(admin). 세션 DB가 MySQL일 때만 등록되고(admin_auth.admin_enabled),
+    # 접근은 개인 계정(admin_users)·서버측 세션(admin_sessions)으로 가린다.
+    # 세션 목록 한 페이지 크기. 페이지당 세션 수만큼 미리보기 조회가 따라붙어
     # (인덱스 조회지만) 왕복이 늘므로, 한 화면에 담기는 정도로 둔다.
     admin_page_size: int = 50
-    # 본문 검색 시 events 스캔에서 거둘 세션 id 상한. LIKE는 인덱스를 못 타 전체 스캔이라
-    # (실측 ~0.3s/16k행) 히트가 많을 때 IN 절이 무한히 커지지 않게 천장을 둔다.
-    admin_search_max_sessions: int = 500
-    # 목록 미리보기(첫 사용자 발화)를 찾으려 세션 앞에서 읽을 이벤트 수. 첫 이벤트가 사용자
-    # 발화인 게 보통이라 몇 건이면 충분하다 — 세션 전체를 읽으면 목록 한 장이 수십 MB가 된다.
-    admin_preview_scan_events: int = 3
     admin_preview_max_chars: int = 140
-    # 상세 타임라인이 한 번에 싣는 이벤트 수 상한(초장기 세션의 응답 폭발 방지).
-    admin_session_max_events: int = 300
-    # 타임라인 part 하나의 본문 상한(문자). 도구 결과는 실측 최대 671KB라 상한 없이는 상세
-    # 응답이 수 MB가 된다. 초과분은 조용히 버리지 않고 truncated·total_chars로 표시한다.
-    admin_part_max_chars: int = 4000
+    # page 쿼리 상한 — 거대값이 OFFSET 전체 스캔(503·DB 장애 로그)이 아니라 422로 떨어진다.
+    admin_max_page: int = 10000
+    # export(CSV 전체) 접속의 MAX_EXECUTION_TIME(ms). 조건 없는 전체 내보내기 한 건이 DB를
+    # 무기한 붙잡지 않게 질의 하나의 상한을 둔다.
+    admin_export_max_execution_ms: int = 60000
+    # 관리자 비밀번호 해시 scrypt 파라미터 — n = 2**log2_n, 메모리 128·r·n(기본 32 MiB).
+    # 저장 문자열이 파라미터를 품어(scrypt$log2n$r$p$salt$dk) 값을 바꿔도 기존 해시가 검증된다.
+    admin_scrypt_log2_n: int = 15
+    admin_scrypt_r: int = 8
+    admin_scrypt_p: int = 1
+    # 비밀번호 최소 길이(복잡도 규칙 없음 — 길이만).
+    admin_password_min_length: int = 12
+    # 비밀번호 입력 상한(로그인·현재·새 비밀번호 공통). 인증 없는 로그인 본문이 거대 문자열을 싣고
+    # scrypt 입력·로그로 흘러가지 않게 한다. 비밀번호 관리자 생성값보다 넉넉한 값.
+    admin_password_max_length: int = 256
+    # 관리자 세션: 절대 만료(쿠키 max_age와 같은 값)·유휴 만료·last_seen_at 갱신 최소 간격(초).
+    # touch 간격은 요청마다 UPDATE를 내지 않기 위한 값이라 유휴 만료보다 훨씬 짧아야 한다.
+    admin_session_ttl_s: int = 12 * 60 * 60
+    admin_session_idle_s: int = 2 * 60 * 60
+    admin_session_touch_s: int = 60
+    # 관리자 쓰기·세션 판정 풀 상한(AdminService). 운영자 한 자릿수의 클릭이 전부다.
+    admin_pool_max: int = 2
+    # scrypt 동시 실행 상한(프로세스 단위). 1회에 128·r·n(기본 32 MiB)을 쓰므로, 인증 없는 로그인
+    # 폭주가 메모리를 무한히 끌어가지 않게 묶는다. 대기 중에는 DB 커넥션을 쥐지 않는다.
+    admin_password_hash_concurrency: int = 2
+    # 로그인 시도 제한 — 시도한 계정명 기준, 창(초) 안 실패가 이 수에 닿으면 창이 지날 때까지 429.
+    admin_login_max_failures: int = 5
+    admin_login_window_s: int = 900
 
     # 서버
     host: str = "0.0.0.0"
@@ -853,11 +866,12 @@ class Settings(BaseSettings):
     log_max_bytes: int = 10 * 1024 * 1024  # 로그 파일 회전 임계 크기(바이트)
     log_backup_count: int = 5  # 회전 보관 백업 파일 수
 
-    # 시크릿 (.env에서만 로드)
-    gemini_api_key: str = ""
-    openai_api_key: str = ""  # LiteLLM 경로(openai/*) 모델용
-    perplexity_api_key: str = ""  # web_search(퍼플렉시티 /search)용 — Bearer 토큰
-    tavily_api_key: str = ""  # web_fetch(Tavily /extract)용
+    # 시크릿 (.env에서만 로드). 시크릿 필드는 전부 repr=False — Settings repr(pytest monkeypatch의
+    # AttributeError 메시지가 통째로 싣는다)에 값이 평문으로 찍혔다(2026-09-14 실측).
+    gemini_api_key: str = Field(default="", repr=False)
+    openai_api_key: str = Field(default="", repr=False)  # LiteLLM 경로(openai/*) 모델용
+    perplexity_api_key: str = Field(default="", repr=False)  # web_search(퍼플렉시티 /search)용
+    tavily_api_key: str = Field(default="", repr=False)  # web_fetch(Tavily /extract)용
 
 
 @lru_cache

@@ -46,11 +46,26 @@ import unicodedata
 import uuid
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from google.genai import types
-from pydantic import AfterValidator, BaseModel, Field, StringConstraints, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 
-from yes24_agent.admin import require_admin
+from yes24_agent.admin_auth import (
+    AdminActor,
+    AdminService,
+    AdminTx,
+    EditBody,
+    EditChanges,
+    admin_enabled,
+    require_editor,
+)
 from yes24_agent.auth import AuthenticatedUser, get_authenticated_user
 from yes24_agent.config import Settings, get_genai_client, get_settings
 from yes24_agent.db import MysqlBackedService
@@ -208,12 +223,6 @@ _TREND_INSTRUCTION = (
 
 # 활성 풀 SELECT의 컬럼 순서 — dict 변환이 이 튜플로 하므로 SQL과 여기가 같이 움직인다.
 _POOL_COLUMNS = ("id", "slot", "text", "source", "goods_no", "run_date", "pinned")
-# 어드민 목록 SELECT의 컬럼 순서(DDL 전 컬럼).
-_ADMIN_COLUMNS = (
-    "id", "slot", "text", "source", "goods_no", "source_url", "run_date", "pinned", "active",
-    "valid_from", "valid_until", "created_at", "updated_at",
-)
-_RUN_COLUMNS = ("slot", "run_date", "status", "detail", "started_at")
 
 
 # ── 순수 함수(DB·네트워크 없음 — 테스트가 직접 잠근다) ─────────────────────────
@@ -1062,26 +1071,12 @@ class StarterService(MysqlBackedService):
     async def _finish_run(self, slot: str, today: dt.date, status: str, detail: str) -> None:
         await self._run(*self._finish_run_statement(slot, today, status, detail))
 
-    # ── 어드민 ────────────────────────────────────────────────────────────
+    # ── 어드민 쓰기 — 주어진 트랜잭션으로만 실행한다(커밋·감사 결합은 AdminService 소유) ──
+    # 목록·실행 이력 조회는 데이터 탐색 데이터셋(starters·starter_runs)이 서빙한다.
 
-    async def list_items(
-        self, *, slot: str | None, source: str | None, active: int | None
-    ) -> list[dict]:
-        where: list[str] = []
-        params: list = []
-        for column, value in (("slot", slot), ("source", source), ("active", active)):
-            if value is not None:
-                where.append(f"{column} = %s")
-                params.append(value)
-        sql = f"SELECT {', '.join(_ADMIN_COLUMNS)} FROM starters"
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY slot, pinned DESC, id DESC"
-        rows = await self._run(sql, tuple(params), fetch_all=True)
-        return [dict(zip(_ADMIN_COLUMNS, row)) for row in rows or ()]
-
+    @staticmethod
     async def add_item(
-        self,
+        tx: AdminTx,
         *,
         slot: str,
         text: str,
@@ -1089,42 +1084,27 @@ class StarterService(MysqlBackedService):
         valid_from: dt.date | None,
         valid_until: dt.date | None,
     ) -> int:
-        _, new_id = await self._run(
+        await tx.cur.execute(
             "INSERT INTO starters (slot, text, source, pinned, valid_from, valid_until) "
             "VALUES (%s, %s, %s, %s, %s, %s)",
             (slot, text, "manual", int(pinned), valid_from, valid_until),
         )
-        return new_id
+        return tx.cur.lastrowid
 
-    async def update_item(self, item_id: int, fields: dict) -> bool:
-        """주어진 필드만 갱신한다(불리언은 TINYINT로). 반환은 **그 항목이 있었는가**.
+    @staticmethod
+    async def update_item(
+        tx: AdminTx, item_id: int, fields: dict, expected: dict | None
+    ) -> tuple[dict, dict]:
+        """실린 필드만 갱신한다 — 행 잠금·404·expected 409·같은 값 제거는 edit_row 한 벌."""
+        return await tx.edit_row("starters", item_id, _EDITABLE, fields, expected)
 
-        rowcount로 판정하지 않는다 — MySQL은 값이 그대로면 0을 돌려주므로 "같은 값으로 다시
-        저장"이 "없는 항목"과 구별되지 않는다(그러면 정상 편집이 404가 된다).
-        """
-        assignments = ", ".join(f"{name} = %s" for name in fields)
-        values = tuple(int(v) if isinstance(v, bool) else v for v in fields.values())
-        rowcount, _ = await self._run(
-            f"UPDATE starters SET {assignments} WHERE id = %s", (*values, item_id)
+    @staticmethod
+    async def deactivate_item(tx: AdminTx, item_id: int, expected: dict | None) -> dict:
+        """비활성화하고 바뀐 경우의 before를 돌려준다(이미 비활성이면 {} — 감사 없음)."""
+        before, _ = await tx.edit_row(
+            "starters", item_id, _EDITABLE, {"active": False}, expected
         )
-        return bool(rowcount) or await self._exists(item_id)
-
-    async def deactivate_item(self, item_id: int) -> bool:
-        rowcount, _ = await self._run("UPDATE starters SET active = 0 WHERE id = %s", (item_id,))
-        return bool(rowcount) or await self._exists(item_id)
-
-    async def _exists(self, item_id: int) -> bool:
-        rows = await self._run("SELECT 1 FROM starters WHERE id = %s", (item_id,), fetch_all=True)
-        return bool(rows)
-
-    async def runs(self, *, today: dt.date, days: int) -> list[dict]:
-        rows = await self._run(
-            f"SELECT {', '.join(_RUN_COLUMNS)} FROM starter_runs "
-            "WHERE run_date >= %s - INTERVAL %s DAY ORDER BY run_date DESC, slot",
-            (today, days),
-            fetch_all=True,
-        )
-        return [dict(zip(_RUN_COLUMNS, row)) for row in rows or ()]
+        return before
 
 
 async def close_starter_service() -> None:
@@ -1228,34 +1208,47 @@ class StarterCreate(BaseModel):
     _range = model_validator(mode="after")(_check_valid_range)
 
 
-class StarterPatch(BaseModel):
-    """부분 갱신 — **실린 필드만** 바꾼다. 빈 본문은 422.
+class _StarterExpected(BaseModel):
+    """편집 프로토콜의 expected — 클라이언트가 본 현재값. 필드가 곧 편집 가능 컬럼이다.
 
-    text·pinned·active에 null을 실으면 422다. DDL이 NOT NULL인 컬럼인데, STRICT가 아닌
-    MySQL은 NULL을 ''·0으로 조용히 강등해 **빈 문장이 그대로 서빙**됐다(실측). 유효기간만
-    null을 받는다 — 그쪽은 "제한 없음"이라는 뜻이다.
+    문장 검증 없이 타입만 맞춘다: JSON 날짜 문자열·0/1이 DB 값과 같은 타입이어야 대조가 된다.
     """
 
-    text: _StarterText | None = None
+    model_config = ConfigDict(extra="forbid")
+
+    text: str | None = None
     pinned: bool | None = None
     active: bool | None = None
     valid_from: dt.date | None = None
     valid_until: dt.date | None = None
 
+
+_EDITABLE = tuple(_StarterExpected.model_fields)
+# 라우트 주석은 모듈 전역에서 해석된다(from __future__ annotations) — 함수 안에 두면 못 찾는다.
+_Editor = Annotated[AdminActor, Depends(require_editor)]
+_ExpectedBody = Annotated[_StarterExpected | None, Body(embed=True)]
+
+
+class StarterChanges(EditChanges):
+    """부분 갱신 — **실린 필드만** 바꾼다(빈 본문·모르는 필드 422는 EditChanges).
+
+    text·pinned·active는 타입에 None이 없다 — 생략은 통과, 명시한 null은 422. DDL이 NOT NULL인
+    컬럼인데 STRICT가 아닌 MySQL은 NULL을 ''·0으로 조용히 강등해 **빈 문장이 그대로 서빙**됐다
+    (실측). 유효기간만 null을 받는다 — 그쪽은 "제한 없음"이라는 뜻이다.
+    """
+
+    text: _StarterText = None
+    pinned: bool = None
+    active: bool = None
+    valid_from: dt.date | None = None
+    valid_until: dt.date | None = None
+
     _range = model_validator(mode="after")(_check_valid_range)
 
-    @model_validator(mode="after")
-    def _fields_present(self) -> StarterPatch:
-        if not self.model_fields_set:
-            raise ValueError("바꿀 필드가 하나도 없습니다")
-        nulled = [
-            name
-            for name in ("text", "pinned", "active")
-            if name in self.model_fields_set and getattr(self, name) is None
-        ]
-        if nulled:
-            raise ValueError(f"null을 받지 않는 필드입니다: {', '.join(nulled)}")
-        return self
+
+class StarterEdit(EditBody):
+    changes: StarterChanges
+    expected: _StarterExpected | None = None
 
 
 def register_starters(app: FastAPI, settings: Settings) -> None:
@@ -1297,48 +1290,53 @@ def register_starters(app: FastAPI, settings: Settings) -> None:
             n=n or settings.starter_count, slot=slot, today=_today()
         )
 
-    # 어드민 API — admin_password가 비어 있으면 미등록(404, admin.py 관례). 자격 판정은
-    # admin.require_admin이 소유한다(쿠키 또는 x-admin-key).
-    if not settings.admin_password:
+    # 어드민 쓰기 API — 등록 판정·세션·역할·트랜잭션은 admin_auth가 소유한다. 변경과 감사가
+    # 같은 트랜잭션이라 감사가 실패하면 변경도 롤백된다.
+    if not admin_enabled(settings):
         return
 
-    admin = {"include_in_schema": False, "dependencies": [Depends(require_admin)]}
+    @app.post("/admin/starters", status_code=201, include_in_schema=False)
+    async def admin_add(body: StarterCreate, request: Request, actor: _Editor) -> dict:
+        item = body.model_dump()
+        async with AdminService.get_instance().transaction(actor, request) as tx:
+            new_id = await StarterService.add_item(tx, **item)
+            await tx.audit("starter", new_id, "create", after=item)
+        return {"id": new_id, **item}
 
-    @app.get("/admin/starters", **admin)
-    async def admin_list(
-        slot: str | None = None, source: str | None = None, active: int | None = None
+    @app.patch("/admin/starters/{item_id}", include_in_schema=False)
+    async def admin_update(
+        item_id: int, body: StarterEdit, request: Request, actor: _Editor
     ) -> dict:
-        items = await StarterService.get_instance().list_items(
-            slot=slot, source=source, active=active
-        )
-        return {"items": items}
+        # model_dump는 선언 순서라 SET 절 순서가 고정된다(model_fields_set은 집합).
+        fields = body.changes.model_dump(exclude_unset=True)
+        expected = body.expected.model_dump(exclude_unset=True) if body.expected else None
+        async with AdminService.get_instance().transaction(actor, request) as tx:
+            before, after = await StarterService.update_item(tx, item_id, fields, expected)
+            if after:
+                await tx.audit("starter", item_id, "update", before, after)
+        return {"id": item_id, "updated": sorted(after)}
 
-    @app.post("/admin/starters", status_code=201, **admin)
-    async def admin_add(body: StarterCreate) -> dict:
-        new_id = await StarterService.get_instance().add_item(**body.model_dump())
-        return {"id": new_id, **body.model_dump()}
-
-    @app.patch("/admin/starters/{item_id}", **admin)
-    async def admin_update(item_id: int, body: StarterPatch) -> dict:
-        # 선언 순서로 SET 절을 만든다 — model_fields_set은 집합이라 순서가 임의다.
-        fields = {
-            name: getattr(body, name)
-            for name in StarterPatch.model_fields
-            if name in body.model_fields_set
-        }
-        if not await StarterService.get_instance().update_item(item_id, fields):
-            raise HTTPException(status_code=404, detail=f"없는 초기 질문입니다: {item_id}")
-        return {"id": item_id, "updated": sorted(fields)}
-
-    @app.delete("/admin/starters/{item_id}", **admin)
-    async def admin_delete(item_id: int) -> dict:
-        if not await StarterService.get_instance().deactivate_item(item_id):
-            raise HTTPException(status_code=404, detail=f"없는 초기 질문입니다: {item_id}")
+    @app.delete("/admin/starters/{item_id}", include_in_schema=False)
+    async def admin_delete(
+        item_id: int, request: Request, actor: _Editor, expected: _ExpectedBody = None
+    ) -> dict:
+        async with AdminService.get_instance().transaction(actor, request) as tx:
+            before = await StarterService.deactivate_item(
+                tx, item_id, expected.model_dump(exclude_unset=True) if expected else None
+            )
+            if before:
+                await tx.audit("starter", item_id, "deactivate", before, {"active": False})
         return {"id": item_id, "active": False}
 
-    @app.post("/admin/starters/generate", **admin)
-    async def admin_generate(slot: str | None = None, force: int = 0) -> dict:
-        """즉시 생성(동기 — 결과를 그대로 돌려준다). force=1이면 오늘자 run이 있어도 재실행."""
+    @app.post("/admin/starters/generate", include_in_schema=False)
+    async def admin_generate(
+        request: Request, actor: _Editor, slot: str | None = None, force: int = 0
+    ) -> dict:
+        """즉시 생성(동기 — 결과를 그대로 돌려준다). force=1이면 오늘자 run이 있어도 재실행.
+
+        생성은 수십 초에 자체 실행 선점 트랜잭션을 가져 감사와 결합하지 않는다 — 완료 후
+        별도 트랜잭션으로 결과 요약만 남긴다(생성 이력 정본은 starter_runs).
+        """
         allowed = auto_slots(settings)
         if slot is not None and slot not in allowed:
             raise HTTPException(
@@ -1346,11 +1344,13 @@ def register_starters(app: FastAPI, settings: Settings) -> None:
                 detail=f"자동 생성 슬롯이 아닙니다: {slot!r} (허용: {allowed})",
             )
         slots = [slot] if slot else allowed
-        return await StarterService.get_instance().run_generation(
+        results = await StarterService.get_instance().run_generation(
             slots, _today(), force=bool(force)
         )
-
-    @app.get("/admin/starters/runs", **admin)
-    async def admin_runs(days: int = 7) -> dict:
-        runs = await StarterService.get_instance().runs(today=_today(), days=days)
-        return {"runs": runs}
+        async with AdminService.get_instance().transaction(actor, request) as tx:
+            for key, result in results.items():
+                await tx.audit("starter", key, "generate", after={
+                    "force": bool(force), "status": result["status"],
+                    "inserted": result["inserted"],
+                })
+        return results

@@ -367,5 +367,5 @@ def signed_access_token(password: str, message: bytes) -> str:
 def token_matches(cookie_value: str | None, password: str, message: bytes) -> bool:
     """쿠키 토큰이 현재 비밀번호 파생값과 일치하는지 상수시간 비교로 판정한다."""
     return bool(cookie_value) and compare_digest(
-        cookie_value, signed_access_token(password, message)
+        cookie_value.encode("utf-8"), signed_access_token(password, message).encode("utf-8")
     )

@@ -1,74 +1,82 @@
-"""운영자용 데이터 조회 페이지 — 세션 DB(MySQL)를 **읽기 전용**으로 들여다본다.
+"""운영자용 데이터 라우트 — 세션 DB(MySQL)를 조회하고, 회원·키 상태만 바꾼다.
 
-대화의 정본은 턴 테이블 `chat_turn`(2026-09-09 정규화, docs/chat-turn-schema-2026-09-09.md)이고,
-운영 뷰 `chat_turn_activity`(scripts/operational_views.sql)가 거기에 턴별 토큰·피드백·클릭을
-결합해 준다. 이 모듈은 그 투영을 조회만 하는 얇은 라우터로, 삭제·수정·실행 엔드포인트를 두지
-않는다(운영 사고 방지). ADK `events` JSON은 읽지 않는다 — 조사 과정(도구 호출·결과)까지
-`chat_turn.process.steps`에 백필 행 포함 전부 들어 있어(라이브 실측) 파싱 계층이 필요 없다.
+모듈 경계: 누가(계정·세션·역할·감사 트랜잭션)는 `admin_auth`가, 무엇을 본다/바꾼다는 이
+모듈이 소유한다. 역방향 import는 없다. 권한은 라우트마다 최소 역할 하나다 — 조회는
+`require_admin`(viewer), 회원·키 변경은 `require_editor`
+(docs/admin-management-design-20260914.md §4).
 
-접속은 세션 DB와 **같은 URL**(session_service.mysql_pool_kwargs — 접속 정보의 단일 출처)에
-`SET SESSION TRANSACTION READ ONLY`를 init_command로 얹어 연다. 쓰기 문장은 서버가 1792로
-거부하므로(라이브 실측) 읽기 전용이 코드 규율이 아니라 접속의 속성이다. 요청마다 접속을
-열고 닫는다 — 운영자 클릭 몇 번이 전부라 풀·종료 훅이 필요 없다.
+조회: 대화의 정본은 턴 테이블 `chat_turn`(2026-09-09 정규화)이고, 운영 뷰 `chat_turn_activity`
+(scripts/operational_views.sql)가 거기에 턴별 토큰·피드백·클릭을 결합해 준다. ADK `events`
+JSON은 읽지 않는다 — 조사 과정까지 `chat_turn.process.steps`에 들어 있어 파싱 계층이 필요 없다.
+조회 접속은 세션 DB와 **같은 URL**(session_service.mysql_pool_kwargs — 접속 정보의 단일 출처)에
+`SET SESSION TRANSACTION READ ONLY`를 init_command로 얹어 요청마다 연다. 쓰기 문장은 서버가
+1792로 거부하므로 읽기 전용이 코드 규율이 아니라 접속의 속성이다.
 
-접근은 `admin_password`로 가린다. 값이 비어 있거나 세션 DB가 MySQL이 아니면 `register_admin`이
-라우트를 아예 등록하지 않아 404가 된다(matrix_enabled와 같은 패턴) — 설정하지 않은 환경에
-admin이 존재조차 하지 않게 하는 편이, 등록해 두고 인증으로 막는 것보다 노출 표면이 작다.
+변경: 회원 PATCH·키 PATCH는 읽기 전용 접속을 쓰지 않고 `AdminService.transaction`의 쓰기
+커넥션에서 편집 프로토콜(`AdminTx.edit_row` — FOR UPDATE·expected 대조)과 감사를 같은
+트랜잭션으로 커밋한다. 감사 기록 조회는 전용 API 없이 데이터셋 `audit`이 서빙한다.
+
+세션 DB가 MySQL이 아니면 `register_admin`이 라우트를 아예 등록하지 않아 404가 된다 — 설정하지
+않은 환경에 admin이 존재조차 하지 않게 하는 편이 노출 표면이 작다.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-from datetime import datetime, timezone
-from decimal import Decimal
+from datetime import date
 from pathlib import Path
-from secrets import compare_digest
-from typing import Any
+from typing import Annotated, Any, Literal
 
 import aiomysql
-from fastapi import APIRouter, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pydantic import Field, StrictBool, StrictInt
 
-from yes24_agent.auth import signed_access_token, token_matches
-from yes24_agent.config import Settings, get_settings
+from yes24_agent.admin_auth import (
+    AdminActor,
+    AdminService,
+    EditBody,
+    EditChanges,
+    require_admin,
+    require_editor,
+)
+from yes24_agent.admin_data import (
+    BOOL_DECODERS,
+    DATASETS,
+    EXACT_FILTER_KEYS,
+    dataset_for,
+    dataset_query,
+    date_range,
+    fetch_analytics,
+    fetch_dataset,
+    jsonable,
+    period_filter,
+    sql_where,
+    stream_csv,
+)
+from yes24_agent.config import Settings
 from yes24_agent.session_service import mysql_pool_kwargs
 
 logger = logging.getLogger(__name__)
 
 _ADMIN_HTML = Path(__file__).parent / "static" / "admin.html"
 
-# admin 게이트 쿠키. 채팅 로그인월(yes24_access)과 별도 이름·별도 비밀번호라, 데모 접근 권한이
-# 곧 운영 데이터 열람 권한이 되지 않는다.
-ADMIN_COOKIE = "yes24_admin"
-# 토큰 HMAC 메시지(비밀번호가 키). 값 자체는 비밀이 아니며 용도·버전만 구분한다.
-_TOKEN_MESSAGE = b"yes24-agent-admin-v1"
-
 # 접속 수준 읽기 전용. 세션 단위라 이 접속으로 실행되는 모든 문장에 걸린다.
-_READ_ONLY_COMMAND = "SET SESSION TRANSACTION READ ONLY"
-# 뷰가 JSON 텍스트로 돌려주는 열 — 응답에는 구조로 싣는다(DDL scripts/chat_turn.sql의 JSON 열).
-_JSON_COLUMNS = ("sources", "process", "meta", "error")
+_READ_ONLY_COMMAND = "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
 
+# /admin* 응답 헤더. admin.html은 인라인 스크립트·스타일이 없어 'self'만으로 돈다.
+_ADMIN_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'",
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+}
 
-def _expected_token(password: str) -> str:
-    """admin 토큰(auth.signed_access_token의 admin message 바인딩)."""
-    return signed_access_token(password, _TOKEN_MESSAGE)
+_DB_ERRORS = (aiomysql.Error, OSError, TimeoutError)
 
-
-def client_ip(request: Request) -> str:
-    """요청 출발지 IP — 프록시 뒤에서는 X-Forwarded-For 첫 항목을 쓴다.
-
-    로그인월(main.py)과 admin 로그인이 같이 쓴다. 위조 가능한 헤더라 차단 근거가 아니라
-    실패 시도를 사후에 알아볼 **관측 신호**로만 쓴다(차단은 프록시 계층 몫).
-    """
-    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    return forwarded or (request.client.host if request.client else "unknown")
-
-
-def _authorized(request: Request, password: str) -> bool:
-    """요청 쿠키가 현재 admin 비밀번호에서 파생된 토큰인지 상수시간 비교로 판정한다."""
-    cookie = request.cookies.get(ADMIN_COOKIE)
-    return token_matches(cookie, password, _TOKEN_MESSAGE)
+# 편집 가능 컬럼(편집 프로토콜의 SELECT … FOR UPDATE 대상이자 감사 before/after의 범위).
+USER_EDITABLE = ("is_active", "rate_limit_rpm", "rate_limit_rpd")
+KEY_EDITABLE = ("is_active",)
 
 
 def readonly_connect_kwargs(session_db_url: str) -> dict[str, Any] | None:
@@ -83,57 +91,46 @@ def readonly_connect_kwargs(session_db_url: str) -> dict[str, Any] | None:
     for pool_only in ("minsize", "maxsize"):
         kwargs.pop(pool_only)
     kwargs["init_command"] = f"{kwargs['init_command']}; {_READ_ONLY_COMMAND}"
+    kwargs["conv"] = BOOL_DECODERS
     return kwargs
-
-
-# ── 행 정형 ────────────────────────────────────────────────────────────────
-
-
-def _epoch(value: datetime | None) -> float | None:
-    """DB의 naive UTC DATETIME → epoch 초(히스토리 API와 같은 축, 화면이 로컬 시각으로 그린다)."""
-    return None if value is None else value.replace(tzinfo=timezone.utc).timestamp()
-
-
-def _jsonable(row: dict[str, Any]) -> dict[str, Any]:
-    """뷰 행을 응답 dict로 — 시각은 epoch, JSON 열은 구조, 집계(Decimal)는 정수."""
-    out: dict[str, Any] = {}
-    for key, value in row.items():
-        if isinstance(value, datetime):
-            value = _epoch(value)
-        elif isinstance(value, Decimal):
-            value = int(value)
-        elif key in _JSON_COLUMNS and isinstance(value, (str, bytes)):
-            value = json.loads(value)
-        out[key] = value
-    return out
 
 
 # ── 조회 ───────────────────────────────────────────────────────────────────
 
-_SESSION_TURNS = (
-    "t.app_name = s.app_name AND t.user_id = s.user_id AND t.session_id = s.id"
-)
+_SESSION_TURNS = "t.app_name = s.app_name AND t.user_id = s.user_id AND t.session_id = s.id"
+# chat_turn_activity의 JSON 열(DDL scripts/chat_turn.sql) — 세션 상세가 구조로 싣는다.
+_TURN_JSON_COLUMNS = ("error", "sources", "process", "meta")
 
 
 async def fetch_overview(cur: aiomysql.DictCursor) -> dict[str, Any]:
-    """개요: 세션·턴 수, DB 크기, 최근 활동, 앱별 분포."""
+    """개요: 세션·턴·회원 수, DB 크기, 최근 활동, 앱·턴 상태별 분포."""
     await cur.execute(
         "SELECT (SELECT COUNT(*) FROM sessions) AS sessions, "
         "(SELECT COUNT(*) FROM chat_turn) AS turns, "
+        "(SELECT COUNT(*) FROM users) AS users, "
+        "(SELECT COUNT(*) FROM users WHERE is_active = 1) AS active_users, "
         "(SELECT MAX(update_time) FROM sessions) AS last_activity, "
         "(SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.tables "
         "WHERE table_schema = DATABASE()) AS db_bytes"
     )
-    overview = _jsonable(await cur.fetchone())
+    overview = jsonable(await cur.fetchone())
     await cur.execute(
         "SELECT app_name, COUNT(*) AS count FROM sessions GROUP BY app_name ORDER BY count DESC"
     )
     overview["apps"] = list(await cur.fetchall())
+    await cur.execute("SELECT status, COUNT(*) AS count FROM chat_turn GROUP BY status")
+    overview["turn_statuses"] = list(await cur.fetchall())
     return overview
 
 
 async def fetch_sessions(
-    cur: aiomysql.DictCursor, settings: Settings, *, query: str, since: str, until: str, page: int
+    cur: aiomysql.DictCursor,
+    settings: Settings,
+    *,
+    query: str,
+    since: date | None,
+    until: date | None,
+    page: int,
 ) -> dict[str, Any]:
     """세션 목록(최근 갱신순 페이지네이션 + 검색·기간 필터).
 
@@ -141,8 +138,7 @@ async def fetch_sessions(
     치든 같은 입력창에서 찾게 한다. 본문은 chat_turn의 질문·답변 TEXT라 한글 원문 LIKE가
     그대로 맞는다(events JSON의 escape 표기 문제가 없다).
     """
-    where: list[str] = []
-    params: list[Any] = []
+    where, params = period_filter("s.update_time", (since, until))
 
     if query:
         where.append(
@@ -150,16 +146,8 @@ async def fetch_sessions(
             f"{_SESSION_TURNS} AND (t.user_text LIKE %s OR t.text LIKE %s)))"
         )
         params.extend([f"%{query}%"] * 3)
-    if since:
-        where.append("s.update_time >= %s")
-        params.append(since)
-    if until:
-        # until은 날짜(YYYY-MM-DD)라 그날 하루를 통째로 포함해야 한다 — 다음 날 00:00 미만.
-        where.append("s.update_time < %s + INTERVAL 1 DAY")
-        params.append(until)
-
-    sql_where = f"WHERE {' AND '.join(where)}" if where else ""
-    await cur.execute(f"SELECT COUNT(*) AS total FROM sessions s {sql_where}", params)
+    where_sql = sql_where(where)
+    await cur.execute(f"SELECT COUNT(*) AS total FROM sessions s {where_sql}", params)
     total = (await cur.fetchone())["total"]
 
     size = settings.admin_page_size
@@ -169,23 +157,39 @@ async def fetch_sessions(
         # 미리보기 = 첫 턴의 질문 앞부분. 자르기를 SQL에 맡겨 본문 전체를 끌어오지 않는다.
         f"(SELECT LEFT(t.user_text, %s) FROM chat_turn t WHERE {_SESSION_TURNS} "
         "ORDER BY t.started_at, t.id LIMIT 1) AS preview "
-        f"FROM sessions s {sql_where} ORDER BY s.update_time DESC LIMIT %s OFFSET %s",
-        [settings.admin_preview_max_chars, *params, size, max(page, 0) * size],
+        f"FROM sessions s {where_sql} "
+        "ORDER BY s.update_time DESC, s.app_name, s.user_id, s.id LIMIT %s OFFSET %s",
+        [settings.admin_preview_max_chars, *params, size, page * size],
     )
-    items = [_jsonable(row) for row in await cur.fetchall()]
+    items = [jsonable(row) for row in await cur.fetchall()]
     return {"total": total, "page": page, "page_size": size, "items": items}
 
 
-async def fetch_session_detail(cur: aiomysql.DictCursor, session_id: str) -> dict[str, Any] | None:
+async def fetch_session_detail(
+    cur: aiomysql.DictCursor,
+    session_id: str,
+    app_name: str | None = None,
+    user_id: str | None = None,
+) -> dict[str, Any] | None:
     """세션 상세: 턴 타임라인(질문·답변·상태·과정·출처·토큰·피드백·클릭) + 간단 지표."""
+    where = ["id = %s"]
+    params = [session_id]
+    for column, value in (("app_name", app_name), ("user_id", user_id)):
+        if value is not None:
+            where.append(f"{column} = %s")
+            params.append(value)
     await cur.execute(
-        "SELECT app_name, user_id, id, create_time, update_time FROM sessions WHERE id = %s",
-        (session_id,),
+        "SELECT app_name, user_id, id, create_time, update_time FROM sessions WHERE "
+        + " AND ".join(where)
+        + " LIMIT 2",
+        params,
     )
-    row = await cur.fetchone()
-    if row is None:
+    rows = await cur.fetchall()
+    if not rows:
         return None
-    session = _jsonable(row)
+    if len(rows) > 1:
+        raise HTTPException(status_code=409, detail="앱과 사용자 식별자를 함께 지정해 주세요.")
+    session = jsonable(rows[0])
 
     await cur.execute(
         "SELECT turn_id, asked_at, completed_at, user_message, assistant_message, status, "
@@ -194,9 +198,7 @@ async def fetch_session_detail(cur: aiomysql.DictCursor, session_id: str) -> dic
         "WHERE app_name = %s AND user_id = %s AND session_id = %s ORDER BY asked_at, turn_id",
         (session["app_name"], session["user_id"], session_id),
     )
-    turns = [_jsonable(turn) for turn in await cur.fetchall()]
-    for turn in turns:
-        turn["history_saved"] = bool(turn["history_saved"])
+    turns = [jsonable(turn, _TURN_JSON_COLUMNS) for turn in await cur.fetchall()]
 
     elapsed = [turn["elapsed_ms"] for turn in turns if turn["elapsed_ms"] is not None]
     return {
@@ -209,106 +211,286 @@ async def fetch_session_detail(cur: aiomysql.DictCursor, session_id: str) -> dic
     }
 
 
-def require_admin(request: Request) -> None:
-    """운영자 자격 판정자 — admin 쿠키(/admin 로그인) 또는 헤더 `x-admin-key`.
+async def fetch_user(cur: aiomysql.DictCursor, user_id: int) -> dict[str, Any] | None:
+    """회원 1명 — 행 패널이 편집 대상 필드(expected의 출처)를 읽는다."""
+    await cur.execute(
+        "SELECT id, user_no, user_login_id, is_active, rate_limit_rpm, rate_limit_rpd, "
+        "created_at, updated_at FROM users WHERE id = %s",
+        (user_id,),
+    )
+    row = await cur.fetchone()
+    return None if row is None else jsonable(row)
 
-    헤더를 함께 받는 이유: 쿠키 없이 붙는 외부 운영 도구(스크립트)의 자리다. 로그인월
-    (main.access_gate)은 이 함수를 **의존성으로 가진 라우트만** x-admin-key로 열어 준다
-    (판정 위임, get_authenticated_user와 같은 규칙).
-    """
-    password = get_settings().admin_password
-    header = request.headers.get("x-admin-key", "")
-    if password and (
-        _authorized(request, password)
-        or compare_digest(header.encode("utf-8"), password.encode("utf-8"))
-    ):
-        return
-    raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+
+async def fetch_user_detail(cur: aiomysql.DictCursor, user_id: int) -> dict[str, Any] | None:
+    """회원 + 키 목록. 키 해시·raw_user_info는 싣지 않는다."""
+    user = await fetch_user(cur, user_id)
+    if user is None:
+        return None
+    await cur.execute(
+        "SELECT id, kind, is_active, created_at, user_cached_at FROM auth_keys "
+        "WHERE user_id = %s ORDER BY id",
+        (user_id,),
+    )
+    return {"user": user, "keys": [jsonable(row) for row in await cur.fetchall()]}
+
+
+# ── 변경 본문 ──────────────────────────────────────────────────────────────
+
+# users.rate_limit_rpm·rpd는 `INT`(scripts/auth_schema.sql) — 부호 있는 32비트 한계. 범위 밖 값이
+# DB 오류(503)가 되기 전에 DB CHECK(ck_users_limits, >= 0)와 함께 422로 먼저 건다.
+MYSQL_INT_MAX = 2**31 - 1
+_NonNegative = Annotated[StrictInt, Field(ge=0, le=MYSQL_INT_MAX)]
+
+
+class UserChanges(EditChanges):
+    # 타입에 None이 없다 — 생략은 기본값(미검증)이라 통과하고, 명시한 null은 422다(NOT NULL 열).
+    is_active: StrictBool = Field(default=None)
+    rate_limit_rpm: _NonNegative = Field(default=None)
+    rate_limit_rpd: _NonNegative = Field(default=None)
+
+
+class KeyChanges(EditChanges):
+    is_active: StrictBool
+
+
+class UserEdit(EditBody):
+    changes: UserChanges
+
+
+class KeyEdit(EditBody):
+    changes: KeyChanges
 
 
 # ── 라우터 ─────────────────────────────────────────────────────────────────
 
 
-def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -> None:
-    """admin_password가 설정되고 세션 DB가 MySQL일 때만 admin 라우트를 등록한다(아니면 404).
+class _ExportResponse(StreamingResponse):
+    """스트림이 끝나든 시작 전에 끊기든 접속을 닫는다(접속 수명의 단일 소유자)."""
 
+    def __init__(self, content, connection, **kwargs):
+        super().__init__(content, **kwargs)
+        self.connection = connection
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.connection.close()
+
+
+def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -> None:
+    """세션 DB가 MySQL일 때만 admin 데이터 라우트를 등록한다(아니면 404).
+
+    등록 조건은 `admin_auth.admin_enabled`와 같은 판정(mysql_pool_kwargs가 None이 아님)이며,
+    읽기 전용 접속 kwargs를 만드는 김에 그 결과로 판정한다.
     connect는 테스트 주입점이다(실 DB 없이 전 경로를 돈다 — AuthService의 pool_factory 패턴).
     """
     connect_kwargs = readonly_connect_kwargs(settings.session_db_url)
-    if not settings.admin_password or connect_kwargs is None:
+    if connect_kwargs is None:
         return
+    # CSV 내보내기는 조건 전체를 긁을 수 있어 질의 시간 상한을 접속에 건다(SELECT에만 적용).
+    export_kwargs = {
+        **connect_kwargs,
+        "init_command": f"{connect_kwargs['init_command']}; "
+        f"SET SESSION MAX_EXECUTION_TIME = {settings.admin_export_max_execution_ms}",
+    }
 
-    router = APIRouter(prefix="/admin")
+    router = APIRouter(prefix="/admin", include_in_schema=False)
 
-    def _guard(request: Request) -> JSONResponse | None:
-        if _authorized(request, settings.admin_password):
-            return None
-        return JSONResponse({"detail": "인증이 필요합니다."}, status_code=401)
+    @app.middleware("http")
+    async def admin_headers(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path == router.prefix or request.url.path.startswith(router.prefix + "/"):
+            response.headers.update(_ADMIN_HEADERS)
+        return response
 
-    async def _query(fetch, *args):
-        """읽기 전용 접속을 열어 조회 하나를 실행하고 닫는다."""
-        conn = await connect(**connect_kwargs)
+    async def _connect_snapshot(kwargs: dict[str, Any]):
+        conn = await connect(**kwargs)
         try:
             async with conn.cursor(aiomysql.DictCursor) as cur:
-                return await fetch(cur, *args)
-        finally:
+                await cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+            return conn
+        except BaseException:
             conn.close()
+            raise
+
+    async def _query(fetch, *args):
+        """한 요청의 모든 SELECT를 동일한 읽기 전용 스냅샷에서 실행한다."""
+        try:
+            conn = await _connect_snapshot(connect_kwargs)
+            try:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    return await fetch(cur, *args)
+            finally:
+                try:
+                    await conn.rollback()
+                finally:
+                    conn.close()
+        except _DB_ERRORS as exc:
+            logger.warning(f"admin DB 조회 실패: {type(exc).__name__}")
+            raise HTTPException(status_code=503, detail="데이터를 불러올 수 없습니다.") from None
 
     @router.get("")
     async def admin_page() -> FileResponse:
-        """admin UI 셸(데이터 없음 — 조회는 아래 API가 쿠키를 요구한다)."""
+        """admin UI 셸(데이터 없음 — 조회는 아래 API가 세션을 요구한다)."""
         return FileResponse(_ADMIN_HTML, media_type="text/html")
 
-    @router.post("/api/login")
-    async def admin_login(request: Request) -> JSONResponse:
-        """admin 비밀번호를 검증해 성공 시 게이트 쿠키를 발급한다."""
-        body = await request.json()
-        candidate = str(body.get("password", ""))
-        if not compare_digest(
-            candidate.encode("utf-8"), settings.admin_password.encode("utf-8")
-        ):
-            logger.warning(f"admin 로그인 실패: ip={client_ip(request)}")
-            return JSONResponse({"detail": "비밀번호가 올바르지 않습니다."}, status_code=401)
-        resp = JSONResponse({"ok": True})
-        resp.set_cookie(
-            ADMIN_COOKIE,
-            _expected_token(settings.admin_password),
-            max_age=settings.access_cookie_max_age_s,
-            httponly=True,
-            samesite="lax",
-            secure=settings.cookie_secure,
-            # admin 쿠키를 읽는 곳은 전부 /admin 하위(admin.html의 fetch 3종 + 이 로그인)라
-            # path를 좁힌다. 기본 "/"면 채팅·SSE·정적 요청마다 운영자 토큰이 함께 실려 나간다.
-            path=router.prefix,
-        )
-        return resp
-
-    @router.get("/api/overview")
-    async def admin_overview(request: Request) -> Any:
-        if denied := _guard(request):
-            return denied
+    @router.get("/api/overview", dependencies=[Depends(require_admin)])
+    async def admin_overview() -> Any:
         return await _query(fetch_overview)
 
-    @router.get("/api/sessions")
+    @router.get("/api/sessions", dependencies=[Depends(require_admin)])
     async def admin_sessions(
-        request: Request, q: str = "", since: str = "", until: str = "", page: int = 0
+        q: str = "",
+        period: tuple[date | None, date | None] = Depends(date_range),
+        page: int = Query(default=0, ge=0, le=settings.admin_max_page),
     ) -> Any:
-        if denied := _guard(request):
-            return denied
         return await _query(
-            lambda cur, s: fetch_sessions(
-                cur, s, query=q.strip(), since=since, until=until, page=page
-            ),
-            settings,
+            lambda cur: fetch_sessions(
+                cur, settings, query=q.strip(), since=period[0], until=period[1], page=page
+            )
         )
 
-    @router.get("/api/sessions/{session_id}")
-    async def admin_session_detail(request: Request, session_id: str) -> Any:
-        if denied := _guard(request):
-            return denied
-        detail = await _query(fetch_session_detail, session_id)
+    @router.get("/api/sessions/{session_id}", dependencies=[Depends(require_admin)])
+    async def admin_session_detail(
+        session_id: str,
+        app_name: str | None = None,
+        user_id: str | None = None,
+    ) -> Any:
+        detail = await _query(fetch_session_detail, session_id, app_name, user_id)
         if detail is None:
             return JSONResponse({"detail": "세션을 찾을 수 없습니다."}, status_code=404)
         return detail
+
+    @router.get("/api/users/{user_id}", dependencies=[Depends(require_admin)])
+    async def admin_user_detail(user_id: int) -> Any:
+        detail = await _query(fetch_user_detail, user_id)
+        if detail is None:
+            return JSONResponse({"detail": "회원을 찾을 수 없습니다."}, status_code=404)
+        return detail
+
+    @router.patch("/api/users/{user_id}")
+    async def admin_patch_user(
+        user_id: int,
+        body: UserEdit,
+        request: Request,
+        actor: AdminActor = Depends(require_editor),
+    ) -> Any:
+        """회원 활성·한도 변경. 다음 요청부터 두 서버 모두 반영된다(auth가 요청마다 DB를 읽는다)."""
+        async with AdminService.get_instance().transaction(actor, request) as tx:
+            before, after = await tx.edit_row(
+                "users",
+                user_id,
+                USER_EDITABLE,
+                body.changes.model_dump(exclude_unset=True),
+                body.expected,
+            )
+            if after:
+                await tx.audit("user", user_id, "update", before, after)
+            user = await fetch_user(tx.cur, user_id)
+        return {"id": user_id, "updated": sorted(after), "user": user}
+
+    @router.patch("/api/users/{user_id}/keys/{key_id}")
+    async def admin_patch_key(
+        user_id: int,
+        key_id: int,
+        body: KeyEdit,
+        request: Request,
+        actor: AdminActor = Depends(require_editor),
+    ) -> Any:
+        """키 활성 변경. 키가 그 회원 것이 아니면 행이 없는 것과 같이 404다."""
+        async with AdminService.get_instance().transaction(actor, request) as tx:
+            before, after = await tx.edit_row(
+                "auth_keys",
+                key_id,
+                KEY_EDITABLE,
+                body.changes.model_dump(exclude_unset=True),
+                body.expected,
+                scope={"user_id": user_id},
+            )
+            if after:
+                await tx.audit("auth_key", key_id, "update", before, after)
+        return {"id": key_id, "updated": sorted(after)}
+
+    @router.get("/api/datasets", dependencies=[Depends(require_admin)])
+    async def admin_datasets() -> Any:
+        return {"items": [dataset.metadata() for dataset in DATASETS.values()]}
+
+    def _data_selection(
+        dataset_id: str,
+        request: Request,
+        q: str = "",
+        sort: str = "",
+        direction: Literal["asc", "desc"] = "desc",
+        status: str = "",
+        status_null: bool = False,
+        app_name: str = "",
+        period: tuple[date | None, date | None] = Depends(date_range),
+    ):
+        dataset = dataset_for(dataset_id, sort, status, app_name)
+        selection = dataset_query(
+            dataset,
+            query=q.strip(),
+            period=period,
+            app_name=app_name,
+            status=status,
+            status_null=status_null,
+            sort=sort,
+            direction=direction,
+            # 정확 일치 필터 이름은 데이터셋 선언이 정본이다(여기서 다시 열거하지 않는다).
+            exact={key: request.query_params.get(key, "") for key in EXACT_FILTER_KEYS},
+        )
+        return dataset, selection
+
+    @router.get("/api/data/{dataset_id}", dependencies=[Depends(require_admin)])
+    async def admin_dataset(
+        selected=Depends(_data_selection),
+        page: int = Query(default=0, ge=0, le=settings.admin_max_page),
+    ) -> Any:
+        dataset, selection = selected
+        return await _query(
+            lambda cur: fetch_dataset(
+                cur, dataset, selection, page=page, size=settings.admin_page_size
+            )
+        )
+
+    @router.get("/api/data/{dataset_id}/export", dependencies=[Depends(require_admin)])
+    async def admin_export(
+        selected=Depends(_data_selection),
+        page: int | None = Query(default=None, ge=0, le=settings.admin_max_page),
+    ) -> StreamingResponse:
+        """조건 전체(page 없음) 또는 그 페이지만 CSV로 — 조회와 같은 스냅샷 규칙이다."""
+        dataset, (_, rows_sql, params) = selected
+        size = settings.admin_page_size
+        if page is not None:
+            rows_sql, params = rows_sql + " LIMIT %s OFFSET %s", [*params, size, page * size]
+        connection = None
+        try:
+            connection = await _connect_snapshot(export_kwargs)
+            cur = await connection.cursor(aiomysql.SSDictCursor)
+            await cur.execute(rows_sql, params)
+            return _ExportResponse(
+                stream_csv(cur, dataset, size),
+                connection,
+                media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition": f'attachment; filename="{dataset.id}.csv"'},
+            )
+        except BaseException as exc:
+            if connection is not None:
+                connection.close()
+            if isinstance(exc, _DB_ERRORS):
+                logger.warning(f"admin CSV 조회 실패: {type(exc).__name__}")
+                raise HTTPException(
+                    status_code=503, detail="데이터를 불러올 수 없습니다."
+                ) from None
+            raise
+
+    @router.get("/api/analytics", dependencies=[Depends(require_admin)])
+    async def admin_analytics(
+        period: tuple[date | None, date | None] = Depends(date_range),
+        app_name: str = "",
+    ) -> Any:
+        return await _query(fetch_analytics, period, app_name)
 
     app.include_router(router)
