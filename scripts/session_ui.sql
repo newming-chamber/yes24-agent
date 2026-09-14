@@ -24,8 +24,9 @@ CREATE TABLE IF NOT EXISTS session_ui (
     -- 직접 비교한다 — unread = last_update_time > last_read_at.
     last_read_at  DOUBLE       NULL,
     -- 사용자가 삭제를 요청한 시각(UTC). NULL = 살아 있는 대화. 값이 있으면 모든 사용자 경로에서
-    -- 부재(404)이고, session_delete_retention_days가 지나면 앱의 파기 루프가 부모 sessions 행을
-    -- 지운다(FK CASCADE로 이 행·chat_turn·turn_feedback·events가 함께 사라진다). 어드민 복구는
+    -- 부재(404)이고, session_delete_retention_days가 양수면(기본 0 = 무기한 보존) 그 일수 뒤
+    -- 앱의 파기 루프가 부모 sessions 행을 지운다(FK CASCADE로 이 행·chat_turn·turn_feedback·
+    -- events가 함께 사라진다). 어드민 복구는
     -- NULL로 되돌리는 것이다. 첫 삭제 시각을 유지한다(재삭제가 보존 시계를 되감지 않는다).
     -- 기존 DB에는 scripts/session_ui_deleted_at.sql로 더한다.
     deleted_at    TIMESTAMP(3) NULL,

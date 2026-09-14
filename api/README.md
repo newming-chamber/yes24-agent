@@ -538,7 +538,7 @@ process의 `*_ms`는 epoch가 아닌 **소요 시간**이다.
 |---|---|
 | `GET /chat/sessions` | 내 세션 목록 |
 | `GET /chat/sessions/{session_id}` | 질문과 턴 스냅샷 복원(읽음 처리 포함) |
-| `DELETE /chat/sessions/{session_id}` | 204. 즉시 전 경로에서 숨김(이후 목록 제외·조회/피드백/클릭 404, 재삭제 404). 보존 기간 뒤 서버가 자동 파기(기간은 OpenAPI 설명) |
+| `DELETE /chat/sessions/{session_id}` | 204. 즉시 전 경로에서 숨김(이후 목록 제외·조회/피드백/클릭 404, 재삭제 404). 서버는 기본 무기한 보존(운영 설정으로 보존 기간을 두면 그 뒤 자동 파기) |
 | `PUT /chat/sessions/{session_id}/turns/{turn_id}/feedback` | `{rating:"up"\|"down"\|"none",comment?}` (`none`은 철회) |
 | `POST /chat/sessions/{session_id}/turns/{turn_id}/clicks` | `{url,source_id?,source_type?,label?}` |
 

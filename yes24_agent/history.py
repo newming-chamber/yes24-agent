@@ -813,8 +813,8 @@ def register_history(app: FastAPI) -> None:
         summary="대화 삭제",
         description="대화를 목록·복원·읽음·이름 변경·피드백·클릭 **전 경로에서 즉시 숨긴다**(이후"
         " 전부 404, 두 번째 DELETE도 404). 서버는 대화와 그 대화에 남긴 것(좋아요/싫어요·코멘트·"
-        f"직접 지은 제목)을 **{get_settings().session_delete_retention_days}일** 동안 보관한 뒤"
-        " 자동으로 파기한다(되돌릴 수 없음). 그 전에는 고객센터 요청으로 복구될 수 있다."
+        "직접 지은 제목)을 **기본적으로 기한 없이 보관**하며, 운영 설정으로 보존 기간이 정해지면"
+        " 그 뒤 자동으로 파기한다(되돌릴 수 없음). 보관 중에는 고객센터 요청으로 복구될 수 있다."
         " 삭제한 session_id로 /chat/stream을 보내면 새 대화가 **새 session_id**로 시작된다"
         "(done.session_id가 정본).",
     )

@@ -20,8 +20,9 @@ ADK는 LLM 원시 이벤트를, chat_turn은 사용자에게 공개한 확정본
 
 **대화 삭제는 소프트 삭제다**(docs/softdelete-design-20260914.md). DELETE는
 `session_ui.deleted_at`만 찍고, 그 순간부터 사용자 경로 전체에서 부재(404)다 — 읽기는
-`history.owned_session` 한 곳이, 쓰기는 `_run_owned`의 부모 잠금 술어가 막는다. 보존 기간
-(`session_delete_retention_days`)이 지나면 파기 루프가 부모 `sessions` 행을 지우고 FK CASCADE가
+`history.owned_session` 한 곳이, 쓰기는 `_run_owned`의 부모 잠금 술어가 막는다. 기본은 무기한
+보존이고, 보존 일수(`session_delete_retention_days`)를 양수로 두면 그 뒤 파기 루프가 부모
+`sessions` 행을 지우고 FK CASCADE가
 events·chat_turn·turn_feedback·session_ui를 함께 지운다. turn_click·usage_log는 FK가 없어
 남는다(분석 로그, 2026-09-08 결정).
 
@@ -468,11 +469,15 @@ class UserDataService(MysqlBackedService):
     async def purge_expired_sessions(self) -> int:
         """보존 기간이 지난 삭제 대화를 물리 파기하고 파기한 세션 수를 돌려준다.
 
+        보존 일수가 0(무기한 보존)이면 아무것도 하지 않는다. 루프는 start_purge_loop가 이미 안
+        띄우지만, 수동 호출(API·스크립트)에서 0이 "삭제분 전부 만료"로 해석되면 되돌릴 수 없는
+        전량 파기라 파괴적 경로의 입구에서 한 번 더 막는다(이중 방어).
+
         배치(`session_purge_batch_size`)를 가득 채운 동안 반복해 밀린 분량을 한 주기에 비운다.
         """
-        if not self.enabled:
-            return 0
         settings = get_settings()
+        if not self.enabled or settings.session_delete_retention_days <= 0:
+            return 0
         purged = 0
         while True:
             batch = await self._purge_batch(
@@ -538,8 +543,10 @@ class UserDataService(MysqlBackedService):
             return purged
 
     def start_purge_loop(self) -> None:
-        """파기 루프를 띄운다(lifespan). 저장소가 없는 구성이면 파기할 것도 없어 no-op이다."""
-        if self.enabled and self._purge_task is None:
+        """파기 루프를 띄운다(lifespan). 저장소가 없거나 보존 일수가 0(무기한 보존)이면 태스크를
+        만들지 않는다 — 파기 여부의 판정은 여기 한 곳이다."""
+        retention = get_settings().session_delete_retention_days
+        if self.enabled and retention and self._purge_task is None:
             self._purge_task = asyncio.get_running_loop().create_task(self._purge_forever())
 
     async def _purge_forever(self) -> None:
