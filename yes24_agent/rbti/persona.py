@@ -61,14 +61,56 @@ AXIS_FRAGMENTS: dict[str, dict[str, str]] = {
     },
 }
 
+# 축·축값의 **화면 표기** 정본. 코드 4글자만으로는 사람이 고를 수 없으므로 선택기와 카드가
+# 읽을 문구를 데이터로 둔다(AXIS_FRAGMENTS는 프롬프트용 데이터, 이건 표시용이라 층위가 다르다
+# — 프롬프트에는 얹지 않는다). `GET /rbti/types`가 이 표를 그대로 내보내므로 프론트마다 같은
+# 문구를 손으로 베끼지 않아도 된다(`static/lib/rbti.js`가 그 사본이었고, 외부 프론트가 생기면
+# 사본이 하나 더 늘 자리였다).
+#   label/short_label  : 축 제목(긴/짧은). 짧은 쪽은 매트릭스 필터 칩처럼 폭이 좁은 자리용.
+#   values[code].label : 그 글자의 짧은 라벨. axis_label()이 "완독-분석-깊이-정보"를 파생한다.
+#   values[code].title/desc : 선택기에서 "이 값이 무엇인지"를 한 줄로 설명하는 문구.
+AXIS_UI_KO: dict[str, dict[str, object]] = {
+    "pattern": {
+        "label": "독서 패턴",
+        "short_label": "패턴",
+        "values": {
+            "C": {"label": "완독", "title": "정독·완독", "desc": "한 권을 끝까지"},
+            "S": {"label": "선택", "title": "발췌·탐색", "desc": "여러 권 골라 읽기"},
+        },
+    },
+    "processing": {
+        "label": "정보 처리",
+        "short_label": "처리",
+        "values": {
+            "A": {"label": "분석", "title": "논리·분석", "desc": "근거와 구조로"},
+            "E": {"label": "공감", "title": "감성·공감", "desc": "감정과 울림으로"},
+        },
+    },
+    "breadth": {
+        "label": "취향의 폭",
+        "short_label": "폭",
+        "values": {
+            "D": {"label": "깊이", "title": "깊이·심화", "desc": "한 분야 깊게"},
+            "B": {"label": "넓이", "title": "넓이·확장", "desc": "여러 분야 넓게"},
+        },
+    },
+    "motivation": {
+        "label": "독서 동기",
+        "short_label": "동기",
+        "values": {
+            "I": {"label": "정보", "title": "지식·정보", "desc": "배우고 얻으려"},
+            "F": {"label": "재미", "title": "재미·즐거움", "desc": "즐기고 몰입하려"},
+        },
+    },
+}
+
 # 축값 → 한글 라벨. 축 설명("완독-분석-깊이-정보")을 코드에서 결정론적으로 파생하는 데 쓴다.
 # 스프레드시트 헤더의 한글 축설명엔 원본 오타가 있어(예: CEBI를 "선택-…"로 오기 — 실제 C=완독)
 # 시트 원문을 데이터로 박지 않고 코드+이 라벨맵으로 파생한다(docs/rbti-feature-plan.md 참조).
+# **위 AXIS_UI_KO에서 파생한 뷰다** — 같은 8개 축값을 가리키는 표를 두 벌 두지 않는다.
 AXIS_VALUE_LABELS_KO: dict[str, dict[str, str]] = {
-    "pattern": {"C": "완독", "S": "선택"},
-    "processing": {"A": "분석", "E": "공감"},
-    "breadth": {"D": "깊이", "B": "넓이"},
-    "motivation": {"I": "정보", "F": "재미"},
+    axis: {code: value["label"] for code, value in ui["values"].items()}  # type: ignore[index,union-attr]
+    for axis, ui in AXIS_UI_KO.items()
 }
 
 # 16 유형 아키타입 — 스프레드시트 "유형별 코멘트"의 콘텐츠 데이터(AXIS_FRAGMENTS가 합성 톤용

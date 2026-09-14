@@ -52,6 +52,7 @@ from yes24_agent.overview import (
 )
 from yes24_agent.rbti.persona import is_valid_code
 from yes24_agent.rbti.profile import fetch_user_rbti
+from yes24_agent.rbti.routes import register_rbti
 from yes24_agent.runner import run_agent_stream
 from yes24_agent.session_service import SQLITE_DIALECT, db_dialect, persistence_mode
 from yes24_agent.sse import OVERVIEW_EVENT_CONTRACT, SSE_EVENT_CONTRACT
@@ -719,7 +720,8 @@ headers.set("x-api-key", decodeURIComponent(key));
 **RBTI 독서 유형** — 유형 코드의 기본 정본은 **서버**다: 프론트가 `use_rbti`(불리언)만 보내면
 서버가 사용자(userNo)로 외부 RBTI API에 조회해 적용한다. 화면에 유형 선택기가 있으면 고른
 코드를 `rbti`로 함께 실어 **이번 턴만** 덮어쓸 수 있다(`ChatRequest.rbti` 설명 참조 — 안
-실으면 화면에서 무엇을 고르든 서버 조회값이 나간다). 응답의 `done.rbti_applied`가
+실으면 화면에서 무엇을 고르든 서버 조회값이 나간다). 그 선택기를 그릴 축·16유형 데이터는
+`GET /rbti/types`가 준다 — 진입 시 1회 받아 캐시한다. 응답의 `done.rbti_applied`가
 **null이 아니면** "✦ RBTI 데이터가 활용됨" 배지를 켠다.
 
 `use_rbti: true`인데도 null이 나오는 경우가 둘 있고 **둘 다 오류가 아니다**: 그 사용자에게
@@ -1037,6 +1039,11 @@ def create_app() -> FastAPI:
     # 초기 질문 회전 풀(GET /chat/starters·/admin/starters/*). starter_model이 빈 값이면 미등록
     # (404 — overview_model 관례). 라우트·풀·생성의 소유자는 starters.py다.
     register_starters(app, settings)
+
+    # 독서 성향 16유형·축 정의(GET /rbti/types). 화면이 `rbti`에 실을 값을 고르게 하는
+    # 재료이고, matrix_enabled와 무관하다 — 매트릭스는 개발자용 검증 뷰이지만 이 목록은
+    # 프론트가 선택기를 그리는 제품 계약이다.
+    register_rbti(app)
 
     # 매트릭스 스트리밍 엔드포인트도 배포 게이팅(matrix_enabled) 대상 — off면 미등록(404).
     if settings.matrix_enabled:
