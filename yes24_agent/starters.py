@@ -21,7 +21,7 @@ import re
 import unicodedata
 import uuid
 from dataclasses import dataclass, field, replace
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
 from bs4 import BeautifulSoup
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Response
@@ -1325,20 +1325,17 @@ class StarterService(MysqlBackedService):
 
     async def serve(
         self, *, n: int, slot: str | None, today: dt.date, rng: random.Random | None = None,
-        exclude_ids: list[int] | None = None,
     ) -> dict:
         """서빙 세트 1건 — 선택 → 서빙 로그 한 줄 → (필요 시) 백그라운드 생성 기동 → 즉답."""
         settings = get_settings()
-        excluded = set(exclude_ids or ())
         pool = await self.active_pool(today, slot)
-        picked = pick_starters([row for row in pool if row["id"] not in excluded], n, rng or random)
-        set_id = uuid.uuid4().hex
+        picked = pick_starters(pool, n, rng or random)
+        # 응답에는 싣지 않지만 운영 추적은 필요하다 — 무엇이 나갔는지는 여기 남는다.
         logger.info(
-            f"starters served set_id={set_id} ids={[p['id'] for p in picked]} "
-            f"slots={[p['slot'] for p in picked]}"
+            f"starters served ids={[p['id'] for p in picked]} slots={[p['slot'] for p in picked]}"
         )
         self.ensure_generation(today)
-        return {"set_id": set_id, "starters": [Starter.of(p, settings) for p in picked]}
+        return {"starters": [Starter.of(p, settings) for p in picked]}
 
     async def refresh_loop(self) -> None:
         """GET과 같은 선점 경로로 미실행·실패·부족 슬롯을 주기적으로 갱신한다."""
@@ -1745,42 +1742,29 @@ async def close_starter_service() -> None:
 
 
 class Starter(BaseModel):
-    """서빙 항목. `text`는 누르면 **그대로** 보내는 문장이다 — 자르거나 고치지 않는다."""
+    """칩 하나 — 화면에 보이는 것만 싣는다.
 
-    id: int = Field(description="풀 항목 id(클릭 대조·어드민 편집 키)")
-    slot: str = Field(description="질문 유형(bestseller·trend·general·policy 등)")
-    label: str = Field(description="슬롯 표시 라벨")
+    종전에는 id·slot·source·goods_no·url·run_date를 함께 실었다. 전수로 확인하니 프론트가
+    쓰는 것은 **label과 text 둘뿐**이었고(내장 데모는 text만 쓴다), 나머지는 계약 문서 자신이
+    "표시용이 아니다"라고 적어 둔 참고값이었다. 참고값을 계약에 두면 바꿀 때마다 프론트와
+    협의해야 하고, 슬롯이 사이트에서 파생되면서 실제로 그 일이 생겼다 — slot은 값이 닫힌
+    아이콘 축이었는데 분야·코너가 늘면 값도 늘어 프론트가 분기할 수 없게 됐다.
+
+    클릭 측정은 세션의 첫 발화가 서빙된 text와 글자 단위로 같은지로 한다 — id도 set_id도
+    그 경로에 없다.
+    """
+
+    label: str = Field(description="칩 위에 표시할 이름(서버가 준 값을 그대로 쓴다)")
     text: str = Field(description="칩 문장 — 누르면 이 값을 그대로 /chat/stream message로 보낸다")
-    source: Literal["auto", "manual"] = Field(description="auto: 자동 생성, manual: 운영 등록")
-    goods_no: int | None = Field(default=None, description="개별 상품을 참조하는 항목의 상품 번호")
-    url: str | None = Field(default=None, description="상품 번호가 있는 항목의 상품 페이지")
-    run_date: dt.date | None = Field(
-        default=None, description="자동 생성 실행일(오늘 이전일 수 있음)"
-    )
 
     @classmethod
     def of(cls, row: dict, settings: Settings) -> Starter:
-        """풀 행을 서빙 항목으로 바꾼다. 값이 없는 선택 필드는 라우트가 응답에서 생략한다."""
-        goods_no = row.get("goods_no")
-        run_date = row.get("run_date")
-        return cls(
-            id=row["id"],
-            slot=row["slot"],
-            label=_label(row, settings),
-            text=row["text"],
-            source=row["source"],
-            goods_no=goods_no,
-            url=product_url(settings.yes24_base_url, str(goods_no)) if goods_no else None,
-            run_date=run_date,
-        )
+        return cls(label=_label(row, settings), text=row["text"])
 
 
 class StartersResponse(BaseModel):
-    set_id: str = Field(
-        description="이 서빙 세트의 id(서버 로그 `starters served set_id=…`와 대조)"
-    )
     starters: list[Starter] = Field(
-        description="최대 n개이며 슬롯별 최대 1개. slot 필터를 지정하면 전체도 최대 1개"
+        description="최대 n개이며 질문 유형별 최대 1개. slot 필터를 지정하면 전체도 최대 1개"
     )
 
 
@@ -1894,13 +1878,12 @@ def register_starters(app: FastAPI, settings: Settings) -> None:
         response_model_exclude_none=True,
         summary="빈 화면의 초기 질문 칩",
         description=(
-            "서버 회전 풀에서 초기 질문을 뽑아 준다 — 요청마다 슬롯(질문 유형)별 1개를 무작위로 "
-            "고르되 같은 상품·출처·문구를 함께 선택하지 않는다. "
-            "exclude_id를 반복 지정해 직전 질문을 제외할 수 있고 부족하면 있는 만큼 반환한다. "
+            "서버 회전 풀에서 초기 질문을 뽑아 준다 — 요청마다 질문 유형별 1개를 무작위로 "
+            "고르되 같은 상품·출처·문구를 함께 선택하지 않는다. 부족하면 있는 만큼 준다. "
             "slot 필터를 지정하면 n과 관계없이 최대 1개다. 응답은 캐시하지 않는다. "
-            "**진입 시 1회** 호출하고(폴링 금지), `text`는 절단·편집 없이 "
-            "그대로 `/chat/stream`의 message로 보낸다. 저장소가 없는 구성이면 503이므로 "
-            "클라이언트는 자체 폴백 문구를 갖는다."
+            "항목은 `label`(칩 이름)과 `text` 둘뿐이다 — `text`는 절단·편집 없이 그대로 "
+            "`/chat/stream`의 message로 보낸다. **진입 시 1회** 호출하고 폴링하지 않는다. "
+            "저장소가 없는 구성이면 503이므로 클라이언트는 자체 폴백 문구를 갖는다."
         ),
         responses={
             503: {"description": "초기 질문 저장소가 없는 구성(로컬 sqlite) 또는 조회 실패"}
@@ -1912,15 +1895,11 @@ def register_starters(app: FastAPI, settings: Settings) -> None:
         slot: Annotated[
             str | None, Query(max_length=_SLOT_MAX_CHARS, description="슬롯 필터(선택)")
         ] = None,
-        exclude_id: Annotated[
-            list[Annotated[int, Field(gt=0)]] | None,
-            Query(description="제외할 질문 ID(반복 지정 가능)"),
-        ] = None,
         user: Annotated[AuthenticatedUser | None, Depends(get_authenticated_user)] = None,
     ) -> dict:
         response.headers["Cache-Control"] = "no-store"
         return await StarterService.get_instance().serve(
-            n=n or settings.starter_count, slot=slot, today=_today(), exclude_ids=exclude_id
+            n=n or settings.starter_count, slot=slot, today=_today()
         )
 
     # 어드민 API — admin_password가 비어 있으면 미등록(404, admin.py 관례). 자격 판정은

@@ -1262,7 +1262,6 @@
       for (const item of items) {
         const chip = document.createElement("button");
         chip.className = "chip";
-        if (item.slot) chip.dataset.slot = item.slot; // 아이콘·스타일 매핑 축은 slot
         chip.textContent = item.text;
         chip.addEventListener("click", () => { if (!sending) submit(item.text); });
         target.appendChild(chip);
