@@ -2422,7 +2422,7 @@
       try {
         // 페르소나 미선택(rbtiCode=null) 시 rbti 필드를 아예 싣지 않아 기존 UX 100% 무변.
         const payload = { message, session_id: sessionId };
-        // 코드와 함께 use_rbti도 보낸다 — 서버 기본이 false(미적용)라 코드만 실으면 무시된다.
+        // 코드와 함께 use_rbti도 보낸다 — 끄기가 이기는 계약이라 토글을 명시해야 적용된다.
         if (rbtiCode) { payload.rbti = rbtiCode; payload.use_rbti = true; }
         // 모델 미선택·기본이면 필드 생략(서버 기본 pro). 화이트리스트 밖은 서버가 폴백.
         if (selectedModel) payload.model = selectedModel;
