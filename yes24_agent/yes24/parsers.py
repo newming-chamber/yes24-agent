@@ -173,9 +173,11 @@ def _parse_list(
     아이템 컨테이너 자체가 없으면 기본적으로 HTML 구조 변경으로 보고 ParseError를
     발생시킨다. 단, Yes24는 결과가 실제로 0건일 때 이 컨테이너 대신 "결과가 없습니다"
     안내 블록(NO_RESULTS_MARKER)을 렌더링하므로, 컨테이너가 없어도 이 신호가 있으면
-    정상적인 빈 결과로 보고 빈 리스트를 반환한다. 컨테이너는 있지만 아이템이 0개인
-    경우도 마찬가지로 빈 리스트. 컨테이너와 아이템이 있는데도 전부 변환 실패하면 역시
-    ParseError(부분적 구조 변경 감지 — 빈 성공 위장 금지).
+    정상적인 빈 결과로 보고 빈 리스트를 반환한다. 무결과의 실측 형태는 목록 넷 모두
+    "컨테이너 없음 + noData"다(search_empty.html·cremaclub_best_empty.html) — 컨테이너를
+    렌더하면서 아이템만 0개인 응답은 관측된 적 없으므로, **컨테이너는 있는데 아이템이
+    0개면 아이템 셀렉터가 썩은 것**으로 보고 ParseError. 컨테이너와 아이템이 있는데도
+    전부 변환 실패하면 역시 ParseError(부분적 구조 변경 감지 — 빈 성공 위장 금지).
     """
     soup = _container_soup(html, container_selector)
 
@@ -194,7 +196,10 @@ def _parse_list(
 
     items = soup.select(item_selector)
     if not items:
-        return []
+        raise ParseError(
+            f"목록 컨테이너({container_selector})는 있는데 아이템({item_selector})이 0개 — "
+            "아이템 셀렉터 구조 변경 의심"
+        )
 
     results: list[dict] = []
     for item in items:
@@ -511,13 +516,15 @@ def parse_browse_list(html: str, *, base_url: str, section: str, limit: int = 24
     파싱 스펙(마크업 종류·셀렉터·순위 마커 유무)은 **urls.BROWSE_SEED_URLS 레코드에서 읽는다**
     — 섹션 열거를 여기 복제하지 않으므로 시드를 늘려도 파서가 갈라지지 않는다.
       - markup="search"   : 검색 결과와 동일한 마크업(베스트셀러·신간).
-      - markup="cremaclub": 별도 마크업(cremaclub.yes24.com). URL은 `/BookClub/Detail/{id}`가
+      - markup="cremaclub": 별도 마크업(cremaclub.yes24.com의 목록 조각 — 코너 페이지는
+        상품을 SSR로 싣지 않는다, urls.BROWSE_SEED_URLS 주석). URL은 `/BookClub/Detail/{id}`가
         아니라 항상 product_url(base_url, goods_no)로 조립한 www.yes24.com 상품 페이지를
         반환한다. publisher·pub_date·sale_price·sale_index는 이 섹션에 필드 자체가 없어 항상 None.
 
     표에 없는 section은 ValueError(도구는 같은 표로 사전 검증하므로 실제로는 프로그래머
-    오류만 잡는다). 목록 컨테이너 자체가 없으면(무결과 신호도 없으면) HTML 구조 변경으로
-    보고 ParseError(parse_search와 동일 원칙).
+    오류만 잡는다). 무결과·구조 파손 판정은 _parse_list(parse_search와 같은 골격)가 한다 —
+    컨테이너 없음+무결과 신호만 0건 성공이고, 컨테이너 없음·아이템 0개·전부 변환 실패는
+    ParseError.
     """
     try:
         spec = BROWSE_SEED_URLS[section]
@@ -1073,6 +1080,49 @@ def product_fields(item: Mapping) -> dict:
 
 
 _CATEGORY_DISPLAY_HREF_RE = re.compile(CATEGORY_DISPLAY_HREF_RE)
+
+
+def parse_corner_links(html: str, *, base_url: str, section: str) -> list[dict]:
+    """목록 페이지가 스스로 걸어 둔 **형제 코너 탭**을 추출한다(종합·실시간·특가·스테디셀러…).
+
+    코너 이름을 코드에 열거하지 않는다 — parse_category_links가 분야 번호를 페이지 내비에서
+    읽는 것과 같은 원리다. 탭 묶음을 찾는 기준도 클래스 이름이 아니라 **시드 URL 자신**이다:
+    코너 탭 목록에는 반드시 시드 코너(종합)로 가는 링크가 들어 있으므로, 시드와 경로가 같은
+    링크를 담은 `<ul>`이 곧 그 묶음이다. 클래스가 개편돼도 이 기준은 살아남는다.
+
+    반환: `[{"key": 경로 마지막 조각(소문자), "label": 탭 문구, "url": 절대 URL}]` — 문서 순서를
+    보존하고 같은 key는 첫 등장만 남긴다. 묶음을 못 찾으면 빈 리스트다. 이것은 "코너가 없다"는
+    정당한 상태(형제 탭이 없는 코너도 있다)이므로 호출자는 시드 그대로를 쓴다.
+    """
+    seed_path = urlsplit(BROWSE_SEED_URLS[section]["url"]).path.lower().rstrip("/")
+    seed_dir, _, _ = seed_path.rpartition("/")
+    soup = BeautifulSoup(html, "lxml")
+    tabs = None
+    for anchor in soup.find_all("a", href=True):
+        if urlsplit(urljoin(base_url, anchor["href"])).path.lower().rstrip("/") != seed_path:
+            continue
+        tabs = anchor.find_parent("ul")
+        if tabs is not None:
+            break
+    if tabs is None:
+        return []
+
+    registered = allowed_domain(base_url)
+    corners: dict[str, dict] = {}
+    for anchor in tabs.find_all("a", href=True):
+        url = urljoin(base_url, anchor["href"])
+        parts = urlsplit(url)
+        # 시드와 **같은 사이트, 같은 디렉터리의 형제**만 코너로 본다. 이 URL은 페이지 HTML에서
+        # 주워 그대로 여는 값이라 경계가 곧 방어다 — 경로만 보면 외부 호스트가 같은 경로를
+        # 흉내 내 통과한다(테스트가 실측). 호스트 판정은 client의 SSRF 방어와 같은 함수다.
+        head, _, key = parts.path.lower().rstrip("/").rpartition("/")
+        label = anchor.get_text(strip=True)
+        if not is_allowed_host(parts.hostname or "", registered):
+            continue
+        if head != seed_dir or not key or not label or key in corners:
+            continue
+        corners[key] = {"key": key, "label": label, "url": url}
+    return list(corners.values())
 
 
 def parse_category_links(html: str, *, limit: int) -> list[dict]:
