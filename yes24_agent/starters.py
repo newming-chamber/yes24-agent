@@ -42,6 +42,7 @@ import datetime as dt
 import json
 import logging
 import random
+import re
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
@@ -71,6 +72,7 @@ from yes24_agent.yes24.parsers import (
 )
 from yes24_agent.yes24.urls import (
     BROWSE_SEED_URLS,
+    EVENT_LIST_URL,
     POLICY_SEEDS,
     browse_category_prefix,
     browse_url,
@@ -93,6 +95,8 @@ _PICK_SUFFIX = "-pick"
 _TREND_SLOT = "trend"
 _GENERAL_SLOT = "general"
 _POLICY_SLOT = "policy"
+# 오늘 걸려 있는 기획전이 재료인 슬롯 — 시즌을 달력이 아니라 **사이트가** 알려준다.
+_SEASON_SLOT = "season"
 # 활성 풀 SELECT의 컬럼 순서 — dict 변환이 이 튜플로 하므로 SQL과 여기가 같이 움직인다.
 _POOL_COLUMNS = ("id", "slot", "text", "source", "goods_no", "run_date", "pinned")
 # 어드민 목록 SELECT의 컬럼 순서(DDL 전 컬럼).
@@ -550,6 +554,44 @@ _TOPIC_PROMPT = (
 )
 
 
+async def observe_events(spec: SlotSpec, ctx: ObserveContext) -> Observed:
+    """오늘 걸려 있는 기획전 — **사이트가 판단한 시즌**이 재료다.
+
+    수능·명절·계절은 달력을 코드에 박으면 매년 썩는다. Yes24는 그 판단을 이미 하고 있고
+    (기획전 제목과 기간에 드러난다) 우리는 오늘 진행 중인 것을 읽기만 하면 된다.
+
+    굿즈·사은품 설명은 재료에서 뺀다 — "미니 북백 증정" 같은 조건을 문장이 옮기면 소진·
+    변경 시 거짓이 되고, 이 슬롯이 할 일은 **그 시기에 무엇을 읽을지 묻는 것**이지 사은품
+    안내가 아니다.
+    """
+    html = await ctx.client.get_text(EVENT_LIST_URL)
+    rows = await asyncio.to_thread(
+        parse_event_list, html, limit=ctx.settings.starter_event_limit
+    )
+    today = ctx.today.strftime("%Y.%m.%d")
+    materials = []
+    for row in rows:
+        start, end = row.get("start"), row.get("end")
+        # 기간이 없는 항목(상시·소진시)은 늘 진행 중이다.
+        if start and end and not (start <= today <= end):
+            continue
+        title = _squash(row.get("title"))
+        # 대괄호 분류표와 콜론 뒤 굿즈 설명을 떼어 **주제만** 남긴다.
+        subject = _squash(re.sub(r"\[[^\]]*\]", " ", title).split(":")[0])
+        if not subject:
+            continue
+        parts = [w.strip("『』〈〉()!,.") for w in subject.split()]
+        parts = [w for w in parts if len(w) >= 2]
+        materials.append(
+            Material(
+                ref=str(len(materials)),
+                evidence=[parts or [subject]],
+                hint={"theme": subject, "until": end} if end else {"theme": subject},
+            )
+        )
+    return Observed(materials=materials)
+
+
 def build_slots(settings: Settings) -> list[SlotSpec]:
     """설정에서 오늘의 슬롯 목록을 만든다 — 자동 생성 대상의 단일 출처.
 
@@ -625,6 +667,22 @@ def build_slots(settings: Settings) -> list[SlotSpec]:
                     "특정 기기 설정처럼 좁은 쪽은 피한다. 답을 쓰지 않고 묻기만 한다."
                 ),
                 observe=observe_faq,
+            )
+        )
+    if settings.starter_event_limit > 0:
+        specs.append(
+            SlotSpec(
+                key=_SEASON_SLOT,
+                ask=(
+                    "재료는 **오늘 Yes24에 걸려 있는 기획전의 주제**다. 지금이 어떤 때인지를 "
+                    "사이트가 그것으로 말하고 있으니(수능 대비·가을 문학·수상작 발표처럼), "
+                    "그 시기에 사람들이 자연스럽게 할 법한 질문을 쓴다 — '요즘 ~는 뭐가 많이 "
+                    "팔려?'·'~에 읽을 만한 책 뭐 있어?'처럼 묻는다. 기획전이나 행사 자체를 "
+                    "설명하거나 홍보하지 않고, 사은품·굿즈·응모 조건은 문장에 넣지 않는다"
+                    "(조건은 바뀌고 소진된다). 상품 하나를 지목하지도 않는다 — 무엇을 권할지는 "
+                    "답변이 정한다."
+                ),
+                observe=observe_events,
             )
         )
     return specs

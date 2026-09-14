@@ -695,6 +695,40 @@ def extract_links(
     return (products + _context_first(pages, page_url))[:limit]
 
 
+_EVENT_PERIOD_RE = re.compile(
+    r"(?P<title>.+?)\s*(?:(?P<start>\d{4}\.\d{2}\.\d{2})\.\s*~\s*(?P<end>\d{4}\.\d{2}\.\d{2})\.|"
+    r"(?P<always>상시|소진시))\s*$"
+)
+
+
+def parse_event_list(html: str, *, limit: int = 40) -> list[dict]:
+    """기획전 목록에서 제목과 기간을 뽑는다.
+
+    한 줄이 "제목 YYYY.MM.DD. ~ YYYY.MM.DD." 또는 "제목 상시/소진시" 꼴로 렌더되므로 한
+    정규식이 둘을 가른다. 기간이 없는 항목은 start·end가 None이고 늘 진행 중으로 본다.
+    시즌 판정(오늘이 그 기간 안인가)은 호출부가 한다 — 파서는 관측만 한다.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for anchor in soup.select("a[href*='EventNo']"):
+        text = " ".join(anchor.get_text(" ", strip=True).split())
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        match = _EVENT_PERIOD_RE.match(text)
+        rows.append(
+            {
+                "title": match.group("title").strip() if match else text,
+                "start": match.group("start") if match else None,
+                "end": match.group("end") if match else None,
+            }
+        )
+        if len(rows) >= limit:
+            break
+    return rows
+
+
 def extract_faq_entries(soup: BeautifulSoup) -> list[dict[str, str]]:
     """선언된 FAQ 목록을 **전부** 순회해 질문·답변 entry로 추출한다.
 
