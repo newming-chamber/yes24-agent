@@ -13,6 +13,12 @@
     --gap: 14px;
     --list-w: 380px;      /* 세션 목록 열 너비 */
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    /* 차트 색 — dataviz 검증기로 흰 패널(#ffffff) 위 통과 확인(설계 §4.1). 역할 이름이라 다크 테마가 생기면 값만 바꾼다.
+       --series-N·--seq-N의 개수가 모델 색 슬롯 수·히트맵 단계 수의 정본이다(admin_charts.js tokenSteps가 센다). 늘리면 아래 클래스도 짝으로. */
+    --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100; --series-5: #e87ba4; --series-6: #008300; --series-other: #898781;
+    --status-critical: #d03b3b; --status-warning: #fab219; --status-muted: #898781; --status-secondary: #52514e;
+    --seq-1: #b7d3f6; --seq-2: #86b6ef; --seq-3: #3987e5; --seq-4: #1c5cab; --seq-5: #0d366b;
+    --good-text: #006300;
   }
 
   * { box-sizing: border-box; }
@@ -198,10 +204,15 @@
   .analysis-filters input, select { height: 36px; }
   .exact-filters { display: contents; }
   .dashboard-content { display: grid; gap: 16px; }
-  .kpis { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 12px; }
+  .dashboard-content.is-loading { opacity: .5; }
+  .presets { display: flex; gap: 6px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
   .kpi, .analysis-card { padding: 16px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); min-width: 0; }
-  .kpi strong { display: block; font-size: 26px; letter-spacing: -.04em; margin-top: 10px; font-variant-numeric: tabular-nums; }
+  .kpi strong { display: block; font-size: 26px; letter-spacing: -.04em; margin: 10px 0 6px; }
   .kpi span, .analysis-note { font-size: 12px; color: var(--muted); }
+  .kpi .delta, .kpi .kpi-sub { display: block; margin-top: 2px; overflow-wrap: anywhere; }
+  .kpi .delta.bad { color: var(--error-text); }
+  .kpi .delta.good { color: var(--good-text); }
   .analysis-card h3 { margin: 0 0 14px; color: var(--text); font-size: 15px; text-transform: none; letter-spacing: 0; }
   .analysis-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 16px; }
   .table-wrap { max-width: 100%; overflow-x: auto; }
@@ -216,11 +227,39 @@
   .data-actions { flex-wrap: wrap; display: flex; justify-content: space-between; gap: 10px; align-items: center; margin-bottom: 10px; color: var(--muted); font-size: 12px; }
   #data-tools { display: flex; gap: 8px; margin-left: auto; }
   #data-tools:empty { display: none; }
-  .trend-row { display: grid; grid-template-columns: 80px minmax(0,1fr) 88px; align-items: center; gap: 10px; margin: 9px 0; font-size: 12px; font-variant-numeric: tabular-nums; }
-  .trend-row > span { white-space: nowrap; }
-  .trend-track { display: block; width: 100%; height: 15px; background: var(--bg); border-radius: 3px; }
-  .trend-total { fill: var(--accent); }
-  .trend-failed { fill: var(--error-text); }
+
+  /* 분석 차트(admin_charts.js). 마크는 클래스가 주는 --c 한 곳에서 칠한다. */
+  .chart-card { margin: 0; }
+  .chart-card .analysis-note { margin: 6px 0 0; }
+  .chart-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 0 0 8px; padding: 0; list-style: none; font-size: 12px; color: var(--muted); }
+  .chart-legend li { display: flex; align-items: center; gap: 6px; overflow-wrap: anywhere; }
+  .swatch { flex: none; width: 10px; height: 10px; border-radius: 2px; background: var(--c); }
+  .swatch.key-line { width: 14px; height: 2px; border-radius: 1px; }
+  .series-1 { --c: var(--series-1); } .series-2 { --c: var(--series-2); } .series-3 { --c: var(--series-3); }
+  .series-4 { --c: var(--series-4); } .series-5 { --c: var(--series-5); } .series-6 { --c: var(--series-6); } .series-other { --c: var(--series-other); }
+  .status-critical { --c: var(--status-critical); } .status-warning { --c: var(--status-warning); }
+  .status-muted { --c: var(--status-muted); } .status-secondary { --c: var(--status-secondary); }
+  .seq-0 { --c: var(--bg); } .seq-1 { --c: var(--seq-1); } .seq-2 { --c: var(--seq-2); } .seq-3 { --c: var(--seq-3); } .seq-4 { --c: var(--seq-4); } .seq-5 { --c: var(--seq-5); }
+  .chart-plot { min-width: 0; }
+  .chart { display: block; overflow: visible; font-size: 11px; }
+  .chart text { fill: var(--muted); font-variant-numeric: tabular-nums; }
+  .chart .grid { stroke: var(--border); stroke-width: 1; }
+  .chart .bar, .chart .cell, .chart .dot { fill: var(--c); }
+  .chart .dot { stroke: var(--panel); stroke-width: 2; }
+  .chart .line { fill: none; stroke: var(--c); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .chart .cursor { fill: var(--bg); }
+  .chart .crosshair { stroke: var(--muted); stroke-width: 1; }
+  .chart .cell-focus { fill: none; stroke: var(--text); stroke-width: 2; }
+  .chart .hit { fill: transparent; outline: none; }
+  .chart .hit:focus-visible { stroke: var(--accent); stroke-width: 2; }
+  .chart-tip { pointer-events: none; }
+  .chart-tip rect { fill: var(--panel); stroke: var(--border); }
+  .chart-tip .key { stroke: var(--c); stroke-width: 2; }
+  .chart-tip .tip-head, .chart-tip .tip-value { fill: var(--text); font-weight: 600; }
+  .chart-notes { margin-top: 6px; }
+  .chart-notes summary { cursor: pointer; }
+  .chart-table { margin-top: 8px; }
+  .chart-table summary { cursor: pointer; font-size: 12px; color: var(--muted); }
 
   dialog { width: min(850px, calc(100vw - 28px)); max-height: calc(100dvh - 40px); padding: 18px; border: 1px solid var(--border); border-radius: var(--radius); color: var(--text); background: var(--panel); }
   dialog::backdrop { background: #0008; }
@@ -250,8 +289,6 @@
     main.has-selection .detail-pane { display: block; }
     .workspace-pane { padding: 14px; }
     .analysis-filters { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); }
-    .kpis { grid-template-columns: repeat(2,minmax(0,1fr)); }
     .analysis-grid { grid-template-columns: minmax(0,1fr); }
-    .trend-row { grid-template-columns: 80px minmax(0,1fr) 72px; gap: 6px; font-size: 11px; }
     #data-tools { margin-left: 0; }
   }

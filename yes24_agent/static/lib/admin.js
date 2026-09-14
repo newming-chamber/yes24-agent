@@ -1,4 +1,5 @@
 import { initManage } from "/static/lib/admin_manage.js?v=1";
+import { initCharts } from "/static/lib/admin_charts.js?v=1";
 
   const $ = (id) => document.getElementById(id);
   const state = { page: 0, selected: null, tab: 'dashboard', dataPage: 0, datasets: [], applied: {}, currentSession: null, exportSnapshot: null, savedQueries: [], role: null, roles: [] };
@@ -263,62 +264,138 @@ import { initManage } from "/static/lib/admin_manage.js?v=1";
     return card;
   }
 
-  /** 일별 막대 — CSP가 인라인 style을 막으므로 폭은 템플릿 SVG의 rect 속성으로 싣는다. */
-  function trendBar(day, maximum) {
-    const track = $('trend-template').content.firstElementChild.cloneNode(true);
-    const [completed, failed] = track.children;
-    const done = Math.max(0, day.turns - day.failed) / maximum * 100;
-    completed.setAttribute('width', String(done));
-    failed.setAttribute('x', String(done));
-    failed.setAttribute('width', String(day.failed / maximum * 100));
-    return track;
+  const charts = initCharts({ template: $('chart-template'), el, table, num });
+  const usd = (value) => value == null ? '—' : `$${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: value && Math.abs(value) < 1 ? 4 : 2 })}`;
+  const compact = (value) => value == null ? '미측정' : Number(value).toLocaleString('ko-KR', { notation: 'compact', maximumFractionDigits: 1 });
+  const percent = (value) => value == null ? '미측정' : `${value.toLocaleString('ko-KR', { maximumFractionDigits: 1 })}%`;
+  const points = (value) => `${value.toLocaleString('ko-KR', { maximumFractionDigits: 1 })}%p`;
+  const failRate = (s) => s?.turns ? (s.failed + s.interrupted) / s.turns * 100 : null;
+  const ungroundedRate = (s) => s?.main_rows ? s.ungrounded_suspect / s.main_rows * 100 : null;
+  const WEEKDAYS = ['월', '화', '수', '목', '금', '토', '일'];
+
+  /** 조회 기간의 모든 UTC 날짜 — API는 기록 있는 날만 주므로 빈 날을 여기서 채운다(추이에선 빈 날도 정보). */
+  function periodDays(period) {
+    const days = [];
+    for (const day = new Date(`${period.since}T00:00:00Z`); day <= new Date(`${period.until}T00:00:00Z`); day.setUTCDate(day.getUTCDate() + 1)) days.push(day.toISOString().slice(0, 10));
+    return days;
+  }
+
+  /** 증감 문구: 부호 + 절대 변화 (변화율). 이전 값이 0이거나 미측정이면 변화율은 N/A. */
+  function change(current, previous, format) {
+    if (current == null || previous == null) return 'N/A · 미측정';
+    const difference = current - previous;
+    const sign = difference > 0 ? '+' : difference < 0 ? '−' : '';
+    // 비율 지표(%p)에 변화율을 또 붙이면 '퍼센트의 퍼센트'라 읽히지 않는다.
+    if (format === points) return `${sign}${format(Math.abs(difference))}`;
+    const rate = !difference ? '0%' : previous === 0 ? 'N/A · 이전 값 0' : `${sign}${Math.abs(difference / previous * 100).toLocaleString('ko-KR', { maximumFractionDigits: 1 })}%`;
+    // 변화가 표시 자릿수 아래로 반올림되면('+$0.00') 절대값은 거짓 정보라 변화율만 남긴다.
+    const absolute = format(Math.abs(difference));
+    return difference && absolute === format(0) ? rate : `${sign}${absolute} (${rate})`;
+  }
+
+  /** KPI 타일. upIsBad면 증가를 빨강·감소를 초록으로 — 부호 글자가 함께 가서 색만으로 읽지 않는다. */
+  function kpi(label, value, { current, previous, format, upIsBad, sub } = {}) {
+    const box = el('div', 'kpi');
+    box.append(el('span', null, label), el('strong', null, value));
+    if (format) {
+      const worse = upIsBad && current != null && previous != null && current !== previous ? (current > previous ? ' bad' : ' good') : '';
+      box.append(el('span', `delta${worse}`, `${change(current, previous, format)} · 이전 기간 대비`));
+    }
+    if (sub) box.append(el('span', 'kpi-sub', sub));
+    return box;
   }
 
   function loadDashboard() {
     const params = new URLSearchParams();
     for (const [id, key] of [['dashboard-since', 'since'], ['dashboard-until', 'until'], ['dashboard-app', 'app_name']]) if ($(id).value) params.set(key, $(id).value);
-    $('dashboard').replaceChildren(el('div', 'placeholder', '운영 지표를 불러오는 중…'));
-    return request('dashboard', `/admin/api/analytics?${params}`, (data) => {
-      const summary = data.summary;
-      const kpis = el('div', 'kpis');
-      for (const [label, value] of [['대화 턴', metric(summary.turns)], ['대화 세션', metric(summary.sessions)], ['앱별 사용자 식별자', metric(summary.users)], ['기록된 토큰', metric(data.usage.total_tokens)]]) {
-        const box = el('div', 'kpi');
-        box.append(el('span', null, label), el('strong', null, value));
-        kpis.append(box);
-      }
-      const trend = el('div');
-      const maximum = Math.max(1, ...data.daily.map((day) => day.turns));
-      for (const day of data.daily) {
-        const row = el('div', 'trend-row');
-        row.append(el('span', null, day.day), trendBar(day, maximum), el('span', null, `${num(day.turns)} / ${num(day.failed)}`));
-        row.title = `${day.day} UTC · 전체 ${num(day.turns)}턴 · 실패 ${num(day.failed)}턴`;
-        trend.append(row);
-      }
-      if (!data.daily.length) trend.append(el('p', 'analysis-note', '선택한 기간에 대화 기록이 없습니다.'));
-      const quality = table([{key: 'label', label: '품질 지표'}, {key: 'value', label: '값'}], [
-        ...['completed', 'failed', 'interrupted', 'unknown'].map((key) => ({label: statusLabel(key), value: metric(summary[key])})),
-        {label: '응답시간 평균', value: seconds(summary.elapsed_avg_seconds)},
-        {label: '응답시간 중앙값 (p50)', value: seconds(data.latency?.p50_seconds)},
-        {label: '응답시간 p95', value: seconds(data.latency?.p95_seconds)},
-        {label: '응답시간 최댓값', value: seconds(data.latency?.max_seconds)},
-        {label: '분위수 측정 표본', value: metric(data.latency?.elapsed_rows)},
-        {label: '응답시간 측정 표본', value: `${metric(summary.elapsed_rows)} / ${metric(summary.turns)}턴`},
-        {label: '히스토리 저장', value: metric(summary.history_saved)},
-      ]);
-      const engagement = table([{key: 'label', label: '활동'}, {key: 'value', label: '건수'}], [
-        {label: '좋아요', value: metric(data.feedback.likes)}, {label: '싫어요', value: metric(data.feedback.dislikes)}, {label: '출처 클릭', value: metric(data.clicks.clicks)},
-        {label: '토큰 측정 표본', value: `${metric(data.usage.known_token_rows)} / ${metric(data.usage.rows)}기록`},
-      ]);
-      const qualityGrid = el('div', 'analysis-grid');
-      qualityGrid.append(analysisCard('대화 품질', quality, '응답시간은 측정된 턴만 집계합니다. p50/p95는 최근접 순위 방식이며 미측정 값은 제외됩니다.'), analysisCard('피드백과 출처 탐색', engagement, '피드백은 갱신일 기준 최종 상태, 클릭은 발생일을 기준으로 집계합니다.'));
-      const usageColumns = [{key: 'rows', label: '기록 수', format: metric}, {key: 'total_tokens', label: '기록된 토큰', format: metric}, {key: 'known_token_rows', label: '토큰 표본', format: metric}, {key: 'latency_avg_seconds', label: '평균 기록 지연', format: seconds}, {key: 'latency_rows', label: '지연 표본', format: metric}];
-      const usageGrid = el('div', 'analysis-grid');
-      for (const [key, field, label] of [['models', 'model', '모델별 사용량'], ['components', 'component', '컴포넌트별 사용량']]) {
-        usageGrid.append(analysisCard(label, data[key].length ? table([{key: field, label: field === 'model' ? '모델' : '컴포넌트'}, ...usageColumns], data[key]) : el('p', 'analysis-note', '사용량 기록이 없습니다.')));
-      }
-      $('dashboard').replaceChildren(kpis, comparisonCard(data), analysisCard('일별 대화 추이', trend, 'UTC 날짜 · 전체 턴 / 실패 턴. 빨간 막대는 실패 턴입니다. 기록이 없는 날짜는 생략합니다.'), qualityGrid, usageGrid,
-        el('p', 'analysis-note', '사용자 식별자는 앱별로 세며 익명 ID를 포함합니다. 대화 세션은 기간 내 턴이 있는 세션입니다. 사용량 기록은 모델 호출과 턴 집계가 섞여 있을 수 있습니다. 기록 수는 호출 수가 아니며 평균 기록 지연은 턴 응답시간과 다릅니다. 토큰은 기록된 값의 합계이며 미측정 기록은 제외됩니다.'));
+    // 재조회는 이전 렌더를 흐리게 유지한다 — 자리표시자로 갈아 끼우면 화면이 튄다.
+    if ($('dashboard').childElementCount) $('dashboard').classList.add('is-loading');
+    else $('dashboard').replaceChildren(el('div', 'placeholder', '운영 지표를 불러오는 중…'));
+    return request('dashboard', `/admin/api/analytics?${params}`, renderDashboard)
+      .finally(() => { if (!pending.has('dashboard')) $('dashboard').classList.remove('is-loading'); });
+  }
+
+  function renderDashboard(data) {
+    const summary = data.summary, prior = data.comparison?.summary;
+    const days = periodDays(data.period);
+    const byDay = new Map(data.daily.map((row) => [row.day, row]));
+    const daily = (pick, missing) => days.map((day) => byDay.has(day) ? pick(byDay.get(day)) : missing);
+    const { krw_per_usd: krw, krw_as_of: krwAsOf } = data.currency;
+
+    const kpis = el('div', 'kpis');
+    kpis.append(
+      kpi('비용 (USD 추정)', usd(summary.cost_usd), { current: summary.cost_usd, previous: prior?.cost_usd, format: usd, sub: krw && summary.cost_usd != null ? `≈ ₩${num(Math.round(summary.cost_usd * krw))} · 환율 ${krwAsOf ?? '기준일 미기재'} 기준` : '원화 환율 미설정' }),
+      kpi('대화 턴', metric(summary.turns), { current: summary.turns, previous: prior?.turns, format: num }),
+      kpi('과금 턴당 비용', usd(summary.cost_per_turn_usd), { current: summary.cost_per_turn_usd, previous: prior?.cost_per_turn_usd, format: usd, sub: `/ ${num(summary.priced_rows)} 과금 턴` }),
+      kpi('실패·중단율', percent(failRate(summary)), { current: failRate(summary), previous: failRate(prior), format: points, upIsBad: true, sub: `실패 ${num(summary.failed)} · 중단 ${num(summary.interrupted)}턴` }),
+      kpi('무접지 의심', percent(ungroundedRate(summary)), { current: ungroundedRate(summary), previous: ungroundedRate(prior), format: points, upIsBad: true, sub: `${num(summary.ungrounded_suspect)} / ${num(summary.main_rows)}턴` }),
+      kpi('피드백', `👍 ${num(summary.likes)} · 👎 ${num(summary.dislikes)}`, { sub: `${prior ? `이전 기간 👍 ${num(prior.likes)} · 👎 ${num(prior.dislikes)} · ` : ''}출처 클릭 ${num(summary.clicks)}` }),
+    );
+
+    // 모델 → 색 슬롯은 API `models`의 위치(config 선언 순서라 기간과 무관하게 고정). 슬롯을 넘는 모델은 '기타'.
+    // 차트엔 이 기간에 금액이 잡힌 모델만 싣는다 — 색은 위치에서 오므로 빠진 모델이 남은 색을 바꾸지 않는다.
+    const costRows = data.cost.by_model_component, slots = charts.seriesSlots();
+    const priced = new Set(costRows.filter((row) => row.cost_usd != null).map((row) => row.model));
+    const shown = data.models.filter((model) => priced.has(model));
+    // 그날 비용이 null(전부 단가 미등록)이면 모델 값도 null — 0으로 바꾸면 표·툴팁이 '$0.00'을 말한다.
+    const modelCost = (names) => daily((row) => row.cost_usd == null ? null : names.reduce((sum, model) => sum + (row.cost_by_model?.[model] ?? 0), 0), 0);
+    const slotted = shown.filter((model) => data.models.indexOf(model) < slots), rest = shown.filter((model) => !slotted.includes(model));
+    const costSeries = slotted.map((model) => ({ label: model, className: `series-${data.models.indexOf(model) + 1}`, values: modelCost([model]) }));
+    if (rest.length) costSeries.push({ label: `기타 ${num(rest.length)}개 모델`, className: 'series-other', values: modelCost(rest) });
+    const costChart = charts.stackedBars({
+      title: '일별 비용 · 모델별', categories: days, series: costSeries, unit: 'usd', format: usd,
+      notes: { summary: '추정치 · 자세히', lines: data.cost.notes.map((item) => item.text) },
     });
+    const statusChart = charts.stackedBars({
+      title: '일별 턴 상태', categories: days, unit: 'count', format: (value) => `${num(value)}턴`,
+      note: '실패·중단을 기준선 쪽에 쌓아 날짜끼리 높이를 비교합니다.',
+      series: [['failed', 'status-critical'], ['interrupted', 'status-warning'], ['unknown', 'status-secondary'], ['completed', 'status-muted']]
+        .map(([key, className]) => ({ label: statusLabel(key), className, values: daily((row) => row[key], 0) })),
+    });
+    const tokenChart = charts.stackedBars({
+      title: '측정 턴당 토큰 구성', categories: days, unit: 'tokens', format: compact,
+      note: '메인 에이전트 기록의 일별 토큰 ÷ 토큰이 측정된 턴 수입니다. 서브콜 토큰은 비용 차트에만 들어갑니다. 비용이 오른 날이 턴 수 때문인지 턴당 토큰 때문인지 위 두 차트와 나란히 봅니다.',
+      series: [['input_uncached', '입력 (캐시 제외)', 'series-1'], ['input_cached', '캐시 입력', 'series-3'], ['output_billed', '출력 (사고 포함)', 'series-2']]
+        .map(([key, label, className]) => ({ label, className, values: daily((row) => row.measured_main_rows ? (row.main_tokens?.[key] ?? 0) / row.measured_main_rows : 0, 0) })),
+    });
+    const latencyChart = charts.lines({
+      title: '응답 지연', categories: days, format: seconds,
+      note: `측정된 턴만 집계합니다(최근접 순위 분위수). 기간 전체 p50 ${seconds(summary.p50_seconds)} · p95 ${seconds(summary.p95_seconds)} · 최댓값 ${seconds(summary.max_seconds)} · 표본 ${num(summary.elapsed_rows)} / ${num(summary.turns)}턴.`,
+      series: [['p50_seconds', 'p50', 'series-1'], ['p95_seconds', 'p95', 'series-2']]
+        .map(([key, label, className]) => ({ label, className, values: daily((row) => row.elapsed_rows ? row[key] : null, null) })),
+      extra: [{ label: '측정 턴', values: daily((row) => row.elapsed_rows, 0) }],
+    });
+    const hours = WEEKDAYS.map(() => Array(24).fill(0));
+    for (const cell of data.hourly) if (hours[cell.weekday] && cell.hour in hours[cell.weekday]) hours[cell.weekday][cell.hour] = cell.turns;
+    const heatmap = charts.heatmap({ title: '요일 × 시간대', note: 'UTC 기준 턴 시작 시각입니다. KST는 +9시간.', rows: WEEKDAYS, cols: [...hours[0].keys()], values: hours, format: (value) => `${num(value)}턴` });
+
+    const optional = (value) => value == null ? '—' : num(value);
+    const costTable = analysisCard('모델 × 컴포넌트 비용', costRows.length ? table([
+      {key: 'model', label: '모델'}, {key: 'component', label: '컴포넌트'}, {key: 'rows', label: '행 수'}, {key: 'llm_calls', label: 'LLM 콜', format: optional},
+      {key: 'input_uncached', label: '입력 (캐시 제외)', format: metric}, {key: 'input_cached', label: '캐시 입력', format: metric}, {key: 'output_billed', label: '출력', format: metric},
+      {key: 'cost_usd', label: '비용 USD', format: (value) => value == null ? '단가 미등록' : usd(value)}, {key: 'price_effective_from', label: '단가 적용일', format: (value) => value ?? '—'},
+    ], costRows.map((row) => ({...row, rows: `${num(row.rows)}${row.component === 'web_grounding' ? ' 요청' : ''}`}))) : el('p', 'analysis-note', '선택한 기간에 사용량 기록이 없습니다.'));
+    const userTable = analysisCard('사용자별 비용 상위', data.users.length ? table([
+      {key: 'app_name', label: '앱'}, {key: 'user_id', label: '사용자'}, {key: 'priced_rows', label: '과금 턴', format: metric}, {key: 'cost_usd', label: '비용', format: usd}, {key: 'cost_per_turn_usd', label: '과금 턴당 비용', format: usd},
+    ], data.users, openUsage) : el('p', 'analysis-note', '사용자에 귀속된 사용량 기록이 없습니다.'), '메인 에이전트 기록 기준입니다(서브콜은 사용자 귀속이 없음). 행을 선택하면 그 사용자의 사용량 원본을 엽니다.');
+    const tables = el('div', 'analysis-grid');
+    tables.append(userTable, comparisonCard(data));
+    $('dashboard').replaceChildren(kpis, costChart, statusChart, tokenChart, latencyChart, heatmap, costTable, tables);
+  }
+
+  /** 사용자 행 → 데이터 탐색 `usage` 원본을 user_id 정확 일치로 연다. 조건을 먼저 채우고 탭 전환이 한 번만 조회한다. */
+  async function openUsage(row) {
+    await ensureDatasets();
+    if (!state.datasets.some((item) => item.id === 'usage')) return;
+    $('dataset').value = 'usage';
+    clearDataFilters();
+    const exact = $('data-exact').querySelector('[data-exact="user_id"]');
+    if (exact) exact.value = row.user_id;
+    $('data-app').value = row.app_name;
+    $('data-since').value = $('dashboard-since').value;
+    $('data-until').value = $('dashboard-until').value;
+    applyQuery('data');
+    switchTab('data');
   }
 
   const currentDataset = () => state.datasets.find((item) => item.id === $('dataset').value);
@@ -346,8 +423,8 @@ import { initManage } from "/static/lib/admin_manage.js?v=1";
     state.dataPage = 0;
   }
 
-  async function loadDatasets() {
-    if (state.datasets.length) return loadData();
+  async function ensureDatasets() {
+    if (state.datasets.length) return;
     $('data').replaceChildren(el('div', 'placeholder', '데이터 목록을 불러오는 중…'));
     await request('data', '/admin/api/datasets', (data) => {
       state.datasets = data.items;
@@ -356,6 +433,10 @@ import { initManage } from "/static/lib/admin_manage.js?v=1";
       applyQuery('data');
       readSavedQueries();
     });
+  }
+
+  async function loadDatasets() {
+    await ensureDatasets();
     if (state.datasets.length) return loadData();
   }
 
@@ -539,39 +620,37 @@ import { initManage } from "/static/lib/admin_manage.js?v=1";
 
   function comparisonCard(data) {
     if (!data.comparison) return analysisCard('이전 기간 비교', el('p', 'analysis-note', '이전 동일 기간을 계산할 수 없습니다. 시작일과 종료일을 확인하세요.'));
-    const prior = data.comparison;
-    const change = (current, previous) => {
-      if (current == null || previous == null) return 'N/A · 미측정';
-      const difference = current - previous;
-      const absolute = `${difference > 0 ? '+' : ''}${Number(difference).toLocaleString('ko-KR', {maximumFractionDigits: 2})}`;
-      return `${absolute} (${previous === 0 ? 'N/A · 이전 값 0' : `${difference > 0 ? '+' : ''}${(difference / previous * 100).toLocaleString('ko-KR', {maximumFractionDigits: 1})}%`})`;
-    };
+    const current = data.summary, prior = data.comparison.summary;
     const rows = [
-      ['대화 턴', data.summary.turns, prior.summary.turns], ['완료 턴', data.summary.completed, prior.summary.completed], ['실패 턴', data.summary.failed, prior.summary.failed],
-      ['중단 턴', data.summary.interrupted, prior.summary.interrupted], ['종료 상태 미확인', data.summary.unknown, prior.summary.unknown],
-      ['응답시간 평균 (초)', data.summary.elapsed_avg_seconds, prior.summary.elapsed_avg_seconds], ['기록된 토큰', data.usage.total_tokens, prior.usage.total_tokens],
-    ].map(([label, current, previous]) => ({label, current: metric(current), previous: metric(previous), change: change(current, previous)}));
-    return analysisCard('이전 동일 기간 비교', table([{key: 'label', label: '지표'}, {key: 'previous', label: '이전 기간'}, {key: 'current', label: '조회 기간'}, {key: 'change', label: '증감 · 변화율'}], rows), `이전 기간 ${prior.period.since} ~ ${prior.period.until} UTC. 증감은 조회 기간 − 이전 기간입니다. 이전 값이 0이거나 미측정이면 변화율은 N/A입니다.`);
+      // KPI 타일에 증감이 이미 있는 지표(턴·비용·과금 턴당 비용·피드백)는 싣지 않는다.
+      ['완료 턴', 'completed', metric], ['실패 턴', 'failed', metric], ['중단 턴', 'interrupted', metric], ['종료 상태 미확인', 'unknown', metric],
+      ['응답시간 평균', 'elapsed_avg_seconds', seconds], ['응답시간 p95', 'p95_seconds', seconds],
+    ].map(([label, key, format]) => ({label, previous: format(prior[key]), current: format(current[key]), change: change(current[key], prior[key], format)}));
+    return analysisCard('이전 동일 기간 비교', table([{key: 'label', label: '지표'}, {key: 'previous', label: '이전 기간'}, {key: 'current', label: '조회 기간'}, {key: 'change', label: '증감 · 변화율'}], rows), `이전 기간 ${data.comparison.period.since} ~ ${data.comparison.period.until} UTC. 증감은 조회 기간 − 이전 기간입니다.`);
   }
 
   const manage = initManage({ api, el, table, clock, valueText, state, openDialog, reloadData: () => loadData() });
 
-  const today = new Date();
-  $('dashboard-until').value = today.toISOString().slice(0, 10);
-  today.setUTCDate(today.getUTCDate() - 6);
-  $('dashboard-since').value = today.toISOString().slice(0, 10);
+  /** 기간 프리셋은 날짜 칸만 채운다 — 조회는 사용자가 누른다. */
+  const setRange = (days) => {
+    const day = new Date();
+    $('dashboard-until').value = day.toISOString().slice(0, 10);
+    day.setUTCDate(day.getUTCDate() - days + 1);
+    $('dashboard-since').value = day.toISOString().slice(0, 10);
+  };
+  setRange(7);
+  for (const button of $('dashboard-filters').querySelectorAll('[data-days]')) button.onclick = () => setRange(Number(button.dataset.days));
   $('dashboard-filters').onsubmit = (event) => { event.preventDefault(); $('app-error').hidden = true; loadDashboard(); };
   $('data-filters').onsubmit = (event) => { event.preventDefault(); applyQuery('data'); $('app-error').hidden = true; loadData(); };
-  $('data-filters').onreset = (event) => {
-    event.preventDefault();
+  function clearDataFilters() {
     for (const input of $('data-filters').querySelectorAll('input')) input.value = '';
     for (const id of ['data-status', 'data-app', 'data-status-null']) $(id).value = '';
     $('data-direction').value = 'desc';
     configureDataset();
     applyQuery('data');
     $('app-error').hidden = true;
-    if (state.role) loadData();
-  };
+  }
+  $('data-filters').onreset = (event) => { event.preventDefault(); clearDataFilters(); if (state.role) loadData(); };
   $('dataset').onchange = () => $('data-filters').reset();
   $('data-prev').onclick = () => { if (state.dataPage > 0) { state.dataPage--; loadData(); } };
   $('data-next').onclick = () => { state.dataPage++; loadData(); };

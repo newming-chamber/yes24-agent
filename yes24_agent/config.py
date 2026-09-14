@@ -7,12 +7,33 @@ URL·UA·타임아웃·모델명·상한값 등 하드코딩 금지 원칙에 �
 
 import logging
 import os
+from datetime import date
 from functools import lru_cache
 from typing import Literal
 
 from google import genai
-from pydantic import Field, model_validator
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ModelPrice(BaseModel):
+    """모델 한 개의 토큰 단가 한 구간(USD / 1M 토큰). 같은 model 중 effective_from이 가장 늦은
+    것이 그 날짜에 이긴다 — 단가 변경은 행을 고치지 않고 새 행을 더한다(이력 보존)."""
+
+    model: str  # usage_log.model 값과 정확 일치(접두·패턴 매칭 없음)
+    effective_from: date  # 이 날짜(UTC)부터 적용
+    input_usd_per_mtok: float
+    cached_input_usd_per_mtok: float  # 캐시 단가가 없는 벤더면 입력 단가와 같은 값(할인 없음)
+    output_usd_per_mtok: float  # 사고·reasoning 포함 출력 단가
+    source: str  # 공식 가격 페이지
+    checked_on: date
+
+
+_GEMINI_PRICING = "https://ai.google.dev/gemini-api/docs/pricing"
+_OPENAI_PRICING = "https://developers.openai.com/api/docs/pricing"
+# 첫 구간의 시작일 — 공식 페이지의 가격 시작일이 아니라 usage_log 기록 전부를 덮는 날짜다.
+_PRICE_EPOCH = date(2026, 1, 1)
+_PRICE_CHECKED = date(2026, 9, 14)
 
 
 class Settings(BaseSettings):
@@ -818,6 +839,38 @@ class Settings(BaseSettings):
     # 로그인 시도 제한 — 시도한 계정명 기준, 창(초) 안 실패가 이 수에 닿으면 창이 지날 때까지 429.
     admin_login_max_failures: int = 5
     admin_login_window_s: int = 900
+    # 어드민 분석의 비용 추정 단가(유료 등급 표준 단가, docs/admin-analytics-design-20260914.md
+    # §2.1). 모델 필드(model_name·selectable_models·*_model)를 추가하면 여기에도 행을 더한다 —
+    # 로컬 테스트 스위트의 단가 누락 가드(test_admin_cost)가 잡는다(tests/는 gitignore).
+    # 2.5-pro는 ≤200k 프롬프트 구간 단가다(main 행이 콜 합산이라 콜별 구간을 복원할 수 없다).
+    # Luna의 272K 초과 할증(입력 2배·출력 1.5배,
+    # developers.openai.com/api/docs/models/gpt-5.6-luna)과 캐시 쓰기 단가도 같은 이유·미기록으로
+    # 반영하지 않는다(어드민 각주가 밝힌다 — admin_cost.cost_notes).
+    # 해당 없음(각주에도 싣지 않는다): Gemini 명시 캐시 저장 시간당 요금 — cachedContents·
+    # caches.create 사용 0건(암묵 캐시만), 3.1-flash-lite 오디오 입력 2배 — 텍스트 입력만 쓴다.
+    # 그라운딩 요청료(무료 한도·초과 단가)는 금액 계산에 쓰지 않아 여기에 두지 않는다.
+    # env: LLM_PRICES='[{"model": ..., ...}]'
+    llm_prices: list[ModelPrice] = [
+        ModelPrice(model=model, effective_from=start, input_usd_per_mtok=p_in,
+                   cached_input_usd_per_mtok=p_cache, output_usd_per_mtok=p_out,
+                   source=source, checked_on=_PRICE_CHECKED)
+        for model, start, p_in, p_cache, p_out, source in (
+            ("gemini-3.6-flash", _PRICE_EPOCH, 0.75, 0.075, 3.75, _GEMINI_PRICING),
+            ("gemini-3.6-flash", date(2027, 1, 1), 1.50, 0.15, 7.50, _GEMINI_PRICING),
+            ("gemini-3.7-flash", _PRICE_EPOCH, 0.75, 0.075, 3.75, _GEMINI_PRICING),
+            ("gemini-3.7-flash", date(2027, 1, 1), 1.50, 0.15, 7.50, _GEMINI_PRICING),
+            ("gemini-3.5-flash", _PRICE_EPOCH, 1.50, 0.15, 9.00, _GEMINI_PRICING),
+            ("gemini-3.1-flash-lite", _PRICE_EPOCH, 0.25, 0.025, 1.50, _GEMINI_PRICING),
+            ("gemini-2.5-pro", _PRICE_EPOCH, 1.25, 0.125, 10.00, _GEMINI_PRICING),
+            ("openai/responses/gpt-5.6-luna", _PRICE_EPOCH, 0.20, 0.02, 1.20, _OPENAI_PRICING),
+        )
+    ]
+    # 원화 환산(선택). 환율은 시변이라 코드 상수가 아니라 운영자가 기준일과 함께 넣는 값이다 —
+    # None이면 어드민이 USD만 보인다.
+    krw_per_usd: float | None = None
+    krw_per_usd_as_of: date | None = None
+    # 어드민 분석의 사용자별 비용 표 행 수.
+    admin_top_users: int = 10
 
     # 서버
     host: str = "0.0.0.0"

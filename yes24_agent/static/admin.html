@@ -36,10 +36,11 @@
   <div class="error notice" id="app-error" role="alert" hidden></div>
   <main hidden id="main">
     <section class="workspace-pane" id="dashboard-pane">
-      <div class="workspace-head"><h2>운영 대시보드</h2><p>대화 품질과 모델 사용량을 함께 확인합니다. 모든 기간과 시각은 UTC 기준입니다.</p></div>
+      <div class="workspace-head"><h2>운영 대시보드</h2><p>비용·대화 품질·사용 시간대를 함께 확인합니다. 모든 기간과 시각은 UTC 기준입니다.</p></div>
       <form id="dashboard-filters" class="analysis-filters">
         <label>시작일 (UTC)<input id="dashboard-since" type="date" required /></label>
         <label>종료일 (UTC)<input id="dashboard-until" type="date" required /></label>
+        <span class="presets" role="group" aria-label="기간 빠른 선택"><button type="button" data-days="7">7일</button><button type="button" data-days="30">30일</button><button type="button" data-days="90">90일</button></span>
         <label>앱<select id="dashboard-app"><option value="">전체 앱</option></select></label>
         <button class="primary" type="submit">조회</button>
       </form>
@@ -112,7 +113,8 @@
 
 <!-- 정확 일치 필터 한 칸 — 데이터셋 메타데이터(exact_filters)의 키마다 복제한다. -->
 <template id="exact-template"><label><span></span><input placeholder="정확히 일치하는 값" /></label></template>
-<template id="trend-template"><svg class="trend-track" viewBox="0 0 100 1" preserveAspectRatio="none" aria-hidden="true"><rect class="trend-total" height="1" /><rect class="trend-failed" height="1" /></svg></template>
+<!-- 차트 SVG 뿌리 — admin_charts.js가 복제하고 네임스페이스를 여기서 파생한다(URL 리터럴 없이). -->
+<template id="chart-template"><svg class="chart"></svg></template>
 
 <script type="module" src="/static/lib/admin.js"></script>
 </html>

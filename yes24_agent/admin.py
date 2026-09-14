@@ -491,6 +491,6 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
         period: tuple[date | None, date | None] = Depends(date_range),
         app_name: str = "",
     ) -> Any:
-        return await _query(fetch_analytics, period, app_name)
+        return await _query(fetch_analytics, settings, period, app_name)
 
     app.include_router(router)
