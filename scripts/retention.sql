@@ -9,3 +9,9 @@
 --
 -- 적용 예: 0 4 * * *  mysql -h <RDS> -u <user> -p<pw> <db> < scripts/retention.sql
 DELETE FROM rate_limit_log WHERE requested_at < NOW() - INTERVAL 7 DAY;
+
+-- admin 세션: 만료·폐기 후 7일이 지나면 삭제(그때까지는 "누가 언제 로그인했나" 조사용).
+DELETE FROM admin_sessions WHERE COALESCE(revoked_at, expires_at) < NOW() - INTERVAL 7 DAY;
+-- admin 로그인 사건(ok/failed/logout)은 90일. 변경 감사(target_type <> 'login')는 지우지 않는다 —
+-- 하루 수십 건 규모라 용량이 문제가 아니고, "누가 한도를 바꿨나"는 오래 지나서 묻는 질문이다.
+DELETE FROM admin_audit WHERE target_type = 'login' AND created_at < NOW() - INTERVAL 90 DAY;

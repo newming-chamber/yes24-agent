@@ -1,429 +1,118 @@
+<!doctype html>
+<html lang="ko">
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>yes24-agent · 운영 데이터</title>
-<style>
-  :root {
-    --bg: #f7f7f8;
-    --panel: #ffffff;
-    --border: #e5e5e8;
-    --text: #1a1a1e;
-    --muted: #8a8a92;
-    --accent: #2563eb;
-    --accent-soft: #dbeafe;
-    --web: #ea580c;
-    --error-bg: #fee2e2;
-    --error-text: #b91c1c;
-    --radius: 10px;
-    --gap: 14px;
-    --list-w: 380px;      /* 세션 목록 열 너비 */
-    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
-
-  /* 페이지(body)는 스크롤하지 않는다 — 스크롤은 목록·상세 두 패널 내부 몫이다. */
-  html, body { height: 100%; margin: 0; overflow: hidden; }
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo",
-      "Noto Sans KR", Roboto, sans-serif;
-    -webkit-font-smoothing: antialiased;
-    font-size: 14px;
-  }
-
-  .app {
-    height: 100vh;
-    height: 100dvh;
-    display: flex;
-    flex-direction: column;
-  }
-
-  header {
-    display: flex;
-    align-items: center;
-    gap: var(--gap);
-    padding: 12px 18px;
-    border-bottom: 1px solid var(--border);
-    background: var(--panel);
-    flex: none;
-  }
-  header h1 { font-size: 15px; font-weight: 600; margin: 0; }
-  header .sub { color: var(--muted); font-size: 12px; }
-
-  /* 개요 지표 줄 */
-  .stats { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
-  .stat {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 5px 10px;
-    line-height: 1.3;
-  }
-  .stat b { display: block; font-size: 13px; font-variant-numeric: tabular-nums; }
-  .stat span { color: var(--muted); font-size: 11px; }
-
-  main { flex: 1; display: flex; min-height: 0; }
-
-  /* 왼쪽: 세션 목록 (자체 스크롤러) */
-  .list-pane {
-    width: var(--list-w);
-    flex: none;
-    display: flex;
-    flex-direction: column;
-    border-right: 1px solid var(--border);
-    background: var(--panel);
-    min-height: 0;
-  }
-  .filters { padding: 10px; border-bottom: 1px solid var(--border); display: grid; gap: 8px; }
-  .filters .row { display: flex; gap: 8px; }
-  input {
-    font: inherit;
-    padding: 7px 10px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--panel);
-    color: var(--text);
-    width: 100%;
-    box-sizing: border-box;
-  }
-  input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
-  button {
-    font: inherit;
-    padding: 7px 12px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--panel);
-    color: var(--text);
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  button:hover { background: var(--bg); }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button:disabled { opacity: .45; cursor: default; }
-
-  .sessions { flex: 1; overflow-y: auto; min-height: 0; }
-  .session {
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--border);
-    cursor: pointer;
-  }
-  .session:hover { background: var(--bg); }
-  .session[aria-selected="true"] { background: var(--accent-soft); }
-  .session .preview {
-    font-weight: 500;
-    /* 미리보기는 두 줄까지만 — 목록의 행 높이를 고르게 유지한다. */
-    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-    overflow: hidden;
-    word-break: break-word;
-  }
-  .session .preview.empty { color: var(--muted); font-weight: 400; }
-  .session .meta {
-    color: var(--muted);
-    font-size: 11px;
-    margin-top: 4px;
-    display: flex;
-    gap: 8px;
-    justify-content: space-between;
-  }
-  .session .sid { font-family: var(--mono); }
-
-  .pager {
-    display: flex; align-items: center; gap: 8px; justify-content: center;
-    padding: 8px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px;
-  }
-
-  /* 오른쪽: 세션 상세 (자체 스크롤러) */
-  .detail-pane { flex: 1; overflow-y: auto; min-height: 0; padding: 16px 20px; }
-  .placeholder { color: var(--muted); text-align: center; margin-top: 15vh; }
-
-  .detail-head { margin-bottom: var(--gap); }
-  .detail-head h2 { font-size: 14px; margin: 0 0 6px; font-family: var(--mono); word-break: break-all; }
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
-  .chip {
-    font-size: 11px; color: var(--muted);
-    background: var(--panel); border: 1px solid var(--border);
-    border-radius: 999px; padding: 3px 9px;
-  }
-
-  .event {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 10px 12px;
-    margin-bottom: 10px;
-  }
-  .event.user { border-color: var(--accent); background: var(--accent-soft); }
-  .event > .who {
-    font-size: 11px; color: var(--muted); margin-bottom: 6px;
-    display: flex; gap: 8px; flex-wrap: wrap;
-  }
-  .event .body { white-space: pre-wrap; word-break: break-word; }
-
-  /* 조사 과정·출처는 접어 둔다 — 타임라인의 주인공은 대화 본문이다. */
-  details.part { margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 8px; }
-  details.part > summary { cursor: pointer; font-size: 12px; color: var(--web); }
-  details.part[data-kind="sources"] > summary { color: var(--muted); }
-  .steps { margin: 8px 0 0; padding-left: 18px; font-size: 12px; }
-  .steps li { margin: 2px 0; word-break: break-word; }
-  .steps .stage { color: var(--muted); font-family: var(--mono); font-size: 11px; margin-right: 6px; }
-  .failed { color: var(--error-text); }
-
-  .sources { display: grid; gap: 6px; }
-  .sources a { color: var(--accent); text-decoration: none; word-break: break-all; }
-  .sources a:hover { text-decoration: underline; }
-  h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 18px 0 8px; }
-
-  /* 로그인 게이트 */
-  .gate { margin: auto; max-width: 300px; text-align: center; display: grid; gap: 10px; }
-  .error { color: var(--error-text); background: var(--error-bg); border-radius: 8px; padding: 8px; }
-  [hidden] { display: none !important; }
-</style>
+<title>yes24-agent · 어드민</title>
+<link rel="stylesheet" href="/static/lib/admin.css" />
 
 <div class="app">
-  <!-- 인증 전: 비밀번호 게이트만 보인다(데이터 요청은 쿠키 없이는 401). -->
-  <form class="gate" id="gate">
-    <h1>운영 데이터 조회</h1>
-    <input type="password" id="password" placeholder="admin 비밀번호" autocomplete="current-password" />
-    <button class="primary" type="submit">열기</button>
+  <!-- 인증 전: 로그인 게이트만 보인다(데이터 요청은 세션 쿠키 없이는 401). -->
+  <form class="gate" id="gate" hidden>
+    <h1>통합 어드민</h1>
+    <input id="username" aria-label="계정명" placeholder="계정명" required autocomplete="username" autocapitalize="none" />
+    <input type="password" id="password" aria-label="비밀번호" placeholder="비밀번호" required autocomplete="current-password" />
+    <button class="primary" type="submit">로그인</button>
     <div class="error" id="gate-error" hidden></div>
   </form>
 
   <header hidden id="header">
     <div>
-      <h1>운영 데이터 조회</h1>
+      <h1>통합 어드민</h1>
       <div class="sub" id="last-activity"></div>
     </div>
     <div class="stats" id="stats"></div>
   </header>
 
+  <nav class="toolbar" id="toolbar" aria-label="관리 메뉴" hidden>
+    <button id="tab-dashboard" aria-pressed="true">대시보드</button>
+    <button id="tab-data" aria-pressed="false">데이터 탐색</button>
+    <button id="tab-sessions" aria-pressed="false">대화</button>
+    <button id="tab-admins" aria-pressed="false" hidden>관리자</button>
+    <span class="account" id="account"></span>
+    <button id="password-change">비밀번호 변경</button>
+    <button id="refresh">새로고침</button>
+    <button id="logout">로그아웃</button>
+  </nav>
+  <div class="error notice" id="app-error" role="alert" hidden></div>
   <main hidden id="main">
-    <section class="list-pane">
+    <section class="workspace-pane" id="dashboard-pane">
+      <div class="workspace-head"><h2>운영 대시보드</h2><p>대화 품질과 모델 사용량을 함께 확인합니다. 모든 기간과 시각은 UTC 기준입니다.</p></div>
+      <form id="dashboard-filters" class="analysis-filters">
+        <label>시작일 (UTC)<input id="dashboard-since" type="date" required /></label>
+        <label>종료일 (UTC)<input id="dashboard-until" type="date" required /></label>
+        <label>앱<select id="dashboard-app"><option value="">전체 앱</option></select></label>
+        <button class="primary" type="submit">조회</button>
+      </form>
+      <div id="dashboard" class="dashboard-content" aria-live="polite"></div>
+    </section>
+    <section class="workspace-pane" id="data-pane" hidden>
+      <div class="workspace-head"><h2>데이터 탐색</h2><p>원본 기록을 조회합니다. 행을 선택하면 전체 필드를 확인하고, 권한이 있으면 회원·초기 질문을 편집할 수 있습니다.</p></div>
+      <form id="data-filters" class="analysis-filters">
+        <label>데이터<select id="dataset"></select></label>
+        <label>검색<input id="data-q" placeholder="검색어" /></label>
+        <label>시작일 (UTC)<input id="data-since" type="date" /></label>
+        <label>종료일 (UTC)<input id="data-until" type="date" /></label>
+        <label>정렬<select id="data-sort"></select></label>
+        <label>순서<select id="data-direction"><option value="desc">내림차순</option><option value="asc">오름차순</option></select></label>
+        <label id="data-status-label">상태<select id="data-status"></select></label>
+        <label id="data-app-label">앱<select id="data-app"><option value="">전체 앱</option></select></label>
+        <label id="data-null-label" hidden>종료 상태<select id="data-status-null"><option value="">전체</option><option value="true">미기록 (NULL)</option></select></label>
+        <span class="exact-filters" id="data-exact"></span>
+        <button class="primary" type="submit">검색</button><button type="reset">초기화</button>
+      </form>
+      <div class="saved-queries">
+        <label>저장된 조회<select id="saved-query"><option value="">선택하세요</option></select></label>
+        <button id="saved-load">불러오기</button><button id="saved-delete">삭제</button>
+        <label>조회 이름<input id="saved-name" placeholder="이 브라우저에 저장할 이름" /></label><button id="saved-save">적용 조건 저장·덮어쓰기</button>
+        <span id="saved-status" role="status">검색 조건만 이 브라우저에 저장합니다.</span>
+      </div>
+      <div class="data-actions"><span id="data-description"></span><span id="data-tools"></span><button id="csv" disabled>현재 페이지 CSV</button><button id="csv-all" disabled>조건 전체 CSV</button><button id="csv-cancel" hidden>다운로드 취소</button></div>
+      <p id="export-status" class="analysis-note" role="status"></p>
+      <div id="data" aria-live="polite"></div>
+      <div class="pager"><button id="data-prev">‹ 이전</button><span id="data-page-info"></span><button id="data-next">다음 ›</button></div>
+    </section>
+    <section class="workspace-pane" id="admins-pane" hidden>
+      <div class="workspace-head"><h2>관리자 계정</h2><p>계정을 만들고 역할·활성 상태를 바꿉니다. 행을 선택하면 편집과 비밀번호 재설정을 할 수 있습니다.</p></div>
+      <form id="admin-create" class="analysis-filters">
+        <label>계정명<input id="admin-username" required autocomplete="off" autocapitalize="none" /></label>
+        <label>초기 비밀번호<input id="admin-password" type="password" required autocomplete="new-password" /></label>
+        <label>역할<select id="admin-role"></select></label>
+        <button class="primary" type="submit">계정 생성</button>
+      </form>
+      <p id="admin-create-status" class="analysis-note" role="status"></p>
+      <div id="admins" aria-live="polite"></div>
+    </section>
+    <section class="list-pane" id="list-pane" hidden>
       <form class="filters" id="filters">
-        <input id="q" placeholder="세션 id 또는 대화 내용 검색" />
+        <input id="q" aria-label="대화 검색" placeholder="세션 id 또는 대화 내용 검색" />
         <div class="row">
-          <input id="since" type="date" title="시작일(갱신 시각 기준)" />
-          <input id="until" type="date" title="종료일(갱신 시각 기준)" />
+          <input id="since" type="date" aria-label="시작일(갱신 시각 기준)" />
+          <input id="until" type="date" aria-label="종료일(갱신 시각 기준)" />
           <button class="primary" type="submit">검색</button>
         </div>
+        <button type="reset">검색 초기화</button>
       </form>
-      <div class="sessions" id="sessions"></div>
+      <div class="sessions" id="sessions" aria-live="polite"></div>
       <div class="pager">
         <button id="prev">‹ 이전</button>
         <span id="page-info"></span>
         <button id="next">다음 ›</button>
       </div>
     </section>
-    <section class="detail-pane" id="detail">
-      <div class="placeholder">왼쪽에서 세션을 선택하세요.</div>
+    <section class="detail-pane" id="detail" hidden>
+      <div class="placeholder">목록에서 대화를 선택하세요.</div>
     </section>
   </main>
 </div>
+<dialog id="record-dialog" aria-labelledby="record-title">
+  <div class="dialog-head"><h2 id="record-title">기록 상세</h2><button id="record-conversation" hidden>대화 열기</button><button id="record-copy">JSON 복사</button><button id="record-close">닫기</button></div>
+  <div id="record-actions"></div>
+  <p id="copy-status" role="status"></p><pre id="record-json"></pre>
+</dialog>
 
-<script type="module">
-  import { isSafeUrl } from "/static/lib/sources.js?v=1";
+<!-- 정확 일치 필터 한 칸 — 데이터셋 메타데이터(exact_filters)의 키마다 복제한다. -->
+<template id="exact-template"><label><span></span><input placeholder="정확히 일치하는 값" /></label></template>
+<template id="trend-template"><svg class="trend-track" viewBox="0 0 100 1" preserveAspectRatio="none" aria-hidden="true"><rect class="trend-total" height="1" /><rect class="trend-failed" height="1" /></svg></template>
 
-  const $ = (id) => document.getElementById(id);
-  const state = { page: 0, total: 0, pageSize: 0, selected: null };
-
-  /** 텍스트를 노드로 넣어 항상 이스케이프한다(대화 본문에 마크업이 섞여도 안전). */
-  const el = (tag, cls, text) => {
-    const node = document.createElement(tag);
-    if (cls) node.className = cls;
-    if (text !== undefined) node.textContent = text;
-    return node;
-  };
-
-  const num = (n) => (n ?? 0).toLocaleString('ko-KR');
-  const bytes = (b) => {
-    const units = ['B', 'KB', 'MB', 'GB'];
-    let i = 0, v = b || 0;
-    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-    return `${v.toFixed(i ? 1 : 0)} ${units[i]}`;
-  };
-  /** epoch 초 → 로컬 시각 문자열. */
-  const clock = (ts) => (ts ? new Date(ts * 1000).toLocaleString('ko-KR') : '');
-
-  async function api(path) {
-    const res = await fetch(path, { credentials: 'same-origin' });
-    if (res.status === 401) { showGate(); throw new Error('unauthorized'); }
-    if (!res.ok) throw new Error(`${res.status}`);
-    return res.json();
-  }
-
-  function showGate(message) {
-    $('gate').hidden = false;
-    $('header').hidden = $('main').hidden = true;
-    $('gate-error').hidden = !message;
-    $('gate-error').textContent = message || '';
-  }
-
-  function showApp() {
-    $('gate').hidden = true;
-    $('header').hidden = $('main').hidden = false;
-  }
-
-  // ── 개요 ────────────────────────────────────────────────────────────────
-  async function loadOverview() {
-    const o = await api('/admin/api/overview');
-    const apps = o.apps.map((a) => `${a.app_name} ${num(a.count)}`).join(' · ');
-    const stats = [
-      ['세션', num(o.sessions)],
-      ['턴', num(o.turns)],
-      ['DB 크기', bytes(o.db_bytes)],
-      ['앱', apps || '-'],
-    ];
-    $('stats').replaceChildren(...stats.map(([label, value]) => {
-      const box = el('div', 'stat');
-      box.append(el('b', null, value), el('span', null, label));
-      return box;
-    }));
-    $('last-activity').textContent = o.last_activity ? `최근 활동 ${clock(o.last_activity)}` : '';
-  }
-
-  // ── 세션 목록 ───────────────────────────────────────────────────────────
-  async function loadSessions() {
-    const params = new URLSearchParams({
-      q: $('q').value.trim(), since: $('since').value, until: $('until').value, page: state.page,
-    });
-    const data = await api(`/admin/api/sessions?${params}`);
-    state.total = data.total;
-    state.pageSize = data.page_size;
-
-    $('sessions').replaceChildren(...data.items.map((s) => {
-      const row = el('div', 'session');
-      row.setAttribute('aria-selected', String(s.id === state.selected));
-      row.onclick = () => selectSession(s.id);
-
-      const preview = el('div', `preview${s.preview ? '' : ' empty'}`, s.preview || '(사용자 발화 없음)');
-      const meta = el('div', 'meta');
-      meta.append(el('span', 'sid', s.id.slice(0, 12)), el('span', null, `${num(s.turn_count)}턴 · ${clock(s.update_time)}`));
-      row.append(preview, meta);
-      return row;
-    }));
-
-    if (!data.items.length) {
-      $('sessions').replaceChildren(el('div', 'placeholder', '조건에 맞는 세션이 없습니다.'));
-    }
-
-    const pages = Math.max(1, Math.ceil(state.total / state.pageSize));
-    $('page-info').textContent = `${state.page + 1} / ${pages} · 총 ${num(state.total)}건`;
-    $('prev').disabled = state.page <= 0;
-    $('next').disabled = state.page + 1 >= pages;
-    $('sessions').scrollTop = 0;
-  }
-
-  // ── 세션 상세 ───────────────────────────────────────────────────────────
-  /** 조사 과정(chat_turn.process.steps) — 도구 호출·결과가 스텝으로 남아 있다. */
-  function renderSteps(steps) {
-    const box = el('details', 'part');
-    box.dataset.kind = 'steps';
-    box.append(el('summary', null, `조사 과정 · ${num(steps.length)}스텝`));
-    const list = el('ol', 'steps');
-    for (const st of steps) {
-      const item = el('li', st.state === 'failed' ? 'failed' : null);
-      item.append(el('span', 'stage', `r${st.round} ${st.stage}`), document.createTextNode(st.detail || ''));
-      if (st.sources?.length) item.append(document.createTextNode(` — ${st.sources.map((x) => x.title || x.url).join(' · ')}`));
-      list.append(item);
-    }
-    box.append(list);
-    return box;
-  }
-
-  function renderSources(sources) {
-    const box = el('details', 'part');
-    box.dataset.kind = 'sources';
-    box.append(el('summary', null, `인용 출처 ${num(sources.length)}건`));
-    const list = el('div', 'sources');
-    for (const s of sources) {
-      const link = el('a', null, `[${s.id}] ${s.title || s.url}`);
-      // 출처 URL은 웹 검색 결과에서 온 비신뢰 데이터다. scheme을 http/https로 한정하지 않으면
-      // `javascript:` URI가 섞였을 때 운영자 클릭이 admin 오리진에서 스크립트를 실행한다.
-      link.href = isSafeUrl(s.url) ? s.url : '#';
-      link.target = '_blank';
-      link.rel = 'noopener noreferrer';
-      const line = el('div');
-      line.append(link);
-      list.append(line);
-    }
-    box.append(list);
-    return box;
-  }
-
-  /** 턴 하나 = 사용자 발화 상자 + 답변 상자(상태·지연·토큰·피드백·과정·출처). */
-  function renderTurn(t) {
-    const user = el('div', 'event user');
-    const asked = el('div', 'who');
-    asked.append(el('span', null, 'user'), el('span', null, clock(t.asked_at)));
-    user.append(asked, el('div', 'body', t.user_message));
-
-    const bot = el('div', 'event');
-    const who = el('div', 'who');
-    who.append(el('span', t.status === 'completed' ? null : 'failed', t.status));
-    if (!t.history_saved) who.append(el('span', null, '구 이벤트 재조립'));
-    if (t.elapsed_ms !== null) who.append(el('span', null, `${(t.elapsed_ms / 1000).toFixed(1)}s`));
-    if (t.attributable_total_tokens) who.append(el('span', null, `${num(t.attributable_total_tokens)} tok`));
-    if (t.rbti_applied) who.append(el('span', null, `RBTI ${t.rbti_applied}`));
-    if (t.likes || t.dislikes) who.append(el('span', null, `👍 ${num(t.likes)} 👎 ${num(t.dislikes)}`));
-    if (t.clicks) who.append(el('span', null, `클릭 ${num(t.clicks)}`));
-    bot.append(who);
-    if (t.error) bot.append(el('div', 'failed', `${t.error.code}: ${t.error.message}`));
-    bot.append(el('div', 'body', t.assistant_message));
-    if (t.process?.steps?.length) bot.append(renderSteps(t.process.steps));
-    if (t.sources?.length) bot.append(renderSources(t.sources));
-    return [user, bot];
-  }
-
-  async function selectSession(id) {
-    state.selected = id;
-    for (const row of $('sessions').children) {
-      if (row.classList.contains('session')) row.setAttribute('aria-selected', String(false));
-    }
-    const d = await api(`/admin/api/sessions/${encodeURIComponent(id)}`);
-    // 선택 표시는 응답 후 다시 칠한다(그 사이 목록이 바뀌었을 수 있다).
-    for (const row of $('sessions').children) {
-      const sid = row.querySelector?.('.sid')?.textContent;
-      if (sid && id.startsWith(sid)) row.setAttribute('aria-selected', 'true');
-    }
-
-    const head = el('div', 'detail-head');
-    head.append(el('h2', null, d.session.id));
-    const chips = el('div', 'chips');
-    const m = d.metrics;
-    chips.append(
-      el('span', 'chip', `${d.session.app_name} / ${d.session.user_id}`),
-      el('span', 'chip', `생성 ${clock(d.session.create_time)}`),
-      el('span', 'chip', `갱신 ${clock(d.session.update_time)}`),
-      el('span', 'chip', `${num(m.turns)}턴`),
-    );
-    if (m.avg_turn_seconds !== null) chips.append(el('span', 'chip', `턴당 평균 ${m.avg_turn_seconds}s`));
-    head.append(chips);
-
-    $('detail').replaceChildren(head, el('h3', null, '대화 타임라인'), ...d.turns.flatMap(renderTurn));
-    $('detail').scrollTop = 0;
-  }
-
-  // ── 배선 ────────────────────────────────────────────────────────────────
-  $('gate').onsubmit = async (e) => {
-    e.preventDefault();
-    const res = await fetch('/admin/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
-      body: JSON.stringify({ password: $('password').value }),
-    });
-    if (!res.ok) return showGate('비밀번호가 올바르지 않습니다.');
-    $('password').value = '';
-    await start();
-  };
-
-  $('filters').onsubmit = (e) => { e.preventDefault(); state.page = 0; loadSessions(); };
-  $('prev').onclick = () => { if (state.page > 0) { state.page--; loadSessions(); } };
-  $('next').onclick = () => { state.page++; loadSessions(); };
-
-  async function start() {
-    showApp();
-    await Promise.all([loadOverview(), loadSessions()]);
-  }
-
-  // 쿠키가 이미 있으면 바로 데이터로, 없으면 401 → 게이트.
-  start().catch(() => {});
-</script>
+<script type="module" src="/static/lib/admin.js"></script>
+</html>
