@@ -582,26 +582,28 @@ async def aclose_shared_client() -> None:
         _shared_client = None
 
 
-async def _search_one(
-    query: str,
-    client: httpx.AsyncClient,
-    headers: dict,
-    settings: Settings,
-    domain_filters: list[str],
+async def search_raw(
+    query: str, settings: Settings, domain_filters: list[str] | None = None,
+    *, max_results: int | None = None,
 ) -> dict:
-    """한 검색 각도(query)로 Perplexity /search를 호출해 **원시 결과만** 돌려준다(등록 없음).
-
-    출처 등록(register_source)은 여기서 하지 않는다 — 여러 각도를 gather로 동시 실행할 때
-    등록을 병렬로 돌리면 source_id 부여에 레이스가 생기므로, 네트워크만 여기서 하고 등록은
-    호출부의 순차 루프에서 처리한다(레이스 0). 예상된 오류(전송·HTTP·JSON)만 잡아 구조화된
-    error dict로 반환하고, 예상 밖 예외는 삼키지 않고 그대로 올려보낸다(fail-loud).
-
-    반환: {"query", "status": "ok", "raw": [원시 item...]} 또는
-          {"query", "status": "error", "error_type": "fetch", "message"}.
-    """
+    """컨텍스트·출처 등록 없이 원시 검색과 URL·본문·날짜 정규화를 수행한다."""
+    if not settings.perplexity_api_key:
+        return {
+            "query": query, "status": "error", "error_type": "not_configured",
+            "message": "웹 검색이 설정되지 않았습니다",
+        }
+    try:
+        domain_filters = _normalize_domain_filters(domain_filters)
+    except ValueError as exc:
+        return {
+            "query": query, "status": "error", "error_type": "invalid_domains",
+            "message": str(exc),
+        }
+    client = get_client(settings)
+    headers = {"Authorization": f"Bearer {settings.perplexity_api_key}"}
     payload = {
         "query": query,
-        "max_results": settings.web_search_max_results,
+        "max_results": settings.web_search_max_results if max_results is None else max_results,
         "max_tokens_per_page": settings.web_search_max_tokens_per_page,
         "max_tokens": settings.web_search_max_tokens,
     }
@@ -647,7 +649,23 @@ async def _search_one(
             "error_type": "fetch",
             "message": f"웹 검색 요청에 실패했습니다: {exc}",
         }
-    return {"query": query, "status": "ok", "raw": raw}
+    normalized = []
+    for item in raw:
+        url = item["url"]
+        if not _url_in_domain_scope(url, domain_filters):
+            continue
+        content = next((
+            value for value in (item.get("snippet"), item.get("body"))
+            if isinstance(value, str) and value.strip()
+        ), None)
+        if content is None:
+            continue
+        normalized.append({
+            "url": url, "title": item.get("title") or url,
+            "snippet": truncate(content, settings.web_search_snippet_max_chars),
+            "date": item.get("date"), "last_updated": item.get("last_updated"),
+        })
+    return {"query": query, "status": "ok", "raw": normalized, "raw_result_count": len(raw)}
 
 
 async def web_search(
@@ -721,24 +739,8 @@ async def web_search(
             )
         return outcome
 
-    if not settings.perplexity_api_key:
-        logger.info("web_search status=error error_type=not_configured")
-        return {
-            "status": "error",
-            "error_type": "not_configured",
-            "message": "웹 검색이 설정되지 않았습니다",
-            "result_count": 0,
-        }
-
-    client = get_client(settings)
-    # 퍼플렉시티는 Bearer 헤더 인증(바디 api_key 아님). 헤더는 요청마다 넘겨 공유 클라이언트를
-    # 인증 중립으로 유지한다. snippet 콘텐츠 분량은 토큰 예산으로 조절(snippet이 종합 재료).
-    headers = {"Authorization": f"Bearer {settings.perplexity_api_key}"}
-
-    # 네트워크(/search POST)만 동시 실행한다(각도별 병렬). 등록은 아래 순차 루프에서 — 레이스 0.
-    # _search_one이 예상 오류를 이미 error dict로 삼키므로 예상 밖 예외만 gather 밖으로 올라온다.
     searched = await asyncio.gather(
-        *(_search_one(q, client, headers, settings, domain_filters) for q in planned)
+        *(search_raw(q, settings, domain_filters) for q in planned)
     )
 
     checked_at = now_checked_at()
@@ -753,22 +755,8 @@ async def web_search(
             continue
         matched = 0
         for item in outcome["raw"]:
-            url = item.get("url")
-            if not _url_in_domain_scope(url, domain_filters):
-                continue
-            content = next(
-                (
-                    value
-                    for value in (item.get("snippet"), item.get("body"))
-                    if isinstance(value, str) and value.strip()
-                ),
-                None,
-            )
-            if content is None:
-                continue
-            # 절단(상한에서 자르고 끝 공백 정리 후 표식)은 세 도구가 같아야 하므로
-            # 공용 텍스트 유틸(tools/_text.truncate)을 공유한다.
-            snippet = truncate(content, settings.web_search_snippet_max_chars)
+            url = item["url"]
+            snippet = item["snippet"]
             matched += 1
             existing = url_to_index.get(url)
             if existing is not None:
@@ -777,9 +765,7 @@ async def web_search(
                 if query not in results[existing]["queries"]:
                     results[existing]["queries"].append(query)
                 continue
-            title = item.get("title") or url
-            # snippet 로컬 하드 상한(벤더 토큰 예산 초과분 방어). 등록·반환 모두 절단본으로
-            # 통일해 세션 출처와 도구 결과의 snippet이 어긋나지 않게 한다.
+            title = item["title"]
             published_at = item.get("date")
             last_updated = item.get("last_updated")
             source_id = register_source(
@@ -814,7 +800,7 @@ async def web_search(
                 "query": query,
                 "status": "ok",
                 "result_count": matched,
-                "raw_result_count": len(outcome["raw"]),
+                "raw_result_count": outcome["raw_result_count"],
             }
         )
 
@@ -825,7 +811,7 @@ async def web_search(
         logger.info(f"web_search queries={len(planned)} status=error error_type=fetch")
         return {
             "status": "error",
-            "error_type": "fetch",
+            "error_type": searched[0]["error_type"],
             "message": searched[0]["message"],
             "result_count": 0,
         }

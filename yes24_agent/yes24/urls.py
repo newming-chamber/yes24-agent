@@ -117,6 +117,11 @@ def product_url(base_url: str, goods_no: str) -> str:
 # links로 돌려주므로, 어느 카테고리로 들어갈지는 에이전트가 **그때그때 페이지에서 읽은
 # 실제 링크로 판단**한다(따라가기 1~2회). 정적 맵은 Yes24 메뉴 개편 시 조용히 썩고,
 # 부분 시드는 빠진 카테고리 질문(실측: 무이자 할부 카드)이 "못 찾음"으로 새는 문제가 있었다.
+# 기획전 목록 — **사이트가 판단한 시즌**의 단일 출처. 수능·명절·계절 기획전이 제목과 기간에
+# 그대로 드러나므로, 달력을 코드에 박지 않고 오늘 걸려 있는 것을 읽기만 하면 된다(정적 달력은
+# 매년 썩는다). event.yes24.com은 www와 별도 robots.txt로 허용된 서브도메인이다.
+EVENT_LIST_URL = "https://event.yes24.com/"
+
 POLICY_SEEDS: dict[str, dict[str, str]] = {
     "notice": {
         "label": "공지사항",

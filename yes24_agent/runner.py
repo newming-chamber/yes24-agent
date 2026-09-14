@@ -753,10 +753,17 @@ async def run_agent_stream(
                                     return_when=asyncio.FIRST_COMPLETED,
                                 )
                                 while thought_tasks and thought_tasks[0].done():
+                                    label = thought_tasks.popleft().result()
+                                    # 본문이 이미 흐르는 중이면(그 뒤로 도구도 안 돌았으면)
+                                    # 이 라벨은 지난 라운드의 사고다 — 번역 왕복(~1초)에
+                                    # 밀려 답변보다 늦게 도착했다. 흘리면 "답변은 나오는데
+                                    # 상태는 검색 중"이라는 모순 표시가 남으므로 버린다.
+                                    # 도구가 다시 돌았으면(tool_ran_since_text) 그 라벨은
+                                    # 새 라운드의 사고라 그대로 흘린다.
+                                    if raw_body and not tool_ran_since_text:
+                                        continue
                                     yield sse_status(
-                                        "thinking",
-                                        thought_tasks.popleft().result(),
-                                        round=process.round,
+                                        "thinking", label, round=process.round
                                     )
                             event = await event_task
                             event_task = None

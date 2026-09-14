@@ -58,3 +58,16 @@ SELECT * FROM (
   UNION ALL SELECT 'general', '이 문장 더 자연스럽게 다듬어줘', 'manual'
 ) AS seed(slot, text, source)
 WHERE NOT EXISTS (SELECT 1 FROM starters WHERE starters.text = seed.text);
+
+-- 칩 라벨(2026-09-14 추가). 슬롯이 사이트에서 파생되면서 키는 예스24가 쓰는 코너·분야
+-- 이름을 담는다("특가"·"에세이"). 그 이름이 그대로 칩에 올라가도 되는지는 이름마다
+-- 다르므로("일별"만으로는 무엇의 일별인지 모른다) 생성 때 정해 행에 싣는다. NULL이면
+-- 코드가 키에서 파생한다(수동 등록분·옛 행). 재적용해도 안전하도록 존재 여부를 먼저 본다.
+SET @add_label := (
+  SELECT IF(COUNT(*) = 0,
+    'ALTER TABLE starters ADD COLUMN label VARCHAR(40) NULL AFTER slot',
+    'DO 0')
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'starters' AND COLUMN_NAME = 'label'
+);
+PREPARE stmt FROM @add_label; EXECUTE stmt; DEALLOCATE PREPARE stmt;

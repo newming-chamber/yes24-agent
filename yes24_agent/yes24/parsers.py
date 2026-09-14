@@ -702,6 +702,40 @@ def extract_links(
     return (products + _context_first(pages, page_url))[:limit]
 
 
+_EVENT_PERIOD_RE = re.compile(
+    r"(?P<title>.+?)\s*(?:(?P<start>\d{4}\.\d{2}\.\d{2})\.\s*~\s*(?P<end>\d{4}\.\d{2}\.\d{2})\.|"
+    r"(?P<always>상시|소진시))\s*$"
+)
+
+
+def parse_event_list(html: str, *, limit: int = 40) -> list[dict]:
+    """기획전 목록에서 제목과 기간을 뽑는다.
+
+    한 줄이 "제목 YYYY.MM.DD. ~ YYYY.MM.DD." 또는 "제목 상시/소진시" 꼴로 렌더되므로 한
+    정규식이 둘을 가른다. 기간이 없는 항목은 start·end가 None이고 늘 진행 중으로 본다.
+    시즌 판정(오늘이 그 기간 안인가)은 호출부가 한다 — 파서는 관측만 한다.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for anchor in soup.select("a[href*='EventNo']"):
+        text = " ".join(anchor.get_text(" ", strip=True).split())
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        match = _EVENT_PERIOD_RE.match(text)
+        rows.append(
+            {
+                "title": match.group("title").strip() if match else text,
+                "start": match.group("start") if match else None,
+                "end": match.group("end") if match else None,
+            }
+        )
+        if len(rows) >= limit:
+            break
+    return rows
+
+
 def extract_faq_entries(soup: BeautifulSoup) -> list[dict[str, str]]:
     """선언된 FAQ 목록을 **전부** 순회해 질문·답변 entry로 추출한다.
 
@@ -1046,6 +1080,49 @@ def product_fields(item: Mapping) -> dict:
 
 
 _CATEGORY_DISPLAY_HREF_RE = re.compile(CATEGORY_DISPLAY_HREF_RE)
+
+
+def parse_corner_links(html: str, *, base_url: str, section: str) -> list[dict]:
+    """목록 페이지가 스스로 걸어 둔 **형제 코너 탭**을 추출한다(종합·실시간·특가·스테디셀러…).
+
+    코너 이름을 코드에 열거하지 않는다 — parse_category_links가 분야 번호를 페이지 내비에서
+    읽는 것과 같은 원리다. 탭 묶음을 찾는 기준도 클래스 이름이 아니라 **시드 URL 자신**이다:
+    코너 탭 목록에는 반드시 시드 코너(종합)로 가는 링크가 들어 있으므로, 시드와 경로가 같은
+    링크를 담은 `<ul>`이 곧 그 묶음이다. 클래스가 개편돼도 이 기준은 살아남는다.
+
+    반환: `[{"key": 경로 마지막 조각(소문자), "label": 탭 문구, "url": 절대 URL}]` — 문서 순서를
+    보존하고 같은 key는 첫 등장만 남긴다. 묶음을 못 찾으면 빈 리스트다. 이것은 "코너가 없다"는
+    정당한 상태(형제 탭이 없는 코너도 있다)이므로 호출자는 시드 그대로를 쓴다.
+    """
+    seed_path = urlsplit(BROWSE_SEED_URLS[section]["url"]).path.lower().rstrip("/")
+    seed_dir, _, _ = seed_path.rpartition("/")
+    soup = BeautifulSoup(html, "lxml")
+    tabs = None
+    for anchor in soup.find_all("a", href=True):
+        if urlsplit(urljoin(base_url, anchor["href"])).path.lower().rstrip("/") != seed_path:
+            continue
+        tabs = anchor.find_parent("ul")
+        if tabs is not None:
+            break
+    if tabs is None:
+        return []
+
+    registered = allowed_domain(base_url)
+    corners: dict[str, dict] = {}
+    for anchor in tabs.find_all("a", href=True):
+        url = urljoin(base_url, anchor["href"])
+        parts = urlsplit(url)
+        # 시드와 **같은 사이트, 같은 디렉터리의 형제**만 코너로 본다. 이 URL은 페이지 HTML에서
+        # 주워 그대로 여는 값이라 경계가 곧 방어다 — 경로만 보면 외부 호스트가 같은 경로를
+        # 흉내 내 통과한다(테스트가 실측). 호스트 판정은 client의 SSRF 방어와 같은 함수다.
+        head, _, key = parts.path.lower().rstrip("/").rpartition("/")
+        label = anchor.get_text(strip=True)
+        if not is_allowed_host(parts.hostname or "", registered):
+            continue
+        if head != seed_dir or not key or not label or key in corners:
+            continue
+        corners[key] = {"key": key, "label": label, "url": url}
+    return list(corners.values())
 
 
 def parse_category_links(html: str, *, limit: int) -> list[dict]:
