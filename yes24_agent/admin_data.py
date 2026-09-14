@@ -200,7 +200,7 @@ DATASETS = {
             # admin_audit.action 어휘 — admin_auth에 새 action을 추가하면 여기 동기화한다.
             tuple(
                 "ok failed logout create update deactivate "
-                "password_reset password_change generate".split()
+                "password_reset password_change generate restore purge".split()
             ),
             exact_filters=("actor_name", "target_type", "target_id"),
             unsortable=("before", "after"),

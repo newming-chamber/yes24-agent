@@ -467,6 +467,9 @@ async def lifespan(app: FastAPI):
     if not ensure_google_api_key_env():
         logger.warning("GEMINI/GOOGLE API 키가 설정되지 않았습니다. LLM 호출이 실패할 수 있어요.")
     await UserDataService.get_instance().verify_schema()
+    # 삭제한 대화의 보존 기간 경과분 파기(개인정보 파기 의무라 외부 cron이 아니라 앱이 소유한다).
+    # 닫기는 close_user_data_service가 한다.
+    UserDataService.get_instance().start_purge_loop()
     # 사고 라벨 번역 경로를 백그라운드로 데운다(첫 채팅의 첫 한국어 라벨 ~0.3초 단축).
     # 기동을 막지 않도록 task로만 띄우고, 참조를 잡아 GC 취소를 막는다.
     app.state.translation_warmup = asyncio.create_task(warmup_translation())
