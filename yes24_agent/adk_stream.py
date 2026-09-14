@@ -3,13 +3,16 @@
 import asyncio
 from collections.abc import AsyncIterator
 
+from yes24_agent.tool_progress import bind_tool_progress
+
 _END = object()
 
 
 async def _pump(stream, queue: asyncio.Queue) -> None:
     try:
-        async for event in stream:
-            await queue.put((event, None))
+        with bind_tool_progress(queue):
+            async for event in stream:
+                await queue.put((event, None))
     except Exception as exc:  # noqa: BLE001 — 소비 task로 원래 예외를 전달한다
         await queue.put((_END, exc))
     else:

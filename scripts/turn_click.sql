@@ -15,14 +15,15 @@
 CREATE TABLE IF NOT EXISTS turn_click (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    user_id VARCHAR(64) NOT NULL,     -- Yes24 userNo (turn_feedback과 같은 폭)
+    app_name VARCHAR(128) NOT NULL,
+    user_id VARCHAR(128) NOT NULL,     -- Yes24 userNo (turn_feedback과 같은 폭)
     session_id VARCHAR(128) NOT NULL, -- ADK 세션 id
-    turn_id VARCHAR(128) NOT NULL,    -- ADK invocation_id (events.invocation_id와 같은 값)
+    turn_id VARCHAR(256) NOT NULL,    -- ADK invocation_id (events.invocation_id와 같은 값)
     url TEXT NOT NULL,                -- 클릭한 링크 (요청 상한은 API 계층 click_url_max_chars)
     source_id INT NULL,               -- 본문 [n] 마커 번호 (출처 카드에서 눌렀을 때만)
     source_type VARCHAR(16) NULL,     -- 공개 출처 어휘 product|notice|web (API 계층 Literal 검증)
     label VARCHAR(255) NULL,          -- 표시 제목 (API 계층 click_label_max_chars와 같은 폭)
     -- 조회 축은 소유자 스코프(사용자→세션→턴)다. URL 집계 인덱스는 그 질의가 생길 때
     -- 얹는다(선제 인덱스 금지).
-    KEY idx_turn_click_owner_turn (user_id, session_id, turn_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    KEY idx_turn_click_owner_turn (app_name, user_id, session_id, turn_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

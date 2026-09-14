@@ -11,6 +11,7 @@ from collections.abc import Callable
 
 from yes24_agent.config import get_settings
 from yes24_agent.sources import REGISTRY_RECORD_FIELDS, SUMMARY_FIDELITY, merge_source_records
+from yes24_agent.tool_progress import ToolProgress
 from yes24_agent.toolsets import TOOLSET_PUBLIC_SOURCE_TYPE, TOOLSET_SOURCE_TYPES
 from yes24_agent.yes24.urls import BROWSE_SEED_URLS
 
@@ -27,22 +28,25 @@ def _browse_label(section: str) -> str | None:
 
 
 def _angles(queries) -> list[str]:
-    """멀티쿼리 도구의 queries 인자에서 유효한 검색 각도만 추린다(진행 문구용).
+    """멀티쿼리 도구의 리스트 인자에서 유효한 문자열 각도만 추린다(진행 문구용).
 
-    yes24_search·web_search가 같은 리스트 계약을 쓰므로 추출도 한 곳에서 한다.
+    yes24_search·web_search의 queries, yes24_browse의 sections가 같은 리스트 계약을 쓰므로
+    추출도 한 곳에서 한다.
     """
     if not isinstance(queries, list):
         return []
     return [q for q in queries if isinstance(q, str) and q.strip()]
 
 
-def _status_for_call(call) -> tuple[str, str] | None:
+def _status_for_call(call, *, split_progress: bool = False) -> tuple[str, str] | None:
     """도구 동작과 관측 인자를 진행 칩으로 옮긴다. 인자가 없으면 detail만 비운다."""
     name = getattr(call, "name", "") or ""
     args = call.args or {}
     if name in ("yes24_search", "web_search"):
         angles = _angles(args.get("queries"))
         stage = "searching_web" if name == "web_search" else "searching"
+        if split_progress and name == "yes24_search" and len(angles) > 1:
+            return stage, angles[0].strip()
         return stage, " · ".join(angles)
     if name == "yes24_fetch":
         title = args.get("title")
@@ -54,8 +58,12 @@ def _status_for_call(call) -> tuple[str, str] | None:
         ] if isinstance(items, list) else []
         return "reading", " · ".join(titles)
     if name == "yes24_browse":
-        label = _browse_label(args.get("section", ""))
-        return "browsing", label or ""
+        sections = _angles(args.get("sections"))
+        if split_progress and len(sections) > 1:
+            first = sections[0].strip()
+            return "browsing", _browse_label(first) or first
+        labels = (_browse_label(s) for s in sections)
+        return "browsing", " · ".join(label for label in labels if label)
     # web_fetch는 제목을 받지 않으므로 동작만 표시한다.
     return ("reading", "") if name == "web_fetch" else None
 
@@ -430,7 +438,8 @@ class TurnProcess:
     라운드 수는 그 오프셋 목록의 길이다 — `round`는 목록에서 읽는다.
     `text_event(at_ms)`는 본문 청크가 도착한 경과 시각을 받고, 라운드의 **첫 청크만** 남긴다 —
     마지막 라운드의 그 값이 `answer_at_ms`(답이 시작되기까지의 조사 시간)다.
-    스텝은 도구 status(호출·결과)만이다 — thinking·refs·persona는 과정의 재료가 아니다.
+    스텝은 도구 status(호출·결과)만이다 — thinking·refs는 과정의 재료가 아니다(RBTI는 status가
+    아니라 전용 `rbti` 이벤트라 애초에 여길 지나지 않는다).
     스텝 dict는 `{round,stage,detail,step_id,state}`이고 결과는 result_count/sources도 갖는다.
     """
 
@@ -482,8 +491,10 @@ class TurnProcess:
         self.steps.append(step)
         return step
 
-    def tool_call(self, call) -> dict:
-        status = _status_for_call(call) or ("working", "")
+    def tool_call(self, call, *, split_progress: bool = False) -> dict:
+        status = _status_for_call(
+            call, split_progress=split_progress and bool(getattr(call, "id", None))
+        ) or ("working", "")
         step = self.step(status)
         step["step_id"] = f"step-{len(self._calls) + 1}"
         step["state"] = "running"
@@ -520,6 +531,10 @@ class TurnProcess:
                 call = candidates[0]
             elif not response_name and len(pending) == 1:
                 call = pending[0]
+        if call is not None:
+            call["resolved"] = True
+            if call.get("progress"):
+                return None, sources
         failed = payload.get("status") == "error"
         status = _status_for_response(payload)
         if status is None:
@@ -529,12 +544,42 @@ class TurnProcess:
         count = payload.get("result_count")
         step["result_count"] = count if isinstance(count, int) else len(sources)
         if call is not None:
-            call["resolved"] = True
             step["step_id"] = call["step"]["step_id"]
             step["round"] = call["step"]["round"]
         step_sources = [item for item in map(project_step_source, sources) if item is not None]
         step["sources"] = step_sources
         return step, sources
+
+    def tool_progress(self, event: ToolProgress) -> dict | None:
+        call = next((
+            call for call in self._calls
+            if not call["resolved"] and call["id"] == event.call_id
+        ), None)
+        if call is None:
+            return None
+        call["progress"] = True
+        status = (event.stage, event.detail)
+        if event.index == 0 and event.payload is None and status == (
+            call["step"]["stage"], call["step"]["detail"]
+        ):
+            return None
+        if event.payload is not None:
+            failed = event.payload.get("status") == "error"
+            status = _status_for_response(event.payload)
+            status = status or (("notice", "") if failed else ("found", ""))
+        step = self.step(status)
+        step["round"] = call["step"]["round"]
+        parent_id = call["step"]["step_id"]
+        step["step_id"] = parent_id if event.index == 0 else f"{parent_id}.{event.index + 1}"
+        step["state"] = "running"
+        if event.payload is not None:
+            step["state"] = "failed" if failed else "completed"
+            sources = [] if failed else event.payload.get("sources", [])
+            step["sources"] = [
+                item for item in map(project_step_source, sources) if item is not None
+            ]
+            step["result_count"] = event.payload.get("result_count", len(sources))
+        return step
 
     def payload(
         self, *, raw_body: str, text: str, finalize_text: Callable[[str], str], elapsed_ms: int

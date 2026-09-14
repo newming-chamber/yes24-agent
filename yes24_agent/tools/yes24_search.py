@@ -34,6 +34,7 @@ from google.adk.tools import ToolContext
 
 from yes24_agent.config import Settings, get_settings
 from yes24_agent.sources import cite_marker, now_checked_at, register_source
+from yes24_agent.tool_progress import ToolProgressGroup, parsed_progress
 from yes24_agent.tools._planning import (
     angle_error_summary,
     dropped_queries_message,
@@ -281,8 +282,20 @@ async def yes24_search(
 
     # 네트워크·파싱만 동시 실행한다(각도별 병렬). 등록은 아래 순차 루프에서 — 레이스 0.
     # _search_one이 예상 오류를 이미 error dict로 삼키므로 예상 밖 예외만 gather 밖으로 올라온다.
-    searched = await asyncio.gather(
-        *(_search_one(q, section, order, author_no, client, settings, budget) for q in planned)
+    progress = ToolProgressGroup(
+        tool_context, stage="searching", details=planned
+    )
+    searched = await progress.gather(
+        [
+            (index, _search_one(q, section, order, author_no, client, settings, budget))
+            for index, q in enumerate(planned)
+        ],
+        summarize=parsed_progress,
+        complete=lambda outcome: (
+            section == WIDEST_SECTION
+            or outcome["status"] != "ok"
+            or bool(outcome["parsed"])
+        ),
     )
 
     # 섹션 한정 검색의 0건은 "없다"가 아니라 **범위 밖**일 수 있다 — 국내도서 한정은 영어판·
@@ -299,11 +312,18 @@ async def yes24_search(
             )
             searched = [
                 *searched,
-                *await asyncio.gather(
-                    *(
-                        _search_one(q, WIDEST_SECTION, order, author_no, client, settings, budget)
-                        for q in widen
-                    )
+                *await progress.gather(
+                    [
+                        (
+                            index,
+                            _search_one(
+                                q, WIDEST_SECTION, order, author_no, client, settings, budget
+                            ),
+                        )
+                        for index, q in enumerate(planned)
+                        if q in widen
+                    ],
+                    summarize=parsed_progress,
                 ),
             ]
 

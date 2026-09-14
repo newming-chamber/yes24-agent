@@ -510,6 +510,13 @@ class Settings(BaseSettings):
     # 공유 Yes24Client의 동시성 Semaphore(http_concurrency=5) 안에 들어가는 폭이기도 하다.
     # 초과분은 조용히 버리지 않고 dropped_queries로 명시한다(fail-loud).
     yes24_search_max_queries: int = 4
+    # 한 번의 yes24_browse 호출에서 동시에 열람할 코너(sections) 수 상한 — 위 검색 각도
+    # 상한과 같은 축(호출 1회의 Yes24 요청 폭, http_concurrency=5 안)이라 같은 기본값을 쓴다.
+    # 코너를 갈아탈 때마다 모델 왕복이 끼어 스텝 사이 2.3~3.9초씩 비던 것(2026-09-09 실측:
+    # 3코너 질의 34.1초 중 9.0초)을 한 호출로 닫는 구조의 천장이다. 허용 코너가 4종
+    # (BROWSE_SEED_URLS)이라 유효·중복 제거된 요청은 이 값에 닿지 않고, 초과분은 조용히
+    # 버리지 않고 dropped_sections로 명시한다(fail-loud).
+    yes24_browse_max_sections: int = 4
     # 코너 목록 반환 상한. **초기값·근거 미기록**(e9cf930). 위 search_result_limit는 24→10
     # 되돌림 A/B가 있는데 이쪽은 그 검토를 받은 적이 없다.
     browse_result_limit: int = 10
@@ -665,6 +672,13 @@ class Settings(BaseSettings):
     # 회원 정보(userNo·userId) 재조회 주기(시간). users.user_cached_at이 이보다 오래되면
     # 다음 인증 때 Yes24를 다시 물어 갱신한다.
     yes24_user_cache_hours: int = 24
+    # RBTI(독서 16유형) 조회처 — userNo로 그 사람의 유형 코드를 묻는다(2026-09-10 확정).
+    # 유형은 사람에게 붙는 값이고 **이 API가 정본**이다: 우리 DB에 복제하지 않는다(복제하면
+    # 사용자가 검사를 다시 해도 우리 쪽이 낡은 값을 계속 적용한다). 응답이 30~70ms라
+    # 턴당 1회 조회를 캐시 없이 그대로 탄다 — 캐시는 그 지연을 아끼는 대신 재검사 반영을
+    # 늦추므로, 아낄 것이 없는 지금은 두지 않는다.
+    rbti_api_url: str = "https://yes24-rbti-api.griplabs.io/api/v1/mvp/users/stats"
+    rbti_api_timeout_s: float = 5.0
     # 개발용 API 키 — **비우면 비활성**(배포 기본). 값이 있으면 그 키 하나만 Yes24 회원 조회를
     # 건너뛰고 `dev_api_user_no`로 식별된 것으로 취급한다. 프론트가 로컬에서 개발하려면
     # x-api-key가 필요한데 진짜 ServiceCookies를 꺼내 오게 하는 건 무리라, 그 통로를 하나 연다.

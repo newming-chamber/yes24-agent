@@ -158,23 +158,14 @@
   }
   .event .body { white-space: pre-wrap; word-break: break-word; }
 
-  /* 도구 호출·결과는 접어 둔다 — 타임라인의 주인공은 대화 본문이다. */
+  /* 조사 과정·출처는 접어 둔다 — 타임라인의 주인공은 대화 본문이다. */
   details.part { margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 8px; }
   details.part > summary { cursor: pointer; font-size: 12px; color: var(--web); }
-  details.part[data-kind="result"] > summary { color: var(--muted); }
-  details.part pre {
-    margin: 8px 0 0;
-    font-family: var(--mono);
-    font-size: 11.5px;
-    background: var(--bg);
-    border-radius: 8px;
-    padding: 8px;
-    /* 넓은 JSON은 이 박스 안에서만 가로 스크롤한다(페이지는 넘치지 않는다). */
-    overflow-x: auto;
-    max-height: 320px;
-    overflow-y: auto;
-  }
-  .truncated { color: var(--error-text); font-size: 11px; }
+  details.part[data-kind="sources"] > summary { color: var(--muted); }
+  .steps { margin: 8px 0 0; padding-left: 18px; font-size: 12px; }
+  .steps li { margin: 2px 0; word-break: break-word; }
+  .steps .stage { color: var(--muted); font-family: var(--mono); font-size: 11px; margin-right: 6px; }
+  .failed { color: var(--error-text); }
 
   .sources { display: grid; gap: 6px; }
   .sources a { color: var(--accent); text-decoration: none; word-break: break-all; }
@@ -276,7 +267,7 @@
     const apps = o.apps.map((a) => `${a.app_name} ${num(a.count)}`).join(' · ');
     const stats = [
       ['세션', num(o.sessions)],
-      ['이벤트', num(o.events)],
+      ['턴', num(o.turns)],
       ['DB 크기', bytes(o.db_bytes)],
       ['앱', apps || '-'],
     ];
@@ -285,7 +276,7 @@
       box.append(el('b', null, value), el('span', null, label));
       return box;
     }));
-    $('last-activity').textContent = o.last_activity ? `최근 활동 ${o.last_activity}` : '';
+    $('last-activity').textContent = o.last_activity ? `최근 활동 ${clock(o.last_activity)}` : '';
   }
 
   // ── 세션 목록 ───────────────────────────────────────────────────────────
@@ -304,7 +295,7 @@
 
       const preview = el('div', `preview${s.preview ? '' : ' empty'}`, s.preview || '(사용자 발화 없음)');
       const meta = el('div', 'meta');
-      meta.append(el('span', 'sid', s.id.slice(0, 12)), el('span', null, `${num(s.event_count)} 이벤트 · ${s.update_time?.slice(0, 16) ?? ''}`));
+      meta.append(el('span', 'sid', s.id.slice(0, 12)), el('span', null, `${num(s.turn_count)}턴 · ${clock(s.update_time)}`));
       row.append(preview, meta);
       return row;
     }));
@@ -321,31 +312,64 @@
   }
 
   // ── 세션 상세 ───────────────────────────────────────────────────────────
-  function renderPart(part) {
-    if (part.kind === 'text') {
-      const body = el('div', 'body', part.text);
-      return part.truncated ? [body, el('div', 'truncated', `… ${num(part.total_chars)}자 중 일부`)] : [body];
-    }
+  /** 조사 과정(chat_turn.process.steps) — 도구 호출·결과가 스텝으로 남아 있다. */
+  function renderSteps(steps) {
     const box = el('details', 'part');
-    box.dataset.kind = part.kind;
-    const label = part.kind === 'call' ? '도구 호출' : '도구 결과';
-    box.append(el('summary', null, `${label} · ${part.name}${part.truncated ? ` (${num(part.total_chars)}자 중 일부)` : ''}`));
-    box.append(el('pre', null, part.text));
-    return [box];
+    box.dataset.kind = 'steps';
+    box.append(el('summary', null, `조사 과정 · ${num(steps.length)}스텝`));
+    const list = el('ol', 'steps');
+    for (const st of steps) {
+      const item = el('li', st.state === 'failed' ? 'failed' : null);
+      item.append(el('span', 'stage', `r${st.round} ${st.stage}`), document.createTextNode(st.detail || ''));
+      if (st.sources?.length) item.append(document.createTextNode(` — ${st.sources.map((x) => x.title || x.url).join(' · ')}`));
+      list.append(item);
+    }
+    box.append(list);
+    return box;
   }
 
-  function renderEvent(ev) {
-    const isUser = ev.author === 'user';
-    const box = el('div', `event${isUser ? ' user' : ''}`);
-    const who = el('div', 'who');
-    who.append(el('span', null, ev.author));
-    if (ev.model) who.append(el('span', null, ev.model));
-    if (ev.total_tokens) who.append(el('span', null, `${num(ev.total_tokens)} tok`));
-    if (ev.timestamp) who.append(el('span', null, clock(ev.timestamp)));
-    box.append(who);
-    if (ev.parse_error) box.append(el('div', 'truncated', '이벤트를 읽을 수 없습니다(JSON 파싱 실패).'));
-    for (const part of ev.parts) box.append(...renderPart(part));
+  function renderSources(sources) {
+    const box = el('details', 'part');
+    box.dataset.kind = 'sources';
+    box.append(el('summary', null, `인용 출처 ${num(sources.length)}건`));
+    const list = el('div', 'sources');
+    for (const s of sources) {
+      const link = el('a', null, `[${s.id}] ${s.title || s.url}`);
+      // 출처 URL은 웹 검색 결과에서 온 비신뢰 데이터다. scheme을 http/https로 한정하지 않으면
+      // `javascript:` URI가 섞였을 때 운영자 클릭이 admin 오리진에서 스크립트를 실행한다.
+      link.href = isSafeUrl(s.url) ? s.url : '#';
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      const line = el('div');
+      line.append(link);
+      list.append(line);
+    }
+    box.append(list);
     return box;
+  }
+
+  /** 턴 하나 = 사용자 발화 상자 + 답변 상자(상태·지연·토큰·피드백·과정·출처). */
+  function renderTurn(t) {
+    const user = el('div', 'event user');
+    const asked = el('div', 'who');
+    asked.append(el('span', null, 'user'), el('span', null, clock(t.asked_at)));
+    user.append(asked, el('div', 'body', t.user_message));
+
+    const bot = el('div', 'event');
+    const who = el('div', 'who');
+    who.append(el('span', t.status === 'completed' ? null : 'failed', t.status));
+    if (!t.history_saved) who.append(el('span', null, '구 이벤트 재조립'));
+    if (t.elapsed_ms !== null) who.append(el('span', null, `${(t.elapsed_ms / 1000).toFixed(1)}s`));
+    if (t.attributable_total_tokens) who.append(el('span', null, `${num(t.attributable_total_tokens)} tok`));
+    if (t.rbti_applied) who.append(el('span', null, `RBTI ${t.rbti_applied}`));
+    if (t.likes || t.dislikes) who.append(el('span', null, `👍 ${num(t.likes)} 👎 ${num(t.dislikes)}`));
+    if (t.clicks) who.append(el('span', null, `클릭 ${num(t.clicks)}`));
+    bot.append(who);
+    if (t.error) bot.append(el('div', 'failed', `${t.error.code}: ${t.error.message}`));
+    bot.append(el('div', 'body', t.assistant_message));
+    if (t.process?.steps?.length) bot.append(renderSteps(t.process.steps));
+    if (t.sources?.length) bot.append(renderSources(t.sources));
+    return [user, bot];
   }
 
   async function selectSession(id) {
@@ -360,45 +384,20 @@
       if (sid && id.startsWith(sid)) row.setAttribute('aria-selected', 'true');
     }
 
-    const out = [];
     const head = el('div', 'detail-head');
     head.append(el('h2', null, d.session.id));
     const chips = el('div', 'chips');
     const m = d.metrics;
     chips.append(
       el('span', 'chip', `${d.session.app_name} / ${d.session.user_id}`),
-      el('span', 'chip', `생성 ${d.session.create_time?.slice(0, 19) ?? ''}`),
-      el('span', 'chip', `갱신 ${d.session.update_time?.slice(0, 19) ?? ''}`),
+      el('span', 'chip', `생성 ${clock(d.session.create_time)}`),
+      el('span', 'chip', `갱신 ${clock(d.session.update_time)}`),
       el('span', 'chip', `${num(m.turns)}턴`),
     );
     if (m.avg_turn_seconds !== null) chips.append(el('span', 'chip', `턴당 평균 ${m.avg_turn_seconds}s`));
-    for (const [name, count] of Object.entries(m.tool_counts)) {
-      chips.append(el('span', 'chip', `${name} ×${count}`));
-    }
     head.append(chips);
-    out.push(head);
 
-    if (d.truncated) out.push(el('div', 'truncated', '이벤트가 많아 앞부분만 표시합니다.'));
-    out.push(el('h3', null, '대화 타임라인'));
-    out.push(...d.events.map(renderEvent));
-
-    if (d.sources.length) {
-      out.push(el('h3', null, `인용 출처 ${d.sources.length}건`));
-      const list = el('div', 'sources');
-      for (const s of d.sources) {
-        const line = el('div');
-        const link = el('a', null, `[${s.id}] ${s.title || s.url}`);
-        // 출처 URL은 웹 검색 결과에서 온 비신뢰 데이터다. scheme을 http/https로 한정하지 않으면
-        // `javascript:` URI가 섞였을 때 운영자 클릭이 admin 오리진에서 스크립트를 실행한다.
-        link.href = isSafeUrl(s.url) ? s.url : '#';
-        link.target = '_blank';
-        link.rel = 'noopener noreferrer';
-        line.append(link);
-        list.append(line);
-      }
-      out.push(list);
-    }
-    $('detail').replaceChildren(...out);
+    $('detail').replaceChildren(head, el('h3', null, '대화 타임라인'), ...d.turns.flatMap(renderTurn));
     $('detail').scrollTop = 0;
   }
 

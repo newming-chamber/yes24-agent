@@ -9,11 +9,11 @@
 -- component 값은 호출부가 넘기는 파라미터라 새 값이 생겨도 스키마 변경이 없다.
 CREATE TABLE IF NOT EXISTS usage_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    -- 기록 시각은 DB 시계·DEFAULT에 위임(naive timestamp는 DB 시계끼리만 비교 — auth 관례).
-    -- 밀리초 정밀도는 rate_limit_log의 NOW(3) 관례와 정렬.
+    app_name VARCHAR(128) NOT NULL,
+    -- 기록 시각은 호출 당시 UTC. DB DEFAULT는 직접 INSERT 소비자를 위한 기본값이다.
     created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     session_id VARCHAR(128) NULL,   -- 서브콜은 세션 문맥이 없을 수 있다(NULL 허용)
-    user_id VARCHAR(64) NULL,       -- Yes24 userNo 또는 익명 단일 사용자 id
+    user_id VARCHAR(128) NULL,      -- Yes24 userNo 또는 익명 단일 사용자 id
     endpoint VARCHAR(32) NULL,      -- 'chat' | 'matrix' — run_agent_stream 호출부가 지정
     component VARCHAR(32) NOT NULL, -- 'main' | 'enrichment' | 'thought_translation' | ...
     model VARCHAR(128) NULL,
@@ -24,5 +24,6 @@ CREATE TABLE IF NOT EXISTS usage_log (
     -- 기간별 비용 집계·세션 추적·모델별 히스토리가 주 조회 축.
     KEY idx_usage_log_created_at (created_at),
     KEY idx_usage_log_session_id (session_id),
-    KEY idx_usage_log_model (model)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    KEY idx_usage_log_model (model),
+    CONSTRAINT ck_usage_log_app_name CHECK (CHAR_LENGTH(TRIM(app_name)) > 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

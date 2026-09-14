@@ -10,10 +10,12 @@
 -- 상태는 우리 DB가 소유한다**(turn_feedback과 같은 원칙).
 --
 -- 적용: mysql -h <RDS> -u <user> -p <db> < scripts/session_ui.sql  (turn_feedback 관례)
+-- ADK sessions 테이블을 먼저 생성한다.
 CREATE TABLE IF NOT EXISTS session_ui (
     id            BIGINT       NOT NULL AUTO_INCREMENT,
     created_at    TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     updated_at    TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    app_name VARCHAR(128) NOT NULL,
     user_id       VARCHAR(128) NOT NULL,
     session_id    VARCHAR(128) NOT NULL,
     -- 사용자가 지은 제목(없으면 NULL → ADK가 자동 생성한 제목을 쓴다).
@@ -22,5 +24,7 @@ CREATE TABLE IF NOT EXISTS session_ui (
     -- 직접 비교한다 — unread = last_update_time > last_read_at.
     last_read_at  DOUBLE       NULL,
     PRIMARY KEY (id),
-    UNIQUE KEY uk_session_ui_owner (user_id, session_id)
+    UNIQUE KEY uk_session_ui_owner (app_name, user_id, session_id),
+    CONSTRAINT fk_session_ui_session FOREIGN KEY (app_name, user_id, session_id)
+        REFERENCES sessions (app_name, user_id, id) ON DELETE CASCADE ON UPDATE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

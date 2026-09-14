@@ -158,14 +158,35 @@ POLICY_SEEDS: dict[str, dict[str, str]] = {
 #           "cremaclub" 마크업이 다른 별도 목록(li에 data-goods-no가 없고 가격 필드도 없음).
 #   has_rank: 순위 마커가 렌더되는 목록인지(신간은 없음).
 #
-# "cremaclub"만 cremaclub.yes24.com 서브도메인 URL이다 — robots.txt가 `Allow: /BookClub/`로
-# 명시 허용했고(정찰 확인), yes24.com 서브도메인이라 클라이언트 도메인 허용 정책도 통과한다.
+# "cremaclub"만 cremaclub.yes24.com 서브도메인 URL이다 — robots.txt가 `Allow: /Bookclub/`
+# (대소문자 4종)로 명시 허용했고, yes24.com 서브도메인이라 클라이언트 도메인 허용 정책도
+# 통과한다.
+#
+# cremaclub 시드는 **페이지가 아니라 목록 조각(AJAX 엔드포인트)**이다(2026-09-09 실측).
+# 코너 페이지 `/BookClub/Best`는 개편 후 상품을 SSR로 싣지 않는다 — 껍데기(130KB)에
+# `<div class="noData" id="bCGoodsWrap">등록된 상품이 없습니다.</div>` 자리표시자만 렌더하고,
+# 페이지의 bookClub.js(getBookclubSumGoodsList)가 아래 엔드포인트를 GET해 그 div를 통째로
+# 교체한다. 쿼리값은 그 페이지의 초기 JS 변수(pageNo=1·pageSize=24·dispNo=''·order=20(주별)·
+# pageGb=BEST)를 그대로 옮긴 것이다. 조각의 마크업은 개편 전 페이지의 목록과 동일해
+# CREMACLUB_* 셀렉터가 그대로 맞는다.
+#
+# **껍데기의 자리표시자와 조각의 진짜 무결과 응답은 바이트 단위로 같은 noData 블록**이라
+# 마크업으로는 구분할 수 없다(dispNo=999999999로 실측한 무결과 조각 = 자리표시자 3줄).
+# 구분 근거는 URL뿐이다: 껍데기 페이지는 상품을 절대 싣지 않고, 조각은 실제로 상품이
+# 없을 때만 noData를 낸다. 그래서 시드가 조각을 가리키는 한 noData는 정당한 0건이고,
+# 시드를 페이지로 되돌리면 파서가 자리표시자를 무결과로 오독해 0건 성공으로 위장한다
+# (2026-09-09까지 실제로 그랬다). 사각: 이 엔드포인트가 또 껍데기화되면 같은 위장이
+# 재발하며, 그건 fixture 회귀가 아니라 라이브 계측(결과 건수 0)으로만 잡힌다.
 BROWSE_SEED_URLS: dict[str, dict] = {
     "bestseller": {
         "url": (
             "https://www.yes24.com/product/category/bestseller?CategoryNumber=001&sumgb=06"
         ),
         "label": "베스트셀러(국내도서)",
+        # 코너 성격은 모델이 보는 계약이다(도구 docstring으로 조립) — 이름만으로는 무엇이
+        # 담기는지 알 수 없어 엉뚱한 코너를 고른다(2026-09-10 실측: 열린 추천에서 "신간"을
+        # 골라 한 시리즈의 세트 변형 9종을 받았다). 관측한 사실만 적고 추천 규칙은 적지 않는다.
+        "blurb": "판매 순위 상위. 화제작·대표작이 모이고 회전이 느리다.",
         "markup": "search",
         "list_container": BESTSELLER_LIST_CONTAINER,
         "item": BESTSELLER_ITEM,
@@ -174,6 +195,11 @@ BROWSE_SEED_URLS: dict[str, dict] = {
     "new": {
         "url": "https://www.yes24.com/product/category/newproduct?categoryNumber=001",
         "label": "신간(국내도서)",
+        "blurb": (
+            "등록 순서 그대로의 원본 피드. 같은 시리즈의 세트 변형이 연달아 오를 수 있어"
+            " (실측: 상위 10건이 한 시리즈 9종 + 수험서) 폭넓은 추천 후보로는 약하다."
+            " 분야로 좁히면 쓸 만해진다."
+        ),
         "markup": "search",
         "list_container": NEWPRODUCT_LIST_CONTAINER,
         "item": NEWPRODUCT_ITEM,
@@ -184,14 +210,22 @@ BROWSE_SEED_URLS: dict[str, dict] = {
             "https://www.yes24.com/product/category/attentionnewproduct?categoryNumber=001"
         ),
         "label": "주목할 신상품(국내도서)",
+        "blurb": "새로 나온 책 중 골라 놓은 목록. 분야가 고루 섞여 신간 추천엔 이쪽이 낫다.",
         "markup": "search",
         "list_container": NEWPRODUCT_LIST_CONTAINER,
         "item": NEWPRODUCT_ITEM,
         "has_rank": False,
     },
     "cremaclub": {
-        "url": "https://cremaclub.yes24.com/BookClub/Best",
+        "url": (
+            "https://cremaclub.yes24.com/Bookclub/GetBookclubSumGoodsList"
+            "?pageNo=1&pageSize=24&dispNo=&order=20&pageGb=BEST"
+        ),
         "label": "크레마클럽 인기(eBook 구독)",
+        "blurb": (
+            "eBook 구독 목록이라 종이책 베스트셀러와 상품 집합이 거의 겹치지 않는다 —"
+            " 다른 결의 후보가 필요할 때 함께 연다. 가격은 구독 상품 기준이다."
+        ),
         "markup": "cremaclub",
         "list_container": CREMACLUB_LIST_CONTAINER,
         "item": CREMACLUB_ITEM,
