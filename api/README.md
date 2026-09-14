@@ -52,6 +52,7 @@ x-api-key: <사용자별 Yes24 ServiceCookies 값>
 | message | string | 필수, 비어 있지 않은 질문 |
 | session_id | string / null | 선택. 첫 턴 생략 가능, 이후 같은 대화의 ID 전달 |
 | use_rbti | boolean | 선택, **기본 true**. 안 싣으면 서버가 유형을 조회해 적용한다. 성향을 끄려는 화면만 `false`를 명시 |
+| rbti | string / null | 선택. 이번 턴에만 쓸 독서 성향 코드 4글자(예 `CADI`). 실으면 **서버 조회를 이긴다** — 화면에 유형 선택기가 있을 때 쓴다. 16코드가 아니면 422 |
 
 - 일반 서비스 인증의 `x-api-key`는 사용자별 Yes24 **ServiceCookies 값**이다. 공용 서버 비밀키가
   아니며 `Bearer `, `ServiceCookies=`, 전체 Cookie 문자열을 붙이지 않는다.
@@ -64,6 +65,16 @@ x-api-key: <사용자별 Yes24 ServiceCookies 값>
 - `message`는 필수이며 공백·상한 초과는 HTTP 422. 상한은 OpenAPI를 따른다.
 - `use_rbti`는 적용 요청이고, 실제 적용 여부는 턴 첫 프레임 `rbti.code`(스트리밍 중)와
   `done.rbti_applied`(완료·복원) 문자열/null로 판단한다. 둘은 같은 값이다.
+- 성향 코드의 출처는 셋 중 하나다. ⑴ `rbti` 미지정(또는 빈 문자열) → 서버가 그 사용자의
+  유형을 외부 RBTI API로 조회해 적용(기본). ⑵ `rbti` 지정 → 그 코드로 이번 턴만 덮어쓰기
+  (조회 생략). ⑶ `use_rbti:false` → 미적용. `rbti`를 함께 실어도 적용하지 않는다(끄기가 이긴다).
+- 화면의 선택기를 답변에 반영하려면 **`rbti`를 실어야 한다**. 배지·축 라벨은 프론트가 고른
+  값이 아니라 서버가 돌려준 `rbti.code`·`done.rbti_applied`로 그리므로, 안 실으면 화면에서
+  무엇을 고르든 서버 조회값 그대로 나온다.
+- `rbti`는 소문자를 올려 받지만 16코드가 아니면 **422**다. 조용히 미적용되지 않으므로 오타를
+  즉시 알 수 있다. 이 거절은 `use_rbti`와 **무관하다** — 끄기가 이기는 것은 성향을 *적용*할지
+  이지 본문이 말이 되는지가 아니므로, `use_rbti:false`라도 깨진 코드를 실으면 422다. 선택을
+  해제한 화면은 그 값을 빈 문자열로 보내거나 키를 빼라. 공백은 다듬지 않는다(`" CADI "`도 422).
 - 모델·도구 선택은 일반 프론트 계약이 아니다. 어드민 전용 필드를 보내지 않는다.
 - 히스토리·클릭·피드백은 인증으로 확인된 사용자 소유권이 필요하다. 같은 session_id라도 다른
   사용자 대화로 이어지지 않는다. 계정 전환 시 진행 요청을 중단하고 로컬 세션/턴 상태도 분리한다.
@@ -313,7 +324,9 @@ round_starts는 0부터 시작하는 단조 비감소 배열이고 마지막 값
 
 아래는 이벤트 처리 연결 예제다. 렌더 함수는 앱에서 구현하며, 바로 아래 리더를 함께 사용하면
 별도 파일 import 없이 POST SSE를 읽을 수 있다. 기존 SSE 라이브러리를 사용해도 계약은 같다.
-baseUrl/message/sessionId/serviceCookies/useRbti는 앱에서 주입한다.
+baseUrl/message/sessionId/serviceCookies/useRbti는 앱에서 주입한다. 화면에 유형 선택기가
+있으면 고른 코드를 `rbti`로 함께 싣고(아래 예제), 선택이 없으면 그 키를 빼거나 빈 값으로
+두어 서버 조회에 맡긴다.
 
 ```js
 const controller = new AbortController();
@@ -324,7 +337,12 @@ try {
   const response = await fetch(`${baseUrl}/chat/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "Accept": "text/event-stream", "x-api-key": serviceCookies },
-    body: JSON.stringify({ message, session_id: requestedSessionId, use_rbti: useRbti }),
+    body: JSON.stringify({
+      message,
+      session_id: requestedSessionId,
+      use_rbti: useRbti,
+      ...(rbtiCode ? { rbti: rbtiCode } : {}),  // 선택기가 고른 코드. 없으면 서버가 조회
+    }),
     signal: controller.signal,
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
