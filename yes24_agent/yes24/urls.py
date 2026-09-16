@@ -10,9 +10,17 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from yes24_agent.yes24.selectors import (
     BESTSELLER_ITEM,
     BESTSELLER_LIST_CONTAINER,
+    BESTSELLER_PERIOD,
+    BESTSELLER_PERIOD_NOTE,
     CREMACLUB_ITEM,
     CREMACLUB_LIST_CONTAINER,
+    CREMACLUB_ORIGINAL_CURRENT_CONTAINER,
+    CREMACLUB_ORIGINAL_CURRENT_ITEM,
+    CREMACLUB_ORIGINAL_EPISODE_INFO,
+    CREMACLUB_ORIGINAL_ITEM,
+    CREMACLUB_ORIGINAL_LIST_CONTAINER,
     GOODS_PATH,
+    MONTHLY_BESTSELLER_PERIOD,
     NEWPRODUCT_ITEM,
     NEWPRODUCT_LIST_CONTAINER,
 )
@@ -157,6 +165,12 @@ POLICY_SEEDS: dict[str, dict[str, str]] = {
 #   markup: "search"    검색 결과와 동일한 ITEM_* 마크업(베스트셀러·신간).
 #           "cremaclub" 마크업이 다른 별도 목록(li에 data-goods-no가 없고 가격 필드도 없음).
 #   has_rank: 순위 마커가 렌더되는 목록인지(신간은 없음).
+#   order:    목록의 정렬(BROWSE_ORDERS의 키) — 페이지에서 관측한 사실이다. 도구가 코너 요약
+#             (browses)에 싣고 행마다 코너 안 위치(position)를 붙이며, 독스트링이 같은 값에서
+#             정렬 사실을 자동 서술한다. 기본순 목록 위치는 등록일·출간일을 뜻하지 않는다.
+#   period / period_note (선택): 페이지가 명시한 집계 기간·집계 방식 문구의 셀렉터. 키가 있는
+#             섹션만 파서(parse_browse_page_meta)가 원문을 뽑는다 — 기간 문구가 없는 페이지는 키를
+#             두지 않는다(fixture 실측: 신간·주목할 신상품·크레마클럽·오리지널 0건).
 #
 # "cremaclub"만 cremaclub.yes24.com 서브도메인 URL이다 — robots.txt가 `Allow: /Bookclub/`
 # (대소문자 4종)로 명시 허용했고, yes24.com 서브도메인이라 클라이언트 도메인 허용 정책도
@@ -177,20 +191,47 @@ POLICY_SEEDS: dict[str, dict[str, str]] = {
 # 시드를 페이지로 되돌리면 파서가 자리표시자를 무결과로 오독해 0건 성공으로 위장한다
 # (2026-09-09까지 실제로 그랬다). 사각: 이 엔드포인트가 또 껍데기화되면 같은 위장이
 # 재발하며, 그건 fixture 회귀가 아니라 라이브 계측(결과 건수 0)으로만 잡힌다.
+# 코너 정렬 어휘: 레코드의 order 값 → 모델이 읽는 사실 서술(도구 독스트링·browses 요약이 공유).
+# 값은 페이지 관측이다: 신간 코너는 등록일순, 오리지널 코너는 기본순이 선택돼 있다.
+# 기본순과 최신순은 별도 선택지이므로 기본 목록의 위치에 날짜 의미를 붙이지 않는다.
+BROWSE_ORDERS: dict[str, str] = {
+    "rank": "순위순(rank 1이 첫 행)",
+    "page": "페이지 기본순(position은 목록 위치이며 등록일·출간일 순서를 뜻하지 않음)",
+    "registered_desc": "등록순(앞이 최근 등록분, position 1이 가장 최근)",
+}
+
 BROWSE_SEED_URLS: dict[str, dict] = {
     "bestseller": {
         "url": (
             "https://www.yes24.com/product/category/bestseller?CategoryNumber=001&sumgb=06"
         ),
-        "label": "베스트셀러(국내도서)",
+        "label": "국내도서 종합 베스트(최근 7일)",
         # 코너 성격은 모델이 보는 계약이다(도구 docstring으로 조립) — 이름만으로는 무엇이
         # 담기는지 알 수 없어 엉뚱한 코너를 고른다(2026-09-10 실측: 열린 추천에서 "신간"을
         # 골라 한 시리즈의 세트 변형 9종을 받았다). 관측한 사실만 적고 추천 규칙은 적지 않는다.
-        "blurb": "판매 순위 상위. 화제작·대표작이 모이고 회전이 느리다.",
+        "blurb": "최근 7일간 온라인과 매장에서의 판매량 및 주문 수를 기준으로 매일 1회 집계됩니다.",
         "markup": "search",
         "list_container": BESTSELLER_LIST_CONTAINER,
         "item": BESTSELLER_ITEM,
         "has_rank": True,
+        "order": "rank",
+        "period": BESTSELLER_PERIOD,
+        "period_note": BESTSELLER_PERIOD_NOTE,
+    },
+    "bestseller_monthly": {
+        "url": "https://www.yes24.com/product/category/monthbestseller?categoryNumber=001",
+        "label": "이번 달 월별 베스트셀러(국내도서)",
+        "blurb": (
+            "현재월 누적 판매 순위. 실제 집계 종료일은 period로 확인하며 "
+            "과거 연월 선택은 지원하지 않는다."
+        ),
+        "markup": "search",
+        "list_container": BESTSELLER_LIST_CONTAINER,
+        "item": BESTSELLER_ITEM,
+        "has_rank": True,
+        "order": "rank",
+        "period": MONTHLY_BESTSELLER_PERIOD,
+        "period_note": BESTSELLER_PERIOD_NOTE,
     },
     "new": {
         "url": "https://www.yes24.com/product/category/newproduct?categoryNumber=001",
@@ -204,17 +245,19 @@ BROWSE_SEED_URLS: dict[str, dict] = {
         "list_container": NEWPRODUCT_LIST_CONTAINER,
         "item": NEWPRODUCT_ITEM,
         "has_rank": False,
+        "order": "registered_desc",
     },
     "attentionnewproduct": {
         "url": (
             "https://www.yes24.com/product/category/attentionnewproduct?categoryNumber=001"
         ),
         "label": "주목할 신상품(국내도서)",
-        "blurb": "새로 나온 책 중 골라 놓은 목록. 분야가 고루 섞여 신간 추천엔 이쪽이 낫다.",
+        "blurb": "새로 나온 책 중 골라 놓은 목록. 분야가 고루 섞여 있다.",
         "markup": "search",
         "list_container": NEWPRODUCT_LIST_CONTAINER,
         "item": NEWPRODUCT_ITEM,
         "has_rank": False,
+        "order": "registered_desc",
     },
     "cremaclub": {
         "url": (
@@ -230,6 +273,46 @@ BROWSE_SEED_URLS: dict[str, dict] = {
         "list_container": CREMACLUB_LIST_CONTAINER,
         "item": CREMACLUB_ITEM,
         "has_rank": True,
+        "order": "rank",
+    },
+    # 크레마클럽 오리지널: 코너 페이지(/BookClub/Original)가 아니라 그 페이지의 "오리지널 전체
+    # 보기" 링크다(2026-09-14 실측). 코너 페이지는 쇼케이스 섹션 넷이 같은 상품을 겹쳐 렌더하고
+    # (고유 29개) 섹션마다 마크업도 다른 반면, 이 페이지는 SSR 단일 목록이고 li 마크업이
+    # cremaclub과 같다. 기본 24건(전체 66건, pageNo로 이어짐).
+    # url_from_link: 최근 오리지널은 **클럽 전용 goods_no**라 www 상품 페이지가 없다(실측 16/18이
+    # 판매 페이지 없음으로 302, 같은 id의 클럽 상세는 200). 그래서 url은 product_url 조립이
+    # 아니라 행의 상세 링크를 이 페이지 기준으로 절대화한 값이다 — 조립하면 인용이 죽은 링크가 된다.
+    "cremaclub_original": {
+        "url": (
+            "https://cremaclub.yes24.com/BookClub/RecommThemeGoods?dispNo=017005001&elemSeq=25"
+        ),
+        "label": "크레마클럽 오리지널(eBook 구독 전용)",
+        "blurb": (
+            "YES24 오리지널 연재 회차·완결작 목록. 대부분 크레마클럽에서만 읽는 전용 상품이라"
+            " 링크는 클럽 상세이고 가격·순위가 없다."
+        ),
+        "markup": "cremaclub",
+        "list_container": CREMACLUB_ORIGINAL_LIST_CONTAINER,
+        "item": CREMACLUB_ORIGINAL_ITEM,
+        "has_rank": False,
+        "order": "page",
+        "url_from_link": True,
+    },
+    "cremaclub_original_current": {
+        "url": "https://cremaclub.yes24.com/BookClub/Original",
+        "label": "크레마클럽 오리지널 — 지금 연재 중",
+        "blurb": (
+            "사이트의 ‘지금 연재 중’ 영역에 배치된 목록. episode_info는 카드에 표시된 총 회차"
+            " 원문이며 없는 항목도 함께 실린다."
+            " 회차별 갱신 상태·완결 여부·연재 시작일은 표시하지 않는다."
+        ),
+        "markup": "cremaclub",
+        "list_container": CREMACLUB_ORIGINAL_CURRENT_CONTAINER,
+        "item": CREMACLUB_ORIGINAL_CURRENT_ITEM,
+        "episode_info": CREMACLUB_ORIGINAL_EPISODE_INFO,
+        "has_rank": False,
+        "order": "page",
+        "url_from_link": True,
     },
 }
 

@@ -14,10 +14,33 @@ from yes24_agent.event_translate import project_public_source
 
 logger = logging.getLogger(__name__)
 
+
 # 서버가 붙인 ASCII 대괄호+숫자만 마커로 간주한다. 도구 데이터 안의 리터럴 `[1]`은
 # 이 패턴과 구분되지 않는다 — 프로즈/코드 스팬 분할(`code_span_ranges`) 외에 이스케이프
 # 계층은 없다(docs/known-limitations.md).
-MARKER_PATTERN = re.compile(r"(?<!\\)\[(\d+(?:\s*,\s*\d+)*)\]")
+def _numeric_body(*, partial: bool = False) -> str:
+    digits = r"\d*" if partial else r"\d+"
+    item = digits + r"(?:\s*-\s*" + digits + r")?"
+    return item + r"(?:\s*,\s*" + item + r")*"
+
+
+MARKER_PATTERN = re.compile(r"(?<!\\)\[(" + _numeric_body() + r")\]")
+
+
+def _marker_ids(body: str, available_ids=()) -> tuple[list[int], list[str]]:
+    """범위는 실제 출처 집합과만 교차한다. 무효 범위도 개별 정수로 펼치지 않는다."""
+    ids, invalid_ranges = [], []
+    for part in body.split(","):
+        bounds = part.split("-")
+        if len(bounds) == 1:
+            ids.append(int(part))
+            continue
+        first, last = map(int, bounds)
+        observed = sorted(source_id for source_id in available_ids if first <= source_id <= last)
+        ids.extend(observed)
+        if first > last or len(observed) != last - first + 1:
+            invalid_ranges.append(part.strip())
+    return ids, invalid_ranges
 
 
 # 코드 스팬(펜스 블록 ```…``` · 인라인 코드 `…`)은 프로즈가 아니라 그대로 표시되는 리터럴
@@ -52,20 +75,20 @@ def _within_code_span(pos: int, ranges: list[tuple[int, int]]) -> bool:
     return any(start <= pos < end for start, end in ranges)
 
 
-def prose_citation_ids(text: str) -> list[int]:
+def prose_citation_ids(text: str, available_ids=()) -> list[int]:
     """본문 프로즈가 인용한 source_id를 등장 순서대로(중복 허용) 돌려준다.
 
     본문만 보고 "무엇이 인용됐는가"를 물어야 하는 바깥(QA 하네스 등)을 위한 공개 진입점이다.
     유효성 대조 없이 마커 판정만 하며, 코드 스팬 제외는 `validate_citations`와 **같은 눈**을
-    쓴다 — 판정을 두 벌 두면 한 벌만 고쳐진다(하네스가 자체 정규식을 들었을 때 코드블록 안
-    `[1]`을 인용으로 세어 정상 턴을 실패로 몰았다).
+    쓴다. 범위형은 available_ids의 실제 출처만 반환한다. 출처 집합이 없으면 범위 내부를
+    추정하지 않으므로 원시 범위 잔류 검사는 MARKER_PATTERN으로 별도 확인해야 한다.
     """
     code_ranges = code_span_ranges(text)
     return [
-        int(part)
+        source_id
         for match in MARKER_PATTERN.finditer(text)
         if not _within_code_span(match.start(), code_ranges)
-        for part in match.group(1).split(",")
+        for source_id in _marker_ids(match.group(1), available_ids)[0]
     ]
 
 
@@ -114,7 +137,7 @@ _MARKER_LINK = r"\(\w[\w+.-]*://" + _link_body(partial=False) + r"\)"
 _OPEN_LINK_TAIL = r"\(" + _link_body(partial=True)
 _DIALECT_MARKER_PATTERN = re.compile(
     r"(?<!\\)\[\s*(?P<label>(?:" + "|".join(_DIALECT_LABELS) + r")\s*[:#]?\s*)?"
-    r"(?P<ids>\d+(?:\s*,\s*\d+)*)\s*\](?P<link>" + _MARKER_LINK + r")?",
+    r"(?P<ids>" + _numeric_body() + r")\s*\](?P<link>" + _MARKER_LINK + r")?",
     re.IGNORECASE,
 )
 
@@ -196,10 +219,10 @@ def _seam_parts(prefix: str, rest: str) -> tuple[str, str]:
 
 
 def validate_citations(text: str, sources: list[dict]) -> CitationResult:
-    """본문의 `[n]`·`[n, m, ...]` 마커를 `sources`의 id 집합과 대조해 검증한다.
+    """본문의 단일·쉼표·ASCII 범위 인용을 `sources`의 id 집합과 대조해 검증한다.
 
     그룹형 마커는 내부 id를 각각 검증한다:
-    - 전부 유효 → 마커 원문을 그대로 유지한다.
+    - 전부 유효 → 마커 원문을 유지하되 범위는 관측 id의 쉼표 목록으로 바꾼다.
     - 일부만 유효 → 유효 id만 남긴 형태로 재작성한다 (예: `[2, 99, 3]` → `[2, 3]`).
     - 전부 무효 → 마커 전체를 제거한다 (단일 무효 마커와 동일하게 처리).
 
@@ -231,7 +254,7 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
             # 진전시키지 않고 건너뛰어, 이 대괄호가 다음 프로즈 마커의 prefix(또는 말미)에
             # 원문 그대로 실려 나가게 둔다.
             continue
-        raw_ids = [int(part) for part in match.group(1).split(",")]
+        raw_ids, invalid_ranges = _marker_ids(match.group(1), valid_ids)
 
         prefix = text[cursor : match.start()]
         cleaned_parts.append(prefix)
@@ -241,7 +264,7 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
         # 마커 내부 id를 유효/무효로 분리한다 (등장 순서 유지, 마커 내부 중복은 제거)
         valid_in_marker: list[int] = []
         seen_in_marker: set[int] = set()
-        invalid_in_marker: list[int] = []
+        invalid_in_marker: list[int | str] = list(invalid_ranges)
         for source_id in raw_ids:
             if source_id in valid_ids:
                 if source_id not in seen_in_marker:
@@ -265,16 +288,17 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
             cursor += len(rest) - len(rest_core)  # 뒤 본문 선두 공백 흡수(미출력)
             continue
 
-        if invalid_in_marker:
-            # 일부만 무효 → 유효 id만 남긴 형태로 재작성
+        if invalid_in_marker or "-" in match.group(1):
+            # 범위도 유효 id만 남긴 정규 목록으로 재작성한다.
             marker_text = f"[{', '.join(str(i) for i in valid_in_marker)}]"
             for source_id in invalid_in_marker:
                 removed_markers.append(f"[{source_id}]")
-            logger.warning(
-                f"마커 {match.group(0)}에서 존재하지 않는 "
-                f"source_id({', '.join(str(i) for i in invalid_in_marker)})를 제거하고 "
-                f"{marker_text}로 재작성합니다."
-            )
+            if invalid_in_marker:
+                logger.warning(
+                    f"마커 {match.group(0)}에서 존재하지 않는 "
+                    f"source_id({', '.join(str(i) for i in invalid_in_marker)})를 제거하고 "
+                    f"{marker_text}로 재작성합니다."
+                )
         else:
             # 전부 유효 → 원문(공백 스타일 포함) 그대로 유지
             marker_text = match.group(0)
@@ -322,7 +346,7 @@ def renumber_markers(
     code_ranges: list[tuple[int, int]] | None = None,
     offset: int = 0,
 ) -> str:
-    """프로즈 마커 안의 id만 표시 번호로 갈아끼운다(구분자·공백 표기 그대로).
+    """프로즈 인용을 표시 번호로 바꾼다. 범위 외에는 구분자·공백 표기를 보존한다.
 
     코드 스팬 안의 `[n]`은 배열 인덱스·수식이므로 검증과 **같은 눈**으로 건너뛴다
     (`code_span_ranges`) — 판정을 두 벌 두면 한 벌만 고치는 실수가 반복된다.
@@ -336,6 +360,14 @@ def renumber_markers(
     def _replace(match: re.Match) -> str:
         if _within_code_span(match.start() + offset, code_ranges):
             return match.group(0)
+        if "-" in match.group(1):
+            ids, _ = _marker_ids(match.group(1), mapping)
+            rendered = list(
+                dict.fromkeys(
+                    str(mapping[source_id]) for source_id in ids if source_id in mapping
+                )
+            )
+            return f"[{', '.join(rendered)}]" if rendered else ""
         inner = re.sub(
             r"\d+",
             lambda digits: str(mapping.get(int(digits.group()), int(digits.group()))),
@@ -371,8 +403,7 @@ def assign_display_numbers(
     for match in MARKER_PATTERN.finditer(text):
         if _within_code_span(match.start() + offset, code_ranges):
             continue
-        for part in match.group(1).split(","):
-            source_id = int(part)
+        for source_id in _marker_ids(match.group(1), valid_ids)[0]:
             if source_id in valid_ids and source_id not in mapping:
                 mapping[source_id] = len(mapping) + 1
     return mapping
@@ -395,7 +426,7 @@ _LABEL_PREFIXES = sorted(
 )
 _OPEN_MARKER_TAIL = re.compile(
     r"(?<!\\)\[(?:\s*(?:" + "|".join(_LABEL_PREFIXES) + r")\s*[:#]?)?"
-    r"\s*\d*(?:\s*,\s*\d*)*\s*"
+    r"\s*" + _numeric_body(partial=True) + r"\s*"
     r"(?:\](?:" + _OPEN_LINK_TAIL + r")?)?\Z",
     re.IGNORECASE,
 )
@@ -404,7 +435,7 @@ _OPEN_MARKER_TAIL = re.compile(
 def _stable_prefix(text: str) -> str:
     """표시 번호 배정이 확정된 접두부만 남긴다(불안정한 꼬리는 다음 청크로 이월).
 
-    흔들리는 것은 둘뿐이다:
+    마지막 이스케이프 문자도 다음 청크의 마커 앞에 붙을 수 있으므로 보류한다.
     ① 형태가 아직 확정되지 않은 마커 꼬리(`_OPEN_MARKER_TAIL` — 미완성 마커·미완성 방언
        라벨·링크가 붙을 수 있는 닫힌 마커).
     ② 마지막 줄의 **열린 인라인 코드 백틱** — 닫히는 순간 그 구간의 `[n]`은 마커가 아니라
@@ -413,7 +444,7 @@ def _stable_prefix(text: str) -> str:
     펜스 블록은 닫히지 않아도 `_FENCE_PATTERN`이 본문 끝까지 코드 스팬으로 잡으므로
     분류가 흔들리지 않는다(그래서 여기서 따로 붙잡지 않는다).
     """
-    cut = len(text)
+    cut = len(text) - 1 if text.endswith("\\") else len(text)
     open_marker = _OPEN_MARKER_TAIL.search(text)
     if open_marker:
         cut = open_marker.start()
