@@ -64,7 +64,10 @@ _EXTRACT_INSTRUCTION = (
     "보낼 수 있도록 사용자의 말투로 쓴 완결된 한국어 질문이다. "
     "적어도 하나는 답변이 이름만 대고 지나간 구체적인 항목(작품·인물·사건·수치·조건 중 "
     "본문에 실제로 등장한 것)을 집어 그것을 더 파는 질문이고, 나머지는 같은 주제의 다른 "
-    "각도로 넓힌다. prior_turn이 있으면 그 대화의 흐름을 이어받는다. "
+    "각도로 넓힌다. prior_turn이 있으면 먼저 continues_prior_turn을 판정한다: 이번 question이 "
+    "prior_turn의 대상·주제를 가리키거나 그 답변을 전제로 묻는가. 이어간다면 그 흐름을 "
+    "이어받고, 이어가지 않는다면 prior_turn은 재료가 아니다 — 후속 질문은 이번 question과 "
+    "answer만 본다. "
     "세 질문 모두 검색으로 확인할 수 있는 사실을 묻는다 — 아직 일어나지 않은 일의 예측, "
     "의견이나 감상 요구, 이 어시스턴트나 서비스의 사용법 자체는 묻지 않는다. 방금 답한 것을 "
     "되묻지 않고, 어느 답변에나 붙일 수 있는 일반적인 질문은 쓰지 않는다(창작 금지는 "
@@ -73,8 +76,8 @@ _EXTRACT_INSTRUCTION = (
 )
 
 
-def _response_schema(want_title: bool) -> types.Schema:
-    """구조화 출력 스키마. session_title·follow_ups는 필요할 때만 **스키마에 존재**한다.
+def _response_schema(want_title: bool, *, has_prior_turn: bool) -> types.Schema:
+    """구조화 출력 스키마. 판정·제목·후속 질문 필드는 필요할 때만 **스키마에 존재**한다.
 
     제목이 이미 있는 세션에서 "제목을 만들지 마라"를 프롬프트 문구로 부탁하는 대신
     필드 자체를 스키마에서 빼 생성을 구조로 차단한다(문구보다 구조 원칙). 후속 질문의
@@ -82,23 +85,24 @@ def _response_schema(want_title: bool) -> types.Schema:
     문구는 지켜지지 않을 때 조용히 어긋나지만 스키마는 어긋날 수 없다.
     """
     settings = get_settings()
-    properties: dict[str, types.Schema] = {
-        # 선행 판정 필드 — 프롬프트 문구 대신 스키마가 "권유인가"의 명시 판정을 강제한다.
-        # 출구(_validated_meta)가 false면 recommendations를 통째로 버린다.
-        "is_recommendation": types.Schema(type=types.Type.BOOLEAN),
-        "recommendations": types.Schema(
-            type=types.Type.ARRAY,
-            items=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "id": types.Schema(type=types.Type.INTEGER),
-                    "reason": types.Schema(type=types.Type.STRING),
-                },
-                required=["id", "reason"],
-            ),
+    properties: dict[str, types.Schema] = {}
+    if has_prior_turn:
+        properties["continues_prior_turn"] = types.Schema(type=types.Type.BOOLEAN)
+    # 선행 판정 2 — 프롬프트 문구 대신 스키마가 "권유인가"의 명시 판정을 강제한다.
+    # 출구(_validated_meta)가 false면 recommendations를 통째로 버린다.
+    properties["is_recommendation"] = types.Schema(type=types.Type.BOOLEAN)
+    properties["recommendations"] = types.Schema(
+        type=types.Type.ARRAY,
+        items=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "id": types.Schema(type=types.Type.INTEGER),
+                "reason": types.Schema(type=types.Type.STRING),
+            },
+            required=["id", "reason"],
         ),
-    }
-    required = ["is_recommendation", "recommendations"]
+    )
+    required = list(properties)
     # 후속 질문은 추천·판정을 **본 뒤** 쓰도록 뒤에 둔다(property_ordering = required 순서).
     if settings.enrichment_follow_ups > 0:
         properties["follow_ups"] = types.Schema(
@@ -233,7 +237,9 @@ async def extract_turn_meta(
     """최종 본문·인용 출처에서 부가 정보를 뽑는다. 실패·빈 결과는 None(예외 전파 없음).
 
     prior_turn은 `{question, answer}`(직전 턴)로, 후속 질문이 대화 흐름을 이어받는 재료다 —
-    없으면(첫 턴) 키 자체를 싣지 않는다.
+    없으면(첫 턴) 키 자체를 싣지 않는다. 있으면 스키마 선행 필드 continues_prior_turn이
+    "이번 질문이 그 대화를 이어가는가"를 먼저 판정하게 하고, 이어가지 않는 턴에서는 재료로
+    쓰지 않는다(판정은 모델 몫, 코드 분기 없음).
 
     cited_sources는 done.sources의 공개 DTO다 — 추천 id는 본문 마커·출처 카드와 같은
     공개 표시 번호 공간을 쓴다. 호출 조건(추출할 재료가 있는가)은 호출부가 판단한다.
@@ -263,7 +269,7 @@ async def extract_turn_meta(
                     temperature=0,
                     max_output_tokens=settings.enrichment_max_output_tokens,
                     response_mime_type="application/json",
-                    response_schema=_response_schema(want_title),
+                    response_schema=_response_schema(want_title, has_prior_turn=bool(prior_turn)),
                 ),
             ),
             timeout=settings.enrichment_timeout_s,
@@ -280,6 +286,7 @@ async def extract_turn_meta(
             f"턴 meta 추출: recommendations={len((meta or {}).get('recommendations', []))} "
             f"follow_ups={len((meta or {}).get('follow_ups', []))} "
             f"title={bool((meta or {}).get('session_title'))} "
+            f"continues_prior_turn={raw.get('continues_prior_turn')} "
             f"elapsed={time.monotonic() - started:.2f}s"
         )
         return meta
