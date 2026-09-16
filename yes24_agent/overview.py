@@ -135,7 +135,7 @@ from yes24_agent.sse import (
     sse_reset,
 )
 from yes24_agent.tools._planning import plan_queries
-from yes24_agent.tools.fetch_many import fetch_many
+from yes24_agent.tools.fetch_many import fetch_pages
 from yes24_agent.tools.web_search import web_search
 from yes24_agent.tools.yes24_search import (
     SEARCH_BUDGET_STATE_KEY,
@@ -2380,8 +2380,9 @@ def _spawn_detail_fetches(
     """상세 보강(G-4) 열람을 **행마다 독립 Task**로 띄운다(아직 기다리지 않는다).
 
     열람 대상은 프롬프트 동봉 선정과 같은 순서(RRF 병합 순서 신뢰 슬라이스)의 상위
-    `fetch_many_max_items`건 — 도구 배치 상한 config 재사용이라 새 상한이 없다. fetch_many를
-    같은 state로 부르므로 register_source의 URL 멱등이 검색 행과 **같은 source_id**를
+    `fetch_many_max_items`건 — 도구 배치 상한 config 재사용이라 새 상한이 없다. fetch_many 본체
+    (fetch_pages — 발췌만 거두므로 도구의 eBook 판형 관측은 끈 채)를 같은 state로
+    부르므로 register_source의 URL 멱등이 검색 행과 **같은 source_id**를
     유지·상세 관측으로 갱신한다 — 행의 cite_as가 그대로 상세 근거의 인용이 된다(source_id
     연속). 등록 루프는 호출마다 await 없는 동기 구간이라 행을 갈라도 id 원자·단조는 그대로다.
 
@@ -2404,7 +2405,7 @@ def _spawn_detail_fetches(
         if len(items) >= settings.fetch_many_max_items:
             break
     return [
-        asyncio.create_task(fetch_many([item], SimpleNamespace(state=state)))
+        asyncio.create_task(fetch_pages([item], SimpleNamespace(state=state)))
         for item in items
     ]
 

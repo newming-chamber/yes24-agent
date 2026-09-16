@@ -2,15 +2,9 @@
 
 배경(지연): 추천·비교에서 여러 후보의 상세(줄거리·목차·서평)를 확인하려면 지금까지 각 책을
 yes24_fetch로 하나씩 열어야 했고, fetch마다 별도 LLM 왕복이 붙어 지연이 누적됐다(N권 → N턴).
-fetch_many는 이 N개 열람을 **한 번의 도구 호출**로 받아 네트워크(get_text)만 asyncio.gather로
-동시에 실행한다 — LLM 왕복이 1회로 줄고(핵심 win), 공유 Yes24Client의 Semaphore(http_concurrency)
-+rps 페이싱이 Yes24 예의(동시성·요청률)를 그대로 지킨다.
-
-정확성 설계(레이스 0): register_source(출처 등록·id 부여)는 동시에 돌리지 않는다. 네트워크만
-gather로 동시 실행하고, 파싱은 워커 스레드 하나(parse_page)에서, 등록은 **순차 루프**
-(register_page)로 처리한다 — 단일 tool_context.state에 대한 등록이 await 없이 순차라 source_id가
-유일·단조로 부여되고, 기존
-settle_sources 정합을 그대로 유지한다(병렬 도구 유실 방지 로직 불변).
+fetch_many는 이 N개 열람을 **한 번의 도구 호출**로 받아 동시에 연다 — LLM 왕복이 1회로 줄고
+(핵심 win), 공유 Yes24Client의 Semaphore(http_concurrency)+rps 페이싱이 Yes24 예의(동시성·요청률)를
+그대로 지킨다. 실행 구조(동시성·파싱·등록 순서)는 fetch_pages 본문 주석이 정본이다.
 
 열람 절약 실험 기각(2026-07-28, 재시도 금지): "검색 필드로 충분하면 상세를 아끼라"는 docstring
 원칙을 A/B했으나 되돌렸다 — 시간 이득이 거의 없고(추천 턴의 지배 항은 검색 라운드·작성 시간이지
@@ -30,7 +24,7 @@ from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
 from yes24_agent.sources import now_checked_at
-from yes24_agent.tools.yes24_fetch import parse_page, register_page
+from yes24_agent.tools.yes24_fetch import open_page, register_page
 from yes24_agent.tools.yes24_search import get_client
 from yes24_agent.yes24.client import Yes24FetchError
 
@@ -55,7 +49,13 @@ async def fetch_many(items: list[dict], tool_context: ToolContext) -> dict:
         인용 대상(source_id)이 된다. 상한을 넘겨 열지 않은 항목이 있으면 dropped_count·
         dropped_urls·message로 무엇을 안 열었는지 명시한다. items 자체가 목록이 아니거나
         비었거나 전체 열람이 실패하면 status="error"이며, result_count는 성공 건수다.
+        상품 상세의 ebook_edition(eBook 판의 url·크레마클럽 여부)은 yes24_fetch와 같다.
     """
+    return await fetch_pages(items, tool_context, observe_formats=True)
+
+
+async def fetch_pages(items: list[dict], tool_context, observe_formats: bool = False) -> dict:
+    """fetch_many 본체. observe_formats(eBook 판형 관측)는 도구만 켜고 오버뷰는 끈다."""
     if not isinstance(items, list):
         return {
             "status": "error",
@@ -103,19 +103,15 @@ async def fetch_many(items: list[dict], tool_context: ToolContext) -> dict:
 
     valid_urls = [url for url in plan if url]
 
-    # 네트워크(get_text)만 동시 실행한다. return_exceptions=True로 개별 실패를 값으로 받아
-    # 부분 실패를 fail-loud로 처리한다(등록은 아래 순차 루프에서 — 레이스 0).
-    gathered = await asyncio.gather(
-        *(client.get_text(url) for url in valid_urls), return_exceptions=True
-    )
-    # 파싱(순수 계산, 상세 1건 ~100ms)은 **워커 스레드 하나**에서 순차로 내린다 — 등록은 아래
-    # 순차 루프. 페이지마다 스레드를 갈라 gather하면 GIL 경합으로 벽시계가 오히려 는다
-    # (실측 2026-08-27: 5건 순차 614ms vs 5스레드 924ms). 루프 차단 해소가 목적이지 병렬이 아니다.
-    parsed = await asyncio.to_thread(
-        lambda: [
-            parse_page(outcome, url, settings) if isinstance(outcome, str) else outcome
-            for url, outcome in zip(valid_urls, gathered)
-        ]
+    # url마다 "주 요청 → 파싱 → (도구면) 판형 요청"을 한 체인(open_page)으로 gather한다.
+    # return_exceptions=True로 개별 실패를 값으로 받는다(등록은 아래 순차 루프 — 레이스 0).
+    parse_lock = asyncio.Lock()
+    parsed = await asyncio.gather(
+        *(
+            open_page(url, client, settings, parse_lock, observe_formats=observe_formats)
+            for url in valid_urls
+        ),
+        return_exceptions=True,
     )
     gathered_iter = iter(parsed)
 
@@ -141,7 +137,8 @@ async def fetch_many(items: list[dict], tool_context: ToolContext) -> dict:
             # 예상 밖 예외는 삼키지 않는다(fail-loud) — 버그를 빈 성공으로 감추지 않는다.
             raise outcome
         else:
-            # 순차 호출: register_source가 await 없이 하나씩 실행돼 id 원자·단조.
+            # 순차 호출: register_source가 await 없이 하나씩 실행돼 id 원자·단조 —
+            # settle_sources 정합(병렬 도구 유실 방지) 불변.
             results.append(register_page(outcome, tool_context))
 
     checked_at = now_checked_at()

@@ -30,7 +30,11 @@ from yes24_agent.yes24.parsers import (
     parse_product,
     product_fields,
 )
-from yes24_agent.yes24.selectors import GOODS_PATH
+from yes24_agent.yes24.selectors import (
+    GOODS_PATH,
+    ITEM_EBOOK_LABEL,
+    ITEM_FORMAT_LABEL_DECORATION,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +101,8 @@ async def yes24_fetch(
         total_chars(전체 길이)가 함께 온다.
         상품 상세의 other_formats는 이 페이지가 함께 렌더한 **다른 판형**(eBook·중고 등)의
         판형명·판매가·url이다(이 페이지에서 관측한 값이라 이 source_id로 인용한다).
+        종이책 상세의 ebook_edition은 함께 연 eBook 판의 url과 크레마클럽 등록 여부(in_cremaclub)
+        이며, None이면 eBook 판이 없고 in_cremaclub 키가 없으면 확인하지 못한 것이다.
         함께 오는 links는 이 페이지에서 더 볼 수 있는 다른 Yes24 페이지 후보
         목록이다(아직 열지 않은 페이지 — 인용 대상이 아니며, 필요하면 그 url로 다시
         yes24_fetch를 호출해 이어서 열람할 수 있다). 실패 시 status="error"와
@@ -125,7 +131,67 @@ async def yes24_fetch(
     # 독스트링에 살았는데, 오늘 fetch·fetch_many가 둘 다 두 단계를 직접 부르게 되면서 그
     # 함수의 호출자가 하나도 남지 않아 삭제했다(2026-08-31 적대 감사) — 근거는 여기로 옮긴다.
     page = await asyncio.to_thread(parse_page, html, url, settings, find)
+    await observe_ebook_format(page, client, settings)
     return register_page(page, tool_context)
+
+
+async def open_page(
+    url: str, client, settings, parse_lock: asyncio.Lock, *, observe_formats: bool
+) -> dict:
+    """url 하나를 열어 parse_page 중간 레코드를 만든다(등록 없음 — 호출부의 순차 루프 몫).
+
+    "조회 → 파싱 → (옵션) 판형 관측"의 한 체인이라 여러 url을 gather하면 한 권의 판형 요청이
+    다른 권의 주 요청·파싱을 기다리지 않는다. 파싱(순수 계산, 1건 ~100ms)은 호출부가 준
+    잠금으로 한 번에 하나씩 스레드에 내린다 — 동시에 돌리면 GIL 경합으로 벽시계가 는다
+    (실측 2026-08-27: 5건 순차 614ms vs 5스레드 924ms). 배치 열람(fetch_many)과 코너 행
+    관측(yes24_browse)이 같은 체인을 쓰므로 여기 한 곳에 둔다.
+    """
+    html = await client.get_text(url)
+    async with parse_lock:
+        page = await asyncio.to_thread(parse_page, html, url, settings)
+    if observe_formats:
+        await observe_ebook_format(page, client, settings)
+    return page
+
+
+async def observe_ebook_format(page: dict, client, settings) -> None:
+    """종이책 상세에 그 eBook 판을 `fields.ebook_edition`으로 싣는다(제자리).
+
+    클럽 배지는 전자책 상세에만 렌더돼(selectors.PRODUCT_CREMACLUB_BADGE) 종이책으로는 관측 불가라
+    판형 위젯이 가리키는 eBook 상세를 함께 열어 관측한다 — 그 상세는 출처로 등록하지 않는다.
+    관측은 한 군데에만 실리고 네 상태를 구분한다: `{"url", "in_cremaclub"}`(열어서 확인) /
+    `{"url"}`(열람·파싱 실패라 클럽 여부 미확인) / None(판형 위젯을 봤고 eBook 판 없음) /
+    키 없음(판형 위젯 관측 자체가 불가 — 전자책 상세·공지, 또는 이 함수를 부르지 않는 오버뷰).
+    벽시계 예산을 두지 않는다 — 프로덕션 조건(세션 쿠키 직렬화)에서 예산이 정상 관측을 잘랐다
+    (2026-09-15 실측 키 손실 0.0778).
+    """
+    if page.get("type") != "book_detail" or page["fields"].get("is_ebook") is not False:
+        return
+    ebook_format = ITEM_EBOOK_LABEL.strip(ITEM_FORMAT_LABEL_DECORATION)
+    record = next(
+        (
+            fmt
+            for fmt in page["fields"].get("other_formats") or []
+            if fmt.get("format") == ebook_format and fmt.get("url")
+        ),
+        None,
+    )
+    if record is None:
+        page["fields"]["ebook_edition"] = None
+        return
+    edition = {"url": record["url"]}
+    page["fields"]["ebook_edition"] = edition
+    try:
+        html = await client.get_text(edition["url"])
+        product = await asyncio.to_thread(parse_product, html, base_url=settings.yes24_base_url)
+    except (Yes24FetchError, ParseError) as exc:
+        reason = type(exc).__name__
+    else:
+        if "in_cremaclub" in product:
+            edition["in_cremaclub"] = product["in_cremaclub"]
+            return
+        reason = "not_ebook"
+    logger.info(f"ebook_edition url={edition['url']!r} in_cremaclub=unobserved reason={reason}")
 
 
 def parse_page(html: str, url: str, settings, find: str | None = None) -> dict:

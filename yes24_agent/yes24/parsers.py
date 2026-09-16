@@ -57,6 +57,7 @@ from yes24_agent.yes24.selectors import (
     LINK_PRODUCT_PATH_RE,
     NO_RESULTS_MARKER,
     PRODUCT_AUTHOR,
+    PRODUCT_CREMACLUB_BADGE,
     PRODUCT_FORMAT_CONTAINER,
     PRODUCT_FORMAT_LINK,
     PRODUCT_FORMAT_PRICE,
@@ -120,6 +121,12 @@ _ITEM_FIELDS = (
     "features",
     "image_url",
     "is_ebook",
+    "in_cremaclub",
+    # 종이책 상세가 함께 연 eBook 판(yes24_fetch.observe_ebook_format이 싣는다) — 그 url과
+    # in_cremaclub을 담은 레코드이거나 None(eBook 판 없음)이다. 주어는 그 값이 앉은 객체라
+    # 이름은 in_cremaclub 하나뿐이며, 종이책 최상위엔 클럽 여부가 따로 실리지 않는다.
+    "ebook_edition",
+    "episode_info",
     "is_book",
     "kind",
     "is_preorder",
@@ -351,6 +358,7 @@ def parse_product(html: str, *, base_url: str) -> dict:
 
     반환 dict 키: goods_no, title, url, author, publisher, pub_date, list_price(int|None),
     sale_price(int|None), rating(float|None), page_count(int|None), is_ebook(bool),
+    in_cremaclub(bool — 클럽 배지는 전자책 상세에만 렌더돼 전자책이 아니면 관측 불가라 키 없음),
     image_url(str|None),
     other_formats(list[dict]), intro, toc, pub_review, weekly_reviews(list[str]),
     info_tables(dict — 캡션→{라벨: 값}, 표가 없으면 빈 dict).
@@ -399,6 +407,7 @@ def parse_product(html: str, *, base_url: str) -> dict:
         "rating": _parse_rating(soup.select_one(PRODUCT_RATING)),
         "page_count": _parse_page_count(soup),
         "is_ebook": is_ebook,
+        **({"in_cremaclub": soup.select_one(PRODUCT_CREMACLUB_BADGE) is not None} if is_ebook else {}),
         **_book_fields(soup),
         "image_url": _image_url_or_none(soup, selector=PRODUCT_IMAGE, attr=PRODUCT_IMAGE_ATTR),
         "other_formats": _other_formats(
@@ -538,11 +547,11 @@ def parse_browse_list(html: str, *, base_url: str, section: str, limit: int = 24
         limit=limit,
         container_selector=spec["list_container"],
         item_selector=spec["item"],
-        convert=_MARKUP_CONVERTERS[spec["markup"]](base_url, has_rank=spec["has_rank"]),
+        convert=_MARKUP_CONVERTERS[spec["markup"]](base_url, spec),
     )
 
 
-def _search_style_converter(base_url: str, *, has_rank: bool):
+def _search_style_converter(base_url: str, spec: Mapping):
     """베스트셀러/신간처럼 검색 결과와 마크업이 동일한 섹션의 아이템 변환기."""
 
     def convert(item) -> dict | None:
@@ -550,34 +559,48 @@ def _search_style_converter(base_url: str, *, has_rank: bool):
         if parsed is None:
             return None
         # rank만 가법 — 나머지 필드는 검색과 같은 _parse_item 결과 그대로다.
-        return {"rank": _parse_rank(item, ITEM_RANK, has_rank), **parsed}
+        return {"rank": _parse_rank(item, ITEM_RANK, spec["has_rank"]), **parsed}
 
     return convert
 
 
-def _cremaclub_converter(base_url: str, *, has_rank: bool):
-    """크레마클럽 인기(eBook 구독) 목록의 아이템 변환기. 검색/베스트셀러와 마크업이 다르다."""
+def _cremaclub_converter(base_url: str, spec: Mapping):
+    """크레마클럽(eBook 구독) 목록의 아이템 변환기. 검색/베스트셀러와 마크업이 다르다."""
 
     def convert(item) -> dict | None:
         goods_no_el = item.select_one(CREMACLUB_GOODS_NO_LINK)
         goods_no = goods_no_el.get(ITEM_GOODS_NO_ATTR) if goods_no_el else None
         title_el = item.select_one(CREMACLUB_TITLE_LINK)
         title = title_el.get_text(strip=True) if title_el else None
+        href = title_el.get("href") if title_el else None
         if not title or not goods_no:
             return None
+        # www 상품이 없는 코너(url_from_link — urls.BROWSE_SEED_URLS 주석)는 행 링크 자체가
+        # 상품 페이지다. 그 링크가 없으면 조립으로 메우지 않고 건너뛴다(죽은 링크 금지).
+        if spec.get("url_from_link"):
+            if not href:
+                return None
+            url = urljoin(spec["url"], href)
+        else:
+            url = product_url(base_url, goods_no)
 
+        episode_selector = spec.get("episode_info")
+        episode_info = (
+            _text_or_none(item.select_one(episode_selector)) if episode_selector else None
+        )
         # 검색/베스트셀러와 같은 필드 순서(_item_fields)를 따르되, 이 페이지에 필드 자체가
         # 없는 publisher·pub_date·sale_price·sale_index는 키를 내지 않는다(구독형 eBook 목록).
         return {
-            "rank": _parse_rank(item, CREMACLUB_RANK, has_rank),
+            "rank": _parse_rank(item, CREMACLUB_RANK, spec["has_rank"]),
             **_item_fields(
                 goods_no=goods_no,
                 title=title,
-                url=product_url(base_url, goods_no),
+                url=url,
                 author=_text_or_none(item.select_one(CREMACLUB_AUTHOR)),
                 rating=_parse_rating(item.select_one(CREMACLUB_RATING)),
                 review_count=_parse_grouped_int(item.select_one(ITEM_REVIEW_COUNT)),
                 image_url=_image_url_or_none(item),
+                **({"episode_info": episode_info} if episode_info else {}),
             ),
         }
 
@@ -1134,7 +1157,39 @@ def parse_category_links(html: str, *, limit: int) -> list[dict]:
     정적 맵은 사이트 개편 시 조용히 썩는다). 이름 없는 링크는 건너뛰고, 같은 번호는
     첫 등장만 남기며(문서 순서 보존), limit에서 멈춘다.
     """
+    return _category_links(BeautifulSoup(html, "lxml"), limit=limit)
+
+
+# 코너 레코드(urls.BROWSE_SEED_URLS)에서 페이지 레벨 **원문 문구**로 뽑는 선택 키. 레코드에
+# 키(셀렉터)가 있고 페이지에 요소가 있을 때만 get_text 원문을 같은 키로 낸다 — 없으면 키 생략
+# (_item_fields의 관측-불가 규약과 같다). 해석(날짜 파싱·'주간' 판정)은 하지 않는다.
+_PAGE_TEXT_FIELDS = ("period", "period_note")
+
+
+def parse_browse_page_meta(html: str, *, section: str, limit: int) -> dict:
+    """코너 페이지의 목록 밖 관측 — 분야 내비와 페이지가 명시한 집계 기간 문구.
+
+    목록 파서(parse_browse_list)는 컨테이너 서브트리만 세우므로(_container_soup) 페이지 레벨
+    요소를 볼 수 없다. 분야 내비(parse_category_links)가 이미 전체 트리를 한 번 세우므로 그
+    한 번에 기간 문구 추출을 합친다 — 전체 트리 2회 세우기 금지(H17).
+
+    반환: {"categories": [...]} + 레코드가 선언한 _PAGE_TEXT_FIELDS 중 페이지에 있는 것만.
+    셀렉터가 여러 요소에 걸치면(월간 코너의 연·월 라벨) 원문을 공백으로 이어 한 값으로 낸다.
+    회귀(2026-09-15 배터리): 페이로드에 집계 기간이 없어 모델이 주간 순위를 월간처럼 썼다.
+    """
+    spec = BROWSE_SEED_URLS[section]
     soup = BeautifulSoup(html, "lxml")
+    meta: dict = {"categories": _category_links(soup, limit=limit)}
+    for field in _PAGE_TEXT_FIELDS:
+        selector = spec.get(field)
+        elements = soup.select(selector) if selector else []
+        text = " ".join(el.get_text(strip=True) for el in elements).strip()
+        if text:
+            meta[field] = text
+    return meta
+
+
+def _category_links(soup: BeautifulSoup, *, limit: int) -> list[dict]:
     seen: dict[str, str] = {}
     for anchor in soup.find_all("a", href=_CATEGORY_DISPLAY_HREF_RE):
         match = _CATEGORY_DISPLAY_HREF_RE.search(anchor["href"])

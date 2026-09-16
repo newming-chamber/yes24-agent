@@ -192,6 +192,14 @@ PRODUCT_PAGE_COUNT_FIELD = "쪽수"
 PRODUCT_GOODS_NO_JS_RE = r"g_GoodsNo\s*=\s*'(\d+)'"
 PRODUCT_GOODS_NAME_JS_RE = r"g_GoodsName\s*=\s*'([^']+)'"
 PRODUCT_IS_EBOOK_JS_RE = r"g_isEbook\s*=\s*'([YN])'"
+# 크레마클럽 등록 배지(제목 영역 keynote). 전자책 상세에서 클럽 상품이면 정확히 1개, 아니면
+# 0개다(2026-09-14 실측: 클럽 135/135, 비클럽 0/116, 클럽 상세 경로 교차 확인 90/90 일치).
+# 종이책 상세엔 렌더되지 않는다. 쓰지 않는 신호: braze `cremaclubGoodsYn`(클럽 28/143이 'N'),
+# 해시태그 "#크레마클럽에있어요"(편집 태그 — 누락·종이책 부착), GNB 클럽 메뉴(공통 템플릿).
+# 판정 단위는 이 상품(goods_no)이다 — 오리지널 클럽 전용판처럼 goods_no가 다른 같은 작품은
+# 이 신호로 알 수 없다. 오디오북 상세도 g_isEbook='Y'이고 배지 슬롯·렌더 구조가 전자책과 같다
+# (2026-09-15 실측: 클럽 오디오북 125104374 배지 1) — g_isEbook 게이트가 관측 가능 집합과 일치한다.
+PRODUCT_CREMACLUB_BADGE = "#spanGdKeynote span.iconC.bClub"
 PRODUCT_SALE_PRICE_JS_RE = r"g_GoodsSalePrice\s*=\s*([\d.]+)"
 # 정가(할인 전 가격). 목록의 취소선 표기(ITEM_LIST_PRICE)와 같은 값이며, 같은 이유로 뽑는다.
 # 할인 폭 전역(g_GoodsDiscountShopPrice)은 두 값의 차라 뽑지 않는다 — 변수명이 이 패턴의
@@ -238,6 +246,17 @@ PRODUCT_REVIEW_WEEK_FULL_TEXT = ".reviewInfoBot.origin .review_cont"
 BESTSELLER_LIST_CONTAINER = "ul#yesBestList"
 BESTSELLER_ITEM = f"{BESTSELLER_LIST_CONTAINER} li[data-goods-no]"
 ITEM_RANK = "em.ico.rank"
+# 베스트셀러 페이지가 목록 위에 명시하는 집계 기간("2026.07.01 ~ 2026.07.07 기준")과 집계 방식
+# 안내("최근 7일간 … 매일 1회 집계됩니다"). 페이지 레벨 요소라 목록 컨테이너 밖에 있고
+# (fixture 3389·3429행, 라이브 2026-09-15 동일 마크업), 신간·크레마클럽 페이지에는 없다.
+# 값은 원문 그대로 싣는다 — 날짜 해석·'주간' 매핑을 코드에 두지 않는다(탭이 무엇을 렌더하든
+# 그대로 따라간다).
+BESTSELLER_PERIOD = "#spnBaseFilter .standardsTxt"
+BESTSELLER_PERIOD_NOTE = ".bSGoodsSecTop .bSGoodsSecEtc"
+MONTHLY_BESTSELLER_PERIOD = (
+    "#spnBaseFilter label[for=scope_year] .txt, "
+    "#spnBaseFilter label[for=scope_month] .txt"
+)
 
 # 신간: 순위 마커가 없다는 점만 빼면 베스트셀러와 동일한 마크업(ITEM_* 재사용).
 NEWPRODUCT_LIST_CONTAINER = "ul#yesNewList"
@@ -249,8 +268,9 @@ NEWPRODUCT_ITEM = f"{NEWPRODUCT_LIST_CONTAINER} li[data-goods-no]"
 #   - li 자체에는 data-goods-no가 없다. 대신 "내서재에 추가" 버튼
 #     (a.btn_addBC)의 data-goods-no 속성에서 뽑아야 한다.
 #   - 상세 링크(a.gd_name의 href)는 `/BookClub/Detail/{id}`라 구매 가능한
-#     상품 페이지가 아니다 — URL은 항상 product_url(base_url, goods_no)로 별도
-#     조립해야 한다("BookClub/Detail 링크 말고 구매 가능한 상품 페이지로").
+#     상품 페이지가 아니다 — URL은 product_url(base_url, goods_no)로 별도
+#     조립한다("BookClub/Detail 링크 말고 구매 가능한 상품 페이지로"). 예외는 www 상품이
+#     없는 코너(레코드의 url_from_link — 오리지널)뿐이다.
 #   - 출판사/출간일 필드 자체가 이 페이지에 없고, 가격 정보도 전혀 없다
 #     (구독형 eBook 서비스라 개별 판매가를 표시하지 않음) — 항상 None.
 CREMACLUB_LIST_CONTAINER = "ul#ulBestBookClubGoods"
@@ -260,6 +280,17 @@ CREMACLUB_TITLE_LINK = "a.gd_name"
 CREMACLUB_RANK = "div.info_row.info_rank em"
 CREMACLUB_AUTHOR = "span.authPub.info_auth"
 CREMACLUB_RATING = ".rating_grade em.yes_b"
+
+# 크레마클럽 오리지널 전체 보기(urls.BROWSE_SEED_URLS["cremaclub_original"], 2026-09-14 실측
+# fixture): SSR 단일 목록이고 li 안쪽은 위 CREMACLUB_* 필드 마크업과 같다 — 다른 것은 목록을
+# 감싼 컨테이너뿐이다. 컨테이너를 `div#bCGoodsWrap`로 잡는 이유: 크레마클럽 코너 껍데기는 같은
+# id로 `div.noData` 자리표시자를 렌더하는데(Best 실측), 그 경우 "컨테이너 있음 + 아이템 0"이
+# 되어 _parse_list가 0건 성공이 아니라 ParseError로 fail-loud한다.
+CREMACLUB_ORIGINAL_LIST_CONTAINER = "div#bCGoodsWrap"
+CREMACLUB_ORIGINAL_ITEM = f"{CREMACLUB_ORIGINAL_LIST_CONTAINER} ul.bCGoodsHor li"
+CREMACLUB_ORIGINAL_CURRENT_CONTAINER = ".bCSecNowing #bCNowing"
+CREMACLUB_ORIGINAL_CURRENT_ITEM = f"{CREMACLUB_ORIGINAL_CURRENT_CONTAINER} .itemUnit"
+CREMACLUB_ORIGINAL_EPISODE_INFO = ".info_pub"
 
 
 # ============================================================
