@@ -26,8 +26,10 @@ from yes24_agent.rbti.persona import (
     AXIS_UI_KO,
     TYPE_ARCHETYPES,
     axis_label,
+    is_valid_code,
     matrix_codes,
 )
+from yes24_agent.rbti.profile import fetch_user_rbti
 
 
 class AxisValue(BaseModel):
@@ -98,6 +100,19 @@ def _types() -> list[RbtiType]:
     ]
 
 
+class MyRbtiResponse(BaseModel):
+    """지금 이 사용자의 독서 성향 코드. 화면이 진입 시 배지·선택기 초기값을 그릴 재료다."""
+
+    code: str | None = Field(
+        default=None,
+        description=(
+            "이 사용자의 유형 코드(예 `SEBF`). 유형이 없거나 조회하지 못했으면 `null`이다"
+            " — 둘을 가르지 않는다(둘 다 '성향 없이 답한다'와 같은 결과다)."
+        ),
+        examples=["SEBF"],
+    )
+
+
 def register_rbti(app: FastAPI) -> None:
     """`GET /rbti/types`를 등록한다.
 
@@ -122,3 +137,28 @@ def register_rbti(app: FastAPI) -> None:
         user: Annotated[AuthenticatedUser | None, Depends(get_authenticated_user)] = None,
     ) -> RbtiTypesResponse:
         return RbtiTypesResponse(axes=_axes(), types=_types())
+
+    @app.get(
+        "/me/rbti",
+        tags=["rbti"],
+        response_model=MyRbtiResponse,
+        summary="이 사용자의 독서 성향 코드",
+        description=(
+            "진입 시 배지·선택기 초기값을 그릴 값이다. 서버가 매 턴 쓰는 그 조회를 그대로"
+            " 돌려주므로 `/chat/stream`의 `rbti` 이벤트·`done.rbti_applied`와 같은 값이다"
+            " (요청에 `rbti`를 실어 덮어쓰거나 `use_rbti:false`로 끈 턴은 예외)."
+            " 유형이 없거나 조회 실패면 `code: null`이며 **오류가 아니다**."
+            " 저장·수정 경로는 없다 — 코드의 정본은 외부 RBTI API다."
+            " 값이 사람에게 붙는 속성이라 자주 바뀌지 않으니 진입 시 1회 받는다(폴링 금지)."
+        ),
+    )
+    async def my_rbti(
+        user: Annotated[AuthenticatedUser | None, Depends(get_authenticated_user)] = None,
+    ) -> MyRbtiResponse:
+        """조회 결과를 채팅 경로와 **같은 판정**으로 거른다(runner.py의 `is_valid_code`).
+
+        무효 코드를 그대로 흘리면 화면은 배지를 그리는데 답변에는 페르소나가 적용되지 않아
+        둘이 어긋난다 — 이 엔드포인트의 값은 "실제로 적용될 코드"여야 한다.
+        """
+        code = await fetch_user_rbti(user.user_no if user else None)
+        return MyRbtiResponse(code=code if is_valid_code(code) else None)
