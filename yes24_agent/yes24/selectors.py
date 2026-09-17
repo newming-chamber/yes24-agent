@@ -142,7 +142,10 @@ NO_RESULTS_MARKER = "div.noData:not(#yRGoodsNoData)"
 
 # 제목. 페이지 안에 사이드 고정 탭 헤더(.gd_tabName)에도 동일 클래스(h2.gd_name)가
 # 중복 렌더되므로, 반드시 `.gd_titArea`로 스코프해야 유일하게 걸린다.
-PRODUCT_TITLE = ".gd_titArea .gd_name"
+# 이 제목 영역은 상세 페이지에만 렌더되므로 "이 문서가 상품 상세인가"의 판별자이기도 하다
+# (parsers.is_product_detail — 클래스명을 두 곳에 적지 않으려고 상수로 뽑았다).
+PRODUCT_TITLE_AREA_CLASS = "gd_titArea"
+PRODUCT_TITLE = f".{PRODUCT_TITLE_AREA_CLASS} .gd_name"
 PRODUCT_AUTHOR = ".gd_auth"
 PRODUCT_PUBLISHER = ".gd_pub"
 PRODUCT_PUB_DATE = ".gd_date"

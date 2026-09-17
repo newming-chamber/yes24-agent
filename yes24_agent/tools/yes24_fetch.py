@@ -27,11 +27,11 @@ from yes24_agent.yes24.parsers import (
     ParseError,
     extract_faq_entries,
     extract_links,
+    is_product_detail,
     parse_product,
     product_fields,
 )
 from yes24_agent.yes24.selectors import (
-    GOODS_PATH,
     ITEM_EBOOK_LABEL,
     ITEM_FORMAT_LABEL_DECORATION,
 )
@@ -210,9 +210,10 @@ def parse_page(html: str, url: str, settings, find: str | None = None) -> dict:
         disallowed_paths=tuple(settings.yes24_disallowed_paths),
     )
 
-    # 경로 판별은 대소문자 무시 — Yes24가 상품 링크를 /Product/Goods/(대문자)로도
-    # 내보내며(크레마클럽 목록 등), 링크 팔로우로 그런 url이 오면 상세로 인식돼야 한다.
-    if GOODS_PATH in url.lower():
+    # 주소가 아니라 문서가 상세를 판별한다(parsers.is_product_detail) — Yes24는 같은 상세
+    # 마크업을 여러 경로로 서빙하고(대소문자 다른 /Product/Goods/, 크레마클럽 /BookClub/Detail/),
+    # 경로 목록을 유지하는 방식은 새 경로가 생길 때마다 조용히 틀린다.
+    if is_product_detail(html):
         return _parse_product_page(
             html,
             url,

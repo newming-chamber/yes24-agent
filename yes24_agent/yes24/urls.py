@@ -295,7 +295,7 @@ BROWSE_SEED_URLS: dict[str, dict] = {
         "list_container": CREMACLUB_ORIGINAL_LIST_CONTAINER,
         "item": CREMACLUB_ORIGINAL_ITEM,
         "has_rank": False,
-        "order": "page",
+        "order": "registered_desc",
         "url_from_link": True,
     },
     "cremaclub_original_current": {
@@ -311,7 +311,7 @@ BROWSE_SEED_URLS: dict[str, dict] = {
         "item": CREMACLUB_ORIGINAL_CURRENT_ITEM,
         "episode_info": CREMACLUB_ORIGINAL_EPISODE_INFO,
         "has_rank": False,
-        "order": "page",
+        "order": "registered_desc",
         "url_from_link": True,
     },
 }

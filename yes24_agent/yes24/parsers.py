@@ -87,6 +87,7 @@ from yes24_agent.yes24.selectors import (
     PRODUCT_SPECIFICATION_VALUE,
     PRODUCT_TEXTAREA_CONTENT,
     PRODUCT_TITLE,
+    PRODUCT_TITLE_AREA_CLASS,
     PRODUCT_TOC,
     SEARCH_ITEM,
     SEARCH_LIST_CONTAINER,
@@ -351,6 +352,23 @@ def _item_fields(**values) -> dict:
     호출자가 `field=None`으로 넘기면 그대로 유지된다.
     """
     return {name: values[name] for name in _ITEM_FIELDS if name in values}
+
+
+def is_product_detail(html: str) -> bool:
+    """이 HTML이 상품 상세 페이지인가 — **주소가 아니라 문서가 판별한다**.
+
+    Yes24는 같은 상세 마크업을 여러 경로로 서빙한다. 크레마클럽 상세
+    (`cremaclub.yes24.com/BookClub/Detail/{id}`)가 대표적으로, `/product/goods/` 경로가
+    아니라는 이유만으로 상세 파서를 못 타면 출간일·저자·출판사가 통째로 사라지고 6,000자
+    원시 텍스트가 된다(2026-09-16 실측: 그래서 오리지널 코너에 pub_date가 0이었다).
+
+    판별은 상세에만 렌더되는 제목 영역(PRODUCT_TITLE)의 존재로 한다. 2026-09-17 실측
+    82개 문서(상세 57 / 비상세 25 — fixture + 라이브 저장본)에서 오분류 0.
+    SoupStrainer로 제목 영역만 만들어 문서당 ~7ms이며, 이 판별이 붙는 곳은 네트워크
+    왕복(페이지당 수백 ms) 뒤라 비용이 묻힌다 — 그래서 더 싼 사전 판별을 겹쳐 두지 않는다.
+    """
+    area = BeautifulSoup(html, "lxml", parse_only=SoupStrainer(class_=PRODUCT_TITLE_AREA_CLASS))
+    return area.find(class_=PRODUCT_TITLE_AREA_CLASS) is not None
 
 
 def parse_product(html: str, *, base_url: str) -> dict:
