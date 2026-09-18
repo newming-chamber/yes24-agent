@@ -282,14 +282,13 @@ async def yes24_search(
 
     # 네트워크·파싱만 동시 실행한다(각도별 병렬). 등록은 아래 순차 루프에서 — 레이스 0.
     # _search_one이 예상 오류를 이미 error dict로 삼키므로 예상 밖 예외만 gather 밖으로 올라온다.
-    progress = ToolProgressGroup(
-        tool_context, stage="searching", details=planned
-    )
+    progress = ToolProgressGroup(tool_context, details=planned)
     searched = await progress.gather(
         [
             (index, _search_one(q, section, order, author_no, client, settings, budget))
             for index, q in enumerate(planned)
         ],
+        stage="searching",
         summarize=parsed_progress,
         complete=lambda outcome: (
             section == WIDEST_SECTION
@@ -323,6 +322,7 @@ async def yes24_search(
                         for index, q in enumerate(planned)
                         if q in widen
                     ],
+                    stage="searching",
                     summarize=parsed_progress,
                 ),
             ]

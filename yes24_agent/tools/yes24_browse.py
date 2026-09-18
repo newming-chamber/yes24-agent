@@ -269,6 +269,34 @@ async def _observe_row_format(
     return any(name in observed for name in _OBSERVED_FORMAT_FIELDS)
 
 
+async def _observe_rows(
+    targets: list[dict], client: Yes24Client, settings: Settings
+) -> list[dict]:
+    """대상 행들을 동시에 관측하고 **확인된 행만** 돌려준다(진행 줄 하나에 대응하는 한 단위).
+
+    예상 밖 예외를 값으로 받는다(return_exceptions) — 한 권이 예외를 던져도 형제가 전원
+    완주해야 죽은 턴의 요청이 공유 클라이언트에 계속 나가는 고아 태스크가 안 생기고
+    (2026-09-18 적대 검증: 도구가 터진 뒤에도 7건 추가 발사), 한 권의 낯선 문서 형태가 멀쩡한
+    코너 열람 전체를 죽일 이유도 없다. 그래서 **관측 예외는 도구 밖으로 나가지 않는다** —
+    그 행의 "확인 못 함"으로 접히고, 조용히 삼키지 않도록 조회·파싱 실패와 같은 형식으로 남는다.
+    """
+    lock = asyncio.Lock()  # 파싱 직렬화 — 이 배치 한 벌(fetch_many와 같은 규약)
+    outcomes = await asyncio.gather(
+        *(_observe_row_format(row, client, settings, lock) for row in targets),
+        return_exceptions=True,
+    )
+    observed = []
+    for row, outcome in zip(targets, outcomes):
+        if isinstance(outcome, BaseException):
+            logger.info(
+                f"yes24_browse observe url={row['url']!r} status=error "
+                f"reason={type(outcome).__name__}"
+            )
+        elif outcome:
+            observed.append(row)
+    return observed
+
+
 async def yes24_browse(
     sections: list[str],
     tool_context: ToolContext,
@@ -336,15 +364,19 @@ async def yes24_browse(
     # 나머지는 정상 열람된다(조용히 코너 전체로 대체하지 않는다).
     category_name = category_name.strip()  # 공백뿐인 이름은 해석 대상이 아니다
     # 네트워크·파싱만 동시 실행한다(코너별 병렬). 등록은 아래 순차 루프에서 — 레이스 0.
-    section_details = [
+    # 진행 줄은 코너들 + (관측을 할 예정이면) 관측 한 줄이다. 관측 줄의 제목은 코너를 열어야
+    # 알지만 **자리는 지금 세어야 한다** — 그래야 코너가 하나뿐인 호출도 줄이 둘이 되어
+    # 서브스텝이 살아난다(코너 그룹만 침묵하면 관측 줄이 코너 건수를 억제한다, 09-18 실측).
+    details = [
         BROWSE_SEED_URLS.get(section, {}).get("label", section) for section in planned
-    ]
-    progress = ToolProgressGroup(tool_context, stage="browsing", details=section_details)
+    ] + ([""] if observe_ebook_editions else [])
+    progress = ToolProgressGroup(tool_context, details=details)
     browsed = await progress.gather(
         [
             (index, _browse_one(s, category_number, category_name, client, settings))
             for index, s in enumerate(planned)
         ],
+        stage="browsing",
         summarize=parsed_progress,
     )
 
@@ -398,29 +430,31 @@ async def yes24_browse(
     #      (fetch_many_max_items — http_concurrency=5와 정렬)을 그대로 쓴다: 같은 축의 값을
     #      코너용으로 한 벌 더 두면 한쪽만 조정되는 드리프트가 생긴다. 초과 행은 관측 없이
     #      키 없음으로 두고 아래 요약에서 명시한다(조용한 truncation 금지).
-    unobserved_count = 0
     observed_count = 0
-    if observe_ebook_editions:
-        targets = _observe_targets(list(rows.values()), settings.fetch_many_max_items)
-        unobserved_count = len(rows) - len(targets)
-        parse_lock = asyncio.Lock()
-        # 진행 이벤트: 관측 구간이 무음이 되지 않게 상세 열람과 같은 stage 어휘(reading)로 낸다.
-        # 서브스텝 번호는 이 도구 호출 안에서 **코너 다음 번호로 이어진다** — 0부터 다시 매기면
-        # step_id가 첫 코너 칩과 충돌해 그 칩을 덮는다(event_translate.tool_progress).
-        observe_progress = ToolProgressGroup(
-            tool_context,
+    # 관측 대상이 **곧 가드**다 — 플래그·행을 따로 보면 예산이 0일 때 대상만 비어 빈 문구 줄과
+    # 가짜 실패 줄이 나간다(적대 검증 재현). 플래그가 꺼지면 예산이 0이라 대상도 비고, 코너가
+    # 전부 실패해 행이 없을 때도 같은 한 조건으로 닫힌다.
+    targets = _observe_targets(
+        list(rows.values()), settings.fetch_many_max_items if observe_ebook_editions else 0
+    )
+    unobserved_count = len(rows) - len(targets) if observe_ebook_editions else 0
+    if targets:
+        # 관측은 이 호출의 마지막 진행 줄이다 — 위에서 잡아 둔 자리를 지금 채운다. 대상이 몇
+        # 권이든 상세 열람과 같은 stage 어휘(reading)로 fetch_many처럼 **한 줄**이다: 책마다
+        # 한 줄이면 화면이 "N단계 탐색"으로 부풀고, 그 줄들엔 건수가 없어 프론트가 "0권을
+        # 찾았어요"로 그린다(09-18 실측). 번호도 코너 다음 하나 — 0부터 매기면 칩이 겹친다.
+        details[len(planned)] = " · ".join(row["title"] for row in targets)
+        observed_count = len((await progress.gather(
+            [(len(planned), _observe_rows(targets, client, settings))],
             stage="reading",
-            details=[*section_details, *(row["title"] for row in targets)],
-        )
-        observed_count = sum(
-            await observe_progress.gather(
-                [
-                    (len(planned) + index, _observe_row_format(row, client, settings, parse_lock))
-                    for index, row in enumerate(targets)
-                ],
-                summarize=lambda observed: {"status": "ok" if observed else "error"},
-            )
-        )
+            summarize=lambda found: {
+                # 전건 실패는 failed 줄로 남는다 — 읽기가 실제로 전부 실패한 것이라
+                # "0건 찾았어요"로 누르면 실패를 빈 성공으로 위장하게 된다(원칙 7).
+                "status": "ok" if found else "error",
+                "result_count": len(found),
+                "sources": found,
+            },
+        ))[0])
 
     ok_count = sum(1 for b in browses if b["status"] == "ok")
     # 2) 등록(순차): 병합된 행마다 한 번만 등록한다 — source_id 유일·단조.
