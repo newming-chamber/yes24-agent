@@ -180,13 +180,23 @@ def project_public_source(source: dict) -> dict:
     event["type"] = _PUBLIC_SOURCE_TYPE.get(event["type"], event["type"])
     if event["type"] == "notice":
         event["card_type"] = "document"
-    elif event.get("is_book") is True or (
-        "is_book" not in event
-        and (event.get("kind") in ("도서", "eBook") or event.get("is_ebook") is True)
-    ):
-        event["card_type"] = "book"
     else:
-        event["card_type"] = "link"
+        # 판형은 **관측됐을 때만** 판정을 뒤집는다. 신호의 권위 순서는 is_book(상세 주문
+        # JSON의 resource_key — 외서·오디오북까지 도서로 답한다) > kind(목록 판형 라벨) >
+        # is_ebook이고, 셋 다 침묵이면 Yes24 상품은 책이다(웹·공지는 아니다).
+        # 침묵을 "책 아님"으로 접던 옛 판정이 2026-09-18 사고의 원인이다: 판형 라벨
+        # (span.gd_res)이 없는 코너 목록(크레마클럽 인기)의 행이 전부 link로 나갔고,
+        # 프론트는 card_type != "book"이면 인라인 인용 칩을 지우고 책 카드도 만들지 않아
+        # 정상 인용된 책이 링크 없이 보였다(dev 코퍼스 09-10~ 실측: product 출처 3,646건 중
+        # link 562건, 그중 558건이 침묵이고 실제 비도서 관측은 4건뿐).
+        is_book = event.get("is_book")
+        if is_book is None and event.get("kind") is not None:
+            is_book = event["kind"] in ("도서", "eBook")
+        if is_book is None and event.get("is_ebook"):
+            is_book = True
+        if is_book is None:
+            is_book = event["type"] == "product"
+        event["card_type"] = "book" if is_book else "link"
     snippet = event.pop("snippet", None)
     if isinstance(snippet, str):
         preview = next((part.strip() for part in snippet.split("\n\n") if part.strip()), "")
