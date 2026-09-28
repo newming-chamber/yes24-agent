@@ -467,7 +467,7 @@ async def _today_corner(
 
     if url and url != seed_url:
         try:
-            html = await ctx.client.get_text(url)
+            html = await ctx.client.get_text(url, cache_ttl_s=ctx.settings.browse_list_cache_ttl_s)
             return url, html, await asyncio.to_thread(_rows, html)
         except ParseError:
             # 계열이 다른 탭을 만난 정상 경로다 — 같은 날 같은 탭에서 되풀이되므로
@@ -479,7 +479,9 @@ async def _today_corner(
                 f"starters 코너 열기 실패(시드로 복귀): section={section} url={url} "
                 f"{type(exc).__name__}: {exc}"
             )
-    seed_html = await ctx.client.get_text(seed_url)
+    seed_html = await ctx.client.get_text(
+        seed_url, cache_ttl_s=ctx.settings.browse_list_cache_ttl_s
+    )
     return seed_url, seed_html, await asyncio.to_thread(_rows, seed_html)
 
 
@@ -977,7 +979,11 @@ async def slot_catalogue(
     claimed: set[str] = set()
 
     for section in settings.starter_sections:
-        seed_html = await client.get_text(browse_url(section))
+        # 코너 목록 페이지는 browse와 같은 TTL(browse_list_cache_ttl_s) — 캐시 키가 URL이라
+        # 호출자마다 TTL이 갈리면 먼저 fetch한 쪽이 만료를 정한다(같은 페이지엔 같은 TTL).
+        seed_html = await client.get_text(
+            browse_url(section), cache_ttl_s=settings.browse_list_cache_ttl_s
+        )
         corners = await asyncio.to_thread(
             parse_corner_links, seed_html, base_url=settings.yes24_base_url, section=section
         ) or [{"key": section, "label": BROWSE_SEED_URLS[section]["label"],
@@ -994,7 +1000,9 @@ async def slot_catalogue(
 
     if settings.starter_pick_from:
         section = settings.starter_pick_from
-        html = await client.get_text(browse_url(section))
+        html = await client.get_text(
+            browse_url(section), cache_ttl_s=settings.browse_list_cache_ttl_s
+        )
         prefix = browse_category_prefix(section)
         links = await asyncio.to_thread(
             parse_category_links, html, limit=settings.starter_pick_category_limit

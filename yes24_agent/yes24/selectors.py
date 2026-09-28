@@ -261,9 +261,18 @@ MONTHLY_BESTSELLER_PERIOD = (
     "#spnBaseFilter label[for=scope_month] .txt"
 )
 
-# 신간: 순위 마커가 없다는 점만 빼면 베스트셀러와 동일한 마크업(ITEM_* 재사용).
+# 신간: 순위 마커가 없다는 점만 빼면 베스트셀러와 동일한 마크업(ITEM_* 재사용). 오늘의 책
+# (`/product/category/display/{번호}` 카테고리 목록)도 같은 id의 컨테이너를 렌더한다
+# (2026-09-22 실측 fixture ``todaybook_sample.html``) — 셀렉터를 두 번 선언하지 않고 재사용.
 NEWPRODUCT_LIST_CONTAINER = "ul#yesNewList"
 NEWPRODUCT_ITEM = f"{NEWPRODUCT_LIST_CONTAINER} li[data-goods-no]"
+
+# 책소개 앞부분 발췌. 행의 `div.info_row.info_read`에 상세 책소개의 첫 문단이 "..."로 잘려 평문
+# SSR된다(편집자 추천문이 아니다 — 상세 PRODUCT_INTRO와 같은 원문의 앞부분). 렌더 여부는
+# 목록마다 다르다(2026-09-22 fixture 실측: 오늘의 책 24/24, 신간 20/24, 주목할 신상품 22/24,
+# 검색·베스트셀러·스테디셀러 0). 어느 코너가 이 값을 행에 싣는지는 코너 레코드(urls.BROWSE_SEED_URLS
+# 의 intro_excerpt 키)가 정한다 — 기본 페이로드를 바꾸지 않고 큐레이션 코너만 켠다.
+ITEM_INTRO_EXCERPT = "div.info_row.info_read"
 
 # 크레마클럽 인기(eBook 구독 서비스)는 검색/베스트셀러/신간과 마크업이 다르다. 값은 코너
 # 페이지가 아니라 **목록 조각**(urls.BROWSE_SEED_URLS["cremaclub"] — AJAX 엔드포인트,

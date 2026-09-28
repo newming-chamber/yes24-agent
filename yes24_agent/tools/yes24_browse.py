@@ -164,7 +164,9 @@ async def _browse_one(
                 f"'{section}' 섹션은 카테고리 좁히기를 지원하지 않습니다",
             )
         try:
-            seed_html = await client.get_text(browse_url(section))
+            seed_html = await client.get_text(
+                browse_url(section), cache_ttl_s=settings.browse_list_cache_ttl_s
+            )
         except Yes24FetchError as exc:
             return _error(section, "fetch", f"Yes24 코너 조회에 실패했습니다: {exc}")
         categories = parse_category_links(seed_html, limit=settings.browse_categories_limit)
@@ -193,7 +195,7 @@ async def _browse_one(
         return _error(section, "invalid_category", str(exc))
 
     try:
-        html = await client.get_text(url)
+        html = await client.get_text(url, cache_ttl_s=settings.browse_list_cache_ttl_s)
     except Yes24FetchError as exc:
         return _error(section, "fetch", f"Yes24 코너 조회에 실패했습니다: {exc}")
 
@@ -321,7 +323,7 @@ async def yes24_browse(
             categories에서 얻은 번호로 코너를 그 분야로 좁힌다. category_name보다 우선한다.
         category_name: 분야 이름(선택, 모든 코너에 공통 적용). "소설"·"에세이"처럼 원하는
             분야명을 주면 코너 내비에서 해석해 한 호출로 그 분야 목록을 받는다. 빈 문자열이면
-            코너 전체(국내도서). 크레마클럽 코너들은 분야 좁히기를 지원하지 않는다.
+            코너 전체(국내도서). 분야 좁히기를 지원하지 않는 코너는 sections 설명에 표시된다.
         observe_ebook_editions: True면 결과 행의 상품 상세를 함께 열어 크레마클럽(eBook 구독)
             등록 여부를 행에 싣는다 — 종이책 행은 ebook_edition(그 eBook 판의 url·in_cremaclub
             또는 None=eBook 판 없음), 전자책 행은 in_cremaclub이다. 행은 지워지지 않고 상위
@@ -330,10 +332,13 @@ async def yes24_browse(
     Returns:
         코너 중 하나라도 열람에 성공하면 status="ok"와 results 목록(모든 코너의 결과를 상품
         기준으로 병합·중복제거, 각 항목에 인용용 source_id, 어느 코너들에서 나왔는지 sections,
-        첫 코너 안의 위치 position(1부터)과 순위 rank 포함), 코너별 성공/실패/결과 수·목록의
+        위치 position(1부터)과 순위 rank 포함 — 둘 다 sections의 **첫 코너** 기준이며 다른 코너의
+        순위는 싣지 않는다), 코너별 성공/실패/결과 수·목록의
         정렬 order·적용된 category_number·해석된 분야명 category_label을 담은 browses 요약
         (browses에는 코너가 명시한 집계 기간 period·period_note도 실린다 — 페이지 원문, 표기한
-        코너만), 페이지들이 노출한 분야 목록 categories([{name, number}]), 검색 시각 checked_at,
+        코너만), 페이지들이 노출한 분야 목록 categories([{name, number}]), 검색 시각 checked_at
+        (도구 실행 시각 — 코너 목록은 캐시로 그보다 앞선 관측일 수 있으니 순위는 browses의
+        집계 기간 period를 기준으로 말한다),
         result_count를 담은 dict. 상한을
         넘겨 열람하지 않은 코너가 있으면 dropped_count·dropped_sections로 명시한다.
         observe_ebook_editions를 켜면 확인한 행 수 ebook_observed_count와, 상한을 넘겨
@@ -422,6 +427,15 @@ async def yes24_browse(
             row["sections"].append(outcome["section"])
             if row.get("rank") is None:
                 row["rank"] = item.get("rank")
+            # 키 없음·None은 둘 다 "그 페이지가 안 보여줌"이라 뒤 코너의 관측으로 채운다(값이
+            # 있는 키는 덮지 않는다 — 바로 위 rank와 같은 "먼저 관측된 값" 규약). 같은 goods_no의
+            # 두 Yes24 관측이므로 신간 페이지의 rating=None을 베스트 페이지의 평점이 채우는 것이
+            # 맞다. 코너마다 싣는 행 텍스트가 다르므로(오늘의 책의 intro_excerpt) 앞 코너에도
+            # 있던 상품은 그 값을 통째로 잃었다(2026-09-22 라이브 실측: 스테디셀러+오늘의 책
+            # 겹침 2/10 행에서 발췌 소실).
+            for name, value in fields.items():
+                if row["fields"].get(name) is None:
+                    row["fields"][name] = value
 
     # 1.5) 판형 관측(옵션): 행마다 상품 상세를 열어 크레마클럽 여부를 **행에 실어** 돌려준다.
     #      코너 목록 마크업엔 클럽 배지가 없어(PRODUCT_CREMACLUB_BADGE는 전자책 상세 전용)
@@ -535,6 +549,7 @@ yes24_browse.__doc__ = yes24_browse.__doc__.replace(
     "__BROWSE_SECTIONS__",
     "\n            ".join(
         f'"{key}" — {seed["label"]}. {seed["blurb"].rstrip(".")}. {BROWSE_ORDERS[seed["order"]]}.'
+        + ("" if browse_category_prefix(key) else " 분야 좁히기 미지원.")
         for key, seed in BROWSE_SEED_URLS.items()
     ),
 )

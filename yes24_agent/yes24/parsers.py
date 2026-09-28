@@ -128,6 +128,7 @@ _ITEM_FIELDS = (
     # 이름은 in_cremaclub 하나뿐이며, 종이책 최상위엔 클럽 여부가 따로 실리지 않는다.
     "ebook_edition",
     "episode_info",
+    "intro_excerpt",
     "is_book",
     "kind",
     "is_preorder",
@@ -576,8 +577,12 @@ def _search_style_converter(base_url: str, spec: Mapping):
         parsed = _parse_item(item, base_url)
         if parsed is None:
             return None
-        # rank만 가법 — 나머지 필드는 검색과 같은 _parse_item 결과 그대로다.
-        return {"rank": _parse_rank(item, ITEM_RANK, spec["has_rank"]), **parsed}
+        # rank와 레코드가 선언한 행 텍스트만 가법 — 필드 순서는 크레마클럽 변환기와 같이
+        # _item_fields(_ITEM_FIELDS 선언 순)가 한 곳에서 정한다.
+        return {
+            "rank": _parse_rank(item, ITEM_RANK, spec["has_rank"]),
+            **_item_fields(**parsed, **_row_text_fields(item, spec)),
+        }
 
     return convert
 
@@ -602,10 +607,6 @@ def _cremaclub_converter(base_url: str, spec: Mapping):
         else:
             url = product_url(base_url, goods_no)
 
-        episode_selector = spec.get("episode_info")
-        episode_info = (
-            _text_or_none(item.select_one(episode_selector)) if episode_selector else None
-        )
         # 검색/베스트셀러와 같은 필드 순서(_item_fields)를 따르되, 이 페이지에 필드 자체가
         # 없는 publisher·pub_date·sale_price·sale_index는 키를 내지 않는다(구독형 eBook 목록).
         return {
@@ -618,11 +619,29 @@ def _cremaclub_converter(base_url: str, spec: Mapping):
                 rating=_parse_rating(item.select_one(CREMACLUB_RATING)),
                 review_count=_parse_grouped_int(item.select_one(ITEM_REVIEW_COUNT)),
                 image_url=_image_url_or_none(item),
-                **({"episode_info": episode_info} if episode_info else {}),
+                **_row_text_fields(item, spec),
             ),
         }
 
     return convert
+
+
+# 코너 레코드(urls.BROWSE_SEED_URLS)가 셀렉터로 선언하는 **행 단위 원문 텍스트** 필드.
+# 페이지 레벨의 _PAGE_TEXT_FIELDS와 같은 규약을 행에 적용한 것이다: 레코드에 키가 있고 그 행에
+# 요소가 있을 때만 원문을 같은 키로 내고, 없으면 키를 생략한다(_item_fields의 관측-불가 규약).
+# 마크업 종류와 무관하게 두 변환기가 같은 헬퍼를 쓴다 — 오리지널 코너의 회차 정보(episode_info)와
+# 오늘의 책의 책소개 발췌(intro_excerpt)가 같은 경로다.
+_ROW_TEXT_FIELDS = ("episode_info", "intro_excerpt")
+
+
+def _row_text_fields(item, spec: Mapping) -> dict[str, str]:
+    observed = {}
+    for field in _ROW_TEXT_FIELDS:
+        selector = spec.get(field)
+        text = _text_or_none(item.select_one(selector)) if selector else None
+        if text:
+            observed[field] = text
+    return observed
 
 
 # 섹션 레코드의 markup 값(urls.BROWSE_SEED_URLS) → 아이템 변환기 팩토리. 파싱 골격은

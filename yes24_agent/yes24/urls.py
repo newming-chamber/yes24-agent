@@ -20,6 +20,7 @@ from yes24_agent.yes24.selectors import (
     CREMACLUB_ORIGINAL_ITEM,
     CREMACLUB_ORIGINAL_LIST_CONTAINER,
     GOODS_PATH,
+    ITEM_INTRO_EXCERPT,
     MONTHLY_BESTSELLER_PERIOD,
     NEWPRODUCT_ITEM,
     NEWPRODUCT_LIST_CONTAINER,
@@ -171,6 +172,8 @@ POLICY_SEEDS: dict[str, dict[str, str]] = {
 #   period / period_note (선택): 페이지가 명시한 집계 기간·집계 방식 문구의 셀렉터. 키가 있는
 #             섹션만 파서(parse_browse_page_meta)가 원문을 뽑는다 — 기간 문구가 없는 페이지는 키를
 #             두지 않는다(fixture 실측: 신간·주목할 신상품·크레마클럽·오리지널 0건).
+#   episode_info / intro_excerpt (선택): 행 단위 원문 텍스트 필드의 셀렉터. 키가 있는 섹션만
+#             파서(_row_text_fields)가 행마다 뽑고, 요소가 없는 행은 키를 생략한다.
 #
 # "cremaclub"만 cremaclub.yes24.com 서브도메인 URL이다 — robots.txt가 `Allow: /Bookclub/`
 # (대소문자 4종)로 명시 허용했고, yes24.com 서브도메인이라 클라이언트 도메인 허용 정책도
@@ -232,6 +235,42 @@ BROWSE_SEED_URLS: dict[str, dict] = {
         "order": "rank",
         "period": MONTHLY_BESTSELLER_PERIOD,
         "period_note": BESTSELLER_PERIOD_NOTE,
+    },
+    # 스테디셀러: 베스트셀러 코너 탭의 형제(같은 /product/category/ 디렉터리)라 마크업·순위 마커가
+    # 종합 베스트와 같다(2026-09-22 실측 fixture: 24행·순위 1~24·평점 24). 집계 기간 표기는 없고
+    # (#spnBaseFilter가 빈 span) 집계 방식 문구만 같은 자리(.bSGoodsSecEtc)에 렌더된다.
+    "steadyseller": {
+        "url": "https://www.yes24.com/product/category/steadyseller?categoryNumber=001",
+        "label": "스테디셀러(국내도서)",
+        "blurb": (
+            "1년 이전에 나온 책 중 지금까지 꾸준히 관심받는 순위. 최근 신간은 정의상 들어오지"
+            " 않으며 집계 기간·갱신 주기는 페이지에 표기되지 않는다. 분야로 좁힐 수 있다."
+        ),
+        "markup": "search",
+        "list_container": BESTSELLER_LIST_CONTAINER,
+        "item": BESTSELLER_ITEM,
+        "has_rank": True,
+        "order": "rank",
+        "period_note": BESTSELLER_PERIOD_NOTE,
+    },
+    # 오늘의 책: 카테고리 목록 페이지(/product/category/display/{번호})다 — 시드에 카테고리
+    # 쿼리 파라미터가 없으므로 분야 좁히기는 정의상 미지원이며(browse_category_prefix가 빈 값),
+    # 페이지 내비에도 이 번호의 하위 분야 링크가 없다(2026-09-22 실측). 목록은 신간과 같은
+    # 컨테이너(ul#yesNewList)·순위 없음·기본순 선택 상태이고, 페이지에 선정 기준·갱신 주기
+    # 표기는 없다. 행마다 책소개 발췌(intro_excerpt)가 24/24 렌더된다.
+    "todaybook": {
+        "url": "https://www.yes24.com/product/category/display/001005033",
+        "label": "YES24 오늘의 책(추천도서 카테고리)",
+        "blurb": (
+            "사이트가 '오늘의 책'으로 묶은 추천도서 카테고리의 첫 페이지. 순위·집계 기간·"
+            "선정 기준 표기는 없고 행마다 책소개 앞부분 발췌(intro_excerpt)가 실린다."
+        ),
+        "markup": "search",
+        "list_container": NEWPRODUCT_LIST_CONTAINER,
+        "item": NEWPRODUCT_ITEM,
+        "has_rank": False,
+        "order": "page",
+        "intro_excerpt": ITEM_INTRO_EXCERPT,
     },
     "new": {
         "url": "https://www.yes24.com/product/category/newproduct?categoryNumber=001",

@@ -185,8 +185,16 @@ class Yes24TextCache:
         """TTL·용량이 모두 양수일 때만 활성 — ttl 0은 완전 비활성(롤백 레버)."""
         return self._ttl_s > 0 and self._max_entries > 0
 
-    async def get_or_fetch(self, key: str, fetch: Callable[[], Awaitable[str]]) -> str:
-        """캐시 히트면 즉시 반환, 아니면 fetch를 **키당 1회만** 실행해 결과를 공유한다."""
+    async def get_or_fetch(
+        self, key: str, fetch: Callable[[], Awaitable[str]], *, ttl_s: float | None = None
+    ) -> str:
+        """캐시 히트면 즉시 반환, 아니면 fetch를 **키당 1회만** 실행해 결과를 공유한다.
+
+        ttl_s는 이 키의 만료 상한을 기본 TTL 대신 쓴다(None·0 이하면 기본). 갱신 주기가 페이지
+        종류마다 다르기 때문이다 — 코너 목록(주간·일간 집계)은 상품 상세(재고·배송)보다
+        훨씬 느리게 바뀌므로 호출자가 페이지 종류를 알 때만 더 긴 값을 넘긴다. 표류 상한
+        (checked_at 정직성)은 그만큼 늘어나므로 그 근거는 넘기는 쪽 config 주석이 진다.
+        """
         entry = self._entries.get(key)
         if entry is not None:
             expires_at, text = entry
@@ -197,7 +205,7 @@ class Yes24TextCache:
 
         task = self._inflight.get(key)
         if task is None:
-            task = asyncio.create_task(self._fetch_and_store(key, fetch))
+            task = asyncio.create_task(self._fetch_and_store(key, fetch, ttl_s))
             # 대기자 전원이 취소돼 예외가 미회수돼도 GC 경고를 내지 않게 소비 표시.
             task.add_done_callback(
                 lambda t: None if t.cancelled() else t.exception()
@@ -206,16 +214,21 @@ class Yes24TextCache:
         # shield: 대기자 하나가 취소돼도 공유 fetch와 다른 대기자는 살아남는다.
         return await asyncio.shield(task)
 
-    async def _fetch_and_store(self, key: str, fetch: Callable[[], Awaitable[str]]) -> str:
+    async def _fetch_and_store(
+        self, key: str, fetch: Callable[[], Awaitable[str]], ttl_s: float | None
+    ) -> str:
         try:
             text = await fetch()
-            self._store(key, text)  # await 없이 inflight 제거와 원자적(asyncio 단일 스레드)
+            self._store(key, text, ttl_s)  # await 없이 inflight 제거와 원자적(asyncio 단일 스레드)
             return text
         finally:
             self._inflight.pop(key, None)
 
-    def _store(self, key: str, text: str) -> None:
-        self._entries[key] = (time.monotonic() + self._ttl_s, text)
+    def _store(self, key: str, text: str, ttl_s: float | None = None) -> None:
+        # 오버라이드가 없거나 0 이하면 기본 TTL — "0 이하 = 기본"의 판정은 여기 한 곳뿐이다
+        # (호출부가 접지 않는다). 음수를 그대로 쓰면 만료가 과거라 매 호출 refetch가 된다.
+        effective = self._ttl_s if ttl_s is None or ttl_s <= 0 else ttl_s
+        self._entries[key] = (time.monotonic() + effective, text)
         self._entries.move_to_end(key)
         while len(self._entries) > self._max_entries:
             self._entries.popitem(last=False)  # LRU 퇴출 — 용량 유계
@@ -307,8 +320,10 @@ class Yes24Client:
             transport=transport,
         )
 
-    async def get_text(self, url: str) -> str:
+    async def get_text(self, url: str, *, cache_ttl_s: float | None = None) -> str:
         """Yes24 URL을 GET 요청해 응답 본문을 반환한다.
+
+        cache_ttl_s는 이 URL의 캐시 만료를 기본 TTL 대신 쓴다(Yes24TextCache.get_or_fetch).
 
         도메인이 base_url과 다르면 요청을 보내지 않고 즉시 `Yes24FetchError`를 던진다.
         리다이렉트는 직접 따라가되 **다음 홉을 요청하기 전에** 같은 검증을 통과시킨다 —
@@ -324,7 +339,9 @@ class Yes24Client:
         """
         self._validate_target(url, original_url=url)
         if self._cache is not None and self._cache.enabled:
-            return await self._cache.get_or_fetch(url, lambda: self._fetch_text(url))
+            return await self._cache.get_or_fetch(
+                url, lambda: self._fetch_text(url), ttl_s=cache_ttl_s
+            )
         return await self._fetch_text(url)
 
     async def _fetch_text(self, url: str) -> str:
