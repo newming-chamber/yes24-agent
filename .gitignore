@@ -19,3 +19,6 @@ CLAUDE.md
 .github/
 skills-lock.json
 .playwright-mcp/
+.env.prod
+prod_db_setup.sql
+.deploy-prod.env
