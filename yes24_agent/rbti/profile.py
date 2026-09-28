@@ -8,6 +8,11 @@
 복제하지 않는다: 복제하면 사용자가 유형 검사를 다시 해도 우리 쪽이 낡은 값을 계속 적용한다.
 그래서 `users.rbti` 컬럼과 `AuthService.read_rbti`는 이 경로에서 더는 쓰지 않는다.
 
+**대신 프로세스 메모리에 만료되는 결과로 기억한다**(2026-09-28): 앱 오픈마다 `/me/rbti`가
+불려 조회가 앱 사용량에 비례하게 됐다. 유형 있음은 길게(`rbti_cache_ttl_s`), 없음은 짧게
+(`rbti_negative_cache_ttl_s` — 첫 검사 직후 반영), 실패는 기억하지 않는다. 재검사 반영 지연의
+상한이 곧 TTL이다. 서버마다 따로 기억하지만 ALB 고정 세션이라 한 회원은 대개 한 서버로 간다.
+
 요청의 `rbti`는 **화면의 유형 선택기가 이번 턴만 덮어쓰는 공개 채널**이다(2026-09-14 공개 —
 그전엔 데모 UI 전용으로 감춰 뒀는데, 통합 프론트의 선택이 서버에 닿을 길이 없었다). 실려 오면
 `main.chat_stream`이 단락 평가로 이 조회를 아예 건너뛴다.
@@ -16,12 +21,30 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections import OrderedDict
 
 import httpx
 
 from yes24_agent.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# user_no → (만료 시각 monotonic, 코드 또는 None). OrderedDict 순서 = LRU(최근 사용이 뒤).
+# 조회는 await 경계 밖에서 읽고 쓰므로(단일 이벤트 루프) 잠금이 필요 없다 — 같은 회원의 동시
+# 첫 조회가 두 번 나갈 수는 있지만 결과가 같아 무해하다.
+_CACHE: OrderedDict[str, tuple[float, str | None]] = OrderedDict()
+
+
+def _remember(user_no: str, code: str | None) -> None:
+    settings = get_settings()
+    ttl = settings.rbti_cache_ttl_s if code else settings.rbti_negative_cache_ttl_s
+    if ttl <= 0 or settings.rbti_cache_max_entries <= 0:
+        return
+    _CACHE[user_no] = (time.monotonic() + ttl, code)
+    _CACHE.move_to_end(user_no)
+    while len(_CACHE) > settings.rbti_cache_max_entries:
+        _CACHE.popitem(last=False)
 
 
 async def fetch_user_rbti(user_no: str | None) -> str | None:
@@ -44,6 +67,12 @@ async def fetch_user_rbti(user_no: str | None) -> str | None:
     """
     if not user_no:
         return None
+    hit = _CACHE.get(user_no)
+    if hit is not None:
+        if time.monotonic() < hit[0]:
+            _CACHE.move_to_end(user_no)
+            return hit[1]
+        del _CACHE[user_no]  # 만료 — 게으른 정리
     settings = get_settings()
     try:
         async with httpx.AsyncClient(timeout=settings.rbti_api_timeout_s) as client:
@@ -55,4 +84,6 @@ async def fetch_user_rbti(user_no: str | None) -> str | None:
         return None
     data = payload.get("data") if isinstance(payload, dict) else None
     code = data.get("typeCode") if isinstance(data, dict) else None
-    return code if isinstance(code, str) and code else None
+    code = code if isinstance(code, str) and code else None
+    _remember(user_no, code)
+    return code
