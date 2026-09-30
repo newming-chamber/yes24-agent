@@ -115,6 +115,18 @@ _ACCESS_EXEMPT_PATHS = frozenset(
         "/admin", "/admin/", "/admin/api/login", "/admin/api/logout",
         "/static/lib/admin.css", "/static/lib/admin.js", "/static/lib/admin_manage.js",
         "/static/lib/admin_charts.js",
+        # 어드민 대화 상세가 채팅과 같은 본문 렌더(md.js)·출처 유틸(sources.js)을 쓴다 —
+        # 데이터가 아니라 라이브러리 코드라 월 밖에 둬도 드러나는 것이 없다
+        # (데이터는 /admin/api 뒤).
+        "/static/lib/md.js",
+        "/static/lib/sources.js",
+        # 로그인 화면이 세션 전에 쓰는 로고(파비콘 겸)·자체 호스팅 폰트(Pretendard, OFL)
+        # — 데이터 없음.
+        "/static/lib/admin-logo.svg",
+        "/static/lib/fonts/Pretendard-Regular.subset.woff2",
+        "/static/lib/fonts/Pretendard-Medium.subset.woff2",
+        "/static/lib/fonts/Pretendard-SemiBold.subset.woff2",
+        "/static/lib/fonts/Pretendard-Bold.subset.woff2",
     }
 )
 

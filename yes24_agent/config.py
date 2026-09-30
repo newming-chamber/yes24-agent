@@ -879,15 +879,13 @@ class Settings(BaseSettings):
 
     # 운영자 데이터 조회(admin). 세션 DB가 MySQL일 때만 등록되고(admin_auth.admin_enabled),
     # 접근은 개인 계정(admin_users)·서버측 세션(admin_sessions)으로 가린다.
-    # 세션 목록 한 페이지 크기. 페이지당 세션 수만큼 미리보기 조회가 따라붙어
-    # (인덱스 조회지만) 왕복이 늘므로, 한 화면에 담기는 정도로 둔다.
+    # 운영 조회 한 페이지 크기(대화·회원·초기 질문 목록). 대화 목록은 페이지당 세션
+    # 수만큼 미리보기 조회가 따라붙어(인덱스 조회지만) 왕복이 늘므로 한 화면에 담기는 정도로
+    # 둔다. 화면은 응답의 page_size로 이 값을 받는다(대화 목록 내려받기도 같은 단위로 넘긴다).
     admin_page_size: int = 50
     admin_preview_max_chars: int = 140
     # page 쿼리 상한 — 거대값이 OFFSET 전체 스캔(503·DB 장애 로그)이 아니라 422로 떨어진다.
     admin_max_page: int = 10000
-    # export(CSV 전체) 접속의 MAX_EXECUTION_TIME(ms). 조건 없는 전체 내보내기 한 건이 DB를
-    # 무기한 붙잡지 않게 질의 하나의 상한을 둔다.
-    admin_export_max_execution_ms: int = 60000
     # 관리자 비밀번호 해시 scrypt 파라미터 — n = 2**log2_n, 메모리 128·r·n(기본 32 MiB).
     # 저장 문자열이 파라미터를 품어(scrypt$log2n$r$p$salt$dk) 값을 바꿔도 기존 해시가 검증된다.
     admin_scrypt_log2_n: int = 15
@@ -943,6 +941,15 @@ class Settings(BaseSettings):
     krw_per_usd_as_of: date | None = None
     # 어드민 분석의 사용자별 비용 표 행 수.
     admin_top_users: int = 10
+    # 어드민 표시 시간대 — 사람이 보는 날짜 경계·일별 묶음·시각 표기가 전부 이 시간대다(저장은
+    # UTC 그대로). SQL이 `열 + INTERVAL n HOUR`로 옮기므로 **서머타임 없는 고정 오프셋**만 된다
+    # (KST는 1988년 이후 고정). 라벨은 응답 period.timezone과 화면 문구에 쓴다(/admin/api/me).
+    # 과금 단가의 유효일 판정(admin_cost)은 이 값과 무관하게 UTC 날짜다.
+    admin_utc_offset_hours: int = Field(default=9, ge=-12, le=14)
+    admin_timezone_label: str = "KST"
+    # 어드민 CSP img-src에 더하는 출처 — 대화 상세의 도서 표지(sources.image_url). dev 데이터의
+    # 표지 8,697건이 전부 이 호스트의 https였다(2026-09-28 실측). 출처 단위(스킴+호스트)로만 연다.
+    admin_image_origins: tuple[str, ...] = ("https://image.yes24.com",)
     # 통계 탭 조회 기간 상한(일). 빈 날도 0행으로 채워 돌려주므로 기간 길이가 곧 응답 행 수다.
     admin_stats_max_days: int = 366
 

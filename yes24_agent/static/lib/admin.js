@@ -1,11 +1,13 @@
-import { initManage } from "/static/lib/admin_manage.js?v=1";
-import { initCharts } from "/static/lib/admin_charts.js?v=1";
+import { initManage } from "/static/lib/admin_manage.js?v=4";
+import { initCharts } from "/static/lib/admin_charts.js?v=6";
+import { renderBody } from "/static/lib/md.js";
+import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceDomain, sourceTitle, CARD_LABELS } from "/static/lib/sources.js";
 
   const $ = (id) => document.getElementById(id);
-  const state = { page: 0, selected: null, tab: 'dashboard', dataPage: 0, datasets: [], applied: {}, currentSession: null, exportSnapshot: null, savedQueries: [], role: null, roles: [] };
+  const state = { page: 0, tz: null, tab: 'dashboard', statistics: null, statisticsView: 'all', usersPage: 0, startersPage: 0, applied: {}, currentSession: null, listScroll: 0, username: null, role: null, roles: [] };
   const queryForms = {
     sessions: {form: 'filters', page: 'page', fields: {q: 'q', since: 'since', until: 'until'}},
-    data: {form: 'data-filters', page: 'dataPage', fields: {dataset: 'dataset', q: 'data-q', since: 'data-since', until: 'data-until', sort: 'data-sort', direction: 'data-direction', status: 'data-status', app_name: 'data-app', status_null: 'data-status-null'}},
+    users: {form: 'users-filters', page: 'usersPage', fields: {q: 'users-q'}},
   };
   const pending = new Map();
 
@@ -17,22 +19,35 @@ import { initCharts } from "/static/lib/admin_charts.js?v=1";
     return node;
   };
 
-  const statusLabel = (status) => ({ completed: '완료', failed: '실패', interrupted: '중단', unknown: '종료 상태 미확인', up: '좋아요', down: '싫어요', '1': '활성', '0': '비활성', running: '진행 중', ok: '성공' })[status] || status;
+  /** 턴 종료 상태 라벨(완료가 아닌 턴의 배지·답변거절 세부). */
+  const statusLabel = (status) => ({ failed: '실패', interrupted: '중단', unknown: '종료 상태 미확인' })[status] || status;
+  /** 답변거절 세부(서버 refused = {상태: 수}) — '실패 n · 중단 n'. 상태 목록은 서버 REFUSED가 정본이다. */
+  const refusedText = (refused) => Object.entries(refused ?? {}).map(([status, n]) => `${statusLabel(status)} ${num(n)}`).join(' · ');
   const num = (n) => (n ?? 0).toLocaleString('ko-KR');
-  const bytes = (b) => {
-    const units = ['B', 'KB', 'MB', 'GB'];
-    let i = 0, v = b || 0;
-    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-    return `${v.toFixed(i ? 1 : 0)} ${units[i]}`;
-  };
-  /** epoch 초 → 로컬 시각 문자열. */
-  const clock = (ts) => (ts ? new Date(ts * 1000).toLocaleString('ko-KR', { timeZone: 'UTC' }) + ' UTC' : '');
+  // ── 어드민 표시 시간대 — /admin/api/me의 timezone(설정 admin_utc_offset_hours·라벨)이 정본이다.
+  // 고정 오프셋이라 epoch를 옮긴 뒤 UTC 달력으로 읽는다(브라우저 시간대·tz 데이터베이스와 무관).
+  const shifted = (ms) => new Date(ms + state.tz.offset_hours * 3600e3);
+  /** 어드민 시간대 날짜 'YYYY-MM-DD' — 기본은 오늘, daysAgo일 전. */
+  const localDay = (daysAgo = 0) => shifted(Date.now() - daysAgo * 864e5).toISOString().slice(0, 10);
+  /** 기간 프리셋 하나의 정의 — 숫자 N은 '오늘 포함 최근 N일'(1 = 오늘, 운영자는 오늘을 본다), month는 이번 달 1일~오늘,
+   *  last-month는 지난달 전체. 대시보드·통계·대화가 같은 계산을 쓴다. [since, until] 'YYYY-MM-DD'. */
+  function presetRange(key) {
+    if (/^\d+$/.test(key)) return [localDay(Number(key) - 1), localDay()];
+    const [y, m] = localDay().split('-').map(Number), day = (date) => date.toISOString().slice(0, 10);
+    return key === 'month' ? [day(new Date(Date.UTC(y, m - 1, 1))), localDay()] : [day(new Date(Date.UTC(y, m - 2, 1))), day(new Date(Date.UTC(y, m - 1, 0)))];
+  }
+  /** 세그먼트 버튼 묶음에서 하나만 눌림 표시. */
+  const press = (group, pressed) => { for (const button of group.querySelectorAll('button')) button.setAttribute('aria-pressed', String(button === pressed)); };
+  /** epoch 초 → 어드민 시간대 시각 문자열(라벨 포함). */
+  const clock = (ts) => (ts ? `${shifted(ts * 1000).toLocaleString('ko-KR', { timeZone: 'UTC' })} ${state.tz.label}` : '');
 
   /** 오류 문구는 서버 `detail`이 정본이다 — 상태코드별 문구를 여기서 다시 만들지 않는다. */
   async function api(path, {responseType, ...options} = {}) {
     const res = await fetch(path, { credentials: 'same-origin', cache: 'no-store', ...options });
     // 로그인한 화면에서 세션이 끊기면 페이지를 통째로 새로 연다 — 화면 상태를 손으로 비우지 않는다.
     if (res.status === 401 && state.role) { location.replace('/admin'); throw new DOMException('', 'AbortError'); }
+    // 403은 이 탭의 역할이 낡았을 수 있다(다른 탭에서 계정 전환) — 계정이 바뀌었으면 새로 그리고, 같으면 오류 그대로.
+    if (res.status === 403 && state.role && await accountChanged()) throw new DOMException('', 'AbortError');
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       const detail = Array.isArray(body.detail) ? body.detail.map((item) => item.msg).join(' · ') : body.detail;
@@ -40,6 +55,17 @@ import { initCharts } from "/static/lib/admin_charts.js?v=1";
     }
     return responseType === 'response' ? res : res.status === 204 ? null : res.json();
   }
+
+  /** 세션 쿠키는 브라우저 전체가 공유한다 — 다른 탭에서 다른 계정으로 로그인하면 이 탭의 state.role은 낡는다.
+   *  /me를 다시 읽어 계정·역할이 다르면(로그아웃 포함) 현재 계정 기준으로 다시 그린다. 확인 실패는 판정 보류. */
+  async function accountChanged() {
+    const me = await fetch('/admin/api/me', { credentials: 'same-origin', cache: 'no-store' })
+      .then((res) => (res.status === 401 ? null : res.ok ? res.json() : undefined), () => undefined);
+    const changed = me !== undefined && (me?.username !== state.username || me?.role !== state.role);
+    if (changed) location.reload();
+    return changed;
+  }
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && state.role) accountChanged(); });
 
   const showError = (message) => { $('app-error').hidden = false; $('app-error').textContent = message; };
 
@@ -55,8 +81,8 @@ import { initCharts } from "/static/lib/admin_charts.js?v=1";
         showError(error.message);
         const target = $(key);
         if (target) {
-          const back = key === 'detail' ? target.querySelector('#back') : null;
-          target.replaceChildren(...(back ? [back] : []), el('div', 'placeholder', '불러오지 못했습니다. 새로고침으로 다시 시도하세요.'));
+          const bar = key === 'detail' ? target.querySelector('#detail-bar') : null;
+          target.replaceChildren(...(bar ? [bar] : []), el('div', 'placeholder', '불러오지 못했습니다. 새로고침으로 다시 시도하세요.'));
         }
       }
     } finally {
@@ -66,160 +92,301 @@ import { initCharts } from "/static/lib/admin_charts.js?v=1";
 
   function loadOverview() {
     return request('stats', '/admin/api/overview', (o) => {
-      for (const id of ['dashboard-app', 'data-app']) {
-        const selected = $(id).value;
-        $(id).replaceChildren(new Option('전체 앱', ''), ...o.apps.map((app) => new Option(app.app_name, app.app_name)));
-        $(id).value = selected;
-      }
-      const stats = [['사용자', num(o.users)], ['활성 사용자', num(o.active_users)], ['대화', num(o.sessions)], ['턴', num(o.turns)],
-        ...(o.turn_statuses || []).map((s) => [statusLabel(s.status), num(s.count)]),
-        ['DB 크기', bytes(o.db_bytes)]];
-      $('stats').replaceChildren(...stats.map(([label, value]) => {
+      // 용어는 통계 탭과 같다 — 활성 사용자 = 실제로 대화한 사용자, 세션 = 대화방(질문 여러 개가 한 세션).
+      const stats = [['활성 사용자(누적)', num(o.chat_users), '실제로 대화한 사용자 수(전체 기간)'], ['세션', num(o.sessions), '대화방 수(질문 여러 개가 한 세션)'], ['질의', num(o.turns)]];
+      $('stats').replaceChildren(...stats.map(([label, value, hint]) => {
         const box = el('div', 'stat');
         box.append(el('b', null, value), el('span', null, label));
+        box.title = hint || `${label} ${value}`;
         return box;
       }));
-      $('last-activity').textContent = o.last_activity ? `전체 기간 · 최근 활동 ${clock(o.last_activity)}` : '전체 기간 · 활동 기록 없음';
     });
   }
 
-  function updatePager(data, prefix, page) {
-    const pages = Math.max(1, Math.ceil(data.total / data.page_size));
-    $(prefix + 'page-info').textContent = `${page + 1} / ${pages} · 총 ${num(data.total)}건`;
-    $(prefix + 'prev').disabled = page <= 0;
-    $(prefix + 'next').disabled = page + 1 >= pages;
+  /** 초 → "N분 N초"(통계 평균 세션시간·대화 지속시간 공용). */
+  const minutes = (value) => { if (value == null) return '-'; const s = Math.round(value); return `${Math.floor(s / 60)}분 ${s % 60}초`; };
+
+  /** 내려받기 한 곳 — 화면이 만든 CSV(대화 목록·통계)를 파일로 저장한다. */
+  function saveBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const link = el('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
-  const sessionKey = (s) => JSON.stringify([s.app_name, s.user_id, s.id]);
+  /** 화면이 만드는 CSV의 셀 규칙 — 스프레드시트가 수식으로 읽는 선두 문자면 앞에 '를 붙인다.
+   *  탭·CR은 원문 첫 글자로, 그 밖은 앞 공백을 벗긴 뒤 = + - @로 본다. */
+  function csvCell(value) {
+    let text = value == null ? '' : String(value);
+    if (/^[\t\r]/.test(text) || /^[=+\-@]/.test(text.replace(/^\s+/, ''))) text = "'" + text;
+    return `"${text.replaceAll('"', '""')}"`;
+  }
+  function saveCsv(filename, rows) {
+    saveBlob(new Blob(['\ufeff' + rows.map((row) => row.map(csvCell).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' }), filename);
+  }
+
+  /** crema 페이지 버튼(QueryAnalysis.tsx): ‹ · 10개 묶음 · › · 다음 묶음. page는 0부터. */
+  function cremaPager(target, total, size, page, go) {
+    const pages = Math.max(1, Math.ceil(total / size)), first = Math.floor(page / 10) * 10, last = Math.min(pages, first + 10);
+    const button = (label, to, aria) => {
+      const node = el('button', null, label);
+      node.type = 'button';
+      if (aria) node.setAttribute('aria-label', aria);
+      node.disabled = to < 0 || to >= pages;
+      node.onclick = () => go(to);
+      return node;
+    };
+    const numbers = [];
+    for (let n = first; n < last; n++) {
+      const node = button(String(n + 1), n);
+      if (n === page) node.setAttribute('aria-current', 'page');
+      numbers.push(node);
+    }
+    target.replaceChildren(button('‹', page - 1, '이전 페이지'), ...numbers, button('›', page + 1, '다음 페이지'), button('»', last, '다음 10페이지'));
+  }
+
+  /** 사용자 칸 — 닉네임(서버가 모르면 회원번호로 채워 준다) + 다르면 작게 회원번호. 둘 다 textContent. */
+  function userCell(s) {
+    const cell = el('span', 'q-user', s.nickname);
+    if (s.nickname !== s.user_id) cell.append(el('small', null, s.user_id));
+    return cell;
+  }
+
+  /** 어드민 시간대 시각을 날짜·시각 두 줄로(목록의 질의일시). */
+  const clockParts = (ts) => { const text = shifted(ts * 1000).toISOString(); return [text.slice(0, 10), `${text.slice(11, 19)} ${state.tz.label}`]; };
 
   function loadSessions() {
     const page = state.page;
     const params = new URLSearchParams({ ...state.applied.sessions, page });
     $('sessions').replaceChildren(el('div', 'placeholder', '대화를 불러오는 중…'));
-    $('prev').disabled = $('next').disabled = true;
     return request('sessions', `/admin/api/sessions?${params}`, (data) => {
-      $('sessions').replaceChildren(...data.items.map((s) => {
-        const row = el('button', 'session');
-        row.dataset.key = sessionKey(s);
-        row.setAttribute('aria-pressed', String(row.dataset.key === state.selected));
+      $('page-info').textContent = `${num(data.total)}건`;
+      const rows = data.items.map((s) => {
+        const row = el('button', 'query-row');
+        row.type = 'button';
+        row.dataset.id = s.id;
+        row.setAttribute('aria-current', String(s.id === state.currentSession?.id));
         row.onclick = () => selectSession(s);
-        const preview = el('div', `preview${s.preview ? '' : ' empty'}`, s.preview || '(사용자 발화 없음)');
-        const meta = el('div', 'meta');
-        meta.append(el('span', 'sid', s.id.slice(0, 12)), el('span', null, `${num(s.turn_count)}턴 · ${clock(s.update_time)}`));
-        row.append(preview, meta);
+        // 카드 3줄(crema QueryAnalysis): ① 세션 id·거절 배지 … 날짜 시각 ② 첫 질문 ③ 사용자 · 외 N건.
+        const top = el('span', 'q-top'), [day, time] = clockParts(s.update_time), when = el('span', 'q-time', day);
+        when.append(el('small', null, time));
+        top.append(el('span', 'q-id', s.id.slice(0, 8)));
+        for (const [status, n] of Object.entries(s.refused ?? {})) if (n) top.append(el('em', `status-${status}`, `${statusLabel(status)} ${num(n)}`));
+        top.append(when);
+        const meta = el('small', null, s.nickname);
+        if (s.turn_count > 1) meta.append(' · 외 ', el('em', null, num(s.turn_count - 1)), '건의 대화가 진행됨');
+        row.append(top, el('b', s.preview ? null : 'empty', s.preview || '(사용자 발화 없음)'), meta);
+        row.title = s.id;
         return row;
-      }));
-      if (!data.items.length) $('sessions').replaceChildren(el('div', 'placeholder', '조건에 맞는 대화가 없습니다. 검색 조건을 초기화해 보세요.'));
-      updatePager(data, '', page);
-      $('sessions').scrollTop = 0;
+      });
+      $('sessions').replaceChildren(...(rows.length ? rows : [el('div', 'placeholder', '조건에 맞는 대화가 없습니다. 검색 조건을 초기화해 보세요.')]));
+      cremaPager($('sessions-pager'), data.total, data.page_size, page, (to) => { state.page = to; loadSessions(); $('sessions-list').scrollTop = $('sessions-pane').scrollTop = 0; });
+      // 상세 칸을 비워 두지 않는다 — 아직 고른 대화가 없으면 첫 대화를 연다(좁은 화면은 목록에 머문다).
+      if (!state.currentSession && data.items.length) selectSession(data.items[0], { reveal: false });
     });
   }
 
-  // ── 세션 상세 ───────────────────────────────────────────────────────────
-  /** 조사 과정(chat_turn.process.steps) — 도구 호출·결과가 스텝으로 남아 있다. */
-  function renderSteps(steps) {
-    const box = el('details', 'part');
-    box.dataset.kind = 'steps';
-    box.append(el('summary', null, `조사 과정 · ${num(steps.length)}스텝`));
-    const list = el('ol', 'steps');
-    for (const st of steps) {
-      const item = el('li', st.state === 'failed' ? 'failed' : null);
-      item.append(el('span', 'stage', `r${st.round} ${st.stage}`), document.createTextNode(st.detail || ''));
-      if (st.sources?.length) item.append(document.createTextNode(` — ${st.sources.map((x) => x.title || x.url).join(' · ')}`));
-      list.append(item);
-    }
-    box.append(list);
-    return box;
+  /** 엑셀 다운로드 = 적용한 검색 조건의 목록 전체(페이지를 이어 받아 UTF-8 BOM CSV로). */
+  async function downloadSessions() {
+    const button = $('sessions-csv'), rows = [];
+    button.disabled = true;
+    try {
+      for (let page = 0; ; page++) {
+        const data = await api(`/admin/api/sessions?${new URLSearchParams({ ...state.applied.sessions, page })}`);
+        rows.push(...data.items);
+        if (rows.length >= data.total || !data.items.length) break;
+      }
+      saveCsv(`sessions_${localDay()}.csv`, [
+        ['No.', '세션 ID', '닉네임', '회원번호', '첫 질문', '턴 수', `생성 (${state.tz.label})`, `최근 갱신 (${state.tz.label})`],
+        ...rows.map((s, i) => [rows.length - i, s.id, s.nickname, s.user_id, s.preview, s.turn_count, clockParts(s.create_time).join(' '), clockParts(s.update_time).join(' ')]),
+      ]);
+    } catch (error) { if (error.name !== 'AbortError') showError(`다운로드 실패: ${error.message}`); }
+    finally { button.disabled = false; }
   }
 
-  function renderSources(sources) {
-    const box = el('details', 'part');
-    box.dataset.kind = 'sources';
-    box.append(el('summary', null, `인용 출처 ${num(sources.length)}건`));
-    const list = el('div', 'sources');
-    for (const s of sources) {
-      const link = el('a', null, `[${s.id}] ${s.title || s.url}`);
-      // 출처 URL은 웹 검색 결과에서 온 비신뢰 데이터다. scheme을 http/https로 한정하지 않으면
-      // `javascript:` URI가 섞였을 때 운영자 클릭이 admin 오리진에서 스크립트를 실행한다.
-      link.href = typeof s.url === 'string' && /^https?:\/\//i.test(s.url) ? s.url : '#';
-      link.target = '_blank';
-      link.rel = 'noopener noreferrer';
-      const line = el('div');
-      line.append(link);
-      list.append(line);
+  // ── 대화 상세(crema QueryDetail.tsx) ──────────────────────────────────────
+  const copyButton = (text, label = '복사') => {
+    const button = el('button', 'copy-btn', label);
+    button.type = 'button';
+    button.onclick = async () => {
+      try { await navigator.clipboard.writeText(text); button.textContent = '복사됨'; }
+      catch { button.textContent = '복사 실패'; }
+    };
+    return button;
+  };
+  const sectionBar = (title, note, tool) => {
+    const bar = el('div', 'section-bar bleed'), label = el('span', null, `${title} `);
+    if (note) label.append(el('small', null, note));
+    bar.append(label);
+    if (tool) bar.append(tool);
+    return bar;
+  };
+
+  /** 인용 출처 카드 — 책·상품은 crema 추천 도서 카드 모양(왼쪽 표지 · 오른쪽 정보).
+   *  출처 URL은 웹 검색에서 온 비신뢰 데이터라 http(s)만 링크로 연다(isSafeUrl). 표지는 coverUrl이
+   *  http(s)만 통과시키고, 어드민 CSP img-src가 설정한 표지 출처(admin_image_origins) 밖은 막는다.
+   *  표지를 못 불러오면 칸째 지우고 표지 칸 배치(has-cover)도 풀어 정보만 남는다. */
+  function sourceCard(src) {
+    const cover = coverUrl(src);
+    const card = el('div', `source-card${cover ? ' has-cover' : ''}`);
+    card.dataset.sourceId = String(src.id);
+    if (cover) {
+      const img = makeCoverImg(cover, 'source-cover', { onError: () => { img.remove(); card.classList.remove('has-cover'); } });
+      card.append(img);
     }
-    box.append(list);
-    return box;
+    const tags = el('span');
+    // 판형: 출처가 준 kind가 정본. 없을 때 is_ebook === true만 긍정 관측으로 쓴다(False·None은 판정 근거가 아니다).
+    tags.append(el('em', null, String(src.id)), el('em', 'kind', src.kind || (src.is_ebook === true ? 'eBook' : CARD_LABELS[sourceCardType(src)])));
+    card.append(tags, sourceTitleLink(src));
+    const byline = [src.author, src.publisher].filter(Boolean).join(' | ');
+    card.append(el('p', null, byline || sourceDomain(src) || src.url || ''));
+    const facts = el('p');
+    if (src.rating) facts.append(el('span', 'rating', `★ ${src.rating}`), document.createTextNode(' '));
+    const extra = [src.review_count ? `리뷰 ${num(src.review_count)}` : '', formatPrice(src) || ''].filter(Boolean).join(' · ');
+    if (extra) facts.append(document.createTextNode(extra));
+    if (facts.childNodes.length) card.append(facts);
+    return card;
   }
 
-  /** 턴 하나 = 사용자 발화 상자 + 답변 상자(상태·지연·토큰·피드백·과정·출처). */
-  function renderTurn(t) {
-    const user = el('div', 'event user');
-    const asked = el('div', 'who');
-    asked.append(el('span', null, 'user'), el('span', null, clock(t.asked_at)));
-    user.append(asked, el('div', 'body', t.user_message));
-
-    const bot = el('div', 'event');
-    user.dataset.turnId = bot.dataset.turnId = t.turn_id || '';
-    const identifier = el('details', 'part');
-    identifier.append(el('summary', null, '턴 식별자'), el('span', null, t.turn_id || '식별자 없음'));
-    if (t.turn_id) {
-      const copy = el('button', null, '식별자 복사');
-      copy.onclick = async () => {
-        try { await navigator.clipboard.writeText(t.turn_id); copy.textContent = '복사됨'; }
-        catch { copy.textContent = '복사 실패 · 텍스트를 선택해 복사하세요'; }
-      };
-      identifier.append(copy);
-    }
-    bot.append(identifier);
-    const who = el('div', 'who');
-    who.append(el('span', t.status === 'completed' ? null : 'failed', statusLabel(t.status)));
-    if (!t.history_saved) who.append(el('span', null, '구 이벤트 재조립'));
-    if (t.elapsed_ms !== null) who.append(el('span', null, `${(t.elapsed_ms / 1000).toFixed(1)}s`));
-    if (t.attributable_total_tokens) who.append(el('span', null, `${num(t.attributable_total_tokens)} tok`));
-    if (t.rbti_applied) who.append(el('span', null, `RBTI ${t.rbti_applied}`));
-    if (t.likes || t.dislikes) who.append(el('span', null, `👍 ${num(t.likes)} 👎 ${num(t.dislikes)}`));
-    if (t.clicks) who.append(el('span', null, `클릭 ${num(t.clicks)}`));
-    bot.append(who);
-    if (t.error) bot.append(el('div', 'failed', `${t.error.code}: ${t.error.message}`));
-    bot.append(el('div', 'body', t.assistant_message));
-    if (t.process?.steps?.length) bot.append(renderSteps(t.process.steps));
-    if (t.sources?.length) bot.append(renderSources(t.sources));
-    return [user, bot];
+  /** 출처 제목 — 안전한 url이면 새 창 링크, 아니면 글자만. */
+  function sourceTitleLink(src) {
+    const title = el(isSafeUrl(src.url) ? 'a' : 'span', null, sourceTitle(src));
+    if (isSafeUrl(src.url)) { title.href = src.url; title.target = '_blank'; title.rel = 'noopener noreferrer'; }
+    title.title = sourceTitle(src);
+    return title;
   }
 
-  function selectSession(session, { preservePosition = false } = {}) {
-    const scrollTop = $('detail').scrollTop;
+  /** 웹·안내 출처 한 줄 — 번호 · 제목 · 도메인(표지·서지 없음). */
+  function sourceLine(src) {
+    const row = el('div', 'source-line');
+    row.dataset.sourceId = String(src.id);
+    row.append(el('em', null, String(src.id)), sourceTitleLink(src), el('small', null, sourceDomain(src)));
+    return row;
+  }
+
+  // 인용 출처 묶음 — 출처의 구조 분류(sources.js sourceCardType: card_type·type)로 나눈다. 도서는 표지 카드, 나머지는 한 줄.
+  const SOURCE_GROUPS = [['book', '도서', sourceCard, 'source-cards'], ['link', '웹', sourceLine, 'source-lines'], ['document', 'Yes24 안내', sourceLine, 'source-lines']];
+
+  /** 질의내역 한 칸 — 머리(질문·시각·지표)를 누르면 그 자리에 답변(md.js 렌더 + 인용 마커)과 출처 카드가 펼쳐진다. */
+  function turnBlock(t, i) {
+    const block = el('details', 'turn bleed');
+    block.dataset.turnId = t.turn_id;
+    const meta = el('small');
+    if (t.status !== 'completed') meta.append(el('span', `status-${t.status}`, statusLabel(t.status)), ' · ');
+    meta.append([clock(t.asked_at), t.elapsed_ms == null ? '' : `응답 ${(t.elapsed_ms / 1000).toFixed(1)}초`,
+      t.likes || t.dislikes ? `좋아요 ${num(t.likes)} · 싫어요 ${num(t.dislikes)}` : '', t.clicks ? `클릭 ${num(t.clicks)}` : '',
+      t.rbti_applied ? `RBTI ${t.rbti_applied}` : ''].filter(Boolean).join(' · '));
+    const head = el('summary', 'turn-head fold');
+    head.append(el('em', null, `#${i + 1}`), el('b', null, t.user_message), meta);
+    const tools = el('div', 'turn-tools');
+    tools.append(copyButton(t.user_message, '질문 복사'), copyButton(t.assistant_message, '답변 복사'));
+    const answer = el('div', 'answer');
+    const body = el('div', 'turn-body');
+    body.append(tools, answer);
+    const byId = new Map((t.sources || []).map((src) => [String(src.id), src]));
+    const sources = el('details', 'sources');
+    if (!t.assistant_message) answer.append(el('span', 'empty', '(응답 없음)'));
+    // 마커는 이 턴의 공개(인용) 출처 id일 때만 배지로 승격되고, 안전한 url이면 링크다(md.js 계약).
+    else renderBody(answer, t.assistant_message, {
+      isCitation: (id) => byId.has(id),
+      citationUrl: (id) => (isSafeUrl(byId.get(id)?.url) ? byId.get(id).url : ''),
+      onMarker: (id) => {
+        sources.open = true;
+        for (const card of sources.querySelectorAll('[data-source-id]')) card.classList.toggle('is-target', card.dataset.sourceId === id);
+        sources.querySelector(`[data-source-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: 'nearest' });
+      },
+    });
+    if (t.sources?.length) {
+      sources.open = true;
+      const counts = [], groups = [];
+      for (const [type, label, render, className] of SOURCE_GROUPS) {
+        const items = t.sources.filter((src) => sourceCardType(src) === type);
+        if (!items.length) continue;
+        const list = el('div', className);
+        list.append(...items.map(render));
+        counts.push(`${label} ${num(items.length)}`);
+        groups.push(el('h4', 'source-group', `${label} ${num(items.length)}`), list);
+      }
+      sources.append(el('summary', 'fold', ['인용 출처', ...counts].join(' · ')), ...groups);
+      body.append(sources);
+    }
+    block.append(head, body);
+    return block;
+  }
+
+  const syncFoldAll = () => {
+    const all = $('fold-all');
+    if (all) all.textContent = [...$('detail').querySelectorAll('details.turn')].every((b) => b.open) ? '모두 접기' : '모두 펼치기';
+  };
+  // 턴이 닫히면 머리(sticky)가 화면 위로 밀려 올라가 있을 수 있다 — 접힌 자리로 돌려 놓는다. toggle은 버블링하지 않아 캡처로 받는다.
+  $('detail').addEventListener('toggle', (e) => {
+    if (!e.target.classList.contains('turn')) return;
+    if (!e.target.open) e.target.firstElementChild.scrollIntoView({ block: 'nearest' });
+    syncFoldAll();
+  }, true);
+
+  /** 좁은 화면의 목록 ↔ 상세 한 칸 전환(넓은 화면은 늘 나란히라 영향이 없다). 한 칸일 땐 창이 스크롤하므로 목록 위치를 기억했다 돌려준다. */
+  function showDetail(on) {
+    const pane = $('sessions-pane');
+    if (on === pane.classList.contains('has-selection')) return;
+    if (on) state.listScroll = pane.scrollTop;
+    pane.classList.toggle('has-selection', on);
+    pane.scrollTop = on ? 0 : state.listScroll;
+  }
+
+  /** 상세 보기 — 첫 진입은 #1만 펼친다. preservePosition(새로고침)은 펼침·스크롤을 지킨다. */
+  function selectSession(session, { preservePosition = false, reveal = !preservePosition } = {}) {
+    const scrollTop = $('detail').scrollTop, infoOpen = !!$('detail').querySelector('details.info')?.open;
+    const openTurns = new Set([...$('detail').querySelectorAll('details.turn[open]')].map((b) => b.dataset.turnId));
     state.currentSession = { ...session };
-    state.selected = sessionKey(session);
-    $('main').classList.add('has-selection');
-    for (const row of $('sessions').querySelectorAll('.session')) row.setAttribute('aria-pressed', String(row.dataset.key === state.selected));
-    const back = el('button', null, '← 대화 목록');
-    back.id = 'back';
-    back.onclick = () => $('main').classList.remove('has-selection');
-    $('detail').replaceChildren(back, el('div', 'placeholder', '대화를 불러오는 중…'));
-    const params = new URLSearchParams({ app_name: session.app_name, user_id: session.user_id });
+    for (const row of $('sessions').querySelectorAll('.query-row')) row.setAttribute('aria-current', String(row.dataset.id === session.id));
+    if (reveal) showDetail(true);  // 새로고침·자동 선택은 좁은 화면의 목록/상세 칸을 그대로 둔다
+    const bar = el('div', 'detail-bar bleed'), back = el('button', 'detail-back', '← 목록');
+    const meta = el('span', 'detail-meta', [session.id.slice(0, 8), session.nickname].filter(Boolean).join(' · '));
+    bar.id = 'detail-bar';  // request()가 오류 화면에서도 이 막대는 남긴다
+    back.type = 'button';
+    back.onclick = () => showDetail(false);
+    bar.append(back, el('h2', null, '대화 상세'), meta);
+    $('detail').replaceChildren(bar, el('div', 'placeholder', '대화를 불러오는 중…'));
+    const params = new URLSearchParams({ user_id: session.user_id });
     return request('detail', `/admin/api/sessions/${encodeURIComponent(session.id)}?${params}`, (d) => {
-    const head = el('div', 'detail-head');
-    head.append(el('h2', null, d.session.id));
-    const chips = el('div', 'chips');
-    const m = d.metrics;
-    chips.append(
-      el('span', 'chip', `${d.session.app_name} / ${d.session.user_id}`),
-      el('span', 'chip', `생성 ${clock(d.session.create_time)}`),
-      el('span', 'chip', `갱신 ${clock(d.session.update_time)}`),
-      el('span', 'chip', `${num(m.turns)}턴`),
-    );
-    if (m.avg_turn_seconds !== null) chips.append(el('span', 'chip', `턴당 평균 ${m.avg_turn_seconds}s`));
-    head.append(chips);
-
-    $('detail').replaceChildren(back, head, el('h3', null, '대화 타임라인'), ...d.turns.flatMap(renderTurn));
-    if (session.turn_id) {
-      const targets = [...$('detail').querySelectorAll('[data-turn-id]')].filter((node) => node.dataset.turnId === session.turn_id);
-      targets.forEach((node) => node.classList.add('selected-turn'));
-      if (targets.length) targets[0].scrollIntoView({block: 'center'});
-      else head.append(el('p', 'error', `선택한 턴(${session.turn_id})을 이 대화에서 찾을 수 없습니다.`));
-    } else $('detail').scrollTop = preservePosition ? scrollTop : 0;
+      const m = d.metrics, turns = d.turns;
+      const info = el('dl', 'info-grid bleed');
+      const rows = [
+        ['세션 ID', d.session.id, copyButton(d.session.id)], ['사용자', userCell(d.session), copyButton(d.session.user_id)],
+        ['시작 일시', turns.length ? clock(turns[0].asked_at) : clock(d.session.create_time)], ['질의 횟수', `${num(m.turns)}회`],
+        ['평균 응답속도', m.avg_turn_seconds == null ? '-' : `${m.avg_turn_seconds}초`], ['지속시간', minutes(m.duration_seconds)],
+        // 지속시간과 같은 기준(chat_turn)의 마지막 응답 — sessions.update_time은 ADK 이벤트 기록 때 밀리는 값이라
+        // 답변 완료(스트림 마감 뒤 기록)와 수 초 어긋난다(목록의 '최근 갱신'이 그 값이다).
+        ['마지막 응답', turns.length ? clock(Math.max(...turns.map((t) => t.completed_at))) : '-'],
+      ];
+      for (const [label, value, tool] of rows) { const dd = el('dd'); dd.append(value, ...(tool ? [tool] : [])); info.append(el('dt', null, label), dd); }
+      const [day, time] = clockParts(turns.length ? turns[0].asked_at : d.session.create_time);
+      const who = d.session.nickname === d.session.user_id ? d.session.user_id : `${d.session.nickname}/${d.session.user_id}`;
+      meta.textContent = `${d.session.id.slice(0, 8)} · ${d.session.nickname}`;
+      const summary = el('summary', 'section-bar bleed fold'), label = el('span', null, '기본정보 ');
+      label.append(el('small', null, [who, `${day.slice(5)} ${time.slice(0, 5)} 시작`, `${num(m.turns)}회`, m.avg_turn_seconds == null ? '' : `평균 ${m.avg_turn_seconds}초`].filter(Boolean).join(' · ')));
+      summary.append(label);
+      const basics = el('details', 'info bleed');
+      basics.open = infoOpen;
+      basics.append(summary, info);
+      if (!turns.length) { $('detail').replaceChildren(bar, basics, el('div', 'placeholder', '이 대화에는 기록된 턴이 없습니다.')); return; }
+      const blocks = turns.map(turnBlock);
+      if (preservePosition) for (const b of blocks) b.open = openTurns.has(b.dataset.turnId);
+      else blocks[0].open = true;
+      const turnsBar = sectionBar('질의내역', `${num(turns.length)}건`);
+      if (turns.length > 1) {
+        const all = el('button', 'fold-all');
+        all.id = 'fold-all';
+        all.type = 'button';
+        all.onclick = () => { const open = all.textContent === '모두 펼치기'; for (const b of blocks) b.open = open; };
+        turnsBar.append(all);
+      }
+      $('detail').replaceChildren(bar, basics, turnsBar, ...blocks);
+      syncFoldAll();
+      $('detail').scrollTop = preservePosition ? scrollTop : 0;
     });
   }
 
@@ -239,8 +406,9 @@ import { initCharts } from "/static/lib/admin_charts.js?v=1";
       const tr = el('tr');
       for (const column of columns) {
         const value = column.format ? column.format(row[column.key]) : valueText(row[column.key]);
-        const td = el('td', null, value);
-        td.title = value;
+        const td = el('td');
+        td.append(value);
+        if (typeof value === 'string') td.title = value;
         tr.append(td);
       }
       if (onRow) {
@@ -264,41 +432,40 @@ import { initCharts } from "/static/lib/admin_charts.js?v=1";
     return card;
   }
 
-  const charts = initCharts({ template: $('chart-template'), el, table, num });
+  const charts = initCharts({ template: $('chart-template'), el, table, timezone: () => state.tz.label });
   const usd = (value) => value == null ? '—' : `$${Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: value && Math.abs(value) < 1 ? 4 : 2 })}`;
-  const compact = (value) => value == null ? '미측정' : Number(value).toLocaleString('ko-KR', { notation: 'compact', maximumFractionDigits: 1 });
   const percent = (value) => value == null ? '미측정' : `${value.toLocaleString('ko-KR', { maximumFractionDigits: 1 })}%`;
   const points = (value) => `${value.toLocaleString('ko-KR', { maximumFractionDigits: 1 })}%p`;
-  const failRate = (s) => s?.turns ? (s.failed + s.interrupted) / s.turns * 100 : null;
-  const ungroundedRate = (s) => s?.main_rows ? s.ungrounded_suspect / s.main_rows * 100 : null;
-  const WEEKDAYS = ['월', '화', '수', '목', '금', '토', '일'];
+  // 답변거절률 = (실패 + 중단) ÷ 질의 — 통계 탭 '답변거절수'와 같은 정의(서버 refusals).
+  const refusalRate = (s) => s?.turns ? s.refusals / s.turns * 100 : null;
+  const isOwner = () => state.roles.indexOf(state.role) >= state.roles.indexOf('owner');
 
-  /** 조회 기간의 모든 UTC 날짜 — API는 기록 있는 날만 주므로 빈 날을 여기서 채운다(추이에선 빈 날도 정보). */
+  /** 조회 기간의 모든 날짜(어드민 시간대 달력일) — API는 기록 있는 날만 주므로 빈 날을 여기서 채운다(추이에선 빈 날도 정보). */
   function periodDays(period) {
     const days = [];
     for (const day = new Date(`${period.since}T00:00:00Z`); day <= new Date(`${period.until}T00:00:00Z`); day.setUTCDate(day.getUTCDate() + 1)) days.push(day.toISOString().slice(0, 10));
     return days;
   }
 
-  /** 증감 문구: 부호 + 절대 변화 (변화율). 이전 값이 0이거나 미측정이면 변화율은 N/A. */
+  /** 증감 문구: 부호 + 절대 변화 (변화율). 비교할 이전 값이 있을 때만 부른다(kpi의 comparable). */
   function change(current, previous, format) {
-    if (current == null || previous == null) return 'N/A · 미측정';
     const difference = current - previous;
     const sign = difference > 0 ? '+' : difference < 0 ? '−' : '';
     // 비율 지표(%p)에 변화율을 또 붙이면 '퍼센트의 퍼센트'라 읽히지 않는다.
     if (format === points) return `${sign}${format(Math.abs(difference))}`;
-    const rate = !difference ? '0%' : previous === 0 ? 'N/A · 이전 값 0' : `${sign}${Math.abs(difference / previous * 100).toLocaleString('ko-KR', { maximumFractionDigits: 1 })}%`;
+    const rate = !difference ? '0%' : `${sign}${Math.abs(difference / previous * 100).toLocaleString('ko-KR', { maximumFractionDigits: 1 })}%`;
     // 변화가 표시 자릿수 아래로 반올림되면('+$0.00') 절대값은 거짓 정보라 변화율만 남긴다.
     const absolute = format(Math.abs(difference));
     return difference && absolute === format(0) ? rate : `${sign}${absolute} (${rate})`;
   }
 
-  /** KPI 타일. upIsBad면 증가를 빨강·감소를 초록으로 — 부호 글자가 함께 가서 색만으로 읽지 않는다. */
+  /** KPI 타일. 증감 줄은 비교할 이전 값이 있을 때만 — 없거나(미측정) 0이면 변화율이 뜻이 없어 줄째 뺀다
+   *  (비율 지표 %p는 이전 0%도 비교값이다). upIsBad면 증가를 빨강·감소를 초록으로 — 부호 글자가 함께 간다. */
   function kpi(label, value, { current, previous, format, upIsBad, sub } = {}) {
     const box = el('div', 'kpi');
     box.append(el('span', null, label), el('strong', null, value));
-    if (format) {
-      const worse = upIsBad && current != null && previous != null && current !== previous ? (current > previous ? ' bad' : ' good') : '';
+    if (format && current != null && previous != null && (previous !== 0 || format === points)) {
+      const worse = upIsBad && current !== previous ? (current > previous ? ' bad' : ' good') : '';
       box.append(el('span', `delta${worse}`, `${change(current, previous, format)} · 이전 기간 대비`));
     }
     if (sub) box.append(el('span', 'kpi-sub', sub));
@@ -306,179 +473,144 @@ import { initCharts } from "/static/lib/admin_charts.js?v=1";
   }
 
   function loadDashboard() {
-    const params = new URLSearchParams();
-    for (const [id, key] of [['dashboard-since', 'since'], ['dashboard-until', 'until'], ['dashboard-app', 'app_name']]) if ($(id).value) params.set(key, $(id).value);
+    const params = new URLSearchParams({ since: $('dashboard-since').value, until: $('dashboard-until').value });
+    showPeriod('dashboard');
     // 재조회는 이전 렌더를 흐리게 유지한다 — 자리표시자로 갈아 끼우면 화면이 튄다.
     if ($('dashboard').childElementCount) $('dashboard').classList.add('is-loading');
     else $('dashboard').replaceChildren(el('div', 'placeholder', '운영 지표를 불러오는 중…'));
-    return request('dashboard', `/admin/api/analytics?${params}`, renderDashboard)
+    // 비용은 owner 전용 엔드포인트다 — 다른 역할은 부르지도 않는다(서버도 403).
+    const cost = isOwner() ? api(`/admin/api/analytics/cost?${params}`).catch((error) => error) : Promise.resolve(null);
+    return request('dashboard', `/admin/api/analytics?${params}`, async (data) => renderDashboard(data, await cost))
       .finally(() => { if (!pending.has('dashboard')) $('dashboard').classList.remove('is-loading'); });
   }
 
-  function renderDashboard(data) {
+  /** 대시보드(모든 역할): 기간 KPI 5개(이전 기간 대비) · 응답 시간 추이 · 시간대별 질의. owner면 비용 패널을 덧붙인다. */
+  function renderDashboard(data, cost) {
     const summary = data.summary, prior = data.comparison?.summary;
     const days = periodDays(data.period);
     const byDay = new Map(data.daily.map((row) => [row.day, row]));
     const daily = (pick, missing) => days.map((day) => byDay.has(day) ? pick(byDay.get(day)) : missing);
-    const { krw_per_usd: krw, krw_as_of: krwAsOf } = data.currency;
 
     const kpis = el('div', 'kpis');
     kpis.append(
-      kpi('비용 (USD 추정)', usd(summary.cost_usd), { current: summary.cost_usd, previous: prior?.cost_usd, format: usd, sub: krw && summary.cost_usd != null ? `≈ ₩${num(Math.round(summary.cost_usd * krw))} · 환율 ${krwAsOf ?? '기준일 미기재'} 기준` : '원화 환율 미설정' }),
-      kpi('대화 턴', metric(summary.turns), { current: summary.turns, previous: prior?.turns, format: num }),
-      kpi('과금 턴당 비용', usd(summary.cost_per_turn_usd), { current: summary.cost_per_turn_usd, previous: prior?.cost_per_turn_usd, format: usd, sub: `/ ${num(summary.priced_rows)} 과금 턴` }),
-      kpi('실패·중단율', percent(failRate(summary)), { current: failRate(summary), previous: failRate(prior), format: points, upIsBad: true, sub: `실패 ${num(summary.failed)} · 중단 ${num(summary.interrupted)}턴` }),
-      kpi('무접지 의심', percent(ungroundedRate(summary)), { current: ungroundedRate(summary), previous: ungroundedRate(prior), format: points, upIsBad: true, sub: `${num(summary.ungrounded_suspect)} / ${num(summary.main_rows)}턴` }),
-      kpi('피드백', `👍 ${num(summary.likes)} · 👎 ${num(summary.dislikes)}`, { sub: `${prior ? `이전 기간 👍 ${num(prior.likes)} · 👎 ${num(prior.dislikes)} · ` : ''}출처 클릭 ${num(summary.clicks)}` }),
+      kpi('활성 사용자(기간)', metric(summary.users), { current: summary.users, previous: prior?.users, format: num, sub: '이 기간에 대화한 사용자' }),
+      kpi('질의 수', metric(summary.turns), { current: summary.turns, previous: prior?.turns, format: num }),
+      kpi('답변거절률', percent(refusalRate(summary)), { current: refusalRate(summary), previous: refusalRate(prior), format: points, upIsBad: true, sub: `${refusedText(summary.refused)} / ${num(summary.turns)}질의` }),
+      kpi('피드백 (좋아요 · 싫어요)', `${num(summary.likes)} · ${num(summary.dislikes)}`, { sub: prior?.likes || prior?.dislikes ? `이전 기간 좋아요 ${num(prior.likes)} · 싫어요 ${num(prior.dislikes)}` : '' }),
+      kpi('출처 클릭', metric(summary.clicks), { current: summary.clicks, previous: prior?.clicks, format: num }),
     );
-
-    // 모델 → 색 슬롯은 API `models`의 위치(config 선언 순서라 기간과 무관하게 고정). 슬롯을 넘는 모델은 '기타'.
-    // 차트엔 이 기간에 금액이 잡힌 모델만 싣는다 — 색은 위치에서 오므로 빠진 모델이 남은 색을 바꾸지 않는다.
-    const costRows = data.cost.by_model_component, slots = charts.seriesSlots();
-    const priced = new Set(costRows.filter((row) => row.cost_usd != null).map((row) => row.model));
-    const shown = data.models.filter((model) => priced.has(model));
-    // 그날 비용이 null(전부 단가 미등록)이면 모델 값도 null — 0으로 바꾸면 표·툴팁이 '$0.00'을 말한다.
-    const modelCost = (names) => daily((row) => row.cost_usd == null ? null : names.reduce((sum, model) => sum + (row.cost_by_model?.[model] ?? 0), 0), 0);
-    const slotted = shown.filter((model) => data.models.indexOf(model) < slots), rest = shown.filter((model) => !slotted.includes(model));
-    const costSeries = slotted.map((model) => ({ label: model, className: `series-${data.models.indexOf(model) + 1}`, values: modelCost([model]) }));
-    if (rest.length) costSeries.push({ label: `기타 ${num(rest.length)}개 모델`, className: 'series-other', values: modelCost(rest) });
-    const costChart = charts.stackedBars({
-      title: '일별 비용 · 모델별', categories: days, series: costSeries, unit: 'usd', format: usd,
-      notes: { summary: '추정치 · 자세히', lines: data.cost.notes.map((item) => item.text) },
-    });
-    const statusChart = charts.stackedBars({
-      title: '일별 턴 상태', categories: days, unit: 'count', format: (value) => `${num(value)}턴`,
-      note: '실패·중단을 기준선 쪽에 쌓아 날짜끼리 높이를 비교합니다.',
-      series: [['failed', 'status-critical'], ['interrupted', 'status-warning'], ['unknown', 'status-secondary'], ['completed', 'status-muted']]
-        .map(([key, className]) => ({ label: statusLabel(key), className, values: daily((row) => row[key], 0) })),
-    });
-    const tokenChart = charts.stackedBars({
-      title: '측정 턴당 토큰 구성', categories: days, unit: 'tokens', format: compact,
-      note: '메인 에이전트 기록의 일별 토큰 ÷ 토큰이 측정된 턴 수입니다. 서브콜 토큰은 비용 차트에만 들어갑니다. 비용이 오른 날이 턴 수 때문인지 턴당 토큰 때문인지 위 두 차트와 나란히 봅니다.',
-      series: [['input_uncached', '입력 (캐시 제외)', 'series-1'], ['input_cached', '캐시 입력', 'series-3'], ['output_billed', '출력 (사고 포함)', 'series-2']]
-        .map(([key, label, className]) => ({ label, className, values: daily((row) => row.measured_main_rows ? (row.main_tokens?.[key] ?? 0) / row.measured_main_rows : 0, 0) })),
-    });
     const latencyChart = charts.lines({
-      title: '응답 지연', categories: days, format: seconds,
-      note: `측정된 턴만 집계합니다(최근접 순위 분위수). 기간 전체 p50 ${seconds(summary.p50_seconds)} · p95 ${seconds(summary.p95_seconds)} · 최댓값 ${seconds(summary.max_seconds)} · 표본 ${num(summary.elapsed_rows)} / ${num(summary.turns)}턴.`,
+      title: '응답 시간', categories: days, format: seconds,
+      note: `기간 전체 p50 ${seconds(summary.p50_seconds)} · p95 ${seconds(summary.p95_seconds)}.`,
       series: [['p50_seconds', 'p50', 'series-1'], ['p95_seconds', 'p95', 'series-2']]
-        .map(([key, label, className]) => ({ label, className, values: daily((row) => row.elapsed_rows ? row[key] : null, null) })),
-      extra: [{ label: '측정 턴', values: daily((row) => row.elapsed_rows, 0) }],
+        .map(([key, label, className]) => ({ label, className, values: daily((row) => row[key], null) })),
     });
-    const hours = WEEKDAYS.map(() => Array(24).fill(0));
-    for (const cell of data.hourly) if (hours[cell.weekday] && cell.hour in hours[cell.weekday]) hours[cell.weekday][cell.hour] = cell.turns;
-    const heatmap = charts.heatmap({ title: '요일 × 시간대', note: 'UTC 기준 턴 시작 시각입니다. KST는 +9시간.', rows: WEEKDAYS, cols: [...hours[0].keys()], values: hours, format: (value) => `${num(value)}턴` });
-
-    const optional = (value) => value == null ? '—' : num(value);
-    const costTable = analysisCard('모델 × 컴포넌트 비용', costRows.length ? table([
-      {key: 'model', label: '모델'}, {key: 'component', label: '컴포넌트'}, {key: 'rows', label: '행 수'}, {key: 'llm_calls', label: 'LLM 콜', format: optional},
-      {key: 'input_uncached', label: '입력 (캐시 제외)', format: metric}, {key: 'input_cached', label: '캐시 입력', format: metric}, {key: 'output_billed', label: '출력', format: metric},
-      {key: 'cost_usd', label: '비용 USD', format: (value) => value == null ? '단가 미등록' : usd(value)}, {key: 'price_effective_from', label: '단가 적용일', format: (value) => value ?? '—'},
-    ], costRows.map((row) => ({...row, rows: `${num(row.rows)}${row.component === 'web_grounding' ? ' 요청' : ''}`}))) : el('p', 'analysis-note', '선택한 기간에 사용량 기록이 없습니다.'));
-    const userTable = analysisCard('사용자별 비용 상위', data.users.length ? table([
-      {key: 'app_name', label: '앱'}, {key: 'user_id', label: '사용자'}, {key: 'priced_rows', label: '과금 턴', format: metric}, {key: 'cost_usd', label: '비용', format: usd}, {key: 'cost_per_turn_usd', label: '과금 턴당 비용', format: usd},
-    ], data.users, openUsage) : el('p', 'analysis-note', '사용자에 귀속된 사용량 기록이 없습니다.'), '메인 에이전트 기록 기준입니다(서브콜은 사용자 귀속이 없음). 행을 선택하면 그 사용자의 사용량 원본을 엽니다.');
-    const tables = el('div', 'analysis-grid');
-    tables.append(userTable, comparisonCard(data));
-    $('dashboard').replaceChildren(kpis, costChart, statusChart, tokenChart, latencyChart, heatmap, costTable, tables);
-  }
-
-  /** 사용자 행 → 데이터 탐색 `usage` 원본을 user_id 정확 일치로 연다. 조건을 먼저 채우고 탭 전환이 한 번만 조회한다. */
-  async function openUsage(row) {
-    await ensureDatasets();
-    if (!state.datasets.some((item) => item.id === 'usage')) return;
-    $('dataset').value = 'usage';
-    clearDataFilters();
-    const exact = $('data-exact').querySelector('[data-exact="user_id"]');
-    if (exact) exact.value = row.user_id;
-    $('data-app').value = row.app_name;
-    $('data-since').value = $('dashboard-since').value;
-    $('data-until').value = $('dashboard-until').value;
-    applyQuery('data');
-    switchTab('data');
-  }
-
-  const currentDataset = () => state.datasets.find((item) => item.id === $('dataset').value);
-
-  function configureDataset() {
-    const dataset = currentDataset();
-    if (!dataset) return;
-    $('data-sort').replaceChildren(...dataset.sort_columns.map((key) => new Option(dataset.columns.find((column) => column.key === key)?.label || key, key)));
-    $('data-sort').value = dataset.default_sort;
-    $('data-status').replaceChildren(new Option('전체 상태', ''), ...(dataset.status_values || []).map((status) => new Option(statusLabel(status), status)));
-    $('data-status-label').hidden = !dataset.status_column;
-    $('data-null-label').hidden = !dataset.nullable_status;
-    $('data-status-null').value = '';
-    $('data-exact').replaceChildren(...(dataset.exact_filters || []).map((key) => {
-      const label = $('exact-template').content.firstElementChild.cloneNode(true);
-      label.firstElementChild.textContent = `${key} 일치`;
-      label.lastElementChild.dataset.exact = key;
-      return label;
-    }));
-    $('data-app-label').hidden = !dataset.app_filter;
-    for (const id of ['data-since', 'data-until']) { $(id).disabled = !dataset.date_column; if (!dataset.date_column) $(id).value = ''; }
-    $('data-q').disabled = !dataset.search_columns.length;
-    $('data-description').textContent = `${dataset.label} · ${dataset.date_column ? `기간 기준: ${dataset.columns.find((column) => column.key === dataset.date_column)?.label || dataset.date_column} (UTC)` : '기간 필터 없음'} · NULL은 값 없음`;
-    manage.datasetTools(dataset);
-    state.dataPage = 0;
-  }
-
-  async function ensureDatasets() {
-    if (state.datasets.length) return;
-    $('data').replaceChildren(el('div', 'placeholder', '데이터 목록을 불러오는 중…'));
-    await request('data', '/admin/api/datasets', (data) => {
-      state.datasets = data.items;
-      $('dataset').replaceChildren(...data.items.map((item) => new Option(item.label, item.id)));
-      configureDataset();
-      applyQuery('data');
-      readSavedQueries();
+    // 시간대별 질의(기간 합계) — 요일 분포는 통계 탭이 맡는다. 기록 없는 시각은 0.
+    const hours = [...Array(24).keys()], byHour = new Map(data.hourly.map((row) => [row.hour, row.turns]));
+    const hourly = charts.stackedBars({
+      title: '시간대별 질의', categories: hours, unit: 'count', format: num,
+      zone: '', tick: (hour) => `${hour}시`, axisTitle: `시각 (${state.tz.label})`,
+      series: [{ label: '질의', className: 'series-1', values: hours.map((hour) => byHour.get(hour) ?? 0) }],
     });
+    $('dashboard').replaceChildren(kpis, latencyChart, hourly, ...(cost ? costPanel(cost, days) : []));
   }
 
-  async function loadDatasets() {
-    await ensureDatasets();
-    if (state.datasets.length) return loadData();
-  }
-
-  function loadData() {
-    const applied = state.applied.data;
-    const dataset = state.datasets.find((item) => item.id === applied?.dataset);
-    if (!dataset) return loadDatasets();
-    const page = state.dataPage;
-    const {dataset: datasetId, ...filters} = applied;
-    const params = new URLSearchParams({...filters, page});
-    $('csv-all').disabled = $('csv').disabled = $('data-prev').disabled = $('data-next').disabled = true;
-    $('data').replaceChildren(el('div', 'placeholder', '데이터를 불러오는 중…'));
-    return request('data', `/admin/api/data/${encodeURIComponent(dataset.id)}?${params}`, (data) => {
-      state.exportSnapshot = {page};
-      $('data').replaceChildren(data.items.length ? table(dataset.columns.map((column) => ({ ...column, format: column.type === 'datetime' ? (value) => value == null ? 'NULL · 값 없음' : clock(value) : undefined })), data.items, (row) => openRecord(dataset, row)) : el('div', 'placeholder', '조건에 맞는 기록이 없습니다. 검색 조건을 초기화해 보세요.'));
-      updatePager(data, 'data-', page);
-      $('csv').disabled = !data.items.length;
-      $('csv-all').disabled = pending.has('export');
+  /** 비용 패널(owner) — 비용 KPI 2개 · 일별 비용 · 사용자별 비용 상위. 모델명은 서버가 싣지 않는다. */
+  function costPanel(cost, days) {
+    if (cost instanceof Error) return [analysisCard('비용', el('p', 'error', `비용을 불러오지 못했습니다: ${cost.message}`))];
+    const summary = cost.summary, prior = cost.comparison?.summary;
+    const { krw_per_usd: krw, krw_as_of: krwAsOf } = cost.currency;
+    const kpis = el('div', 'kpis');
+    kpis.append(
+      kpi('비용 (USD 추정)', usd(summary.cost_usd), { current: summary.cost_usd, previous: prior?.cost_usd, format: usd, sub: krw && summary.cost_usd != null ? `≈ ₩${num(Math.round(summary.cost_usd * krw))} · 환율 ${krwAsOf ?? '기준일 미기재'} 기준` : '' }),
+      kpi('과금 턴당 비용', usd(summary.cost_per_turn_usd), { current: summary.cost_per_turn_usd, previous: prior?.cost_per_turn_usd, format: usd, sub: `/ ${num(summary.priced_rows)} 과금 턴` }),
+    );
+    const byDay = new Map(cost.daily.map((row) => [row.day, row.cost_usd]));
+    // 그날 비용이 null(전부 단가 미등록)이면 null 그대로 — 0으로 바꾸면 표·툴팁이 '$0.00'을 말한다.
+    const chart = charts.stackedBars({
+      title: '일별 비용', categories: days, unit: 'usd', format: usd,
+      series: [{ label: '비용', className: 'series-1', values: days.map((day) => byDay.has(day) ? byDay.get(day) : 0) }],
+      notes: { summary: '추정치 · 자세히', lines: cost.notes.map((item) => item.text) },
     });
+    const users = analysisCard('사용자별 비용 상위', cost.users.length ? table([
+      {key: 'nickname', label: '사용자'}, {key: 'user_id', label: '회원번호'}, {key: 'priced_rows', label: '과금 턴', format: metric}, {key: 'cost_usd', label: '비용', format: usd}, {key: 'cost_per_turn_usd', label: '과금 턴당 비용', format: usd},
+    ], cost.users) : el('p', 'analysis-note', '사용자에 귀속된 사용량 기록이 없습니다.'), '메인 에이전트 기록 기준입니다(서브콜은 사용자 귀속이 없음).');
+    const head = el('div', 'section-head');
+    head.append(el('h3', null, '비용'), el('span', null, 'owner 전용 · 추정치'));
+    return [head, kpis, chart, users];
   }
 
-  /** 기록 다이얼로그 — 데이터 행·관리자 행·관리 폼이 같은 다이얼로그를 쓴다. 폼은 #record-actions에 붙는다. */
-  function openDialog(title, record) {
+  /** 기록 표 — 라벨 · 값 두 열. columns가 있으면 그 순서·라벨·시각 서식, 없으면 키 이름 그대로. */
+  function showRecord(record, columns = state.recordColumns) {
+    state.recordColumns = columns;
+    const rows = (columns || Object.keys(record || {}).map((key) => ({ key, label: key })))
+      .map((column) => ({ label: column.label, value: column.format ? column.format(record[column.key]) : valueText(record[column.key]) }));
+    $('record-view').replaceChildren(...(record ? [table([{ key: 'label', label: '항목' }, { key: 'value', label: '값' }], rows)] : []));
+  }
+
+  /** 옆 패널(비모달) — 회원·초기 질문·관리자 행과 관리 폼이 같은 패널을 쓴다. 폼은 #record-actions에 붙는다.
+   *  비모달이라 패널을 연 채 다른 행을 누르면 내용만 바뀐다. */
+  function openDialog(title, record, columns = null) {
     $('record-title').textContent = title;
-    $('record-json').textContent = record ? JSON.stringify(record, null, 2) : '';
-    $('record-copy').hidden = !record;
-    $('copy-status').textContent = '';
+    showRecord(record, columns);
     $('record-actions').replaceChildren();
-    $('record-dialog').showModal();
+    $('record-dialog').show();
   }
 
-  function openRecord(dataset, row) {
-    openDialog('기록 상세', row);
-    const conversation = $('record-conversation');
-    conversation.hidden = !row.app_name || !row.user_id || !row.session_id;
-    conversation.onclick = () => {
-      const session = { id: row.session_id, app_name: row.app_name, user_id: row.user_id, turn_id: row.turn_id };
-      $('record-dialog').close();
+  // ── 회원 · 초기 질문: 목록(검색·페이지) + 옆 패널 편집. 편집 폼은 admin_manage.js가 만든다.
+  /** 시각 칸 — 대화 목록과 같은 모양(날짜 + 작은 시각). */
+  const when = (ts) => {
+    if (ts == null) return '-';
+    const [date, time] = clockParts(ts), cell = el('span', 'stamp', date);
+    cell.append(el('small', null, time));
+    return cell;
+  };
+  const day = (value) => value ?? '-';
+  const flag = (on, yes, no = '-') => (on ? yes : no);
+  const SOURCE_KINDS = { auto: '자동', manual: '수동' };
+  const USER_COLUMNS = [
+    { key: 'nickname', label: '닉네임', format: day }, { key: 'user_no', label: '회원번호' },
+    { key: 'is_active', label: '이용 가능', format: (v) => flag(v, '가능', '차단') }, { key: 'turns', label: '질의 수(누적)', format: num },
+    { key: 'last_chat_at', label: '마지막 질의', format: when }, { key: 'created_at', label: '등록일', format: when },
+  ];
+  // 슬롯은 내부 키 대신 칩 라벨(서버가 서빙과 같은 규칙으로 채움). 노출 기간은 편집 패널에만.
+  const STARTER_COLUMNS = [
+    { key: 'label', label: '슬롯' }, { key: 'text', label: '문장' }, { key: 'source', label: '출처 종류', format: (v) => SOURCE_KINDS[v] ?? v }, { key: 'run_date', label: '생성일', format: day },
+    { key: 'pinned', label: '고정', format: (v) => flag(v, '고정', '') }, { key: 'active', label: '활성', format: (v) => flag(v, '노출', '중지') },
+  ];
+  const STARTER_DETAIL = [...STARTER_COLUMNS, { key: 'slot', label: '슬롯 키' }, { key: 'valid_from', label: '노출 시작일', format: day }, { key: 'valid_until', label: '노출 종료일', format: day }];
+
+  /** 목록 한 화면 — 표 + 건수 + crema 페이지 버튼. key는 pane 접두(users·starters), 페이지는 state[key + 'Page']. */
+  function loadList(key, path, columns, onRow) {
+    const page = state[key + 'Page'];
+    $(key).replaceChildren(el('div', 'placeholder', '불러오는 중…'));
+    return request(key, `${path}${path.includes('?') ? '&' : '?'}page=${page}`, (data) => {
+      $(key + '-info').textContent = `${num(data.total)}건`;
+      $(key).replaceChildren(data.items.length ? table(columns, data.items, onRow) : el('div', 'placeholder', '조건에 맞는 기록이 없습니다.'));
+      cremaPager($(key + '-pager'), data.total, data.page_size, page, (to) => { state[key + 'Page'] = to; loaders[key](); });
+    });
+  }
+  const loadUsers = () => loadList('users', `/admin/api/users?${new URLSearchParams(state.applied.users)}`, USER_COLUMNS, openUser);
+  const loadStarters = () => { manage.starterTools($('starters-tools')); return loadList('starters', '/admin/api/starters', STARTER_COLUMNS, openStarter); };
+
+  function openUser(row) {
+    openDialog(`회원 ${row.nickname ?? row.user_no}`, row, USER_COLUMNS);
+    // 대화 탭의 검색이 회원번호 일치를 받는다 — 그 회원의 대화만 걸고 첫 대화를 연다.
+    const sessions = el('button', null, '이 회원의 대화 보기');
+    sessions.onclick = () => {
+      clearSessionFilters();
+      $('q').value = row.user_no;
+      applyQuery('sessions');
+      state.currentSession = null;
       switchTab('sessions');
-      selectSession(session);
     };
-    manage.recordActions(dataset, row);
+    $('record-actions').append(sessions);
+    manage.userPanel(row);
+  }
+
+  function openStarter(row) {
+    openDialog('초기 질문', row, STARTER_DETAIL);
+    manage.starterPanel(row);
   }
 
   function readQuery(name) {
@@ -487,19 +619,18 @@ import { initCharts } from "/static/lib/admin_charts.js?v=1";
       if ($(id).closest('label')?.hidden || $(id).disabled) continue;
       if ($(id).value.trim()) values[key] = $(id).value.trim();
     }
-    // 정확 일치는 데이터셋이 선언한 키마다 한 칸이고, 채운 칸끼리 AND로 걸린다.
-    if (name === 'data') for (const input of $('data-exact').querySelectorAll('input')) if (input.value.trim()) values[input.dataset.exact] = input.value.trim();
     return values;
   }
 
-  const queryLabels = {q: '검색', since: '시작일 UTC', until: '종료일 UTC', sort: '정렬', direction: '순서', status: '상태', app_name: '앱'};
+  const queryLabels = {q: '검색', since: '시작일', until: '종료일'};
 
   function queryNote(name) {
     const applied = state.applied[name] || {};
     const dirty = JSON.stringify(readQuery(name)) !== JSON.stringify(applied);
     const note = $('query-note-' + name);
-    const summary = Object.entries(applied).filter(([key]) => key !== 'dataset').map(([key, value]) => `${queryLabels[key] || key}: ${value}`).join(' · ') || '전체';
-    note.textContent = `${dirty ? '조건 변경됨 · 검색을 눌러 적용하세요. ' : ''}조회 조건: ${summary}`;
+    const summary = Object.entries(applied).map(([key, value]) => `${queryLabels[key] || key}: ${value}`).join(' · ');
+    note.textContent = `${dirty ? '조건 변경됨 · 검색을 눌러 적용하세요. ' : ''}조회 조건: ${summary || '전체'}`;
+    note.hidden = !dirty && !summary;  // 기본 조건(전체)은 알릴 것이 없다 — 조건이 걸렸거나 바뀌었을 때만 보인다
     note.classList.toggle('dirty', dirty);
   }
 
@@ -519,160 +650,152 @@ import { initCharts } from "/static/lib/admin_charts.js?v=1";
     applyQuery(name);
   }
 
-  // 저장 조회는 이 브라우저의 편의 기능이다. 조건의 유효성은 서버가 판정하고(422 detail 표시),
-  // 여기서는 사라진 데이터셋만 거른다.
-  const savedQueryKey = 'yes24-admin-saved-queries-v1';
-  const usableQuery = (query) => Boolean(query) && typeof query === 'object' && state.datasets.some((item) => item.id === query.dataset);
-
-  function showSavedQueries() {
-    $('saved-query').replaceChildren(new Option('선택하세요', ''), ...state.savedQueries.map((item, index) => new Option(item.name, String(index))));
-  }
-
-  function readSavedQueries() {
-    try {
-      const stored = JSON.parse(localStorage.getItem(savedQueryKey) || '[]');
-      if (!Array.isArray(stored)) throw new Error('invalid');
-      state.savedQueries = stored.filter((item) => item && typeof item.name === 'string' && item.name.trim() && usableQuery(item.query));
-      $('saved-status').textContent = state.savedQueries.length !== stored.length ? '더 이상 없는 데이터의 저장 조건은 제외했습니다.' : '검색 조건을 이 브라우저에 저장합니다.';
-    } catch {
-      state.savedQueries = [];
-      $('saved-status').textContent = '저장된 조건을 읽을 수 없습니다. 브라우저 저장소 설정을 확인하세요.';
-    }
-    showSavedQueries();
-  }
-
-  function writeSavedQueries(items) {
-    try {
-      localStorage.setItem(savedQueryKey, JSON.stringify(items));
-      state.savedQueries = items;
-      showSavedQueries();
-      return true;
-    } catch {
-      $('saved-status').textContent = '저장할 수 없습니다. 브라우저 저장소가 차단되었거나 용량이 부족합니다.';
-      return false;
-    }
-  }
-
-  $('saved-save').onclick = () => {
-    const name = $('saved-name').value.trim();
-    if (!name) { $('saved-status').textContent = '조회 이름을 입력하세요.'; $('saved-name').focus(); return; }
-    if (!usableQuery(state.applied.data)) { $('saved-status').textContent = '조회 조건을 먼저 적용하세요.'; return; }
-    if (writeSavedQueries([...state.savedQueries.filter((item) => item.name !== name), {name, query: {...state.applied.data}}])) $('saved-status').textContent = `'${name}' 이름으로 적용된 조건을 저장했습니다. 같은 이름은 덮어씁니다.`;
-  };
-  $('saved-load').onclick = () => {
-    const item = state.savedQueries[$('saved-query').value];
-    if (!item) { $('saved-status').textContent = '불러올 조회를 선택하세요.'; return; }
-    $('dataset').value = item.query.dataset;
-    configureDataset();
-    for (const [key, id] of Object.entries(queryForms.data.fields)) {
-      if (key === 'app_name' && item.query[key] && ![...$(id).options].some((option) => option.value === item.query[key])) $(id).append(new Option(item.query[key], item.query[key]));
-      $(id).value = item.query[key] || '';
-      // 선택지에 없는 값이면 select가 비는데, 비운 채 두지 않고 데이터셋 기본값으로 되돌린다.
-      if ($(id).selectedIndex < 0) { if (key === 'sort') $(id).value = currentDataset().default_sort; else $(id).selectedIndex = 0; }
-    }
-    for (const input of $('data-exact').querySelectorAll('input')) input.value = item.query[input.dataset.exact] || '';
-    applyQuery('data');
-    // 복원 판정은 폼이 실제로 받아들인 조건(메타데이터가 만든 선택지·칸)과 저장본의 차이다.
-    const dropped = Object.entries(item.query).filter(([key, value]) => state.applied.data[key] !== value).map(([key, value]) => `${queryLabels[key] || key} '${value}'`);
-    $('saved-name').value = item.name;
-    $('saved-status').textContent = dropped.length ? `'${item.name}' 조건을 불러왔지만 저장된 ${dropped.join(' · ')}은(는) 이 데이터에 적용할 수 없어 기본값으로 불러왔습니다.` : `'${item.name}' 조건을 적용했습니다.`;
-    $('app-error').hidden = true;
-    loadData();
-  };
-  $('saved-delete').onclick = () => {
-    const selected = $('saved-query').value;
-    if (selected === '' || !state.savedQueries[selected]) { $('saved-status').textContent = '삭제할 조회를 선택하세요.'; return; }
-    if (writeSavedQueries(state.savedQueries.filter((_, index) => index !== Number(selected)))) { $('saved-name').value = ''; $('saved-status').textContent = '저장된 조회를 삭제했습니다.'; }
+  // ── 통계: 어드민 시간대 일별 보고(고객사 엑셀 양식 11열). 집계·빈 날 채움·기간 요약은 서버(/admin/api/stats)가 한다.
+  // 화면 구성은 crema-ai-admin Statistics.tsx를 따른다(카드 → 추이 → 요일 막대·인사이트 → 표). 색은 --crema-* 토큰 클래스.
+  const fixed2 = (value) => value == null ? '-' : value.toFixed(2);
+  const average = (value) => value == null ? '-' : Number(value.toFixed(2)).toLocaleString('ko-KR');
+  const dotted = (day) => day.replaceAll('-', '. ');
+  // 건수는 화면에선 천 단위 구분, CSV에선 원값(엑셀이 수로 읽게). unit은 카드의 단위 글자, tone은 차트 색 클래스.
+  const counted = (key, label, unit, tone) => ({ key, label, unit, tone, format: num, csv: String });
+  const STAT_COLUMNS = [
+    { key: 'day', label: '날짜', format: (day) => day.replaceAll('-', '.') }, { key: 'weekday', label: '요일', format: String },
+    counted('sessions', '세션수', '회', 'tone-blue'), counted('users', '활성사용자수', '명', 'tone-green'), counted('queries', '질의수', '회', 'tone-grey'),
+    { key: 'queries_per_session', label: '세션당 평균 질의수', unit: '회', format: fixed2 }, { key: 'avg_session_seconds', label: '평균 세션시간', format: minutes },
+    { ...counted('refusals', '답변거절수', '회', 'tone-red'), detail: (row) => refusedText(row.refused) }, counted('links', '링크제공수', '회', 'tone-blue'), counted('clicks', '클릭수', '회', 'tone-yellow'),
+    { key: 'click_rate', label: '클릭률', format: (value) => value == null ? '-' : `${value.toFixed(2)}%` },
+  ];
+  const statColumn = Object.fromEntries(STAT_COLUMNS.map((column) => [column.key, column]));
+  const LEAD = ['day', 'weekday'];
+  // 묶음별 카드 행 · 추이 선 · 요일 막대 · 표 열. 표는 전체 묶음이 11열 전부이고, CSV는 묶음과 무관하게 11열이다.
+  const STAT_VIEWS = {
+    all: { cards: [['sessions', 'queries', 'links'], ['users', 'queries_per_session', 'clicks']], series: ['sessions', 'queries'], columns: STAT_COLUMNS.map((column) => column.key) },
+    session: { cards: [['sessions', 'users', 'avg_session_seconds']], series: ['sessions', 'users'], columns: [...LEAD, 'sessions', 'users', 'avg_session_seconds'],
+      weekday: { key: 'sessions', title: '요일별 평균 세션 수', insight: '세션이 가장 많이 발생된 요일' } },
+    query: { cards: [['queries', 'queries_per_session', 'refusals']], series: ['queries', 'refusals'], columns: [...LEAD, 'queries', 'queries_per_session', 'refusals'],
+      weekday: { key: 'queries', title: '요일별 평균 질의 수', insight: '질의가 가장 많은 요일' } },
+    click: { note: '클릭은 클릭한 시각의 날짜로 세고 같은 링크를 다시 눌러도 셉니다 — 그래서 클릭률이 100%를 넘을 수 있습니다.',
+      cards: [['links', 'clicks', 'click_rate']], series: ['links', 'clicks'], columns: [...LEAD, 'links', 'clicks', 'click_rate'],
+      weekday: { key: 'clicks', title: '요일별 평균 클릭 수', insight: '클릭이 가장 많이 일어난 요일' } },
   };
 
-  /** CSV는 서버 export가 만든다 — page가 있으면 그 페이지만, 없으면 적용 조건 전체. */
-  async function downloadCsv(page) {
-    const {dataset: datasetId, ...filters} = state.applied.data;
-    if (!datasetId || pending.has('export')) return;
-    const controller = new AbortController();
-    pending.set('export', controller);
-    const scope = page === undefined ? '조건 전체' : `${page + 1}페이지`;
-    $('csv-all').disabled = $('csv').disabled = true;
-    $('csv-cancel').hidden = false;
-    $('export-status').textContent = `${datasetId} · ${scope} CSV를 준비하고 있습니다.`;
-    try {
-      const params = new URLSearchParams(page === undefined ? filters : {...filters, page});
-      const response = await api(`/admin/api/data/${encodeURIComponent(datasetId)}/export?${params}`, {signal: controller.signal, responseType: 'response'});
-      const blob = await response.blob();
-      if (controller.signal.aborted) return;
-      const url = URL.createObjectURL(blob);
-      const link = el('a');
-      link.href = url;
-      link.download = page === undefined ? `${datasetId}-filtered.csv` : `${datasetId}-page-${page + 1}.csv`;
-      link.click();
-      setTimeout(() => URL.revokeObjectURL(url), 0);
-      $('export-status').textContent = `${datasetId} ${scope} CSV를 다운로드했습니다.`;
-    } catch (error) {
-      if (pending.get('export') === controller) $('export-status').textContent = error.name === 'AbortError' ? '다운로드를 취소했습니다.' : `다운로드 실패: ${error.message}`;
-    } finally {
-      if (pending.get('export') === controller) {
-        pending.delete('export');
-        $('csv-cancel').hidden = true;
-        $('csv-all').disabled = $('csv').disabled = !state.exportSnapshot;
-      }
+  /** 기간 바(대시보드·통계 공용, name = 'dashboard' | 'statistics'). 프리셋은 presetRange(오늘 포함)로 날짜 칸을
+   *  채우고, '직접'은 기간 표시 대신 날짜 칸을 연다(crema의 기간 버튼 → 달력 패널 자리). */
+  function setPeriod(name, range) {
+    for (const button of $(`${name}-filters`).querySelectorAll('[data-range]')) button.setAttribute('aria-pressed', String(button.dataset.range === range));
+    $(`${name}-custom`).hidden = range !== 'custom';
+    $(`${name}-range`).parentElement.hidden = range === 'custom';
+    if (range === 'custom') return;
+    [$(`${name}-since`).value, $(`${name}-until`).value] = presetRange(range);
+  }
+  /** 기간 표시 문구(기간 바의 '기간 YYYY. MM. DD ~ …'). */
+  const showPeriod = (name) => { $(`${name}-range`).textContent = `${dotted($(`${name}-since`).value)} ~ ${dotted($(`${name}-until`).value)}`; };
+
+  function loadStatistics() {
+    const params = new URLSearchParams({ since: $('statistics-since').value, until: $('statistics-until').value });
+    showPeriod('statistics');
+    // 받기 전엔 이전 기간 데이터를 버린다 — 실패하면 화면은 오류인데 이전 기간 표가 내려받히면 안 된다.
+    state.statistics = null;
+    if ($('statistics').childElementCount) $('statistics').classList.add('is-loading');
+    else $('statistics').replaceChildren(el('div', 'placeholder', '통계를 불러오는 중…'));
+    return request('statistics', `/admin/api/stats?${params}`, (data) => { state.statistics = data; renderStatistics(); })
+      .finally(() => { if (!pending.has('statistics')) $('statistics').classList.remove('is-loading'); });
+  }
+
+  /** crema SummaryCard: 라벨 · 큰 숫자+단위 · 보조 문구(세부가 있는 열은 세부, 아니면 기간). */
+  function cremaCard(key, summary, range) {
+    const column = statColumn[key], value = summary[key], detail = column.detail?.(summary);
+    const card = el('div', 'crema-card'), figure = el('div', 'crema-value');
+    figure.append(el('strong', null, column.format(value)));
+    if (column.unit && value != null) figure.append(el('span', null, column.unit));
+    card.append(el('span', 'crema-label', column.label), figure, detail ? el('span', 'crema-sub crema-detail', detail) : el('span', 'crema-sub', range));
+    return card;
+  }
+
+  function renderStatistics() {
+    const data = state.statistics, view = STAT_VIEWS[state.statisticsView];
+    if (!data) return;
+    const range = `${dotted(data.period.since)} ~ ${dotted(data.period.until)}`;
+    const cards = el('div', 'crema-cards');
+    for (const row of view.cards) { const line = el('div', 'crema-row'); line.append(...row.map((key) => cremaCard(key, data.summary, range))); cards.append(line); }
+    const oldestFirst = [...data.daily].reverse();
+    const trend = charts.lines({
+      title: `${range} 기준`, categories: oldestFirst.map((row) => row.day), format: num,
+      // 범례엔 기간 합계를 붙이고(legend), 툴팁·표는 계열명만(label) — 합계가 칸 값 옆에 붙으면 '12 세션수 2,322'로 읽힌다.
+      series: view.series.map((key) => ({ label: statColumn[key].label, legend: `${statColumn[key].label} ${num(data.summary[key])}`, className: statColumn[key].tone, values: oldestFirst.map((row) => row[key]) })),
+    });
+    const blocks = [...(view.note ? [el('p', 'crema-note', view.note)] : []), cards, trend];
+    if (view.weekday) {
+      const { key, title, insight } = view.weekday, column = statColumn[key];
+      const bars = charts.stackedBars({
+        title, categories: data.weekday.map((row) => row.weekday), zone: '', tick: String, axisTitle: '요일', format: average,
+        series: [{ label: `평균 ${column.label}`, className: 'tone-blue', values: data.weekday.map((row) => row[key]) }],
+      });
+      bars.classList.add('crema-bars');
+      blocks.push(bars);
+      const top = data.weekday.reduce((best, row) => (row[key] ?? 0) > (best?.[key] ?? 0) ? row : best, null);
+      const card = el('div', 'crema-insight'), metric = el('span', 'crema-metric');
+      metric.append(el('span', null, `평균 ${column.label}`), el('b', null, top ? `${average(top[key])}${column.unit}` : '-'));
+      card.append(el('span', null, insight), el('strong', null, top ? `${top.weekday}요일` : '-'), metric);
+      blocks.push(card);
     }
+    const head = el('div', 'crema-table-head'), download = el('button', 'crema-download');
+    download.type = 'button';
+    download.append($('download-icon').content.firstElementChild.cloneNode(true), document.createTextNode('엑셀 다운로드'));
+    download.onclick = downloadStatistics;
+    head.append(el('span', null, `${num(data.daily.length)}건`), download);
+    const grid = table(view.columns.map((key) => statColumn[key]), data.daily);
+    grid.classList.add('crema-table', 'bleed');
+    $('statistics').replaceChildren(...blocks, head, grid);
   }
 
-  function comparisonCard(data) {
-    if (!data.comparison) return analysisCard('이전 기간 비교', el('p', 'analysis-note', '이전 동일 기간을 계산할 수 없습니다. 시작일과 종료일을 확인하세요.'));
-    const current = data.summary, prior = data.comparison.summary;
-    const rows = [
-      // KPI 타일에 증감이 이미 있는 지표(턴·비용·과금 턴당 비용·피드백)는 싣지 않는다.
-      ['완료 턴', 'completed', metric], ['실패 턴', 'failed', metric], ['중단 턴', 'interrupted', metric], ['종료 상태 미확인', 'unknown', metric],
-      ['응답시간 평균', 'elapsed_avg_seconds', seconds], ['응답시간 p95', 'p95_seconds', seconds],
-    ].map(([label, key, format]) => ({label, previous: format(prior[key]), current: format(current[key]), change: change(current[key], prior[key], format)}));
-    return analysisCard('이전 동일 기간 비교', table([{key: 'label', label: '지표'}, {key: 'previous', label: '이전 기간'}, {key: 'current', label: '조회 기간'}, {key: 'change', label: '증감 · 변화율'}], rows), `이전 기간 ${data.comparison.period.since} ~ ${data.comparison.period.until} UTC. 증감은 조회 기간 − 이전 기간입니다.`);
+  /** 엑셀 다운로드 = 일별 11열(최신순, 화면과 같은 서식)을 UTF-8 BOM CSV로. */
+  function downloadStatistics() {
+    const data = state.statistics;
+    if (!data) return;
+    // 값이 없는 칸(분모 0)은 빈 칸이다 — 화면의 '-'는 선두 '-'라 셀 규칙이 '로 감싸 엑셀에 '-로 보인다.
+    saveCsv(`statistics_${data.period.since}_${data.period.until}.csv`, [
+      STAT_COLUMNS.map((column) => column.label),
+      ...data.daily.map((row) => STAT_COLUMNS.map((column) => (row[column.key] == null ? '' : (column.csv || column.format)(row[column.key])))),
+    ]);
   }
 
-  const manage = initManage({ api, el, table, clock, valueText, state, openDialog, reloadData: () => loadData() });
 
-  /** 기간 프리셋은 날짜 칸만 채운다 — 조회는 사용자가 누른다. */
-  const setRange = (days) => {
-    const day = new Date();
-    $('dashboard-until').value = day.toISOString().slice(0, 10);
-    day.setUTCDate(day.getUTCDate() - days + 1);
-    $('dashboard-since').value = day.toISOString().slice(0, 10);
+  const manage = initManage({ api, el, table, clock, valueText, state, openDialog, showRecord, reload: () => loaders[state.tab]() });
+
+  // 기간 바: 프리셋은 누르면 바로 조회, '직접'은 날짜 칸의 조회 버튼으로.
+  for (const [name, load] of [['dashboard', loadDashboard], ['statistics', loadStatistics]]) {
+    for (const button of $(`${name}-filters`).querySelectorAll('[data-range]')) button.onclick = () => {
+      setPeriod(name, button.dataset.range);
+      if (button.dataset.range !== 'custom') { $('app-error').hidden = true; load(); }
+    };
+    $(`${name}-filters`).onsubmit = (event) => { event.preventDefault(); $('app-error').hidden = true; load(); };
+  }
+  for (const button of $('statistics-views').querySelectorAll('[data-view]')) button.onclick = () => {
+    state.statisticsView = button.dataset.view;
+    for (const other of $('statistics-views').children) other.setAttribute('aria-pressed', String(other === button));
+    renderStatistics();
   };
-  setRange(7);
-  for (const button of $('dashboard-filters').querySelectorAll('[data-days]')) button.onclick = () => setRange(Number(button.dataset.days));
-  $('dashboard-filters').onsubmit = (event) => { event.preventDefault(); $('app-error').hidden = true; loadDashboard(); };
-  $('data-filters').onsubmit = (event) => { event.preventDefault(); applyQuery('data'); $('app-error').hidden = true; loadData(); };
-  function clearDataFilters() {
-    for (const input of $('data-filters').querySelectorAll('input')) input.value = '';
-    for (const id of ['data-status', 'data-app', 'data-status-null']) $(id).value = '';
-    $('data-direction').value = 'desc';
-    configureDataset();
-    applyQuery('data');
-    $('app-error').hidden = true;
-  }
-  $('data-filters').onreset = (event) => { event.preventDefault(); clearDataFilters(); if (state.role) loadData(); };
-  $('dataset').onchange = () => $('data-filters').reset();
-  $('data-prev').onclick = () => { if (state.dataPage > 0) { state.dataPage--; loadData(); } };
-  $('data-next').onclick = () => { state.dataPage++; loadData(); };
   $('record-close').onclick = () => $('record-dialog').close();
-  $('record-dialog').onclose = () => { $('record-conversation').onclick = null; $('record-conversation').hidden = true; $('record-json').textContent = ''; $('copy-status').textContent = ''; $('record-actions').replaceChildren(); };
-  $('record-copy').onclick = async () => {
-    try { await navigator.clipboard.writeText($('record-json').textContent); $('copy-status').textContent = 'JSON을 복사했습니다.'; }
-    catch { $('copy-status').textContent = '복사할 수 없습니다. 아래 JSON을 선택해 복사하세요.'; }
-  };
-  $('csv').onclick = () => downloadCsv(state.exportSnapshot?.page);
-  $('csv-all').onclick = () => downloadCsv();
-  $('csv-cancel').onclick = () => pending.get('export')?.abort();
-  $('data-status-null').onchange = () => { if ($('data-status-null').value) $('data-status').value = ''; queryNote('data'); };
-  $('data-status').onchange = () => { if ($('data-status').value) $('data-status-null').value = ''; queryNote('data'); };
+  $('record-dialog').onclose = () => { $('record-view').replaceChildren(); $('record-actions').replaceChildren(); };
+  // 비모달 패널은 Esc를 스스로 받지 않는다 — 문서에서 받아 닫는다.
+  document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && $('record-dialog').open) $('record-dialog').close(); });
+  $('users-filters').onsubmit = (event) => { event.preventDefault(); applyQuery('users'); $('app-error').hidden = true; loadUsers(); };
+  // 검색칸(type=search): Enter로 검색, 지우기(✕)로 비우면 곧바로 전체를 다시 읽는다. 대화 폼은 날짜 칸이 있어
+  // 브라우저의 Enter 암묵 제출이 막히므로 Enter도 여기서 받는다.
+  for (const [input, form] of [['q', 'filters'], ['users-q', 'users-filters']]) {
+    $(input).addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); $(form).requestSubmit(); } });
+    $(input).addEventListener('search', () => { if (!$(input).value) $(form).requestSubmit(); });
+  }
 
-  const loaders = { dashboard: loadDashboard, data: loadDatasets, sessions: loadSessions, admins: manage.loadAdmins };
+  const loaders = { dashboard: loadDashboard, statistics: loadStatistics, sessions: loadSessions, users: loadUsers, starters: loadStarters, admins: manage.loadAdmins };
 
   function switchTab(tab) {
     state.tab = tab;
-    $('main').classList.remove('has-selection');
-    $('list-pane').hidden = $('detail').hidden = tab !== 'sessions';
-    for (const name of ['dashboard', 'data', 'admins']) $(name + '-pane').hidden = tab !== name;
+    for (const name of Object.keys(loaders)) $(name + '-pane').hidden = tab !== name;
+    $('record-dialog').close();  // 패널은 연 화면의 행을 보여 준다 — 화면을 떠나면 닫는다
+    if (tab === 'sessions') showDetail(false);
+    $('app').classList.remove('nav-open');
+    $('menu-toggle').setAttribute('aria-expanded', 'false');
     for (const name of Object.keys(loaders)) $('tab-' + name).setAttribute('aria-pressed', String(name === tab));
     $('app-error').hidden = true;
     return loaders[tab]();
@@ -683,6 +806,7 @@ import { initCharts } from "/static/lib/admin_charts.js?v=1";
     const button = $('gate').querySelector('button');
     button.disabled = true;
     $('gate-error').hidden = true;
+    $('gate').classList.remove('failed');
     try {
       await api('/admin/api/login', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -694,6 +818,7 @@ import { initCharts } from "/static/lib/admin_charts.js?v=1";
       const retry = Number(error.response?.headers.get('Retry-After'));
       $('gate-error').textContent = error.status === 429 && retry ? `${error.message} ${num(Math.ceil(retry / 60))}분(${num(retry)}초) 뒤 다시 시도하세요.` : error.status ? error.message : '서버에 연결하지 못했습니다. 다시 시도하세요.';
       $('gate-error').hidden = false;
+      $('gate').classList.add('failed');  // 입력칸 테두리를 오류색으로(Login.tsx)
     } finally { button.disabled = false; }
   };
 
@@ -705,28 +830,37 @@ import { initCharts } from "/static/lib/admin_charts.js?v=1";
   $('password-change').onclick = () => manage.openPasswordChange();
 
   $('filters').onsubmit = (e) => { e.preventDefault(); applyQuery('sessions'); $('app-error').hidden = true; loadSessions(); };
-  $('filters').onreset = (event) => {
-    event.preventDefault();
+  /** 대화 조회 조건을 기본(전체·검색어 없음)으로 — 회원 화면의 '대화 보기'가 회원번호만 걸 때 쓴다. */
+  function clearSessionFilters() {
     for (const input of $('filters').querySelectorAll('input')) input.value = '';
-    applyQuery('sessions');
-    $('app-error').hidden = true;
-    if (state.role) loadSessions();
+    for (const button of $('sessions-range').children) button.setAttribute('aria-pressed', String(!button.dataset.days));
+    $('sessions-custom').hidden = true;
+  }
+  // 기간 세그먼트는 갱신 시각의 어드민 시간대 날짜 칸을 채우고 바로 조회한다. '직접'은 날짜 칸을 연다.
+  for (const button of $('sessions-range').children) button.onclick = () => {
+    press($('sessions-range'), button);
+    const days = button.dataset.days;
+    $('sessions-custom').hidden = days !== 'custom';
+    if (days === 'custom') return;
+    [$('since').value, $('until').value] = days ? presetRange(days) : ['', ''];
+    $('filters').requestSubmit();
   };
-  $('prev').onclick = () => { if (state.page > 0) { state.page--; loadSessions(); } };
-  $('next').onclick = () => { state.page++; loadSessions(); };
-  for (const tab of Object.keys(loaders)) $('tab-' + tab).onclick = () => switchTab(tab);
-  $('refresh').onclick = () => {
+  $('sessions-csv').prepend($('download-icon').content.firstElementChild.cloneNode(true));
+  $('sessions-csv').onclick = downloadSessions;
+  $('menu-toggle').onclick = () => {
+    const open = $('app').classList.toggle('nav-open');
+    $('menu-toggle').setAttribute('aria-expanded', String(open));
+  };
+  // 서랍 바깥은 덮개(#nav-scrim)가 탭을 받는다 — 아래 요소로 클릭이 새지 않고 서랍만 닫힌다(crema RootLayout).
+  $('nav-scrim').onclick = () => { $('app').classList.remove('nav-open'); $('menu-toggle').setAttribute('aria-expanded', 'false'); };
+  /** 새로고침 = 지금 화면을 다시 읽는다(활성 메뉴를 다시 누를 때). 대화는 열어 둔 상세의 펼침·스크롤을 지킨다. */
+  function refresh() {
     $('app-error').hidden = true;
     loadOverview();
-    if (state.tab === 'sessions') {
-      const detailVisible = $('main').classList.contains('has-selection');
-      loadSessions();
-      if (state.currentSession) {
-        selectSession(state.currentSession, {preservePosition: true});
-        if (!detailVisible) $('main').classList.remove('has-selection');
-      }
-    } else loaders[state.tab]();
-  };
+    loaders[state.tab]();
+    if (state.tab === 'sessions' && state.currentSession) selectSession(state.currentSession, {preservePosition: true});
+  }
+  for (const tab of Object.keys(loaders)) $('tab-' + tab).onclick = () => (tab === state.tab ? refresh() : switchTab(tab));
 
   /** 세션이 있으면 역할을 받아 화면을 연다. 401이면 로그인 게이트만 보인다. */
   async function start() {
@@ -739,10 +873,16 @@ import { initCharts } from "/static/lib/admin_charts.js?v=1";
     }
     state.role = me.role;
     state.roles = me.roles;
-    $('account').textContent = `${me.username} · ${me.role}`;
-    $('tab-admins').hidden = me.role !== 'owner';
+    state.username = me.username;
+    // 시간대가 정해진 뒤에야 날짜 칸 기본값(오늘 기준 프리셋)과 화면 라벨을 채울 수 있다.
+    state.tz = me.timezone;
+    for (const node of document.querySelectorAll('.tz')) node.textContent = state.tz.label;
+    setPeriod('dashboard', '7');
+    setPeriod('statistics', '7');
+    $('account').replaceChildren(document.createTextNode(me.username), el('small', null, me.role));
+    $('toolbar-owner').hidden = me.role !== 'owner';
     $('gate').hidden = true;
-    for (const id of ['header', 'toolbar', 'main']) $(id).hidden = false;
+    for (const id of ['sidebar', 'mobile-bar', 'main']) $(id).hidden = false;
     await Promise.all([loadOverview(), switchTab(state.tab)]);
   }
   start();

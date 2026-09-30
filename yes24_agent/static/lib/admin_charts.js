@@ -7,20 +7,12 @@
 
 // 기하(px). 글자 크기는 CSS가 고정하고, 확대 대신 컨테이너 폭으로 다시 그린다.
 const TOP = 10, PLOT_H = 180, AXIS_H = 24, LEFT = 56, RIGHT = 16, BAR_MAX = 24, GAP = 2, RADIUS = 4, LINE_H = 16;
-// 좁은 폭에서 x축 날짜 라벨(MM-DD)이 차지하는 최소 칸, 히트맵 시간 라벨의 최소 칸.
-const DAY_LABEL_W = 44, HOUR_LABEL_W = 30;
+// 좁은 폭에서 x축 날짜 라벨(MM-DD)이 차지하는 최소 칸.
+const DAY_LABEL_W = 44;
 const EMPTY = '선택한 기간에 기록이 없습니다.';
 const KEYS = { ArrowLeft: -1, ArrowRight: 1, Home: -Infinity, End: Infinity };
 
-/** CSS 토큰 `--{name}-1..n`의 n. 색 단계 수의 정본은 admin.css이고 JS는 세기만 한다(짝 표류 방지). */
-const tokenSteps = (name) => {
-  const style = getComputedStyle(document.documentElement);
-  let steps = 0;
-  while (style.getPropertyValue(`--${name}-${steps + 1}`).trim()) steps++;
-  return steps;
-};
-
-export function initCharts({ template, el, table, num }) {
+export function initCharts({ template, el, table, timezone }) {
   const svgNS = template.content.firstElementChild.namespaceURI;
 
   const node = (parent, tag, attrs, cls, text) => {
@@ -104,12 +96,12 @@ export function initCharts({ template, el, table, num }) {
     return { left, y };
   }
 
-  /** 날짜 라벨은 마지막 날부터 거꾸로 솎는다 — 가장 최근 날짜가 항상 보인다. */
-  function xAxis(svg, categories, left, band) {
+  /** 날짜 라벨은 마지막 날부터 거꾸로 솎는다 — 가장 최근 날짜가 항상 보인다. tick은 칸 라벨(기본 MM-DD). */
+  function xAxis(svg, categories, left, band, tick = (category) => category.slice(5)) {
     const stride = Math.max(1, Math.ceil(DAY_LABEL_W / band));
     categories.forEach((category, i) => {
       if ((categories.length - 1 - i) % stride) return;
-      node(svg, 'text', { x: left + band * (i + 0.5), y: TOP + PLOT_H + 16, 'text-anchor': 'middle' }, null, category.slice(5));
+      node(svg, 'text', { x: left + band * (i + 0.5), y: TOP + PLOT_H + 16, 'text-anchor': 'middle' }, null, tick(category));
     });
   }
 
@@ -170,9 +162,12 @@ export function initCharts({ template, el, table, num }) {
     return `M${x},${bottom}V${top + r}Q${x},${top} ${x + r},${top}H${x + width - r}Q${x + width},${top} ${x + width},${top + r}V${bottom}Z`;
   };
 
-  /** 날짜별 누적 막대. 첫 시리즈가 기준선에 붙는다. */
-  function stackedBars({ title, note, notes, categories, series, unit, format }) {
+  /** 날짜별 누적 막대. 첫 시리즈가 기준선에 붙는다. 날짜가 아닌 칸(요일)은 tick·axisTitle과 빈 zone으로 그린다. */
+  function stackedBars({ title, note, notes, categories, series, unit, format, zone = timezone(), tick, axisTitle = `날짜 (${zone})` }) {
     // null(미측정·단가 미등록)은 0이 아니다 — 막대는 그리지 않고 표·툴팁엔 포맷터의 null 표기로 간다.
+    // 칸 이름 — tick(축 라벨 서식)이 있으면 툴팁·낭독·표도 같은 이름(예: 13 → '13시'). 날짜는 원문 그대로.
+    const name = (category) => (tick ? tick(category) : category);
+    const single = series.length === 1;
     const totals = categories.map((_, i) => (series.every((item) => item.values[i] == null) ? null : series.reduce((sum, item) => sum + (item.values[i] ?? 0), 0)));
     const draw = (svg, width) => {
       size(svg, width, TOP + PLOT_H + AXIS_H);
@@ -197,7 +192,7 @@ export function initCharts({ template, el, table, num }) {
           else node(svg, 'rect', { x, y: upper, width: barWidth, height: lower - upper }, `bar ${item.className}`);
         });
       });
-      xAxis(svg, categories, left, band);
+      xAxis(svg, categories, left, band, tick);
       const layer = node(svg, 'rect', { x: left, y: TOP, width: width - left - RIGHT, height: PLOT_H }, 'hit');
       const tooltip = tip(svg, width);
       cursor(svg, layer, {
@@ -207,9 +202,11 @@ export function initCharts({ template, el, table, num }) {
         show: (i) => {
           highlight.setAttribute('x', left + band * i);
           highlight.removeAttribute('display');
-          const rows = [...series.filter((item) => item.values[i] > 0).map((item) => ({ value: format(item.values[i]), label: item.label, className: item.className })), { value: format(totals[i]), label: '합계' }];
-          tooltip.show(left + band * (i + 0.5), `${categories[i]} UTC`, rows);
-          return `${categories[i]} ${rows.map((row) => `${row.label} ${row.value}`).join(', ')}`;
+          // 계열이 하나면 값 한 줄뿐 — 계열명(제목·범례가 이미 말함)·합계 줄을 붙이면 '100질의 질의 / 100질의 합계'로 겹친다.
+          const rows = single ? [{ value: format(totals[i]), className: series[0].className }]
+            : [...series.filter((item) => item.values[i] > 0).map((item) => ({ value: format(item.values[i]), label: item.label, className: item.className })), { value: format(totals[i]), label: '합계' }];
+          tooltip.show(left + band * (i + 0.5), `${name(categories[i])} ${zone}`.trim(), rows);
+          return `${name(categories[i])} ${rows.map((row) => [row.label, row.value].filter(Boolean).join(' ')).join(', ')}`;
         },
         hide: () => { highlight.setAttribute('display', 'none'); tooltip.hide(); },
       });
@@ -217,16 +214,16 @@ export function initCharts({ template, el, table, num }) {
     return card({
       title, note, notes, draw,
       empty: totals.every((total) => !total),
-      legend: series.map(({ label, className }) => ({ label, className })),
+      legend: series.map(({ label, legend, className }) => ({ label: legend ?? label, className })),
       tableView: () => table(
-        [{ key: 'category', label: '날짜 (UTC)' }, ...series.map((item, k) => ({ key: k, label: item.label, format })), { key: 'total', label: '합계', format }],
-        categories.map((category, i) => ({ category, total: totals[i], ...series.map((item) => item.values[i]) })),
+        [{ key: 'category', label: axisTitle }, ...series.map((item, k) => ({ key: k, label: item.label, format })), ...(single ? [] : [{ key: 'total', label: '합계', format }])],
+        categories.map((category, i) => ({ category: name(category), total: totals[i], ...series.map((item) => item.values[i]) })),
       ),
     });
   }
 
-  /** 날짜별 선. null은 선을 끊는다(0으로 잇지 않음). extra는 툴팁·표에만 싣는 부가 행(표본 수). */
-  function lines({ title, note, categories, series, format, extra = [] }) {
+  /** 날짜별 선. null은 선을 끊는다(0으로 잇지 않음). */
+  function lines({ title, note, categories, series, format, zone = timezone() }) {
     const present = series.flatMap((item) => item.values).filter((value) => value != null);
     const lastIndex = series.map((item) => item.values.findLastIndex((value) => value != null));
     const draw = (svg, width) => {
@@ -265,8 +262,8 @@ export function initCharts({ template, el, table, num }) {
           crosshair.setAttribute('x1', x(i));
           crosshair.setAttribute('x2', x(i));
           crosshair.removeAttribute('display');
-          const rows = [...series.map((item) => ({ value: format(item.values[i]), label: item.label, className: item.className })), ...extra.map((item) => ({ value: num(item.values[i]), label: item.label }))];
-          tooltip.show(x(i), `${categories[i]} UTC`, rows);
+          const rows = series.map((item) => ({ value: format(item.values[i]), label: item.label, className: item.className }));
+          tooltip.show(x(i), `${categories[i]} ${zone}`, rows);
           return `${categories[i]} ${rows.map((row) => `${row.label} ${row.value}`).join(', ')}`;
         },
         hide: () => { crosshair.setAttribute('display', 'none'); tooltip.hide(); },
@@ -275,73 +272,13 @@ export function initCharts({ template, el, table, num }) {
     return card({
       title, note, draw,
       empty: !present.length,
-      legend: series.map(({ label, className }) => ({ label, className, line: true })),
+      legend: series.map(({ label, legend, className }) => ({ label: legend ?? label, className, line: true })),
       tableView: () => table(
-        [{ key: 'category', label: '날짜 (UTC)' }, ...series.map((item, k) => ({ key: `s${k}`, label: item.label, format })), ...extra.map((item, k) => ({ key: `e${k}`, label: item.label, format: num }))],
-        categories.map((category, i) => Object.fromEntries([['category', category], ...series.map((item, k) => [`s${k}`, item.values[i]]), ...extra.map((item, k) => [`e${k}`, item.values[i]])])),
+        [{ key: 'category', label: `날짜 (${zone})` }, ...series.map((item, k) => ({ key: `s${k}`, label: item.label, format }))],
+        categories.map((category, i) => Object.fromEntries([['category', category], ...series.map((item, k) => [`s${k}`, item.values[i]])])),
       ),
     });
   }
 
-  /** 행×열 격자. 셀 색은 최대값 기준 순차 램프(단계 수 = admin.css `--seq-*` 개수), 0은 바탕색. */
-  function heatmap({ title, note, rows, cols, values, format }) {
-    const max = Math.max(0, ...values.flat());
-    const steps = tokenSteps('seq');
-    const level = (value) => (value > 0 ? Math.min(steps, Math.ceil((value / max) * steps)) : 0);
-    // 범례는 실제로 값이 들어갈 수 있는 단계만 — 정수 건수라 좁은 최대값에선 빈 단계가 생긴다.
-    const legend = [{ label: format(0), className: 'seq-0' }];
-    for (let k = 1; k <= steps; k++) {
-      const low = Math.floor((max * (k - 1)) / steps) + 1, high = Math.floor((max * k) / steps);
-      if (low <= high) legend.push({ label: low === high ? format(high) : `${num(low)}–${format(high)}`, className: `seq-${k}` });
-    }
-    const draw = (svg, width) => {
-      size(svg, width, 1);
-      const labels = rows.map((row) => node(svg, 'text', { 'text-anchor': 'end' }, null, row));
-      const left = Math.ceil(Math.max(...labels.map((label) => label.getComputedTextLength()))) + 10;
-      // 칸 폭은 컨테이너를 채우고, 높이는 요일 라벨 한 줄(LINE_H)~28px 사이 — 넓은 화면에서 격자가 세로로 커지지 않게.
-      const cw = Math.max(8, Math.floor((width - left) / cols.length)), ch = Math.min(28, Math.max(LINE_H, cw));
-      const height = TOP + rows.length * ch + AXIS_H;
-      svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
-      svg.setAttribute('height', height);
-      labels.forEach((label, r) => { label.setAttribute('x', left - 8); label.setAttribute('y', TOP + ch * (r + 0.5) + 4); });
-      values.forEach((row, r) => row.forEach((value, c) => {
-        node(svg, 'rect', { x: left + c * cw, y: TOP + r * ch, width: cw - GAP, height: ch - GAP, rx: 2 }, `cell seq-${level(value)}`);
-      }));
-      const stride = Math.ceil(HOUR_LABEL_W / cw);
-      cols.forEach((col, c) => {
-        if (c % stride === 0) node(svg, 'text', { x: left + c * cw + (cw - GAP) / 2, y: TOP + rows.length * ch + 14, 'text-anchor': 'middle' }, null, col);
-      });
-      const focus = node(svg, 'rect', { width: cw, height: ch, rx: 3, display: 'none' }, 'cell-focus');
-      const layer = node(svg, 'rect', { x: left, y: TOP, width: cols.length * cw, height: rows.length * ch }, 'hit');
-      const tooltip = tip(svg, width);
-      cursor(svg, layer, {
-        count: rows.length * cols.length,
-        keys: { ...KEYS, ArrowUp: -cols.length, ArrowDown: cols.length },
-        pick: (px, py) => {
-          const c = Math.floor((px - left) / cw), r = Math.floor((py - TOP) / ch);
-          return c < 0 || r < 0 || c >= cols.length || r >= rows.length ? null : r * cols.length + c;
-        },
-        show: (i) => {
-          const r = Math.floor(i / cols.length), c = i % cols.length;
-          focus.setAttribute('x', left + c * cw - 1);
-          focus.setAttribute('y', TOP + r * ch - 1);
-          focus.removeAttribute('display');
-          const head = `${rows[r]} ${String(cols[c]).padStart(2, '0')}:00 UTC`;
-          tooltip.show(left + c * cw + cw / 2, head, [{ value: format(values[r][c]) }]);
-          return `${head} ${format(values[r][c])}`;
-        },
-        hide: () => { focus.setAttribute('display', 'none'); tooltip.hide(); },
-      });
-    };
-    return card({
-      title, note, draw, legend,
-      empty: max === 0,
-      tableView: () => table(
-        [{ key: 'row', label: '요일' }, ...cols.map((col, c) => ({ key: c, label: String(col), format: num }))],
-        rows.map((row, r) => ({ row, ...values[r] })),
-      ),
-    });
-  }
-
-  return { stackedBars, lines, heatmap, seriesSlots: () => tokenSteps('series') };
+  return { stackedBars, lines };
 }

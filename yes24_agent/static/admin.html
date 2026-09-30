@@ -2,119 +2,128 @@
 <html lang="ko">
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>yes24-agent · 어드민</title>
-<link rel="stylesheet" href="/static/lib/admin.css" />
+<title>크레마 AI 관리자</title>
+<link rel="stylesheet" href="/static/lib/admin.css?v=13" />
+<!-- 로고(crema 마스코트)가 파비콘을 겸한다 — 자기 출처 정적 파일이라 /favicon.ico 401 콘솔 오류도 없다. -->
+<link rel="icon" href="/static/lib/admin-logo.svg" type="image/svg+xml" />
 
-<div class="app">
-  <!-- 인증 전: 로그인 게이트만 보인다(데이터 요청은 세션 쿠키 없이는 401). -->
+<div class="app" id="app">
+  <!-- 인증 전: 로그인 게이트만 보인다(데이터 요청은 세션 쿠키 없이는 401). crema-ai-admin Login.tsx 화면 구성. -->
   <form class="gate" id="gate" hidden>
-    <h1>통합 어드민</h1>
-    <input id="username" aria-label="계정명" placeholder="계정명" required autocomplete="username" autocapitalize="none" />
-    <input type="password" id="password" aria-label="비밀번호" placeholder="비밀번호" required autocomplete="current-password" />
+    <img class="gate-logo" src="/static/lib/admin-logo.svg" alt="" />
+    <h1>Crema AI <b>ADMIN</b></h1>
+    <p class="gate-sub">크레마 AI 관리자</p>
+    <label class="gate-field"><svg viewBox="-1.25 -3.75 20 20" aria-hidden="true"><path d="M0 0.625L0.625 0H16.875L17.5 0.625V11.875L16.875 12.5H0.625L0 11.875V0.625ZM1.25 1.91875V11.25H16.25V1.92L9.1375 7.375H8.375L1.25 1.91875ZM15.0375 1.25H2.4625L8.75 6.08625L15.0375 1.25Z" /></svg><input id="username" aria-label="계정명" placeholder="계정명" required autocomplete="username" autocapitalize="none" /></label>
+    <label class="gate-field"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16.6667 10C16.6667 9.08083 15.9192 8.33333 15 8.33333H14.1667V5.83333C14.1667 3.53583 12.2975 1.66667 10 1.66667C7.7025 1.66667 5.83333 3.53583 5.83333 5.83333V8.33333H5C4.08083 8.33333 3.33333 9.08083 3.33333 10V16.6667C3.33333 17.5858 4.08083 18.3333 5 18.3333H15C15.9192 18.3333 16.6667 17.5858 16.6667 16.6667V10ZM7.5 5.83333C7.5 4.455 8.62167 3.33333 10 3.33333C11.3783 3.33333 12.5 4.455 12.5 5.83333V8.33333H7.5V5.83333Z" /></svg><input type="password" id="password" aria-label="비밀번호" placeholder="비밀번호" required autocomplete="current-password" /></label>
+    <p class="gate-error" id="gate-error" role="alert" hidden></p>
     <button class="primary" type="submit">로그인</button>
-    <div class="error" id="gate-error" hidden></div>
+    <p class="gate-foot">Powered by <b>Grip Labs</b></p>
   </form>
 
-  <header hidden id="header">
-    <div>
-      <h1>통합 어드민</h1>
-      <div class="sub" id="last-activity"></div>
-    </div>
-    <div class="stats" id="stats"></div>
-  </header>
-
-  <nav class="toolbar" id="toolbar" aria-label="관리 메뉴" hidden>
-    <button id="tab-dashboard" aria-pressed="true">대시보드</button>
-    <button id="tab-data" aria-pressed="false">데이터 탐색</button>
-    <button id="tab-sessions" aria-pressed="false">대화</button>
-    <button id="tab-admins" aria-pressed="false" hidden>관리자</button>
-    <span class="account" id="account"></span>
-    <button id="password-change">비밀번호 변경</button>
-    <button id="refresh">새로고침</button>
-    <button id="logout">로그아웃</button>
-  </nav>
-  <div class="error notice" id="app-error" role="alert" hidden></div>
+  <!-- 셸: crema-ai-admin Sidebar.tsx·RootLayout.tsx — 왼쪽 240px 메뉴, 좁은 화면은 상단 바 + 서랍. 활성 메뉴를 다시 누르면 새로고침. -->
+  <div class="mobile-bar" id="mobile-bar" hidden><button id="menu-toggle" aria-label="메뉴 열기" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18" /></svg></button><b>크레마 AI 관리자</b></div>
+  <div class="nav-scrim" id="nav-scrim"></div>
+  <aside class="sidebar" id="sidebar" hidden>
+    <div class="brand"><img src="/static/lib/admin-logo.svg" alt="" /><b>크레마 AI 관리자</b></div>
+    <nav class="toolbar" aria-label="관리 메뉴">
+      <button id="tab-dashboard" aria-pressed="true"><svg viewBox="-4 -4 20 20" aria-hidden="true"><path d="M1.28571 12C0.932143 12 0.629464 11.8741 0.377678 11.6223C0.125893 11.3705 0 11.0679 0 10.7143V6.42857H4.71429V12H1.28571ZM6 12V6.42857H12V10.7143C12 11.0679 11.8741 11.3705 11.6223 11.6223C11.3705 11.8741 11.0679 12 10.7143 12H6ZM0 5.14286V1.28571C0 0.932143 0.125893 0.629465 0.377678 0.377679C0.629464 0.125893 0.932143 0 1.28571 0H10.7143C11.0679 0 11.3705 0.125893 11.6223 0.377679C11.8741 0.629465 12 0.932143 12 1.28571V5.14286H0Z" /></svg>대시보드</button>
+      <button id="tab-statistics" aria-pressed="false"><svg viewBox="-3.333 -3.333 20 20" aria-hidden="true"><path d="M0 13.3333V6.66667H3.33333V13.3333H0ZM5 13.3333V0H8.33333V13.3333H5ZM10 13.3333V4.16667H13.3333V13.3333H10Z" /></svg>통계</button>
+      <button id="tab-sessions" aria-pressed="false"><svg viewBox="-3 -3 20 20" aria-hidden="true"><path d="M9.25 14C8.625 14 8.09375 13.7812 7.65625 13.3438C7.21875 12.9062 7 12.375 7 11.75C7 11.125 7.21875 10.5938 7.65625 10.1562C8.09375 9.71875 8.625 9.5 9.25 9.5C9.875 9.5 10.4062 9.71875 10.8438 10.1562C11.2812 10.5938 11.5 11.125 11.5 11.75C11.5 12.375 11.2812 12.9062 10.8438 13.3438C10.4062 13.7812 9.875 14 9.25 14ZM10.7546 8.5C9.57097 8.5 8.56597 8.08833 7.73958 7.265C6.91319 6.44167 6.5 5.43819 6.5 4.25458C6.5 3.07097 6.91167 2.06597 7.735 1.23958C8.55833 0.413194 9.56181 0 10.7454 0C11.929 0 12.934 0.411667 13.7604 1.235C14.5868 2.05833 15 3.06181 15 4.24542C15 5.42903 14.5883 6.43403 13.765 7.26042C12.9417 8.08681 11.9382 8.5 10.7546 8.5ZM3.02354 12C2.19215 12 1.48035 11.7083 0.888125 11.125C0.296042 10.5417 0 9.83333 0 9C0 8.16667 0.291667 7.45833 0.875 6.875C1.45833 6.29167 2.16667 6 3 6C3.83333 6 4.54167 6.29167 5.125 6.875C5.70833 7.45833 6 8.16667 6 9C6 9.83333 5.71181 10.5417 5.13542 11.125C4.55903 11.7083 3.85507 12 3.02354 12Z" /></svg>대화</button>
+      <button id="tab-users" aria-pressed="false"><svg viewBox="-3 -3 20 20" aria-hidden="true"><path d="M7 7a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zm0 1.5c-2.3 0-7 1.2-7 3.5V14h14v-2c0-2.3-4.7-3.5-7-3.5z" /></svg>회원</button>
+      <button id="tab-starters" aria-pressed="false"><svg viewBox="-3 -3 20 20" aria-hidden="true"><path d="M0 6.61765V5.29412H1.27273V6.61765H0ZM6.25758 15C6.0101 15 5.76557 14.9479 5.52399 14.8438C5.28241 14.7396 5.07323 14.5956 4.89646 14.4118L1.34343 10.7169L2.01515 10.0184C2.14478 9.88358 2.28914 9.79473 2.44823 9.75184C2.60732 9.70895 2.76936 9.71201 2.93434 9.76103L4.45455 10.1654V4.19118C4.45455 4.00368 4.51518 3.84651 4.63644 3.71967C4.7577 3.59283 4.90796 3.52941 5.0872 3.52941C5.26644 3.52941 5.41793 3.59283 5.54167 3.71967C5.6654 3.84651 5.72727 4.00368 5.72727 4.19118V8.82353H6.57576V6.84301C6.57576 6.65601 6.63639 6.49816 6.75765 6.36949C6.87891 6.24081 7.02917 6.17647 7.20841 6.17647C7.38765 6.17647 7.53914 6.23989 7.66288 6.36673C7.78662 6.49357 7.84849 6.65074 7.84849 6.83824V8.82353H8.69697V7.72059C8.69697 7.53309 8.7576 7.37592 8.87886 7.24908C9.00013 7.12224 9.15038 7.05882 9.32962 7.05882C9.50886 7.05882 9.66035 7.12224 9.78409 7.24908C9.90783 7.37592 9.9697 7.53309 9.9697 7.72059V8.82353H10.8182V8.60294C10.8182 8.41544 10.8788 8.25827 11.0001 8.13143C11.1213 8.0046 11.2716 7.94118 11.4508 7.94118C11.6301 7.94118 11.7816 8.0046 11.9053 8.13143C12.029 8.25827 12.0909 8.41544 12.0909 8.60294V12.1324C12.0909 12.9289 11.8228 13.606 11.2866 14.1636C10.7504 14.7212 10.0993 15 9.33333 15H6.25758ZM0 3.97059V2.64706H1.27273V3.97059H0ZM2.54545 6.61765V5.29412H3.81818V6.61765H2.54545ZM10.1818 6.61765V5.29412H11.4545V6.61765H10.1818ZM12.7273 6.61765V5.29412H14V6.61765H12.7273ZM0 1.32353V0H1.27273V1.32353H0ZM2.54545 1.32353V0H3.81818V1.32353H2.54545ZM5.09091 1.32353V0H6.36364V1.32353H5.09091ZM7.63636 1.32353V0H8.90909V1.32353H7.63636ZM10.1818 1.32353V0H11.4545V1.32353H10.1818ZM12.7273 3.97059V2.64706H14V3.97059H12.7273ZM12.7273 1.32353V0H14V1.32353H12.7273Z" /></svg>초기 질문</button>
+    </nav>
+    <!-- owner 전용 메뉴는 구분선 아래 따로(crema Sidebar.tsx superuser 메뉴 자리). -->
+    <nav class="toolbar" id="toolbar-owner" aria-label="owner 메뉴" hidden>
+      <button id="tab-admins" aria-pressed="false"><svg viewBox="-3 -3 20 20" aria-hidden="true"><path d="M2.333 12.25c-.412 0-.764-.147-1.058-.441A1.443 1.443 0 0 1 .833 10.75V3.25c0-.412.147-.764.442-1.058.294-.294.646-.442 1.058-.442h9.334c.412 0 .764.148 1.058.442.294.294.442.646.442 1.058v7.5c0 .412-.148.764-.442 1.059-.294.294-.646.441-1.058.441H2.333Zm0-1.167h9.334V4.417H2.333v6.666Zm1.75-1.166h2.334V8.75H4.083v1.167Zm0-2.334h5.834V6.417H4.083v1.166Zm0-2.333h5.834V4.083H4.083v1.167Z" /></svg>관리자</button>
+    </nav>
+    <details class="profile">
+      <summary><span class="badge" aria-hidden="true"><svg viewBox="0 0 13.2875 20.0002"><path d="M0.227335 19.7215C1.47239 20.0333 2.7685 20.0839 4.03408 19.8702C6.77616 19.4399 10.0739 17.3851 11.1915 12.6341L13.2834 4.17171C13.2887 4.14974 13.2889 4.12686 13.2841 4.10479C13.2792 4.08272 13.2694 4.06203 13.2554 4.0443C13.2414 4.02656 13.2236 4.01225 13.2032 4.00242C13.1829 3.9926 13.1606 3.98753 13.138 3.98759H9.96478C9.96478 3.98759 8.94718 7.91388 8.75932 8.63407C8.09536 11.1812 6.70494 12.6049 4.76844 12.6174C3.47717 12.6258 2.98982 11.6332 3.3972 9.78497L4.75803 4.16878C4.76307 4.14731 4.76318 4.12498 4.75834 4.10346C4.75349 4.08194 4.74383 4.0618 4.73008 4.04455C4.71632 4.02731 4.69883 4.0134 4.67893 4.0039C4.65902 3.99439 4.63722 3.98953 4.61516 3.98967H1.54942C1.54942 3.98967 0.802572 7.05373 0.31647 8.90233C-0.583256 12.3246 0.429347 15.0009 3.4326 15.2066C5.05044 15.3174 6.45752 14.5302 7.52553 13.5022L7.57842 13.5076C6.96153 15.5815 5.91976 16.732 3.87122 17.1215C2.94456 17.2674 1.99543 17.1264 1.15121 16.7174C1.13457 16.7083 1.11606 16.7031 1.09711 16.7023C1.07816 16.7014 1.05926 16.7048 1.04184 16.7123C1.02442 16.7198 1.00894 16.7312 0.996563 16.7456C0.984191 16.76 0.975263 16.777 0.97044 16.7953L0.229 19.724" fill="#6b7684" /><path d="M5.66809 3.37063C6.53408 3.37063 6.87021 2.71499 7.09056 1.68531C7.30466 0.683119 7.2572 0 6.38913 0C5.52106 0 5.18115 0.683119 4.96663 1.68531C4.74669 2.71458 4.8021 3.37063 5.66809 3.37063Z" fill="#0080FF" /><path d="M8.98492 3.37063C9.85091 3.37063 10.187 2.71499 10.4074 1.68531C10.6219 0.683119 10.574 0 9.70593 0C8.83786 0 8.49798 0.683119 8.28346 1.68531C8.06352 2.71458 8.11685 3.37063 8.98492 3.37063Z" fill="#0080FF" /></svg></span><span class="account" id="account"></span></summary>
+      <div class="profile-menu">
+        <button id="password-change">비밀번호 변경</button>
+        <button id="logout"><svg viewBox="-3 -3 20 20" aria-hidden="true"><path d="M1.5 14C1.0875 14 0.734375 13.8531 0.440625 13.5594C0.146875 13.2656 0 12.9125 0 12.5V1.5C0 1.0875 0.146875 0.734376 0.440625 0.440626C0.734375 0.146876 1.0875 0 1.5 0H7V1.5H1.5V12.5H7V14H1.5ZM10.5 10.5L9.4375 9.4375L11.125 7.75H5V6.25H11.125L9.4375 4.5625L10.5 3.5L14 7L10.5 10.5Z" /></svg>로그아웃</button>
+      </div>
+    </details>
+  </aside>
   <main hidden id="main">
+    <div class="error notice" id="app-error" role="alert" hidden></div>
     <section class="workspace-pane" id="dashboard-pane">
-      <div class="workspace-head"><h2>운영 대시보드</h2><p>비용·대화 품질·사용 시간대를 함께 확인합니다. 모든 기간과 시각은 UTC 기준입니다.</p></div>
-      <form id="dashboard-filters" class="analysis-filters">
-        <label>시작일 (UTC)<input id="dashboard-since" type="date" required /></label>
-        <label>종료일 (UTC)<input id="dashboard-until" type="date" required /></label>
-        <span class="presets" role="group" aria-label="기간 빠른 선택"><button type="button" data-days="7">7일</button><button type="button" data-days="30">30일</button><button type="button" data-days="90">90일</button></span>
-        <label>앱<select id="dashboard-app"><option value="">전체 앱</option></select></label>
-        <button class="primary" type="submit">조회</button>
+      <div class="workspace-head"><h2>대시보드</h2></div>
+      <!-- 전체 현황(누적) — crema 대시보드 '오늘 사용 현황' 자리. 섹션 제목 + 우측 보조 문구. -->
+      <section class="section"><div class="section-head"><h3>전체 사용 현황</h3><span>전체 기간 누적</span></div><div class="stats" id="stats"></div></section>
+      <form id="dashboard-filters" class="crema-filters">
+        <span class="crema-segment" role="group" aria-label="기간 선택"><button type="button" data-range="1" aria-pressed="false">오늘</button><button type="button" data-range="7" aria-pressed="true">최근 7일</button><button type="button" data-range="30" aria-pressed="false">최근 30일</button><button type="button" data-range="90" aria-pressed="false">최근 90일</button><button type="button" data-range="custom" aria-pressed="false">직접</button></span>
+        <span class="crema-period"><b>기간</b><span id="dashboard-range"></span></span>
+        <span class="crema-custom" id="dashboard-custom" hidden><input id="dashboard-since" type="date" aria-label="시작일" required /> ~ <input id="dashboard-until" type="date" aria-label="종료일" required /><button class="crema-button" type="submit">조회</button></span>
       </form>
+      <p class="crema-note">모든 기간과 시각은 <span class="tz"></span> 기준입니다.</p>
       <div id="dashboard" class="dashboard-content" aria-live="polite"></div>
     </section>
-    <section class="workspace-pane" id="data-pane" hidden>
-      <div class="workspace-head"><h2>데이터 탐색</h2><p>원본 기록을 조회합니다. 행을 선택하면 전체 필드를 확인하고, 권한이 있으면 회원·초기 질문을 편집할 수 있습니다.</p></div>
-      <form id="data-filters" class="analysis-filters">
-        <label>데이터<select id="dataset"></select></label>
-        <label>검색<input id="data-q" placeholder="검색어" /></label>
-        <label>시작일 (UTC)<input id="data-since" type="date" /></label>
-        <label>종료일 (UTC)<input id="data-until" type="date" /></label>
-        <label>정렬<select id="data-sort"></select></label>
-        <label>순서<select id="data-direction"><option value="desc">내림차순</option><option value="asc">오름차순</option></select></label>
-        <label id="data-status-label">상태<select id="data-status"></select></label>
-        <label id="data-app-label">앱<select id="data-app"><option value="">전체 앱</option></select></label>
-        <label id="data-null-label" hidden>종료 상태<select id="data-status-null"><option value="">전체</option><option value="true">미기록 (NULL)</option></select></label>
-        <span class="exact-filters" id="data-exact"></span>
-        <button class="primary" type="submit">검색</button><button type="reset">초기화</button>
+    <!-- 통계: crema-ai-admin Statistics 화면 구성(제목 → 서브탭 → 기간 바 → 카드 → 추이 → 요일 → 표). 색·크기는 admin.css --crema-* 토큰. -->
+    <section class="workspace-pane" id="statistics-pane" hidden>
+      <div class="workspace-head"><h2>통계</h2></div>
+      <div class="crema-tabs" id="statistics-views" role="group" aria-label="지표 묶음"><button data-view="all" aria-pressed="true">전체</button><button data-view="session" aria-pressed="false">세션</button><button data-view="query" aria-pressed="false">질의</button><button data-view="click" aria-pressed="false">클릭</button></div>
+      <form id="statistics-filters" class="crema-filters">
+        <span class="crema-segment" role="group" aria-label="기간 선택"><button type="button" data-range="1" aria-pressed="false">오늘</button><button type="button" data-range="7" aria-pressed="true">최근 7일</button><button type="button" data-range="month" aria-pressed="false">이번 달</button><button type="button" data-range="last-month" aria-pressed="false">지난 달</button><button type="button" data-range="custom" aria-pressed="false">직접</button></span>
+        <span class="crema-period"><b>기간</b><span id="statistics-range"></span></span>
+        <span class="crema-custom" id="statistics-custom" hidden><input id="statistics-since" type="date" aria-label="시작일" required /> ~ <input id="statistics-until" type="date" aria-label="종료일" required /><button class="crema-button" type="submit">조회</button></span>
       </form>
-      <div class="saved-queries">
-        <label>저장된 조회<select id="saved-query"><option value="">선택하세요</option></select></label>
-        <button id="saved-load">불러오기</button><button id="saved-delete">삭제</button>
-        <label>조회 이름<input id="saved-name" placeholder="이 브라우저에 저장할 이름" /></label><button id="saved-save">적용 조건 저장·덮어쓰기</button>
-        <span id="saved-status" role="status">검색 조건만 이 브라우저에 저장합니다.</span>
-      </div>
-      <div class="data-actions"><span id="data-description"></span><span id="data-tools"></span><button id="csv" disabled>현재 페이지 CSV</button><button id="csv-all" disabled>조건 전체 CSV</button><button id="csv-cancel" hidden>다운로드 취소</button></div>
-      <p id="export-status" class="analysis-note" role="status"></p>
-      <div id="data" aria-live="polite"></div>
-      <div class="pager"><button id="data-prev">‹ 이전</button><span id="data-page-info"></span><button id="data-next">다음 ›</button></div>
+      <p class="crema-note">모든 날짜는 <span class="tz"></span> 기준입니다. 기간 요약은 일별 값의 합이 아니라 기간 전체로 다시 셉니다.</p>
+      <div id="statistics" class="crema-content bleed pad" aria-live="polite"></div>
+    </section>
+    <!-- 회원: 한 번이라도 대화한 회원(chat_turn) — 닉네임(대화한 회원 안)·회원번호(전체, 정확 일치) 검색 + 표. 행을 누르면 옆 패널에서 이용 가능 토글(editor 이상)·대화 보기. -->
+    <section class="workspace-pane" id="users-pane" hidden>
+      <div class="workspace-head"><h2>회원</h2></div>
+      <form class="crema-filters" id="users-filters">
+        <label class="crema-search"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8.5 3a5.5 5.5 0 0 1 4.38 8.83l3.65 3.64-1.06 1.06-3.64-3.65A5.5 5.5 0 1 1 8.5 3zm0 1.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" /></svg><input type="search" id="users-q" aria-label="회원 검색" placeholder="닉네임 또는 회원번호 검색" /></label>
+      </form>
+      <p class="crema-note">한 번이라도 대화한 회원 · 회원번호로 검색하면 전체에서 찾습니다 · 시각은 <span class="tz"></span> 기준입니다.</p>
+      <div class="crema-table-head"><span id="users-info"></span></div>
+      <div class="bleed" id="users" aria-live="polite"></div>
+      <nav class="crema-pager" id="users-pager" aria-label="페이지"></nav>
+    </section>
+    <!-- 초기 질문: 풀 목록(노출 중 먼저). 행을 누르면 옆 패널에서 편집, editor 이상은 수동 추가·지금 생성. -->
+    <section class="workspace-pane" id="starters-pane" hidden>
+      <div class="workspace-head"><h2>초기 질문</h2></div>
+      <div class="crema-table-head"><span id="starters-info"></span><span class="table-tools" id="starters-tools"></span></div>
+      <div class="bleed" id="starters" aria-live="polite"></div>
+      <nav class="crema-pager" id="starters-pager" aria-label="페이지"></nav>
     </section>
     <section class="workspace-pane" id="admins-pane" hidden>
-      <div class="workspace-head"><h2>관리자 계정</h2><p>계정을 만들고 역할·활성 상태를 바꿉니다. 행을 선택하면 편집과 비밀번호 재설정을 할 수 있습니다.</p></div>
-      <form id="admin-create" class="analysis-filters">
-        <label>계정명<input id="admin-username" required autocomplete="off" autocapitalize="none" /></label>
-        <label>초기 비밀번호<input id="admin-password" type="password" required autocomplete="new-password" /></label>
-        <label>역할<select id="admin-role"></select></label>
-        <button class="primary" type="submit">계정 생성</button>
-      </form>
-      <p id="admin-create-status" class="analysis-note" role="status"></p>
-      <div id="admins" aria-live="polite"></div>
+      <div class="workspace-head"><h2>관리자</h2></div>
+      <div class="crema-table-head"><span id="admins-info"></span><button class="primary" id="admin-create" type="button">계정 생성</button></div>
+      <div class="bleed" id="admins" aria-live="polite"></div>
     </section>
-    <section class="list-pane" id="list-pane" hidden>
-      <form class="filters" id="filters">
-        <input id="q" aria-label="대화 검색" placeholder="세션 id 또는 대화 내용 검색" />
-        <div class="row">
-          <input id="since" type="date" aria-label="시작일(갱신 시각 기준)" />
-          <input id="until" type="date" aria-label="종료일(갱신 시각 기준)" />
-          <button class="primary" type="submit">검색</button>
-        </div>
-        <button type="reset">검색 초기화</button>
-      </form>
-      <div class="sessions" id="sessions" aria-live="polite"></div>
-      <div class="pager">
-        <button id="prev">‹ 이전</button>
-        <span id="page-info"></span>
-        <button id="next">다음 ›</button>
+    <!-- 대화: crema-ai-admin QueryAnalysis.tsx(목록)·QueryDetail.tsx(상세). 넓은 화면은 T자(위 조회 바 전체 폭, 아래 목록|상세 상시 분할), 좁은 화면은 목록→상세 한 칸. -->
+    <section class="workspace-pane" id="sessions-pane" hidden>
+      <div id="sessions-top" class="bleed pad">
+        <div class="workspace-head"><h2>대화</h2></div>
+        <form class="crema-filters" id="filters">
+          <span class="crema-segment" id="sessions-range" role="group" aria-label="기간 선택"><button type="button" data-days="" aria-pressed="true">전체</button><button type="button" data-days="1" aria-pressed="false">오늘</button><button type="button" data-days="7" aria-pressed="false">최근 7일</button><button type="button" data-days="30" aria-pressed="false">최근 30일</button><button type="button" data-days="custom" aria-pressed="false">직접</button></span>
+          <span class="crema-custom" id="sessions-custom" hidden><input id="since" type="date" aria-label="시작일" /> ~ <input id="until" type="date" aria-label="종료일" /></span>
+          <label class="crema-search"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8.5 3a5.5 5.5 0 0 1 4.38 8.83l3.65 3.64-1.06 1.06-3.64-3.65A5.5 5.5 0 1 1 8.5 3zm0 1.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" /></svg><input type="search" id="q" aria-label="대화 검색" placeholder="세션 id·회원번호 또는 대화 내용 검색" /></label>
+        </form>
+        <div class="crema-table-head"><span id="page-info"></span><span class="table-tools"><button class="crema-download" id="sessions-csv" type="button">엑셀 다운로드</button></span></div>
+        <p class="crema-note">기간은 대화의 최근 갱신 시각(<span class="tz"></span>) 기준입니다.</p>
       </div>
-    </section>
-    <section class="detail-pane" id="detail" hidden>
-      <div class="placeholder">목록에서 대화를 선택하세요.</div>
+      <div id="sessions-list" class="bleed pad">
+        <div class="bleed" id="sessions" aria-live="polite"></div>
+        <nav class="crema-pager" id="sessions-pager" aria-label="페이지"></nav>
+      </div>
+      <div class="bleed pad" id="detail"></div>
     </section>
   </main>
 </div>
+<!-- 옆 패널(비모달 dialog) — 회원·초기 질문·관리자 행 상세와 관리 폼이 같은 자리를 쓴다. 폼은 #record-actions에 붙는다. -->
 <dialog id="record-dialog" aria-labelledby="record-title">
-  <div class="dialog-head"><h2 id="record-title">기록 상세</h2><button id="record-conversation" hidden>대화 열기</button><button id="record-copy">JSON 복사</button><button id="record-close">닫기</button></div>
+  <div class="dialog-head"><h2 id="record-title">기록 상세</h2><button id="record-close" aria-label="닫기">×</button></div>
   <div id="record-actions"></div>
-  <p id="copy-status" role="status"></p><pre id="record-json"></pre>
+  <div id="record-view"></div>
 </dialog>
 
-<!-- 정확 일치 필터 한 칸 — 데이터셋 메타데이터(exact_filters)의 키마다 복제한다. -->
-<template id="exact-template"><label><span></span><input placeholder="정확히 일치하는 값" /></label></template>
 <!-- 차트 SVG 뿌리 — admin_charts.js가 복제하고 네임스페이스를 여기서 파생한다(URL 리터럴 없이). -->
 <template id="chart-template"><svg class="chart"></svg></template>
+<!-- 엑셀 다운로드 아이콘(crema-ai-admin Statistics.tsx DownloadIcon 경로). -->
+<template id="download-icon"><svg class="crema-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="M9 11.625L5.625 8.25L6.6375 7.2L8.25 8.8125V3H9.75V8.8125L11.3625 7.2L12.375 8.25L9 11.625ZM4.5 15C4.0875 15 3.73438 14.8531 3.44063 14.5594C3.14688 14.2656 3 13.9125 3 13.5V11.25H4.5V13.5H13.5V11.25H15V13.5C15 13.9125 14.8531 14.2656 14.5594 14.5594C14.2656 14.8531 13.9125 15 13.5 15H4.5Z" /></svg></template>
 
-<script type="module" src="/static/lib/admin.js"></script>
+<script type="module" src="/static/lib/admin.js?v=17"></script>
 </html>

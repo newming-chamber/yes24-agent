@@ -304,26 +304,20 @@ class AdminTx:
         editable: tuple[str, ...],
         changes: dict,
         expected: dict | None,
-        *,
-        scope: dict[str, Any] | None = None,
     ) -> tuple[dict, dict]:
         """편집 프로토콜 한 벌(§5.3): 잠금 선조회 → expected 대조 → 같은 값 제거 → UPDATE.
 
         rowcount로 판정하지 않는다(값이 같으면 0). 비교는 행 값과 `==`다 — expected·changes는
-        호출부 모델이 컬럼 타입으로 맞춘 값이다(TINYINT 1 == True, date == date). `scope`는
-        소속 조건(열 = 값 동등, 예: 키가 그 회원 것인가)이라 어긋나면 행이 없는 것과 같이 404다.
-        컬럼명(editable·scope 키)은 SQL에 보간되므로 호출부 상수여야 하고, changes·expected의
+        호출부 모델이 컬럼 타입으로 맞춘 값이다(TINYINT 1 == True, date == date). 행이 없으면 404다.
+        컬럼명(editable)은 SQL에 보간되므로 호출부 상수여야 하고, changes·expected의
         `editable` 밖 키는 여기서 422로 끊는다. 감사는 target_type을 아는 호출부 몫.
         """
         stray = (set(changes) | set(expected or ())) - set(editable)
         if stray:
             raise HTTPException(status_code=422, detail=f"편집할 수 없는 필드: {sorted(stray)}")
-        scope = scope or {}
         columns = ", ".join(f"`{column}`" for column in editable)
-        conditions = "".join(f" AND `{column}` = %s" for column in scope)
         await self.cur.execute(
-            f"SELECT {columns} FROM `{table}` WHERE id = %s{conditions} FOR UPDATE",
-            (row_id, *scope.values()),
+            f"SELECT {columns} FROM `{table}` WHERE id = %s FOR UPDATE", (row_id,)
         )
         row = await self.cur.fetchone()
         if row is None:
@@ -650,15 +644,27 @@ class _AdminEdit(EditBody):
     changes: _AdminChanges
 
 
-def _actor_body(actor: AdminActor) -> dict[str, Any]:
-    return {"id": actor.user_id, "username": actor.username, "role": actor.role}
-
-
 def register_admin_auth(app: FastAPI, settings: Settings) -> None:
     """관리자 인증·계정 라우트 등록 — `admin_enabled(settings)`일 때만."""
     if not admin_enabled(settings):
         return
     router = APIRouter(prefix=_COOKIE_PATH, include_in_schema=False)
+
+    def me_body(actor: AdminActor) -> dict[str, Any]:
+        """로그인 응답과 /me의 한 모양. 계정 id는 화면이 쓰지 않아 싣지 않는다(내부 식별자).
+
+        roles = 권한 순서(낮음→높음) — 프론트가 역할 비교표를 따로 들지 않게 정본을 싣는다.
+        timezone = 어드민 표시 시간대(오프셋·라벨) — 화면의 시각 표기·기간 프리셋의 '오늘'이 따른다.
+        """
+        return {
+            "username": actor.username,
+            "role": actor.role,
+            "roles": list(ROLES),
+            "timezone": {
+                "offset_hours": settings.admin_utc_offset_hours,
+                "label": settings.admin_timezone_label,
+            },
+        }
 
     @app.exception_handler(RequestValidationError)
     async def admin_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -695,7 +701,7 @@ def register_admin_auth(app: FastAPI, settings: Settings) -> None:
             )
         if result.status == "failed":
             return JSONResponse({"detail": _LOGIN_FAILED}, status_code=401)
-        response = JSONResponse(_actor_body(result.actor))
+        response = JSONResponse(me_body(result.actor))
         response.set_cookie(
             ADMIN_COOKIE,
             result.token,
@@ -722,8 +728,7 @@ def register_admin_auth(app: FastAPI, settings: Settings) -> None:
 
     @router.get("/api/me")
     async def me(actor: AdminActor = Depends(require_admin)) -> dict[str, Any]:
-        """roles = 권한 순서(낮음→높음). 프론트가 역할 비교표를 따로 들지 않게 정본을 싣는다."""
-        return {**_actor_body(actor), "roles": list(ROLES)}
+        return me_body(actor)
 
     @router.post("/api/me/password")
     async def change_password(
