@@ -190,6 +190,14 @@ class SourceFormat(TypedDict, total=False):
     sale_price: int | float | None
 
 
+class SourceEbookEdition(TypedDict, total=False):
+    """종이책 상세가 함께 연 eBook 판. 키 생략은 미관측이다."""
+
+    url: str
+    in_cremaclub: bool
+    cremaclub_url: str
+
+
 class SourceCard(BaseModel):
     """인용·카드·자료 탭이 공유하는 공개 출처. 미관측 필드는 보내지 않는다."""
 
@@ -230,6 +238,20 @@ class SourceCard(BaseModel):
         default=None,
         description="이 출처에서 관측한 다른 판형. []는 관측했으나 없음, 키 생략은 미관측."
         " 판형 링크 자체에 별도 인용 번호를 부여하지 않는다",
+    )
+    ebook_edition: SourceEbookEdition | None = Field(
+        default=None,
+        description="종이책 출처가 함께 관측한 eBook 판. 키 생략은 미관측, null은 eBook 판 없음."
+        " {url}만 있으면 크레마클럽 여부 미확인, in_cremaclub=false는 미등록,"
+        " true면 cremaclub_url(클럽 상세 링크)이 함께 온다",
+    )
+    in_cremaclub: bool | None = Field(
+        default=None,
+        description="전자책 출처의 크레마클럽 등록 여부. 키 생략은 미확인."
+        " 종이책의 클럽 여부는 ebook_edition.in_cremaclub에 싣는다",
+    )
+    cremaclub_url: str | None = Field(
+        default=None, description="전자책 출처가 크레마클럽에 등록됐을 때만 오는 클럽 상세 링크"
     )
 
     @model_serializer(mode="wrap")

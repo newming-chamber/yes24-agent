@@ -234,6 +234,7 @@ thinking/refs는 done.process.steps에 저장되지 않는다. 복원 시 thinki
 - `sale_price`가 숫자면 표시하며 **0도 유효**하다. 없음/null을 0원으로 바꾸지 않는다.
 - `other_formats` 없음 = 미관측, `[]` = 관측했으나 없음. 판형의 `sale_price:null`은 가격 미상이다.
 - 크레마클럽 여부는 `in_cremaclub`(그 상품) 또는 `ebook_edition.in_cremaclub`(연결 eBook 판) 한 곳에만 있다. 두 키 모두 없으면 **확인하지 않은 것**이지 "클럽에 없음"이 아니다.
+- 크레마클럽 링크는 등록(`in_cremaclub:true`)일 때만 같은 객체의 `cremaclub_url`로 온다(종이책은 `ebook_edition.cremaclub_url`, 전자책은 최상위 `cremaclub_url`). 프론트가 URL을 조립하지 않는다 — 키가 없으면 클럽 링크를 그리지 않는다. 성인 상품은 등록돼 있어도 `false`로 올 수 있다(서버가 확인할 수 없는 사각).
   다른 판형 링크만 관측했다고 별도 인용 번호가 생기지 않는다.
 - 자료 탭은 **질문별로 해당 턴 sources를 그룹화**한다. 전체/도서/문서/웹 필터와 종류별 건수,
   빈 상태를 제공한다. 데스크톱 3열·모바일 1열은 내장 HTML의 표시 정책이지 서버 계약은 아니다.
@@ -276,8 +277,9 @@ thinking/refs는 done.process.steps에 저장되지 않는다. 복원 시 thinki
 | is_book, is_ebook | boolean / null | 관측 속성 참고. 렌더링 선택은 card_type 사용 |
 | sale_index, page_count, rank | number / null | 판매지수·쪽수·순위. 관측됐을 때만 제공 |
 | other_formats | 배열 / null | `{format?:string|null,url?:string|null,sale_price?:number|null}` 목록 |
-| ebook_edition | 객체 / null | 종이책 출처에 붙는 연결 eBook 판의 크레마클럽 여부. `{url, in_cremaclub?}` — `in_cremaclub` 키가 없으면 확인하지 못한 것, 값이 `null`이면 eBook 판이 없는 것, 키 자체가 없으면 관측 대상이 아닌 페이지다 |
-| in_cremaclub | boolean | 전자책 출처 자신의 크레마클럽 등록 여부(전자책 상세에서만 관측된다) |
+| ebook_edition | 객체 / null | 종이책 출처에 붙는 연결 eBook 판. `{url, in_cremaclub?, cremaclub_url?}` — `ebook_edition` 자체가 `null`이면 eBook 판이 없는 것, 키 자체가 없으면 미관측. `{url}`만이면 클럽 여부 미확인, `in_cremaclub:false`는 미등록, `true`면 `cremaclub_url`이 함께 온다 |
+| in_cremaclub | boolean | 전자책 출처 자신의 크레마클럽 등록 여부. 키 없음 = 미확인 |
+| cremaclub_url | string | 전자책 출처가 크레마클럽에 등록됐을 때만 오는 클럽 상세 링크 |
 
 키 생략과 null은 모두 표시할 값을 제공하지 않는 경우다. `0`과 `false`를 결측으로 지우지 않는다.
 가격의 표시 여부는 `typeof sale_price === "number"`로 확인한다. 내부 snippet은 받지 않는다.

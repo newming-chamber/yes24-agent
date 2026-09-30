@@ -195,14 +195,6 @@ PRODUCT_PAGE_COUNT_FIELD = "쪽수"
 PRODUCT_GOODS_NO_JS_RE = r"g_GoodsNo\s*=\s*'(\d+)'"
 PRODUCT_GOODS_NAME_JS_RE = r"g_GoodsName\s*=\s*'([^']+)'"
 PRODUCT_IS_EBOOK_JS_RE = r"g_isEbook\s*=\s*'([YN])'"
-# 크레마클럽 등록 배지(제목 영역 keynote). 전자책 상세에서 클럽 상품이면 정확히 1개, 아니면
-# 0개다(2026-09-14 실측: 클럽 135/135, 비클럽 0/116, 클럽 상세 경로 교차 확인 90/90 일치).
-# 종이책 상세엔 렌더되지 않는다. 쓰지 않는 신호: braze `cremaclubGoodsYn`(클럽 28/143이 'N'),
-# 해시태그 "#크레마클럽에있어요"(편집 태그 — 누락·종이책 부착), GNB 클럽 메뉴(공통 템플릿).
-# 판정 단위는 이 상품(goods_no)이다 — 오리지널 클럽 전용판처럼 goods_no가 다른 같은 작품은
-# 이 신호로 알 수 없다. 오디오북 상세도 g_isEbook='Y'이고 배지 슬롯·렌더 구조가 전자책과 같다
-# (2026-09-15 실측: 클럽 오디오북 125104374 배지 1) — g_isEbook 게이트가 관측 가능 집합과 일치한다.
-PRODUCT_CREMACLUB_BADGE = "#spanGdKeynote span.iconC.bClub"
 PRODUCT_SALE_PRICE_JS_RE = r"g_GoodsSalePrice\s*=\s*([\d.]+)"
 # 정가(할인 전 가격). 목록의 취소선 표기(ITEM_LIST_PRICE)와 같은 값이며, 같은 이유로 뽑는다.
 # 할인 폭 전역(g_GoodsDiscountShopPrice)은 두 값의 차라 뽑지 않는다 — 변수명이 이 패턴의
@@ -217,7 +209,12 @@ PRODUCT_LIST_PRICE_JS_RE = r"g_GoodsShopPrice\s*=\s*([\d.]+)"
 # em.txC_blue 하나로, 없는 판형(중고상품)도 있으므로 없으면 None으로 둔다. 링크 셀렉터는
 # 컨테이너로 스코프된 한 줄이다 — 목록판(ITEM_FORMAT_LINK)과 같은 꼴이라 파서가 헬퍼 하나로
 # 두 마크업을 읽는다. 컨테이너 상수는 extract_links가 위젯을 통째로 걷어낼 때 따로 쓴다.
-PRODUCT_FORMAT_CONTAINER = "#divFormatInfo"
+# 컨테이너는 **클래스**로 잡는다: id `divFormatInfo`는 종이책 상세에만 붙고 전자책 상세의 같은
+# 위젯("종이책 13,500원 이동")은 id 없는 `div.gd_formatInfo`다(2026-09-30 실측 저장본 125건:
+# 클래스는 종이책·전자책 전부 1개, id는 종이책 2건뿐). id로 잡던 동안 전자책 상세의
+# other_formats는 늘 빈 목록이었다 — 관측 못 한 것을 "판형 없음"으로 접은 결함이다. 위젯이
+# 있고 링크가 없으면(빈 ul, 56건) 그것이 진짜 "판형 없음"이다.
+PRODUCT_FORMAT_CONTAINER = "div.gd_formatInfo"
 PRODUCT_FORMAT_LINK = f"{PRODUCT_FORMAT_CONTAINER} a.formatLnk"
 PRODUCT_FORMAT_PRICE = "em.txC_blue"
 
@@ -313,7 +310,8 @@ CREMACLUB_ORIGINAL_EPISODE_INFO = ".info_pub"
 # 실측 결과 대소문자가 페이지마다 혼용된다 — 검색/베스트셀러/신간은 소문자
 # "/product/goods/{id}"인데, 크레마클럽 리뷰 건수 링크는
 # "/Product/Goods/{id}?ReviewYn=Y"로 대문자 혼용. 반드시 대소문자 무시로 매칭해야 한다.
-LINK_PRODUCT_PATH_RE = rf"(?i)^{GOODS_PATH}\d+"
+# 캡처 그룹 1은 goods_no다(urls.goods_no_from_url이 판형 링크에서 eBook 판 번호를 읽는다).
+LINK_PRODUCT_PATH_RE = rf"(?i)^{GOODS_PATH}(\d+)"
 
 # yes24.com 계열 서브도메인이지만 콘텐츠 탐색에 쓸모없는 노이즈로 실측 확인된 것들
 # (goods_paper.html/bestseller_domestic_sample.html의 모든 <a href> 전수 조사 기준).

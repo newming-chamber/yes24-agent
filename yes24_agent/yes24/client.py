@@ -8,6 +8,7 @@
 
 import asyncio
 import codecs
+import http.cookiejar
 import re
 import time
 from collections import OrderedDict
@@ -254,6 +255,7 @@ class Yes24Client:
         burst: int | None = None,
         cache: Yes24TextCache | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        persist_cookies: bool = True,
     ) -> None:
         self._allowed_domain = allowed_domain(base_url)
         self._error_redirect_param = error_redirect_param
@@ -281,6 +283,13 @@ class Yes24Client:
             headers={"User-Agent": user_agent},
             follow_redirects=False,
             transport=transport,
+            # persist_cookies=False면 모든 도메인을 막는 정책의 쿠키 저장소를 둔다 — Set-Cookie를
+            # 저장하지도 요청에 싣지도 않는다(서버가 세션 단위로 요청을 직렬화하는 경로용).
+            # httpx.Cookies로 감싸 넘기면 클라이언트가 기본 정책의 새 저장소로 복사해 정책이
+            # 사라진다 — CookieJar를 그대로 넘겨야 그 저장소가 쓰인다.
+            cookies=None
+            if persist_cookies
+            else http.cookiejar.CookieJar(http.cookiejar.DefaultCookiePolicy(allowed_domains=[])),
         )
 
     @classmethod
@@ -293,6 +302,9 @@ class Yes24Client:
         burst: int | None = None,
         cache: Yes24TextCache | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        timeout_s: float | None = None,
+        max_retries: int | None = None,
+        persist_cookies: bool = True,
     ) -> "Yes24Client":
         """`Settings` 값을 생성자 파라미터로 매핑하는 편의 팩토리.
 
@@ -300,16 +312,18 @@ class Yes24Client:
         주입할 수 있게 열어 둔다(미지정이면 settings 기본). 나머지 정책(타임아웃·백오프·
         도메인/robots 게이트)은 경로와 무관하게 동일하다. `cache`는 호출자가 만들어
         주입한다 — 채팅·매트릭스 클라이언트가 **같은 캐시 인스턴스**를 공유해야 하므로
-        여기서 새로 만들지 않는다(미주입이면 캐시 없음 = 기존 동작).
+        여기서 새로 만들지 않는다(미주입이면 캐시 없음 = 기존 동작). `timeout_s`·
+        `max_retries`·`persist_cookies`는 곁가지 관측(크레마클럽 조회) 같은 전용 경로가 자기
+        정책을 주입하는 자리다(미지정이면 settings 기본·쿠키 유지).
         """
         return cls(
             base_url=settings.yes24_base_url,
             user_agent=settings.user_agent,
-            timeout_s=settings.http_timeout_s,
+            timeout_s=settings.http_timeout_s if timeout_s is None else timeout_s,
             connect_timeout_s=settings.http_connect_timeout_s,
             concurrency=settings.http_concurrency if concurrency is None else concurrency,
             rps=settings.http_rps if rps is None else rps,
-            max_retries=settings.http_max_retries,
+            max_retries=settings.http_max_retries if max_retries is None else max_retries,
             backoff_base_s=settings.http_backoff_base_s,
             max_redirects=settings.http_max_redirects,
             max_replacement_ratio=settings.http_max_replacement_char_ratio,
@@ -318,6 +332,7 @@ class Yes24Client:
             burst=burst,
             cache=cache,
             transport=transport,
+            persist_cookies=persist_cookies,
         )
 
     async def get_text(self, url: str, *, cache_ttl_s: float | None = None) -> str:
@@ -343,6 +358,21 @@ class Yes24Client:
                 url, lambda: self._fetch_text(url), ttl_s=cache_ttl_s
             )
         return await self._fetch_text(url)
+
+    async def get_status_text(self, url: str) -> tuple[int, str]:
+        """단일 홉 GET — 리다이렉트를 따라가지 않고 (상태 코드, 본문)을 돌려준다(캐시 없음).
+
+        응답의 종류 자체가 판정 입력인 곁가지 관측(크레마클럽 조회)용이다: get_text는 3xx를
+        추종하거나(Location 없으면 그 본문을 최종 문서로) 204를 빈 문자열로 돌려줘, 호출자가
+        "200 문서"와 구분할 수 없다. 검증·재시도·4xx/5xx 예외·디코딩은 get_text와 같다.
+        """
+        self._validate_target(url, original_url=url)
+        async with self._semaphore:
+            response = await self._fetch_once(url, original_url=url)
+            text = _decode_response(
+                response, url=url, max_replacement_ratio=self._max_replacement_ratio
+            )
+            return response.status_code, text
 
     async def _fetch_text(self, url: str) -> str:
         """검증을 마친 URL을 실제로 fetch한다(리다이렉트 추종·재시도·디코딩)."""

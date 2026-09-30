@@ -485,6 +485,25 @@ class Settings(BaseSettings):
     # 링크 팔로우로 차단 경로가 흘러들 수 있으므로 client.get_text가 도메인 검증과 **같은 층에서**
     # 판정해 요청 자체를 막는다(도구별 필터는 우회 경로가 생긴다 — 게이트는 한 곳).
     yes24_disallowed_paths: list[str] = ["/goods/", "/member/"]
+    # 크레마클럽 등록 관측(tools.cremaclub). eBook goods_no로 클럽 상세를 GET하면 등록 상품은
+    # 상세 문서, 미등록은 200 + alert 스크립트가 온다(2026-09-28 실측: eBook 상세 배지와 123/123
+    # 일치, p50 0.087s). **쿠키 없는 전용 클라이언트**로 보낸다 — 세션 쿠키를 실으면 서버가
+    # 같은 세션 요청을 직렬화해 동시 10건이 4.7s(무쿠키 0.22s, 무쿠키 동시 30건까지 무탈).
+    # 정중함 경계는 이 동시성 하나다(rps 스로틀 없음 — 요청 1건이 ~0.1s라 동시성이 곧 속도
+    # 상한이다). **실효 상한은 cremaclub_budget_s 하나다**: 한 도구 호출의 클럽 조회 배치 전체
+    # (세마포어 대기 포함)가 이 벽시계 안에 끝나지 않으면 남은 행은 "미확인"(키 없음)으로 두고
+    # 결과를 그대로 낸다. 요청은 재시도하지 않고(1회 시도, 실패=미확인), 요청 타임아웃도 이
+    # 예산과 같다 — 장애 시 재시도×세마포어로 검색·코너 결과를 수십 초 붙잡던 경로를 닫는다.
+    # 1.5s = 정상 24행 배치(5폭 × ~0.1s ≈ 0.5s)의 3배 여유.
+    cremaclub_detail_url_template: str = "https://cremaclub.yes24.com/BookClub/Detail/{goods_no}"
+    cremaclub_concurrency: int = 5
+    cremaclub_budget_s: float = 1.5
+    # 클럽 **판정 값** 캐시(client.Yes24TextCache 재사용 — single-flight·고정 TTL·성공만 저장).
+    # 클럽 HTML(~210KB)이 아니라 "1"/"0"만 담고, 미확인은 저장하지 않는다. 등록 여부는 상품
+    # 단위로 드물게 바뀌어 6시간이면 턴·세션 간 재조회를 흡수하면서 표류가 반나절을 넘지 않는다.
+    # 엔트리가 수 바이트라 용량은 넉넉히(한 턴 최대 ~40건 × 동시 세션) 잡는다. 0이면 비활성.
+    cremaclub_cache_ttl_s: float = 21600.0
+    cremaclub_cache_max_entries: int = 4096
     # Yes24 HTTP 짧은 TTL 캐시 + single-flight(client.Yes24TextCache). 매트릭스 16셀이
     # 같은 질문으로 거의 같은 URL(베스트셀러 목록·상품 상세)을 동시 중복 요청하는 버스트가
     # 표적 — TTL 내 재요청은 fetch 없이 즉답, 동시 요청은 키당 1회만 fetch. 성공 응답만

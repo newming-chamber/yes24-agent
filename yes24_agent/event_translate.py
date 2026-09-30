@@ -161,8 +161,9 @@ PUBLIC_RECORD_LIST_FIELDS: dict[str, tuple[str, ...]] = {
 # 그건 사실이라 실어야 한다. 선언하지 않으면 dict가 스칼라 필터에 걸려 공개 DTO뿐 아니라
 # **레지스트리 레코드(settle_sources)에서도** 통째로 사라져 다음 턴이 그 관측을 잃는다
 # (2026-09-15 QA 감사가 지적한 계약 누락 — 2026-09-16 실측으로 확인하고 여기서 닫는다).
+# cremaclub_url은 in_cremaclub이 True일 때만 관측값으로 실린다 — 키 생략이 "클럽 링크 없음"이다.
 PUBLIC_RECORD_FIELDS: dict[str, tuple[str, ...]] = {
-    "ebook_edition": ("url", "in_cremaclub"),
+    "ebook_edition": ("url", "in_cremaclub", "cremaclub_url"),
 }
 
 

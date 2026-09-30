@@ -25,7 +25,7 @@ from google.adk.tools import ToolContext
 from yes24_agent.config import get_settings
 from yes24_agent.sources import now_checked_at
 from yes24_agent.tools.yes24_fetch import open_page, register_page
-from yes24_agent.tools.yes24_search import get_client
+from yes24_agent.tools.yes24_search import get_client, observes_cremaclub
 from yes24_agent.yes24.client import Yes24FetchError
 
 logger = logging.getLogger(__name__)
@@ -49,13 +49,13 @@ async def fetch_many(items: list[dict], tool_context: ToolContext) -> dict:
         인용 대상(source_id)이 된다. 상한을 넘겨 열지 않은 항목이 있으면 dropped_count·
         dropped_urls·message로 무엇을 안 열었는지 명시한다. items 자체가 목록이 아니거나
         비었거나 전체 열람이 실패하면 status="error"이며, result_count는 성공 건수다.
-        상품 상세의 ebook_edition(eBook 판의 url·크레마클럽 여부)은 yes24_fetch와 같다.
+        상품 상세의 크레마클럽 여부(in_cremaclub·ebook_edition·cremaclub_url)는 yes24_fetch와 같다.
     """
-    return await fetch_pages(items, tool_context, observe_formats=True)
+    return await fetch_pages(items, tool_context, observe_formats=observes_cremaclub())
 
 
 async def fetch_pages(items: list[dict], tool_context, observe_formats: bool = False) -> dict:
-    """fetch_many 본체. observe_formats(eBook 판형 관측)는 도구만 켜고 오버뷰는 끈다."""
+    """fetch_many 본체. observe_formats(크레마클럽 관측)는 도구만 켜고 오버뷰는 끈다."""
     if not isinstance(items, list):
         return {
             "status": "error",
@@ -103,7 +103,7 @@ async def fetch_pages(items: list[dict], tool_context, observe_formats: bool = F
 
     valid_urls = [url for url in plan if url]
 
-    # url마다 "주 요청 → 파싱 → (도구면) 판형 요청"을 한 체인(open_page)으로 gather한다.
+    # url마다 "주 요청 → 파싱 → (도구면) 크레마클럽 조회"를 한 체인(open_page)으로 gather한다.
     # return_exceptions=True로 개별 실패를 값으로 받는다(등록은 아래 순차 루프 — 레이스 0).
     parse_lock = asyncio.Lock()
     parsed = await asyncio.gather(

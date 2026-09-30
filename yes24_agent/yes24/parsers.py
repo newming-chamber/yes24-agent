@@ -57,7 +57,6 @@ from yes24_agent.yes24.selectors import (
     LINK_PRODUCT_PATH_RE,
     NO_RESULTS_MARKER,
     PRODUCT_AUTHOR,
-    PRODUCT_CREMACLUB_BADGE,
     PRODUCT_FORMAT_CONTAINER,
     PRODUCT_FORMAT_LINK,
     PRODUCT_FORMAT_PRICE,
@@ -122,10 +121,12 @@ _ITEM_FIELDS = (
     "features",
     "image_url",
     "is_ebook",
+    # 크레마클럽 관측(tools.cremaclub.observe_cremaclub이 파싱 뒤에 싣는다 — 파서는 내지 않는다).
+    # 전자책 행은 최상위 in_cremaclub(+등록이면 cremaclub_url), 종이책 행은 ebook_edition(그
+    # eBook 판의 url·in_cremaclub·cremaclub_url 레코드, eBook 판이 없으면 None)이다. 주어는 그
+    # 값이 앉은 객체라 이름은 한 벌뿐이며, 종이책 최상위엔 클럽 여부가 따로 실리지 않는다.
     "in_cremaclub",
-    # 종이책 상세가 함께 연 eBook 판(yes24_fetch.observe_ebook_format이 싣는다) — 그 url과
-    # in_cremaclub을 담은 레코드이거나 None(eBook 판 없음)이다. 주어는 그 값이 앉은 객체라
-    # 이름은 in_cremaclub 하나뿐이며, 종이책 최상위엔 클럽 여부가 따로 실리지 않는다.
+    "cremaclub_url",
     "ebook_edition",
     "episode_info",
     "intro_excerpt",
@@ -376,13 +377,15 @@ def parse_product(html: str, *, base_url: str) -> dict:
     """Yes24 상품 상세 페이지 HTML을 파싱해 상세 정보를 반환한다.
 
     반환 dict 키: goods_no, title, url, author, publisher, pub_date, list_price(int|None),
-    sale_price(int|None), rating(float|None), page_count(int|None), is_ebook(bool),
-    in_cremaclub(bool — 클럽 배지는 전자책 상세에만 렌더돼 전자책이 아니면 관측 불가라 키 없음),
+    sale_price(int|None), rating(float|None), page_count(int|None), is_ebook(bool — 판형 전역변수가
+    없는 문서면 키 없음),
     image_url(str|None),
     other_formats(list[dict]), intro, toc, pub_review, weekly_reviews(list[str]),
     info_tables(dict — 캡션→{라벨: 값}, 표가 없으면 빈 dict).
     텍스트 블록(intro/toc/pub_review)은 없으면 None, weekly_reviews는 없으면 빈 리스트.
-    other_formats는 다른 판형이 없는 상품이면 빈 리스트다(관측했으나 없음).
+    other_formats는 판형 위젯이 있고 다른 판형이 없으면 빈 리스트(관측했으나 없음), 위젯
+    자체가 없는 문서(크레마클럽 상세 등)면 키가 없다(관측 불가 — 빈 목록으로 접지 않는다).
+    크레마클럽 등록 여부는 여기서 내지 않는다(tools.cremaclub이 클럽 상세 경로로 관측한다).
 
     가격·goods_no·eBook 여부는 CSS가 아니라 페이지 인라인 <script>의 전역변수를
     정규식으로 추출한다 — 상세페이지 CSS 가격(em.yes_b)은 번들가·중고가까지 섞여
@@ -411,8 +414,10 @@ def parse_product(html: str, *, base_url: str) -> dict:
         name_match = re.search(PRODUCT_GOODS_NAME_JS_RE, html)
         title = name_match.group(1) if name_match else None
 
+    # 판형 전역변수가 없는 문서(크레마클럽 상세 등)는 키를 생략한다 — False로 접으면 종이책으로
+    # 단정돼 판형·클럽 판정의 입력이 오염된다(_item_fields의 관측-불가 규약).
     is_ebook_match = re.search(PRODUCT_IS_EBOOK_JS_RE, html)
-    is_ebook = is_ebook_match.group(1) == "Y" if is_ebook_match else False
+    observed_format = {"is_ebook": is_ebook_match.group(1) == "Y"} if is_ebook_match else {}
 
     return {
         "goods_no": goods_no,
@@ -425,15 +430,20 @@ def parse_product(html: str, *, base_url: str) -> dict:
         "sale_price": _js_price(html, PRODUCT_SALE_PRICE_JS_RE),
         "rating": _parse_rating(soup.select_one(PRODUCT_RATING)),
         "page_count": _parse_page_count(soup),
-        "is_ebook": is_ebook,
-        **({"in_cremaclub": soup.select_one(PRODUCT_CREMACLUB_BADGE) is not None} if is_ebook else {}),
+        **observed_format,
         **_book_fields(soup),
         "image_url": _image_url_or_none(soup, selector=PRODUCT_IMAGE, attr=PRODUCT_IMAGE_ATTR),
-        "other_formats": _other_formats(
-            soup,
-            link_selector=PRODUCT_FORMAT_LINK,
-            price_selector=PRODUCT_FORMAT_PRICE,
-            base_url=base_url,
+        **(
+            {
+                "other_formats": _other_formats(
+                    soup,
+                    link_selector=PRODUCT_FORMAT_LINK,
+                    price_selector=PRODUCT_FORMAT_PRICE,
+                    base_url=base_url,
+                )
+            }
+            if soup.select_one(PRODUCT_FORMAT_CONTAINER) is not None
+            else {}
         ),
         "intro": _extract_infoset_text(soup, PRODUCT_INTRO),
         "toc": _extract_infoset_text(soup, PRODUCT_TOC),
@@ -619,6 +629,14 @@ def _cremaclub_converter(base_url: str, spec: Mapping):
                 rating=_parse_rating(item.select_one(CREMACLUB_RATING)),
                 review_count=_parse_grouped_int(item.select_one(ITEM_REVIEW_COUNT)),
                 image_url=_image_url_or_none(item),
+                # 행 라벨은 없지만 이 마크업은 구독 eBook 목록이라 판형이 구조로 정해진다(코너
+                # 종류가 곧 판형 신호). kind는 사이트 라벨이 없으므로 내지 않는다.
+                is_ebook=True,
+                # 클럽 등록은 이 행에서 관측된다: 행을 받아들이는 조건인 "북클럽에 담기" 버튼
+                # (CREMACLUB_GOODS_NO_LINK)은 클럽 상품에만 렌더되고, 제목 링크가 클럽 상세다.
+                # 목록 관측이라 tools.cremaclub은 이 행을 다시 조회하지 않는다.
+                in_cremaclub=True,
+                **({"cremaclub_url": urljoin(spec["url"], href)} if href else {}),
                 **_row_text_fields(item, spec),
             ),
         }

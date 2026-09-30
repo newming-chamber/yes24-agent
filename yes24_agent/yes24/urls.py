@@ -5,6 +5,7 @@
 파생한다(같은 섹션을 여러 곳에 나열하면 하나만 늘려도 다른 쪽이 조용히 터진다).
 """
 
+import re
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from yes24_agent.yes24.selectors import (
@@ -21,6 +22,7 @@ from yes24_agent.yes24.selectors import (
     CREMACLUB_ORIGINAL_LIST_CONTAINER,
     GOODS_PATH,
     ITEM_INTRO_EXCERPT,
+    LINK_PRODUCT_PATH_RE,
     MONTHLY_BESTSELLER_PERIOD,
     NEWPRODUCT_ITEM,
     NEWPRODUCT_LIST_CONTAINER,
@@ -105,6 +107,12 @@ def product_url(base_url: str, goods_no: str) -> str:
     """상품 상세 페이지 URL을 조립한다."""
     base = base_url.rstrip("/")
     return f"{base}{GOODS_PATH}{goods_no}"
+
+
+def goods_no_from_url(url: str) -> str | None:
+    """상품 상세 URL(product_url의 역)에서 goods_no를 읽는다. 상품 경로가 아니면 None."""
+    match = re.match(LINK_PRODUCT_PATH_RE, urlsplit(url).path)
+    return match.group(1) if match else None
 
 
 # 정책/CS 시드 URL 맵. docs/m2-scout-report.md 라이브 조사 기준으로 확정.

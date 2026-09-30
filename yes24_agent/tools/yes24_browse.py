@@ -29,8 +29,8 @@ from yes24_agent.config import Settings, get_settings
 from yes24_agent.sources import cite_marker, now_checked_at, register_source
 from yes24_agent.tool_progress import ToolProgressGroup, parsed_progress
 from yes24_agent.tools._planning import dropped_queries_message, plan_queries
-from yes24_agent.tools.yes24_fetch import open_page
-from yes24_agent.tools.yes24_search import get_client
+from yes24_agent.tools.cremaclub import observe_cremaclub
+from yes24_agent.tools.yes24_search import get_client, observes_cremaclub
 from yes24_agent.yes24.client import Yes24Client, Yes24FetchError
 from yes24_agent.yes24.parsers import (
     ParseError,
@@ -39,7 +39,6 @@ from yes24_agent.yes24.parsers import (
     parse_category_links,
     product_fields,
 )
-from yes24_agent.yes24.selectors import ITEM_EBOOK_LABEL, ITEM_FORMAT_LABEL_DECORATION
 from yes24_agent.yes24.urls import (
     BROWSE_ORDERS,
     BROWSE_SEED_URLS,
@@ -222,89 +221,11 @@ async def _browse_one(
     }
 
 
-# 코너 행에 실을 판형 관측 필드. 관측 대상 상세가 종이책이면 `ebook_edition`(그 eBook 판의
-# url·in_cremaclub 또는 None), 전자책이면 최상위 `in_cremaclub` 하나다 — 상세(yes24_fetch)가
-# 이미 쓰는 이름·규약을 그대로 옮긴다(관측 불가는 키 없음). 두 이름은 parsers._ITEM_FIELDS의
-# 선언이 정본이고, 여기는 "행으로 옮길 관측"의 목록일 뿐이다.
-_OBSERVED_FORMAT_FIELDS = ("ebook_edition", "in_cremaclub")
-
-
-def _observe_targets(rows: list[dict], limit: int) -> list[dict]:
-    """관측 예산(limit)을 **전자책 판이 있는 행부터** 쓴다. 코너 안 순서는 그대로 유지한다.
-
-    코너 목록 행은 자기 마크업에서 이미 다른 판형 링크를 관측한다(ITEM_FORMAT_LINK →
-    other_formats). 클럽 여부는 전자책 상세에만 있으므로, 전자책 판이 없는 행을 열어 봐야
-    ebook_edition=None만 나온다 — 상위 N을 순위대로 자르면 그런 행이 예산을 다 쓰고 정작
-    판정이 필요한 행은 키 없음으로 남는다(2026-09-16 실측: 종합 베스트 상위 5가 전부 전자책
-    없는 행이라 6~9위의 전자책 보유 행이 전부 미관측). 순서만 바꾸는 안정 정렬이라 관측
-    대상이 아닌 행의 형태·순서는 그대로다.
-    """
-    ebook_format = ITEM_EBOOK_LABEL.strip(ITEM_FORMAT_LABEL_DECORATION)
-
-    def has_ebook(row: dict) -> bool:
-        formats = row["fields"].get("other_formats") or []
-        return any(fmt.get("format") == ebook_format for fmt in formats)
-
-    return sorted(rows, key=lambda row: not has_ebook(row))[:limit]
-
-
-async def _observe_row_format(
-    row: dict, client: Yes24Client, settings: Settings, parse_lock: asyncio.Lock
-) -> bool:
-    """행 하나의 상품 상세를 열어 판형 관측을 행의 fields에 싣는다(제자리). 관측 여부를 돌려준다.
-
-    상세 도구와 **같은 체인**(open_page + observe_ebook_format)을 그대로 쓴다 — 새 파서·새
-    셀렉터를 두지 않는다. 실패(조회·파싱)는 예외를 밖으로 던지지 않고 키 없음으로 남긴다:
-    "확인 못 함"을 "클럽 아님"으로 위장하지 않는 것이 상세 쪽과 같은 규약이다.
-    """
-    try:
-        page = await open_page(row["url"], client, settings, parse_lock, observe_formats=True)
-    except (Yes24FetchError, ParseError) as exc:
-        logger.info(
-            f"yes24_browse observe url={row['url']!r} status=error reason={type(exc).__name__}"
-        )
-        return False
-    observed = page.get("fields") or {}
-    row["fields"].update(
-        {name: observed[name] for name in _OBSERVED_FORMAT_FIELDS if name in observed}
-    )
-    return any(name in observed for name in _OBSERVED_FORMAT_FIELDS)
-
-
-async def _observe_rows(
-    targets: list[dict], client: Yes24Client, settings: Settings
-) -> list[dict]:
-    """대상 행들을 동시에 관측하고 **확인된 행만** 돌려준다(진행 줄 하나에 대응하는 한 단위).
-
-    예상 밖 예외를 값으로 받는다(return_exceptions) — 한 권이 예외를 던져도 형제가 전원
-    완주해야 죽은 턴의 요청이 공유 클라이언트에 계속 나가는 고아 태스크가 안 생기고
-    (2026-09-18 적대 검증: 도구가 터진 뒤에도 7건 추가 발사), 한 권의 낯선 문서 형태가 멀쩡한
-    코너 열람 전체를 죽일 이유도 없다. 그래서 **관측 예외는 도구 밖으로 나가지 않는다** —
-    그 행의 "확인 못 함"으로 접히고, 조용히 삼키지 않도록 조회·파싱 실패와 같은 형식으로 남는다.
-    """
-    lock = asyncio.Lock()  # 파싱 직렬화 — 이 배치 한 벌(fetch_many와 같은 규약)
-    outcomes = await asyncio.gather(
-        *(_observe_row_format(row, client, settings, lock) for row in targets),
-        return_exceptions=True,
-    )
-    observed = []
-    for row, outcome in zip(targets, outcomes):
-        if isinstance(outcome, BaseException):
-            logger.info(
-                f"yes24_browse observe url={row['url']!r} status=error "
-                f"reason={type(outcome).__name__}"
-            )
-        elif outcome:
-            observed.append(row)
-    return observed
-
-
 async def yes24_browse(
     sections: list[str],
     tool_context: ToolContext,
     category_number: str = "",
     category_name: str = "",
-    observe_ebook_editions: bool = False,
 ) -> dict:
     """Yes24의 코너(목록)들을 직접 열람한다. 분야별로 좁힐 수 있다.
 
@@ -324,10 +245,6 @@ async def yes24_browse(
         category_name: 분야 이름(선택, 모든 코너에 공통 적용). "소설"·"에세이"처럼 원하는
             분야명을 주면 코너 내비에서 해석해 한 호출로 그 분야 목록을 받는다. 빈 문자열이면
             코너 전체(국내도서). 분야 좁히기를 지원하지 않는 코너는 sections 설명에 표시된다.
-        observe_ebook_editions: True면 결과 행의 상품 상세를 함께 열어 크레마클럽(eBook 구독)
-            등록 여부를 행에 싣는다 — 종이책 행은 ebook_edition(그 eBook 판의 url·in_cremaclub
-            또는 None=eBook 판 없음), 전자책 행은 in_cremaclub이다. 행은 지워지지 않고 상위
-            몇 건만 확인하므로, 키가 없는 행은 확인하지 않은 것이다.
 
     Returns:
         코너 중 하나라도 열람에 성공하면 status="ok"와 results 목록(모든 코너의 결과를 상품
@@ -341,8 +258,9 @@ async def yes24_browse(
         집계 기간 period를 기준으로 말한다),
         result_count를 담은 dict. 상한을
         넘겨 열람하지 않은 코너가 있으면 dropped_count·dropped_sections로 명시한다.
-        observe_ebook_editions를 켜면 확인한 행 수 ebook_observed_count와, 상한을 넘겨
-        확인하지 않은 행 수 ebook_unobserved_count(있을 때만)를 함께 담는다. 모든 코너가
+        전자책 행의 in_cremaclub과 종이책 행의 ebook_edition(그 eBook 판의 url·in_cremaclub,
+        None이면 eBook 판 없음)은 크레마클럽 등록 여부이고, 등록이면 cremaclub_url이 함께 온다 —
+        in_cremaclub 키가 없으면 확인하지 못한 것이지 클럽에 없는 것이 아니다. 모든 코너가
         실패했을 때만 status="error"와 error_type, message, result_count=0을 담은 dict —
         잘못된 코너 코드는 error_type="invalid_section", 잘못된 분야 번호·미지원 섹션
         좁히기는 "invalid_category", 이름 미매칭은 "category_not_found"(categories 동봉),
@@ -369,12 +287,7 @@ async def yes24_browse(
     # 나머지는 정상 열람된다(조용히 코너 전체로 대체하지 않는다).
     category_name = category_name.strip()  # 공백뿐인 이름은 해석 대상이 아니다
     # 네트워크·파싱만 동시 실행한다(코너별 병렬). 등록은 아래 순차 루프에서 — 레이스 0.
-    # 진행 줄은 코너들 + (관측을 할 예정이면) 관측 한 줄이다. 관측 줄의 제목은 코너를 열어야
-    # 알지만 **자리는 지금 세어야 한다** — 그래야 코너가 하나뿐인 호출도 줄이 둘이 되어
-    # 서브스텝이 살아난다(코너 그룹만 침묵하면 관측 줄이 코너 건수를 억제한다, 09-18 실측).
-    details = [
-        BROWSE_SEED_URLS.get(section, {}).get("label", section) for section in planned
-    ] + ([""] if observe_ebook_editions else [])
+    details = [BROWSE_SEED_URLS.get(section, {}).get("label", section) for section in planned]
     progress = ToolProgressGroup(tool_context, details=details)
     browsed = await progress.gather(
         [
@@ -437,38 +350,11 @@ async def yes24_browse(
                 if row["fields"].get(name) is None:
                     row["fields"][name] = value
 
-    # 1.5) 판형 관측(옵션): 행마다 상품 상세를 열어 크레마클럽 여부를 **행에 실어** 돌려준다.
-    #      코너 목록 마크업엔 클럽 배지가 없어(PRODUCT_CREMACLUB_BADGE는 전자책 상세 전용)
-    #      지금까지는 모델이 후보를 스스로 골라 상세를 열어야 했다. 등록 **전에** 실어야 행의
-    #      fields와 출처 meta가 한 값이 된다. 상한은 "한 번에 여는 상세 수"의 기존 천장
-    #      (fetch_many_max_items — http_concurrency=5와 정렬)을 그대로 쓴다: 같은 축의 값을
-    #      코너용으로 한 벌 더 두면 한쪽만 조정되는 드리프트가 생긴다. 초과 행은 관측 없이
-    #      키 없음으로 두고 아래 요약에서 명시한다(조용한 truncation 금지).
-    observed_count = 0
-    # 관측 대상이 **곧 가드**다 — 플래그·행을 따로 보면 예산이 0일 때 대상만 비어 빈 문구 줄과
-    # 가짜 실패 줄이 나간다(적대 검증 재현). 플래그가 꺼지면 예산이 0이라 대상도 비고, 코너가
-    # 전부 실패해 행이 없을 때도 같은 한 조건으로 닫힌다.
-    targets = _observe_targets(
-        list(rows.values()), settings.fetch_many_max_items if observe_ebook_editions else 0
-    )
-    unobserved_count = len(rows) - len(targets) if observe_ebook_editions else 0
-    if targets:
-        # 관측은 이 호출의 마지막 진행 줄이다 — 위에서 잡아 둔 자리를 지금 채운다. 대상이 몇
-        # 권이든 상세 열람과 같은 stage 어휘(reading)로 fetch_many처럼 **한 줄**이다: 책마다
-        # 한 줄이면 화면이 "N단계 탐색"으로 부풀고, 그 줄들엔 건수가 없어 프론트가 "0권을
-        # 찾았어요"로 그린다(09-18 실측). 번호도 코너 다음 하나 — 0부터 매기면 칩이 겹친다.
-        details[len(planned)] = " · ".join(row["title"] for row in targets)
-        observed_count = len((await progress.gather(
-            [(len(planned), _observe_rows(targets, client, settings))],
-            stage="reading",
-            summarize=lambda found: {
-                # 전건 실패는 failed 줄로 남는다 — 읽기가 실제로 전부 실패한 것이라
-                # "0건 찾았어요"로 누르면 실패를 빈 성공으로 위장하게 된다(원칙 7).
-                "status": "ok" if found else "error",
-                "result_count": len(found),
-                "sources": found,
-            },
-        ))[0])
+    # 1.5) 크레마클럽 관측: 코너 목록 마크업엔 클럽 여부가 없어 행마다 클럽 상세를 조회한다
+    #      (tools.cremaclub — 쿠키 없는 경량 요청이라 상한 없이 전 행). 등록 **전에** 실어야
+    #      행의 fields와 출처 meta가 한 값이 된다. 매트릭스 셀은 싣지 않는다(observes_cremaclub).
+    if observes_cremaclub():
+        await observe_cremaclub([row["fields"] for row in rows.values()], settings)
 
     ok_count = sum(1 for b in browses if b["status"] == "ok")
     # 2) 등록(순차): 병합된 행마다 한 번만 등록한다 — source_id 유일·단조.
@@ -503,8 +389,7 @@ async def yes24_browse(
 
     logger.info(
         f"yes24_browse sections={len(planned)} sections_ok={ok_count} "
-        f"results={len(results)} dropped={len(dropped_sections)} "
-        f"observed={observed_count} unobserved={unobserved_count}"
+        f"results={len(results)} dropped={len(dropped_sections)}"
     )
     if ok_count == 0:
         response = {**browses[0], "browses": browses, "categories": categories}
@@ -526,18 +411,6 @@ async def yes24_browse(
             settings.yes24_browse_max_sections, len(dropped_sections), unit="코너", action="열람"
         )
         response["message"] = " ".join(filter(None, (response.get("message"), dropped_message)))
-    if observe_ebook_editions:
-        # 가법 필드: 옵션을 끄면 반환 형태는 기존과 동일하다. 관측 건수를 세어 돌려주는 이유는
-        # 행의 키 없음이 "클럽 아님"이 아니라 "확인 안 함"임을 요약에서도 읽히게 하기 위함이다.
-        response["ebook_observed_count"] = observed_count
-        if unobserved_count:
-            response["ebook_unobserved_count"] = unobserved_count
-            response["message"] = " ".join(filter(None, (
-                response.get("message"),
-                f"크레마클럽 확인은 상위 {settings.fetch_many_max_items}건까지만 했습니다 — "
-                f"나머지 {unobserved_count}건에는 ebook_edition·in_cremaclub 키가 없으며 "
-                "이는 '확인하지 않음'이지 '클럽에 없음'이 아닙니다.",
-            )))
     return response
 
 

@@ -40,6 +40,7 @@ from yes24_agent.tools._planning import (
     dropped_queries_message,
     plan_queries,
 )
+from yes24_agent.tools.cremaclub import aclose_club_client, observe_cremaclub
 from yes24_agent.yes24.client import Yes24Client, Yes24FetchError, Yes24TextCache
 from yes24_agent.yes24.parsers import (
     ParseError,
@@ -97,6 +98,15 @@ def high_throughput_client():
         _high_throughput.reset(token)
 
 
+def observes_cremaclub() -> bool:
+    """이 컨텍스트의 도구 호출이 크레마클럽 조회를 싣는가.
+
+    매트릭스 셀(고처리량 컨텍스트)은 싣지 않는다 — 셀들이 한 클럽 클라이언트(동시성 5)로 몰리고,
+    매트릭스는 클럽 칩을 그리지도 않는다(오버뷰의 관측 꺼짐과 같은 결정을 이 경로에서 명시한다).
+    """
+    return not _high_throughput.get()
+
+
 def get_client(settings: Settings) -> Yes24Client:
     """이 태스크 컨텍스트에 맞는 Yes24Client 싱글턴을 반환한다(최초 호출 시 생성).
 
@@ -128,6 +138,7 @@ async def aclose_shared_client() -> None:
         await _matrix_client.aclose()
         _matrix_client = None
     _shared_cache = None
+    await aclose_club_client()
 
 
 # 검색 예산(1페이지 요청 폭·파스 상한)의 **요청 로컬 오버라이드** 키. 챗 세션 state엔 이 키가
@@ -138,10 +149,17 @@ SEARCH_BUDGET_STATE_KEY = "yes24_search_budget"
 
 
 class SearchBudget(NamedTuple):
-    """검색 1콜의 상류 폭(size 파라미터)과 파스 상한 — 한 소비자의 한 벌이라 함께 옮긴다."""
+    """검색 1콜의 상류 폭(size 파라미터)과 파스 상한 — 한 소비자의 한 벌이라 함께 옮긴다.
+
+    observe_cremaclub은 행마다 크레마클럽 조회(행당 요청 1건)를 붙일지다. 기본이 꺼짐인 이유:
+    예산을 싣는 소비자는 오버뷰뿐이고 오버뷰는 지연이 정본 지표라 곁가지 조회를 싣지 않는다
+    (fetch_pages의 observe_formats=False와 같은 결정). 챗 기본 예산(_search_budget)만 켠다
+    — 그것도 매트릭스 셀에선 끈다(observes_cremaclub).
+    """
 
     result_limit: int
     page_size: int
+    observe_cremaclub: bool = False
 
 
 def _search_budget(state, settings: Settings) -> SearchBudget:
@@ -149,7 +167,11 @@ def _search_budget(state, settings: Settings) -> SearchBudget:
     override = state.get(SEARCH_BUDGET_STATE_KEY) if state is not None else None
     if isinstance(override, SearchBudget):
         return override
-    return SearchBudget(settings.search_result_limit, settings.search_page_size)
+    return SearchBudget(
+        settings.search_result_limit,
+        settings.search_page_size,
+        observe_cremaclub=observes_cremaclub(),
+    )
 
 
 async def _search_one(
@@ -248,7 +270,10 @@ async def yes24_search(
         result_count=0이다. 섹션을 한정했는데 0건인
         각도는 통합 검색으로 한 번 더 자동 재검색되며, 그 항목은 searches에 expanded_from으로
         표시된다(원 각도의 0건 항목도 함께 남는다). 상한을 넘겨 검색하지 않은
-        각도가 있으면 dropped_count·dropped_queries로 명시한다. 모든 각도가 실패했을 때만
+        각도가 있으면 dropped_count·dropped_queries로 명시한다. 전자책 행의 in_cremaclub과
+        종이책 행의 ebook_edition(그 eBook 판의 url·in_cremaclub, None이면 eBook 판 없음)은
+        크레마클럽 등록 여부이고, 등록이면 cremaclub_url이 함께 온다 — in_cremaclub 키가 없으면
+        확인하지 못한 것이지 클럽에 없는 것이 아니다. 모든 각도가 실패했을 때만
         status="error"와 error_type("empty_query"|"fetch"|"parse"), message에 더해
         result_count=0을 담은 dict.
     """
@@ -327,10 +352,11 @@ async def yes24_search(
                 ),
             ]
 
-    checked_at = now_checked_at()
-
-    results: list[dict] = []
-    key_to_index: dict[str, int] = {}  # 상품 키 → results 인덱스(각도 간 중복제거·병합용)
+    # 1) 병합(순수): 같은 상품의 동일성은 goods_no가 정본이다(검색 결과 URL은 같은 상품이어도
+    #    각도별로 파라미터가 붙을 수 있다). goods_no가 없는 항목은 url로 갈음한다. 같은 상품이
+    #    다른 각도에서도 걸리면 한 행으로 합치고 어느 각도에서 나왔는지만 모아 교차 확증 신호로
+    #    남긴다(source_id 중복 방지).
+    merged: dict[str, dict] = {}
     searches: list[dict] = []  # 각도별 성공/실패/결과 수 요약(부분 실패·0건 fail-loud)
     for outcome in searched:
         query = outcome["query"]
@@ -344,45 +370,48 @@ async def yes24_search(
         if outcome["status"] == "error":
             searches.append({**angle_error_summary(query, outcome["error_type"]), **widened})
             continue
-        matched = 0
         for item in outcome["parsed"]:
             # 등록(meta)과 반환에 같은 필드 집합을 싣는다 — 도구별 선택 누락 불가(product_fields).
             fields = product_fields(item)
-            # 같은 상품의 동일성은 goods_no가 정본이다(검색 결과 URL은 같은 상품이어도
-            # 각도별로 파라미터가 붙을 수 있다). goods_no가 없는 항목은 url로 갈음한다.
             key = fields.get("goods_no") or item["url"]
-            matched += 1
-            existing = key_to_index.get(key)
-            if existing is not None:
-                # 같은 상품이 다른 각도에서도 걸렸다 — 재등록하지 않고 어느 각도에서 나왔는지만
-                # 합쳐 교차 확증 신호로 남긴다(source_id 중복 방지).
-                if query not in results[existing]["queries"]:
-                    results[existing]["queries"].append(query)
-                continue
-            source_id = register_source(
-                tool_context.state,
-                title=item["title"],
-                url=item["url"],
-                source_type="search_result",
-                snippet=item.get("author"),
-                checked_at=checked_at,
-                meta=fields,
-                invocation_id=getattr(tool_context, "invocation_id", None),
-            )
-            key_to_index[key] = len(results)
-            results.append(
-                {
-                    "source_id": source_id,
-                    "cite_as": cite_marker(source_id),
-                    "type": "search_result",
-                    "title": item["title"],
-                    "url": item["url"],
-                    "checked_at": checked_at,
-                    "queries": [query],
-                    **fields,
-                }
-            )
-        searches.append({"query": query, "status": "ok", "result_count": matched, **widened})
+            row = merged.setdefault(key, {"item": item, "fields": fields, "queries": []})
+            if query not in row["queries"]:
+                row["queries"].append(query)
+        searches.append(
+            {"query": query, "status": "ok", "result_count": len(outcome["parsed"]), **widened}
+        )
+
+    # 1.5) 크레마클럽 관측: 등록 **전에** 행 필드에 실어야 반환 행과 출처 meta가 한 값이 된다.
+    if budget.observe_cremaclub:
+        await observe_cremaclub([row["fields"] for row in merged.values()], settings)
+
+    # 2) 등록(순차): 병합된 행마다 한 번만 등록한다 — source_id 유일·단조.
+    checked_at = now_checked_at()
+    results: list[dict] = []
+    for row in merged.values():
+        item, fields = row["item"], row["fields"]
+        source_id = register_source(
+            tool_context.state,
+            title=item["title"],
+            url=item["url"],
+            source_type="search_result",
+            snippet=item.get("author"),
+            checked_at=checked_at,
+            meta=fields,
+            invocation_id=getattr(tool_context, "invocation_id", None),
+        )
+        results.append(
+            {
+                "source_id": source_id,
+                "cite_as": cite_marker(source_id),
+                "type": "search_result",
+                "title": item["title"],
+                "url": item["url"],
+                "checked_at": checked_at,
+                "queries": row["queries"],
+                **fields,
+            }
+        )
 
     ok_count = sum(1 for s in searches if s["status"] == "ok")
     if ok_count == 0:

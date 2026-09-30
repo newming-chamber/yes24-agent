@@ -374,7 +374,7 @@
       align-items: center; justify-content: center; padding: 0 4px;
     }
     .card .type, .card .format { font-size: 10px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
-    /* 다른 판형 칩(other_formats) — 타입 뱃지와 같은 톤, 누르면 카드 대신 그 판형 페이지. */
+    /* 판형 칩(자기 판형 · 다른 판형 · 크레마클럽, editionLinks) — 타입 뱃지와 같은 톤, 누르면 그 판형 페이지. */
     .card .formats { display: flex; flex-wrap: wrap; gap: 4px; }
     .card .format { font-family: inherit; background: none; cursor: pointer; }
     .card .format:hover { color: var(--accent); border-color: var(--accent); }
@@ -877,7 +877,7 @@
       AXES as RBTI_AXES, parseCode as parseRbtiCode, deriveCode, deriveAxisLabel,
       RBTI_STORAGE_KEY, MATRIX_HANDOFF_KEY,
     } from "/static/lib/rbti.js?v=1";
-    import { WEB_TYPES, CARD_LABELS, sourceCardType, sourceDomain, sourceTitle, textOffset, coverUrl, isSafeUrl, safeOpen, formatPrice, makeCoverImg, relayTypingFocus, overviewIsRenderable } from "/static/lib/sources.js?v=1";
+    import { WEB_TYPES, CARD_LABELS, sourceCardType, sourceDomain, sourceTitle, textOffset, coverUrl, isSafeUrl, safeOpen, formatPrice, editionLinks, makeCoverImg, relayTypingFocus, overviewIsRenderable } from "/static/lib/sources.js?v=1";
 
     // 16유형 비교(/matrix) 네비 링크는 서버 배포 게이팅(matrix_enabled)을 따라간다.
     // 기본 hidden(fail-closed: 프로드 숨김)이고, /matrix가 살아 있을 때만(200) 노출한다.
@@ -1710,12 +1710,14 @@
           return row;
         };
         info(sourceDomain(src), "domain");
+        // 판형 칩(종이책 · eBook · 크레마클럽) — 무엇을 그릴지는 editionLinks가 정한다(확인된 것만).
+        // 자기 판형 칩(own)이 카드 가격을 싣고 있으면 가격 줄은 생략한다(같은 값 두 번 금지).
+        // 자기 칩이 없는 카드(판형 침묵·카드가 곧 클럽 상세)는 가격 줄이 유일한 자기 가격이다.
+        const formats = editionLinks(src);
         if (kind === "book") {
-          const author = src.author;
-          const price = formatPrice(src);
-          info(author, "author");
+          info(src.author, "author");
           info(src.publisher, "publisher");
-          info(price, "price");
+          if (!formats.some((f) => f.own)) info(formatPrice(src), "price");
           if (src.rating != null) info(`평점 ${src.rating}`, "rating");
         }
         const preview = info(src.preview ?? src.snippet, "preview");
@@ -1728,12 +1730,8 @@
           info(reason, "reason");
           if (reason) card.title = reason;
         }
-        // 다른 판형 칩(other_formats: 종이책 카드의 eBook 등). 키 없음=관측 불가, []=판형 없음
-        // — 둘 다 아무것도 그리지 않는다. 항목의 가격 키는 카드와 같아(sale_price) formatPrice를
-        // 그대로 쓴다. <button>이라 키보드 활성화는 브라우저 기본 — 카드의 keydown이 preventDefault로
+        // 칩은 <button>이라 키보드 활성화는 브라우저 기본 — 카드의 keydown이 preventDefault로
         // 그 활성화를 삼키지 않도록 클릭·키 이벤트 모두 카드로 올리지 않는다.
-        const formats = (Array.isArray(src.other_formats) ? src.other_formats : [])
-          .filter((f) => f && f.format && isSafeUrl(f.url));
         if (formats.length) {
           const row = document.createElement("div");
           row.className = "formats";
@@ -1743,11 +1741,11 @@
             chip.className = "format";
             chip.dataset.formatUrl = f.url;
             const fPrice = formatPrice(f);
-            chip.textContent = fPrice ? `${f.format} ${fPrice}` : f.format;
+            chip.textContent = fPrice ? `${f.label} ${fPrice}` : f.label;
             chip.addEventListener("click", (e) => {
               e.stopPropagation();
               safeOpen(f.url);
-              trackSourceClick(src, f.url, f.format, "product");
+              trackSourceClick(src, f.url, f.label, "product");
             });
             chip.addEventListener("keydown", (e) => e.stopPropagation());
             row.appendChild(chip);
@@ -2127,7 +2125,7 @@
           if (sessionIdSaved && turnIdSaved) void (async () => {
             for (const click of queued) {
               const source = [...srcById.values()].find((src) => src.url === click.url
-                || src.other_formats?.some((format) => format.url === click.url));
+                || editionLinks(src).some((link) => link.url === click.url));
               await recordClick(sessionIdSaved, turnIdSaved, { ...click, source_id: source ? Number(source.id) : null });
             }
           })();
