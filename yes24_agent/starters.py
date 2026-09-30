@@ -172,8 +172,8 @@ def _today() -> dt.date:
     return dt.datetime.now(KST).date()
 
 
-def _label(row: dict, settings: Settings) -> str:
-    """칩에 표시할 라벨 — **행에 실린 것이 먼저**다.
+def chip_label(row: dict, settings: Settings) -> str:
+    """칩에 표시할 라벨 — **행에 실린 것이 먼저**다. 어드민 초기 질문 목록도 같은 규칙으로 보인다.
 
     슬롯 키는 예스24가 쓰는 코너·분야 이름을 담는다("특가"·"에세이"). 그 이름이 그대로
     칩에 올라가도 되는지는 이름마다 다르다 — "에세이"는 되고 "일별"은 무엇의 일별인지
@@ -946,21 +946,21 @@ async def _chip_labels(specs: list[SlotSpec], settings: Settings, genai_client: 
                 ),
             ), timeout=settings.starter_timeout_s,
         )
+        record_usage("starter_labels", response.usage_metadata, model=settings.starter_model)
+        known = {item["key"] for item in items}
+        labels = {}
+        for entry in json.loads(response.text or "{}").get("labels", []):
+            key, label = entry.get("key"), _squash(entry.get("label") or "")
+            if key in known and label and len(label) <= _CHIP_LABEL_MAX_CHARS:
+                labels[key] = label
+        return labels
     except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001 — 라벨은 질문을 막지 않는다
         logger.warning(f"starters 칩 라벨 생성 실패(키에서 파생): {type(exc).__name__}: {exc}")
         return {}
-    record_usage("starter_labels", response.usage_metadata, model=settings.starter_model)
-    known = {item["key"] for item in items}
-    labels = {}
-    for entry in json.loads(response.text or "{}").get("labels", []):
-        key, label = entry.get("key"), _squash(entry.get("label") or "")
-        if key in known and label and len(label) <= _CHIP_LABEL_MAX_CHARS:
-            labels[key] = label
-    return labels
 
 
 async def slot_catalogue(
-    settings: Settings, client: Any, today: dt.date, genai_client: Any = None
+    settings: Settings, client: Any, today: dt.date
 ) -> tuple[list[SlotSpec], list[SlotSpec]]:
     """오늘 만들 수 있는 슬롯 전부 — (고정 슬롯, 대상이 여럿인 슬롯).
 
@@ -1035,12 +1035,6 @@ async def slot_catalogue(
                               target=settings.starter_policy_source))
     if settings.starter_event_limit > 0:
         fixed.append(SlotSpec(key=_SEASON_SLOT, ask=_SEASON_ASK, observe=observe_events))
-
-    labels = await _chip_labels(many, settings, genai_client)
-    many = [
-        spec if spec.key not in labels else replace(spec, label=labels[spec.key])
-        for spec in many
-    ]
     return fixed, many
 
 
@@ -1096,15 +1090,13 @@ def rotate_slots(many: list[SlotSpec], today: dt.date, low: int, high: int) -> l
     return picked
 
 
-async def build_slots(
-    settings: Settings, client: Any, today: dt.date, genai_client: Any = None
-) -> list[SlotSpec]:
+async def build_slots(settings: Settings, client: Any, today: dt.date) -> list[SlotSpec]:
     """오늘의 슬롯 목록 — 고정 슬롯 + 날짜로 고른 대상 슬롯.
 
     생성·관리자 생성·관리자 검증이 **같은 목록**을 본다. 목록이 여러 벌이면 한쪽만 고쳐
     옛 슬롯이 고아로 남는다. 서빙은 이 목록을 보지 않는다(신선도로 판정한다).
     """
-    fixed, many = await slot_catalogue(settings, client, today, genai_client)
+    fixed, many = await slot_catalogue(settings, client, today)
     return [
         *fixed,
         *rotate_slots(many, today, settings.starter_rotating_slots_min,
@@ -1127,7 +1119,8 @@ async def generate_slot(
         if observed is None:
             observed = await spec.observe(spec, ctx)
     except Exception as exc:  # noqa: BLE001 — 관측 실패는 그 슬롯만 접는다
-        return _failed(f"관측 실패: {type(exc).__name__}: {exc}")
+        logger.warning(f"starters 관측 실패: slot={spec.key} {type(exc).__name__}: {exc}")
+        return _failed("관측 실패")
     if not observed.materials:
         return _failed("관측 0건(재료 없음)")
 
@@ -1183,7 +1176,8 @@ async def generate_slot(
         record_usage("starter", response.usage_metadata, model=model)
         raw_items = json.loads(response.text or "{}").get("items") or []
     except Exception as exc:  # noqa: BLE001 — 백그라운드 생성: 실패는 슬롯 failed로 접는다
-        return _failed(f"생성 실패: {type(exc).__name__}: {exc}")
+        logger.warning(f"starters 생성 실패: slot={spec.key} {type(exc).__name__}: {exc}")
+        return _failed("생성 실패")
 
     logger.info(
         "starters 생성 판단: slot=%s items=%s", spec.key, json.dumps(raw_items, ensure_ascii=False)
@@ -1230,7 +1224,7 @@ async def build_candidates(
     genai_client = genai_client or get_genai_client()
     by_key = {
         spec.key: spec
-        for spec in await build_slots(settings, client, today, genai_client)
+        for spec in await build_slots(settings, client, today)
     }
     results: dict[str, dict] = {}
     shared: dict = {}
@@ -1403,11 +1397,11 @@ class StarterService(MysqlBackedService):
         async with self._generation_lock:
             settings = get_settings()
             specs = {
-                spec.key: spec
-                for spec in await build_slots(
-                    settings, get_client(settings), today, get_genai_client()
-                )
+                spec.key: spec for spec in await build_slots(settings, get_client(settings), today)
             }
+            # 칩 라벨은 첫 선점 뒤에 한 번만 짓는다. 목록을 만들 때 지으면 오늘 생성이 끝난 뒤의
+            # 서빙마다 모델 콜이 나간다(2026-09-28 운영: 하루 5,644콜, LLM 비용의 62%).
+            labels: dict | None = None
             if slots is None:
                 slots = list(specs)
             shared: dict = {}
@@ -1419,9 +1413,6 @@ class StarterService(MysqlBackedService):
                         **_failed(f"자동 생성 슬롯이 아닙니다: {slot!r} (허용: {list(specs)})"),
                         "inserted": 0, "unknown": True,
                     }
-                    continue
-                if slot not in specs:
-                    results[slot] = {**_failed("자동 생성 슬롯 아님"), "inserted": 0}
                     continue
                 token = uuid.uuid4().hex
                 claim = None
@@ -1435,7 +1426,11 @@ class StarterService(MysqlBackedService):
                             "detail": "목표 충족 또는 실행 중/재시도 대기",
                         }
                         continue
-                    token, replace = claim
+                    token, replace_pool = claim
+                    if labels is None:
+                        labels = await _chip_labels(
+                            list(specs.values()), settings, get_genai_client()
+                        )
                     exclude = await self.recent_goods(
                         [slot], today, settings.starter_repeat_window_days
                     )
@@ -1445,15 +1440,20 @@ class StarterService(MysqlBackedService):
                         exclude=exclude.get(slot, set()),
                         shared=shared,
                     )
-                    results[slot] = await self._generate_into(specs[slot], ctx, token, replace)
+                    spec = specs[slot]
+                    if slot in labels:
+                        spec = replace(spec, label=labels[slot])
+                    results[slot] = await self._generate_into(spec, ctx, token, replace_pool)
                 except HTTPException as exc:
                     db_error = exc
                     results[slot] = {**_failed(str(exc.detail)), "inserted": 0}
                 except Exception as exc:  # noqa: BLE001 — 다른 슬롯은 계속 갱신한다
-                    results[slot] = {
-                        **_failed(f"갱신 실패(이전 풀 보존): {type(exc).__name__}: {exc}"),
-                        "inserted": 0,
-                    }
+                    # 결과 detail은 어드민 화면·starter_runs에 그대로 실린다 — 예외 원문(모델명·
+                    # URL)은 로그에만 남기고 운영자에겐 일반 문구만 준다.
+                    logger.warning(
+                        f"starters 갱신 실패: slot={slot} {type(exc).__name__}: {exc}"
+                    )
+                    results[slot] = {**_failed("갱신 실패(이전 풀 보존)"), "inserted": 0}
                 finally:
                     if claim is not None or claim_pending:
                         try:
@@ -1644,7 +1644,7 @@ class StarterService(MysqlBackedService):
         await self._run(*self._finish_run_statement(slot, today, token, status, detail))
 
     # ── 어드민 쓰기 — 주어진 트랜잭션으로만 실행한다(커밋·감사 결합은 AdminService 소유) ──
-    # 목록·실행 이력 조회는 데이터 탐색 데이터셋(starters·starter_runs)이 서빙한다.
+    # 목록 조회는 GET /admin/api/starters(admin.py)가 서빙한다(실행 이력은 화면에 내지 않는다).
 
     @staticmethod
     async def add_item(
@@ -1743,7 +1743,7 @@ class Starter(BaseModel):
 
     @classmethod
     def of(cls, row: dict, settings: Settings) -> Starter:
-        return cls(label=_label(row, settings), text=row["text"])
+        return cls(label=chip_label(row, settings), text=row["text"])
 
 
 class StartersResponse(BaseModel):
