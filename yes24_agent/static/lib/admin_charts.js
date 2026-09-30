@@ -12,7 +12,7 @@ const DAY_LABEL_W = 44;
 const EMPTY = '선택한 기간에 기록이 없습니다.';
 const KEYS = { ArrowLeft: -1, ArrowRight: 1, Home: -Infinity, End: Infinity };
 
-export function initCharts({ template, el, table, timezone }) {
+export function initCharts({ template, el, table }) {
   const svgNS = template.content.firstElementChild.namespaceURI;
 
   const node = (parent, tag, attrs, cls, text) => {
@@ -40,17 +40,26 @@ export function initCharts({ template, el, table, timezone }) {
     return { top: count * step, ticks: Array.from({ length: count + 1 }, (_, i) => i * step) };
   }
 
-  /** 카드 뼈대: 제목 · 범례 · 그림 · 각주 · 표 토글. draw(svg, width)는 폭이 바뀔 때마다 다시 부른다. */
+  /** 카드 뼈대: 제목 · 범례 · 그림 · 각주 · 표 토글. draw(svg, width)는 폭이 바뀔 때마다 다시 부른다.
+   *  범례 항목에 toggle이 있으면 범례가 버튼이다 — 누르면 toggle()이 참일 때 그 계열을 끄고/켜고 다시 그린다. */
   function card({ title, note, notes, legend, empty, tableView, draw }) {
     const figure = el('figure', 'analysis-card chart-card');
+    let redraw = () => {};
     figure.append(el('h3', null, title));
     if (empty) figure.append(el('p', 'analysis-note', EMPTY));
     else {
       if (legend.length) {
         const list = el('ul', 'chart-legend');
         for (const item of legend) {
-          const entry = el('li');
-          entry.append(el('span', `swatch ${item.line ? 'key-line ' : ''}${item.className}`), document.createTextNode(item.label));
+          const entry = el('li'), key = item.toggle ? el('button', 'legend-toggle') : entry;
+          key.append(el('span', `swatch ${item.line ? 'key-line ' : ''}${item.className}`), document.createTextNode(item.label));
+          if (item.toggle) {
+            key.type = 'button';
+            key.setAttribute('aria-pressed', 'true');
+            key.title = '누르면 이 계열을 끄고 켭니다';
+            key.onclick = () => { if (item.toggle()) { key.setAttribute('aria-pressed', String(key.getAttribute('aria-pressed') !== 'true')); redraw(); } };
+            entry.append(key);
+          }
           list.append(entry);
         }
         figure.append(list);
@@ -60,6 +69,7 @@ export function initCharts({ template, el, table, timezone }) {
       plot.append(svg);
       figure.append(plot);
       let width = 0;
+      redraw = () => { if (width) draw(svg, width); };
       const observer = new ResizeObserver(() => {
         // 대시보드가 다시 그려져 카드가 빠지면 관찰을 끝낸다(첫 관찰은 붙기 전일 수 있다).
         if (!figure.isConnected) { if (width) observer.disconnect(); return; }
@@ -134,7 +144,8 @@ export function initCharts({ template, el, table, timezone }) {
   }
 
   /** 포인터와 키보드가 같은 인덱스를 고른다 — 막대·셀은 칸 전체가 타깃, 선은 가까운 날짜로 스냅. */
-  function cursor(svg, layer, { count, pick, keys, show, hide }) {
+  /** choose가 있으면 칸을 누르거나 Enter로 그 칸을 고른다(막대 → 필터된 목록 등). */
+  function cursor(svg, layer, { count, pick, keys, show, hide, choose }) {
     let index = null;
     const go = (i) => { index = Math.max(0, Math.min(count - 1, i)); layer.setAttribute('aria-label', show(index)); };
     layer.setAttribute('tabindex', '0');
@@ -147,7 +158,12 @@ export function initCharts({ template, el, table, timezone }) {
     layer.addEventListener('pointerleave', () => { if (document.activeElement !== layer) hide(); });
     layer.addEventListener('focus', () => go(index ?? count - 1));
     layer.addEventListener('blur', hide);
+    if (choose) {
+      layer.classList.add('pickable');
+      layer.addEventListener('click', (event) => { const box = svg.getBoundingClientRect(), i = pick(event.clientX - box.left, event.clientY - box.top); if (i !== null) choose(i); });
+    }
     layer.addEventListener('keydown', (event) => {
+      if (choose && event.key === 'Enter' && index !== null) { choose(index); return; }
       if (!(event.key in keys)) return;
       event.preventDefault();
       go((index ?? 0) + keys[event.key]);
@@ -162,8 +178,8 @@ export function initCharts({ template, el, table, timezone }) {
     return `M${x},${bottom}V${top + r}Q${x},${top} ${x + r},${top}H${x + width - r}Q${x + width},${top} ${x + width},${top + r}V${bottom}Z`;
   };
 
-  /** 날짜별 누적 막대. 첫 시리즈가 기준선에 붙는다. 날짜가 아닌 칸(요일)은 tick·axisTitle과 빈 zone으로 그린다. */
-  function stackedBars({ title, note, notes, categories, series, unit, format, zone = timezone(), tick, axisTitle = `날짜 (${zone})` }) {
+  /** 날짜별 누적 막대. 첫 시리즈가 기준선에 붙는다. 날짜가 아닌 칸(요일·시각)은 tick·axisTitle로 그린다. */
+  function stackedBars({ title, note, notes, categories, series, unit, format, tick, axisTitle = '날짜', onPick }) {
     // null(미측정·단가 미등록)은 0이 아니다 — 막대는 그리지 않고 표·툴팁엔 포맷터의 null 표기로 간다.
     // 칸 이름 — tick(축 라벨 서식)이 있으면 툴팁·낭독·표도 같은 이름(예: 13 → '13시'). 날짜는 원문 그대로.
     const name = (category) => (tick ? tick(category) : category);
@@ -205,10 +221,11 @@ export function initCharts({ template, el, table, timezone }) {
           // 계열이 하나면 값 한 줄뿐 — 계열명(제목·범례가 이미 말함)·합계 줄을 붙이면 '100질의 질의 / 100질의 합계'로 겹친다.
           const rows = single ? [{ value: format(totals[i]), className: series[0].className }]
             : [...series.filter((item) => item.values[i] > 0).map((item) => ({ value: format(item.values[i]), label: item.label, className: item.className })), { value: format(totals[i]), label: '합계' }];
-          tooltip.show(left + band * (i + 0.5), `${name(categories[i])} ${zone}`.trim(), rows);
+          tooltip.show(left + band * (i + 0.5), name(categories[i]), rows);
           return `${name(categories[i])} ${rows.map((row) => [row.label, row.value].filter(Boolean).join(' ')).join(', ')}`;
         },
         hide: () => { highlight.setAttribute('display', 'none'); tooltip.hide(); },
+        choose: onPick && ((i) => onPick(categories[i])),
       });
     };
     return card({
@@ -222,13 +239,17 @@ export function initCharts({ template, el, table, timezone }) {
     });
   }
 
-  /** 날짜별 선. null은 선을 끊는다(0으로 잇지 않음). */
-  function lines({ title, note, categories, series, format, zone = timezone() }) {
-    const present = series.flatMap((item) => item.values).filter((value) => value != null);
-    const lastIndex = series.map((item) => item.values.findLastIndex((value) => value != null));
+  /** 날짜별 선. null은 선을 끊는다(0으로 잇지 않음). 범례를 눌러 계열을 끄면 남은 계열로 y축을 다시 잡는다
+   *  (마지막 하나는 끄지 않는다). */
+  function lines({ title, note, categories, series: all, format }) {
+    const present = all.flatMap((item) => item.values).filter((value) => value != null);
+    const hidden = new Set();
     const draw = (svg, width) => {
+      const series = all.filter((item) => !hidden.has(item));
+      const lastIndex = series.map((item) => item.values.findLastIndex((value) => value != null));
+      const shown = series.flatMap((item) => item.values).filter((value) => value != null);
       size(svg, width, TOP + PLOT_H + AXIS_H);
-      const { top, ticks } = scale(Math.max(...present), false);
+      const { top, ticks } = scale(Math.max(...shown), false);
       // 끝 라벨이 서로 겹칠 만큼 가까우면 라벨을 버리고 범례·툴팁에 맡긴다(밀어 붙이지 않는다).
       const ends = series.map((item, k) => (lastIndex[k] < 0 ? null : (item.values[lastIndex[k]] / top) * PLOT_H));
       const crowded = ends.some((a, i) => a !== null && ends.some((b, j) => i < j && b !== null && Math.abs(a - b) < LINE_H));
@@ -263,7 +284,7 @@ export function initCharts({ template, el, table, timezone }) {
           crosshair.setAttribute('x2', x(i));
           crosshair.removeAttribute('display');
           const rows = series.map((item) => ({ value: format(item.values[i]), label: item.label, className: item.className }));
-          tooltip.show(x(i), `${categories[i]} ${zone}`, rows);
+          tooltip.show(x(i), categories[i], rows);
           return `${categories[i]} ${rows.map((row) => `${row.label} ${row.value}`).join(', ')}`;
         },
         hide: () => { crosshair.setAttribute('display', 'none'); tooltip.hide(); },
@@ -272,10 +293,13 @@ export function initCharts({ template, el, table, timezone }) {
     return card({
       title, note, draw,
       empty: !present.length,
-      legend: series.map(({ label, legend, className }) => ({ label: legend ?? label, className, line: true })),
+      legend: all.map((item) => ({
+        label: item.legend ?? item.label, className: item.className, line: true,
+        toggle: all.length > 1 ? () => (hidden.delete(item) || (hidden.size < all.length - 1 && !!hidden.add(item))) : null,
+      })),
       tableView: () => table(
-        [{ key: 'category', label: `날짜 (${zone})` }, ...series.map((item, k) => ({ key: `s${k}`, label: item.label, format }))],
-        categories.map((category, i) => Object.fromEntries([['category', category], ...series.map((item, k) => [`s${k}`, item.values[i]])])),
+        [{ key: 'category', label: '날짜' }, ...all.map((item, k) => ({ key: `s${k}`, label: item.label, format }))],
+        categories.map((category, i) => Object.fromEntries([['category', category], ...all.map((item, k) => [`s${k}`, item.values[i]])])),
       ),
     });
   }

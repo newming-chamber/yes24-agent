@@ -1,9 +1,9 @@
-"""운영자용 데이터 라우트 — 세션 DB(MySQL)를 조회하고, 회원 이용 가능 여부만 바꾼다.
+"""운영자용 데이터 라우트 — 세션 DB(MySQL)를 읽기 전용으로 조회한다.
 
 모듈 경계: 누가(계정·세션·역할·감사 트랜잭션)는 `admin_auth`가, 무엇을 본다/바꾼다는 이
 모듈이 소유한다. 역방향 import는 없다. 권한은 라우트마다 최소 역할 하나다 — 조회는
-`require_admin`(viewer), 회원 차단 토글은 `require_editor`, 비용은 `require_owner`
-(docs/admin-management-design-20260914.md §4).
+`require_admin`(viewer), 비용·감사 기록은 `require_owner`(docs/admin-management-design-20260914.md
+§4). 쓰기 라우트(계정·초기 질문)는 `admin_auth`·`starters`가 소유한다.
 
 내부 정보(조사 과정·오류 내부·토큰·비용)는 화면이 아니라 **응답에서** 뺀다 — 개발자 도구로
 보이면 화면에서 숨긴 의미가 없다. 비용만 owner 전용 라우트 하나로 나간다.
@@ -16,10 +16,6 @@
 `SET SESSION TRANSACTION READ ONLY`를 init_command로 얹어 요청마다 연다. 쓰기 문장은 서버가
 1792로 거부하므로 읽기 전용이 코드 규율이 아니라 접속의 속성이다.
 
-변경: 회원 PATCH는 읽기 전용 접속을 쓰지 않고 `AdminService.transaction`의 쓰기
-커넥션에서 편집 프로토콜(`AdminTx.edit_row` — FOR UPDATE·expected 대조)과 감사를 같은
-트랜잭션으로 커밋한다.
-
 세션 DB가 MySQL이 아니면 `register_admin`이 라우트를 아예 등록하지 않아 404가 된다 — 설정하지
 않은 환경에 admin이 존재조차 하지 않게 하는 편이 노출 표면이 작다.
 """
@@ -29,20 +25,14 @@ from __future__ import annotations
 import logging
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import aiomysql
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import Field, StrictBool
 
 from yes24_agent.admin_auth import (
-    AdminActor,
-    AdminService,
-    EditBody,
-    EditChanges,
     require_admin,
-    require_editor,
     require_owner,
 )
 from yes24_agent.admin_data import (
@@ -63,7 +53,7 @@ from yes24_agent.admin_data import (
 )
 from yes24_agent.config import Settings
 from yes24_agent.session_service import mysql_pool_kwargs
-from yes24_agent.starters import chip_label
+from yes24_agent.starters import TARGET_SEP, chip_label
 
 logger = logging.getLogger(__name__)
 
@@ -89,9 +79,6 @@ def admin_headers(settings: Settings) -> dict[str, str]:
 
 _DB_ERRORS = (aiomysql.Error, OSError, TimeoutError)
 
-# 편집 가능 컬럼(편집 프로토콜의 SELECT … FOR UPDATE 대상이자 감사 before/after의 범위).
-USER_EDITABLE = ("is_active",)
-
 
 def readonly_connect_kwargs(session_db_url: str) -> dict[str, Any] | None:
     """읽기 전용 접속 kwargs — 세션 DB가 MySQL이 아니면 None(admin 비활성).
@@ -112,20 +99,56 @@ def readonly_connect_kwargs(session_db_url: str) -> dict[str, Any] | None:
 # ── 조회 ───────────────────────────────────────────────────────────────────
 
 _SESSION_TURNS = "t.app_name = s.app_name AND t.user_id = s.user_id AND t.session_id = s.id"
+# 세션의 피드백 — uq_turn_feedback_user_turn 앞부분(앱·사용자·세션)으로 찾는다.
+_SESSION_FEEDBACK = "f.app_name = s.app_name AND f.user_id = s.user_id AND f.session_id = s.id"
+# 세션 RBTI = 그 세션에서 가장 최근에 적용된 유형(적용 안 된 턴은 건너뛴다) — 목록 배지·필터가
+# 같은 식.
+_SESSION_RBTI = (
+    f"(SELECT t.rbti_applied FROM chat_turn t WHERE {_SESSION_TURNS} "
+    "AND t.rbti_applied IS NOT NULL ORDER BY t.started_at DESC, t.id DESC LIMIT 1)"
+)
+# RBTI 필터 값 — ""(전체)·any(있음)·none(없음)·유형 코드(4글자 대문자, 데이터에 나온 코드를 화면이
+# 목록으로 받는다). 라우트가 이 패턴으로 검증하고 코드는 바인딩한다.
+RBTI_FILTER = r"^(|any|none|[A-Z]{4})$"
+
+
+def _rbti_condition(expr: str, rbti: str) -> tuple[str, list[Any]] | None:
+    """RBTI 필터 → (조건, 파라미터). expr는 대상의 RBTI 식(회원 t.rbti·세션 _SESSION_RBTI)."""
+    if not rbti:
+        return None
+    if rbti == "any":
+        return f"{expr} IS NOT NULL", []
+    if rbti == "none":
+        return f"{expr} IS NULL", []
+    return f"{expr} = %s", [rbti]
+
+
+async def _rbti_types(cur: aiomysql.DictCursor) -> list[str]:
+    """필터 선택지 — 데이터에 나온 RBTI 코드만(코드 목록을 코드에 적지 않는다)."""
+    await cur.execute(
+        "SELECT DISTINCT rbti_applied AS rbti FROM chat_turn "
+        "WHERE rbti_applied IS NOT NULL ORDER BY rbti_applied"
+    )
+    return [row["rbti"] for row in await cur.fetchall()]
+
+
+# 피드백 평가 값(DDL ck_turn_feedback_rating) → 목록 열 이름.
+FEEDBACK_RATINGS = {"up": "likes", "down": "dislikes"}
 
 # 세션 상세 턴 JSON 열(DDL scripts/chat_turn.sql) — 구조로 싣는다.
 _TURN_JSON_COLUMNS = ("sources",)
-# 턴 하나에 붙는 피드백·클릭 수 — 그 턴의 소유자 스코프 키(앱·사용자·세션·턴)로만 센다.
+# 턴 하나에 붙는 클릭 수 — 그 턴의 소유자 스코프 키(앱·사용자·세션·턴)로만 센다.
 _TURN_SCOPE = "x.app_name = t.app_name AND x.user_id = t.user_id AND x.session_id = t.session_id "
 _TURN_SCOPE += "AND x.turn_id = t.turn_id"
 _DETAIL_TURNS_SQL = (
     "SELECT t.turn_id, t.asked_at, t.completed_at, t.user_message, t.assistant_message, "
     "t.status, t.sources, t.rbti_applied, t.elapsed_ms, "
-    f"(SELECT COUNT(*) FROM turn_feedback x WHERE {_TURN_SCOPE} AND x.rating = 'up') AS likes, "
-    f"(SELECT COUNT(*) FROM turn_feedback x WHERE {_TURN_SCOPE} AND x.rating = 'down') "
-    "AS dislikes, "
+    # 피드백은 턴당 최신 1행(uq_turn_feedback_user_turn)이라 JOIN해도 턴이 늘지 않는다.
+    "f.rating AS rating, f.comment AS feedback_comment, "
     f"(SELECT COUNT(*) FROM turn_click x WHERE {_TURN_SCOPE}) AS clicks "
-    "FROM chat_turns t WHERE t.app_name = %s AND t.user_id = %s AND t.session_id = %s "
+    "FROM chat_turns t LEFT JOIN turn_feedback f ON f.app_name = t.app_name "
+    "AND f.user_id = t.user_id AND f.session_id = t.session_id AND f.turn_id = t.turn_id "
+    "WHERE t.app_name = %s AND t.user_id = %s AND t.session_id = %s "
     "ORDER BY t.asked_at, t.turn_id"
 )
 
@@ -155,8 +178,15 @@ async def fetch_sessions(
     since: date | None,
     until: date | None,
     page: int,
+    rating: str = "",
+    rbti: str = "",
+    status: str = "",
+    sort: str = "",
+    direction: str = "desc",
 ) -> dict[str, Any]:
-    """세션 목록(최근 갱신순 페이지네이션 + 검색·기간 필터).
+    """세션 목록(기본 최근 갱신순 페이지네이션 + 검색·기간·피드백 필터, 정렬은 SESSION_SORTS).
+
+    rating('up'|'down')을 주면 그 평가가 1개 이상 달린 세션만 — 같은 문장의 EXISTS다.
 
     본문 검색은 세션 id 부분 일치·회원번호 일치와 합집합이다 — 운영자가 세션 id·회원번호를
     붙여넣든 대화에 나온 낱말을 치든 같은 입력창에서 찾게 한다(회원 화면의 '대화 보기'가
@@ -164,14 +194,36 @@ async def fetch_sessions(
     그대로 맞는다(events JSON의 escape 표기 문제가 없다).
     """
     where, params = period_filter("s.update_time", (since, until), settings.admin_utc_offset_hours)
+    # 질문 없이 열리기만 한 빈 세션은 싣지 않는다 — 대시보드·통계 '세션'(턴 있는 세션)과 같은 정의.
+    where.append(f"EXISTS (SELECT 1 FROM chat_turn t WHERE {_SESSION_TURNS})")
 
     if query:
+        # 닉네임은 세션 행마다 닉네임 식을 돌리지 않고, 닉네임이 맞는 회원번호 집합으로 건다.
         where.append(
-            "(s.id LIKE %s OR s.user_id = %s OR EXISTS (SELECT 1 FROM chat_turn t WHERE "
+            "(s.id LIKE %s OR s.user_id = %s OR s.user_id IN ("
+            "SELECT nick_u.user_no FROM users nick_u "
+            "JOIN auth_keys nick_k ON nick_k.user_id = nick_u.id "
+            "WHERE JSON_UNQUOTE(JSON_EXTRACT(nick_k.raw_user_info, '$.nickNm')) LIKE %s) "
+            "OR EXISTS (SELECT 1 FROM chat_turn t WHERE "
             f"{_SESSION_TURNS} AND (t.user_text LIKE %s OR t.text LIKE %s)))"
         )
-        params.extend([f"%{query}%", query, f"%{query}%", f"%{query}%"])
+        params.extend([f"%{query}%", query, f"%{query}%", f"%{query}%", f"%{query}%"])
+    if rating:
+        where.append(
+            f"EXISTS (SELECT 1 FROM turn_feedback f WHERE {_SESSION_FEEDBACK} AND f.rating = %s)"
+        )
+        params.append(rating)
+    if condition := _rbti_condition(_SESSION_RBTI, rbti):
+        where.append(condition[0])
+        params.extend(condition[1])
+    if status == "refused":  # 답변거절(실패·중단) 턴이 있는 세션 — 대시보드 답변거절률과 같은 정의
+        marks = ", ".join(["%s"] * len(REFUSED))
+        where.append(
+            f"EXISTS (SELECT 1 FROM chat_turn t WHERE {_SESSION_TURNS} AND t.status IN ({marks}))"
+        )
+        params.extend(REFUSED)
     where_sql = sql_where(where)
+    rbti_types = await _rbti_types(cur)  # 필터 선택지(목록 문장보다 먼저 — 목록이 마지막 두 문장)
     await cur.execute(f"SELECT COUNT(*) AS total FROM sessions s {where_sql}", params)
     total = (await cur.fetchone())["total"]
 
@@ -182,21 +234,36 @@ async def fetch_sessions(
         f"AND t.status = '{status}') AS {status}, "
         for status in REFUSED
     )
+    # 목록 배지(좋아요·싫어요 n) — 같은 방식의 상관 서브쿼리.
+    feedback = "".join(
+        f"(SELECT COUNT(*) FROM turn_feedback f WHERE {_SESSION_FEEDBACK} "
+        f"AND f.rating = '{value}') AS {column}, "
+        for value, column in FEEDBACK_RATINGS.items()
+    )
     await cur.execute(
         f"SELECT s.user_id, {nickname_sql('s.user_id')} AS nickname, "
         "s.id, s.create_time, s.update_time, "
-        f"(SELECT COUNT(*) FROM chat_turn t WHERE {_SESSION_TURNS}) AS turn_count, {refused}"
+        f"(SELECT COUNT(*) FROM chat_turn t WHERE {_SESSION_TURNS}) AS turn_count, "
+        f"{refused}{feedback}"
+        f"{_SESSION_RBTI} AS rbti, "
         # 미리보기 = 첫 턴의 질문 앞부분. 자르기를 SQL에 맡겨 본문 전체를 끌어오지 않는다.
         f"(SELECT LEFT(t.user_text, %s) FROM chat_turn t WHERE {_SESSION_TURNS} "
         "ORDER BY t.started_at, t.id LIMIT 1) AS preview "
         f"FROM sessions s {where_sql} "
-        "ORDER BY s.update_time DESC, s.app_name, s.user_id, s.id LIMIT %s OFFSET %s",
+        f"ORDER BY {_order(SESSION_SORTS, sort, direction, 's.id', _SESSION_ORDER)} "
+        "LIMIT %s OFFSET %s",
         [settings.admin_preview_max_chars, *params, size, page * size],
     )
     items = [
         {**with_nickname(jsonable(row)), **refusal_breakdown([row])} for row in await cur.fetchall()
     ]
-    return {"total": total, "page": page, "page_size": size, "items": items}
+    return {
+        "total": total,
+        "page": page,
+        "page_size": size,
+        "items": items,
+        "rbti_types": rbti_types,
+    }
 
 
 async def fetch_session_detail(
@@ -260,6 +327,7 @@ async def _fetch_page(
     params: list[Any],
     order: str,
     page: int,
+    json_columns: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """목록 한 페이지와 전체 건수 — 대화 목록과 같은 응답 모양(total·page·page_size·items)."""
     where_sql = sql_where(where)
@@ -270,7 +338,7 @@ async def _fetch_page(
         f"SELECT {columns} FROM {source}{where_sql} ORDER BY {order} LIMIT %s OFFSET %s",
         [*params, size, page * size],
     )
-    items = [jsonable(row) for row in await cur.fetchall()]
+    items = [jsonable(row, json_columns) for row in await cur.fetchall()]
     return {"total": total, "page": page, "page_size": size, "items": items}
 
 
@@ -278,9 +346,13 @@ async def _fetch_page(
 # 같은 소스다. idx_chat_turn_session_time 선두 (app_name, user_id)로 인덱스만 훑어 묶고(앱은 하나라
 # 회원당 한 행), users(uq_users_user_no)에 붙인다. 전 회원 뷰(user_activity)는 쓰지 않는다(운영 28k
 # 회원에서 2.5~4.7s).
+# rbti = 그 회원의 가장 최근 적용 RBTI(대화 목록 배지와 같은 정의). users.rbti는 운영에서 비어
+# 있어 쓰지 않는다. GROUP_CONCAT은 NULL을 건너뛰고 최신순이라 첫 항목이 가장 최근 적용값이다
+# (group_concat_max_len으로 뒤가 잘려도 첫 항목은 남는다).
 _CHATTED = (
-    "(SELECT user_id, COUNT(*) AS turns, MAX(started_at) AS last_chat_at "
-    "FROM chat_turn GROUP BY app_name, user_id) t"
+    "(SELECT user_id, COUNT(*) AS turns, MAX(started_at) AS last_chat_at, "
+    "SUBSTRING_INDEX(GROUP_CONCAT(rbti_applied ORDER BY started_at DESC, id DESC), ',', 1) "
+    "AS rbti FROM chat_turn GROUP BY app_name, user_id) t"
 )
 
 
@@ -289,10 +361,57 @@ def _user_nickname(alias: str) -> str:
     return f"COALESCE({nickname_by_user_pk_sql(f'{alias}.id')}, {alias}.user_no)"
 
 
+# 목록 정렬 — 화면 열 키 → SQL 식. 라우트가 이 키만 받고(Literal) 값은 식으로만 바꾼다
+# (입력 보간 없음).
+# 같은 값끼리는 id로 순서를 고정한다. 기본(sort 없음)은 각 목록의 원래 순서다.
+USER_SORTS = {
+    "nickname": "nickname",  # SELECT 별칭 — 대화한 회원 집합(수백 행)에만 계산된다
+    # 회원번호는 숫자 순 — 숫자가 아닌 값은 NULL로 두어 뒤로 보낸다(_order의 IS NULL).
+    "user_no": "IF(COALESCE(u.user_no, t.user_id) REGEXP '^[0-9]+$', "
+    "CAST(COALESCE(u.user_no, t.user_id) AS UNSIGNED), NULL)",
+    "rbti": "t.rbti",
+    "turns": "t.turns",
+    "last_chat_at": "t.last_chat_at",
+    "created_at": "u.created_at",
+}
+# 대화 목록 — 최근/오래된(갱신 시각)·질의 수(SELECT 별칭, 걸러진 세션에만 계산된다).
+SESSION_SORTS = {"update_time": "s.update_time", "turn_count": "turn_count"}
+_SESSION_ORDER = "s.update_time DESC, s.app_name, s.user_id, s.id"
+STARTER_SORTS = {
+    # 칩 라벨 근사 — 행 라벨, 없으면 슬롯 키의 대상 부분(chip_label의 앞 두 단계). 설정·시드 라벨은
+    # 표시에만 쓰여 정렬 위치가 조금 다를 수 있다.
+    "label": f"COALESCE(NULLIF(label, ''), SUBSTRING_INDEX(slot, '{TARGET_SEP}', -1))",
+    "run_date": "run_date",
+    "active": "active",
+    "pinned": "pinned",
+}
+SORT_DIRECTIONS = ("asc", "desc")
+
+
+def _order(sorts: dict[str, str], sort: str, direction: str, tie: str, default: str) -> str:
+    """정렬 키·방향 → ORDER BY 식(허용 목록 밖은 라우트가 이미 422로 막는다). 빈 값(NULL)은
+    방향과 무관하게 뒤로 — 닉네임·RBTI처럼 비어 있는 행이 많은 열에서 앞 페이지를 채우지 않게."""
+    if not sort:
+        return default
+    expr, way = sorts[sort], direction.upper()
+    return f"{expr} IS NULL, {expr} {way}, {tie} {way}"
+
+
 async def fetch_users(
-    cur: aiomysql.DictCursor, settings: Settings, *, query: str, page: int
+    cur: aiomysql.DictCursor,
+    settings: Settings,
+    *,
+    query: str,
+    page: int,
+    sort: str = "",
+    direction: str = "desc",
+    rbti: str = "",
+    nickname: str = "",
 ) -> dict[str, Any]:
-    """한 번이라도 대화한 회원(마지막 질의 최근순).
+    """한 번이라도 대화한 회원(기본은 마지막 질의 최근순, sort로 열 정렬 — 검색과 함께 동작).
+
+    필터: rbti(전체·있음·없음·유형 — 가장 최근 적용값 t.rbti 기준), nickname=any(닉네임 있는
+    회원만).
 
     검색: 회원번호 정확 일치는 전체 회원에서 찾는다(대화 전인 회원도 차단할 수 있게, 유일 인덱스).
     닉네임 부분 일치는 대화한 회원 안에서만 — 전 회원 닉네임 LIKE는 JSON 서브쿼리가 행마다 돈다.
@@ -311,25 +430,46 @@ async def fetch_users(
         )
         params: list[Any] = [query, f"%{query}%"]
     else:
-        source, params = f"{_CHATTED} JOIN users u ON u.user_no = t.user_id", []
-    return await _fetch_page(
+        # users 행이 없는 대화 사용자(개발 키·시험 계정)도 활성 사용자에 들어가므로 LEFT JOIN으로
+        # 싣는다 — 회원 수가 대시보드 '활성 사용자'와 같다(회원번호 칸은 대화의 user_id).
+        source, params = f"{_CHATTED} LEFT JOIN users u ON u.user_no = t.user_id", []
+    where: list[str] = []
+    if condition := _rbti_condition("t.rbti", rbti):
+        where.append(condition[0])
+        params.extend(condition[1])
+    if nickname == "any":
+        where.append(f"{nickname_by_user_pk_sql('u.id')} IS NOT NULL")
+    rbti_types = await _rbti_types(cur)
+    page_data = await _fetch_page(
         cur,
         settings,
         # 표에는 닉네임 원값(없으면 null — 회원번호 칸이 따로 있다). 검색만 회원번호 폴백을 쓴다.
-        columns=f"u.id, u.user_no, {nickname_by_user_pk_sql('u.id')} AS nickname, u.is_active, "
+        columns=f"u.id, COALESCE(u.user_no, t.user_id) AS user_no, "
+        f"{nickname_by_user_pk_sql('u.id')} AS nickname, t.rbti, "
         "t.turns, t.last_chat_at, u.created_at",
         source=source,
-        where=[],
+        where=where,
         params=params,
-        order="t.last_chat_at DESC, u.id DESC",
+        order=_order(USER_SORTS, sort, direction, "u.id", "t.last_chat_at DESC, u.id DESC"),
         page=page,
     )
+    return {**page_data, "rbti_types": rbti_types}
 
 
 async def fetch_starters(
-    cur: aiomysql.DictCursor, settings: Settings, *, page: int
+    cur: aiomysql.DictCursor,
+    settings: Settings,
+    *,
+    page: int,
+    sort: str = "",
+    direction: str = "desc",
 ) -> dict[str, Any]:
     """초기 질문 풀(생성 최근순) — 목록과 편집 패널이 쓰는 열만. 쓰기는 starters.py 라우트다."""
+    # 수동 추가·지금 생성의 슬롯 선택지 — 풀에 있는 슬롯 키와 그 칩 라벨(행 라벨이 있으면 최신 것).
+    await cur.execute("SELECT slot, MAX(label) AS label FROM starters GROUP BY slot ORDER BY slot")
+    slots = [
+        {"slot": row["slot"], "label": chip_label(row, settings)} for row in await cur.fetchall()
+    ]
     page_data = await _fetch_page(
         cur,
         settings,
@@ -338,35 +478,73 @@ async def fetch_starters(
         source="starters",
         where=[],
         params=[],
-        order="active DESC, created_at DESC, id DESC",  # 지금 노출 중인 풀이 먼저
+        # 기본은 지금 노출 중인 풀이 먼저, 생성 최근순.
+        order=_order(STARTER_SORTS, sort, direction, "id", "active DESC, created_at DESC, id DESC"),
         page=page,
     )
     # 슬롯 키 대신 칩에 보이는 라벨 — 서빙과 같은 규칙(starters.chip_label)을 서버가 채운다.
     for item in page_data["items"]:
         item["label"] = chip_label(item, settings)
-    return page_data
+    return {**page_data, "slots": slots}
 
 
-async def fetch_user(cur: aiomysql.DictCursor, user_id: int) -> dict[str, Any] | None:
-    """회원 1명 — 편집 뒤 응답에 싣는다(편집 대상 필드와 식별자만)."""
-    await cur.execute(
-        "SELECT id, user_no, is_active FROM users WHERE id = %s",
-        (user_id,),
+# 감사 기록 대상 종류(admin_management.sql target_type) — 화면 필터 값이 곧 이 값이다.
+AUDIT_TARGETS = ("login", "admin", "user", "starter", "session")
+# 대상 이름 — 계정은 계정명, 회원은 회원번호로 바꿔 싣고(행 id는 사람이 못 읽는다) 나머지는
+# target_id 그대로.
+# 로그인 기록의 target_id는 사용자가 입력한 계정명 원문이다 — 실제 계정일 때만 이름을 싣고(없으면
+# NULL → 화면 "알 수 없는 계정"), 원문(target_id)은 응답에 싣지 않는다. 아이디 칸에 비밀번호를
+# 잘못 친 실패 기록이 화면에 비밀번호를 드러내지 않게.
+_AUDIT_SOURCE = (
+    "admin_audit x "
+    "LEFT JOIN admin_users a ON x.target_type = 'admin' AND a.id = x.target_id "
+    "LEFT JOIN admin_users la ON x.target_type = 'login' AND la.username = x.target_id "
+    "LEFT JOIN users u ON x.target_type = 'user' AND u.id = x.target_id"
+)
+
+
+async def fetch_audit(
+    cur: aiomysql.DictCursor,
+    settings: Settings,
+    *,
+    page: int,
+    target: str,
+    actor: str,
+    period: tuple[date | None, date | None],
+) -> dict[str, Any]:
+    """관리 감사 기록(owner 전용 라우트) — 최신순, 대상 종류·계정·기간(어드민 시간대 달력일) 필터.
+
+    before/after는 바뀐 열만 담고 해시·키·원문 회원정보는 애초에 기록하지 않는다(쓰는 쪽 계약).
+    필터 값은 전부 바인딩한다. 기간은 idx_admin_audit_time, 계정은 스냅샷 이름(actor_name)이다.
+    """
+    where, params = period_filter("x.created_at", period, settings.admin_utc_offset_hours)
+    if target:
+        where.append("x.target_type = %s")
+        params.append(target)
+    if actor:
+        where.append("x.actor_name = %s")
+        params.append(actor)
+    page_data = await _fetch_page(
+        cur,
+        settings,
+        columns="x.id, x.created_at, x.actor_name, x.target_type, "
+        "CASE x.target_type WHEN 'admin' THEN a.username WHEN 'user' THEN u.user_no "
+        "WHEN 'login' THEN la.username ELSE x.target_id END AS target_name, "
+        "x.action, x.`before`, x.`after`, x.ip",
+        source=_AUDIT_SOURCE,
+        where=where,
+        params=params,
+        order="x.created_at DESC, x.id DESC",
+        page=page,
+        json_columns=("before", "after"),
     )
-    row = await cur.fetchone()
-    return None if row is None else jsonable(row)
-
-
-# ── 변경 본문 ──────────────────────────────────────────────────────────────
-
-
-class UserChanges(EditChanges):
-    # 타입에 None이 없다 — 생략은 기본값(미검증)이라 통과하고, 명시한 null은 422다(NOT NULL 열).
-    is_active: StrictBool = Field(default=None)
-
-
-class UserEdit(EditBody):
-    changes: UserChanges
+    # 계정 필터 선택지 — 기록에 남은 계정 이름(스냅샷). 계정 관리 API가 없어 여기서 준다.
+    await cur.execute(
+        "SELECT DISTINCT actor_name FROM admin_audit "
+        "WHERE actor_name IS NOT NULL ORDER BY actor_name"
+    )
+    page_data["actors"] = [row["actor_name"] for row in await cur.fetchall()]
+    return page_data
 
 
 # ── 라우터 ─────────────────────────────────────────────────────────────────
@@ -426,10 +604,25 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
         q: str = "",
         period: tuple[date | None, date | None] = Depends(date_range),
         page: int = page_query,
+        rating: Literal["", "up", "down"] = "",
+        rbti: str = Query(default="", pattern=RBTI_FILTER),
+        status: Literal["", "refused"] = "",
+        sort: Literal[("", *SESSION_SORTS)] = "",  # type: ignore[valid-type]
+        dir: Literal[SORT_DIRECTIONS] = "desc",  # type: ignore[valid-type]
     ) -> Any:
         return await _query(
             lambda cur: fetch_sessions(
-                cur, settings, query=q.strip(), since=period[0], until=period[1], page=page
+                cur,
+                settings,
+                query=q.strip(),
+                since=period[0],
+                until=period[1],
+                page=page,
+                rating=rating,
+                rbti=rbti,
+                status=status,
+                sort=sort,
+                direction=dir,
             )
         )
 
@@ -444,39 +637,56 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
         return detail
 
     @router.get("/api/users", dependencies=[Depends(require_admin)])
-    async def admin_users(q: str = "", page: int = page_query) -> Any:
-        return await _query(lambda cur: fetch_users(cur, settings, query=q.strip(), page=page))
+    async def admin_users(
+        q: str = "",
+        page: int = page_query,
+        sort: Literal[("", *USER_SORTS)] = "",  # type: ignore[valid-type]
+        dir: Literal[SORT_DIRECTIONS] = "desc",  # type: ignore[valid-type]
+        rbti: str = Query(default="", pattern=RBTI_FILTER),
+        nickname: Literal["", "any"] = "",
+    ) -> Any:
+        return await _query(
+            lambda cur: fetch_users(
+                cur,
+                settings,
+                query=q.strip(),
+                page=page,
+                sort=sort,
+                direction=dir,
+                rbti=rbti,
+                nickname=nickname,
+            )
+        )
 
     @router.get("/api/starters", dependencies=[Depends(require_admin)])
-    async def admin_starters(page: int = page_query) -> Any:
-        return await _query(lambda cur: fetch_starters(cur, settings, page=page))
-
-    @router.patch("/api/users/{user_id}")
-    async def admin_patch_user(
-        user_id: int,
-        body: UserEdit,
-        request: Request,
-        actor: AdminActor = Depends(require_editor),
+    async def admin_starters(
+        page: int = page_query,
+        sort: Literal[("", *STARTER_SORTS)] = "",  # type: ignore[valid-type]
+        dir: Literal[SORT_DIRECTIONS] = "desc",  # type: ignore[valid-type]
     ) -> Any:
-        """회원 이용 가능(차단) 토글 — 다음 요청부터 반영된다(auth가 요청마다 DB를 읽는다)."""
-        async with AdminService.get_instance().transaction(actor, request) as tx:
-            before, after = await tx.edit_row(
-                "users",
-                user_id,
-                USER_EDITABLE,
-                body.changes.model_dump(exclude_unset=True),
-                body.expected,
-            )
-            if after:
-                await tx.audit("user", user_id, "update", before, after)
-            user = await fetch_user(tx.cur, user_id)
-        return {"id": user_id, "updated": sorted(after), "user": user}
+        return await _query(
+            lambda cur: fetch_starters(cur, settings, page=page, sort=sort, direction=dir)
+        )
 
     @router.get("/api/analytics", dependencies=[Depends(require_admin)])
     async def admin_analytics(
         period: tuple[date | None, date | None] = Depends(date_range),
     ) -> Any:
         return await _query(fetch_analytics, settings, period)
+
+    @router.get("/api/audit", dependencies=[Depends(require_owner)])
+    async def admin_audit(
+        page: int = page_query,
+        target: Literal[("", *AUDIT_TARGETS)] = "",  # type: ignore[valid-type]
+        actor: str = "",
+        period: tuple[date | None, date | None] = Depends(date_range),
+    ) -> Any:
+        """관리 감사 기록(owner 전용) — 누가 언제 무엇을 바꿨는지."""
+        return await _query(
+            lambda cur: fetch_audit(
+                cur, settings, page=page, target=target, actor=actor.strip(), period=period
+            )
+        )
 
     @router.get("/api/analytics/cost", dependencies=[Depends(require_owner)])
     async def admin_cost(period: tuple[date | None, date | None] = Depends(date_range)) -> Any:

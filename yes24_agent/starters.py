@@ -94,7 +94,7 @@ _RETRY_RUN_WHERE = (
     "OR (status <> 'running' AND %s)"
 )
 # 슬롯 키의 `종류:대상` 구분자. 라벨 파생과 관리자 필터가 같은 규약을 본다.
-_TARGET_SEP = ":"
+TARGET_SEP = ":"
 # 대상이 여럿인 종류의 키 접두(대상 이름이 뒤에 붙는다).
 _CORNER_KIND = "corner"
 _PICK_KIND = "pick"
@@ -186,7 +186,7 @@ def chip_label(row: dict, settings: Settings) -> str:
     stored = _squash(row.get("label") or "")
     if stored:
         return stored
-    _, sep, target = slot.partition(_TARGET_SEP)
+    _, sep, target = slot.partition(TARGET_SEP)
     if sep and target:
         return settings.starter_labels.get(slot) or target
     seed = BROWSE_SEED_URLS.get(slot)
@@ -919,9 +919,9 @@ async def _chip_labels(specs: list[SlotSpec], settings: Settings, genai_client: 
     못 지었다고 질문 생성을 막지 않는다(키에서 파생한 이름이 폴백이다).
     """
     items = [
-        {"key": spec.key, "kind": spec.key.partition(_TARGET_SEP)[0],
-         "name": spec.key.partition(_TARGET_SEP)[2]}
-        for spec in specs if _TARGET_SEP in spec.key
+        {"key": spec.key, "kind": spec.key.partition(TARGET_SEP)[0],
+         "name": spec.key.partition(TARGET_SEP)[2]}
+        for spec in specs if TARGET_SEP in spec.key
     ]
     if not items or not genai_client:
         return {}
@@ -993,7 +993,7 @@ async def slot_catalogue(
                 continue
             claimed.add(corner["key"])
             many.append(SlotSpec(
-                key=f"{_CORNER_KIND}{_TARGET_SEP}{corner['label']}",
+                key=f"{_CORNER_KIND}{TARGET_SEP}{corner['label']}",
                 ask=_PRODUCT_ASK, observe=observe_corner_products,
                 target={"section": section, "url": corner["url"]},
             ))
@@ -1011,7 +1011,7 @@ async def slot_catalogue(
             name = _squash(link["name"])
             if not name or not link["number"].startswith(prefix) or link["number"] == prefix:
                 continue
-            key = f"{_PICK_KIND}{_TARGET_SEP}{name}"
+            key = f"{_PICK_KIND}{TARGET_SEP}{name}"
             if key in claimed:
                 continue
             if len(key) > _SLOT_MAX_CHARS:
@@ -1072,7 +1072,7 @@ def rotate_slots(many: list[SlotSpec], today: dt.date, low: int, high: int) -> l
 
     kinds: dict[str, list[SlotSpec]] = {}
     for spec in sorted(many, key=lambda spec: spec.key):
-        kinds.setdefault(spec.key.partition(_TARGET_SEP)[0], []).append(spec)
+        kinds.setdefault(spec.key.partition(TARGET_SEP)[0], []).append(spec)
 
     rotated = []
     for group in kinds.values():

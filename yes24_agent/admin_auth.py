@@ -37,8 +37,6 @@ from pydantic import (
     AfterValidator,
     BaseModel,
     ConfigDict,
-    Field,
-    StrictBool,
     StringConstraints,
     model_validator,
 )
@@ -78,7 +76,6 @@ _UNAUTHORIZED = "인증이 필요합니다."
 _LOGIN_FAILED = "아이디 또는 비밀번호가 올바르지 않습니다."
 _LOCKED = "로그인 시도가 너무 많습니다. 잠시 후 다시 시도해 주세요."
 _CONFLICT = "다른 관리자가 먼저 바꿨습니다."
-_LAST_OWNER = "마지막 활성 owner는 강등·비활성화할 수 없습니다."
 
 AUDIT_INSERT = (
     "INSERT INTO admin_audit (actor_id, actor_name, target_type, target_id, action, "
@@ -621,31 +618,22 @@ class _PasswordChange(BaseModel):
 
 
 class PasswordReset(BaseModel):
-    """재설정 본문 — owner API와 CLI `reset-password`가 같은 검증을 쓴다."""
+    """재설정 본문 — CLI `reset-password`의 검증(계정 관리 화면·API는 2026-09-30 삭제)."""
 
     new_password: _NEW_PASSWORD
 
 
 class AdminCreate(BaseModel):
-    """계정 생성 본문 — owner API와 CLI `create`가 같은 검증을 쓴다."""
+    """계정 생성 본문 — CLI `create`의 검증. 생성·비밀번호 재설정은 CLI,
+    역할 변경·비활성은 DB로 한다(docs/admin-operations.md)."""
 
     username: _USERNAME
     password: _NEW_PASSWORD
     role: _ROLE
 
 
-class _AdminChanges(EditChanges):
-    # NOT NULL 컬럼 — 생략은 허용(default), 입력된 null은 타입이 422로 거부한다(`| None` 금지).
-    role: _ROLE = Field(default=None)
-    is_active: StrictBool = Field(default=None)
-
-
-class _AdminEdit(EditBody):
-    changes: _AdminChanges
-
-
 def register_admin_auth(app: FastAPI, settings: Settings) -> None:
-    """관리자 인증·계정 라우트 등록 — `admin_enabled(settings)`일 때만."""
+    """관리자 인증 라우트(로그인·로그아웃·/me·본인 비밀번호) 등록 — `admin_enabled`일 때만."""
     if not admin_enabled(settings):
         return
     router = APIRouter(prefix=_COOKIE_PATH, include_in_schema=False)
@@ -655,6 +643,8 @@ def register_admin_auth(app: FastAPI, settings: Settings) -> None:
 
         roles = 권한 순서(낮음→높음) — 프론트가 역할 비교표를 따로 들지 않게 정본을 싣는다.
         timezone = 어드민 표시 시간대(오프셋·라벨) — 화면의 시각 표기·기간 프리셋의 '오늘'이 따른다.
+        password_min_length = 비밀번호 변경 폼의 안내·사전 검사(판정은 서버 검증이 정본).
+        change_min_base = 대시보드 증감에서 변화율(%)을 보일 이전 값 하한(설정값 — 화면 표시 규칙).
         """
         return {
             "username": actor.username,
@@ -664,6 +654,8 @@ def register_admin_auth(app: FastAPI, settings: Settings) -> None:
                 "offset_hours": settings.admin_utc_offset_hours,
                 "label": settings.admin_timezone_label,
             },
+            "password_min_length": settings.admin_password_min_length,
+            "change_min_base": settings.admin_change_min_base,
         }
 
     @app.exception_handler(RequestValidationError)
@@ -758,92 +750,5 @@ def register_admin_auth(app: FastAPI, settings: Settings) -> None:
             await service.revoke_sessions(tx.cur, actor.user_id, keep=actor.session_id)
             await tx.audit("admin", actor.user_id, "password_change")
         return {"ok": True}
-
-    @router.get("/api/admins")
-    async def list_admins(
-        request: Request, actor: AdminActor = Depends(require_owner)
-    ) -> dict[str, Any]:
-        async with AdminService.get_instance().transaction(actor, request) as tx:
-            await tx.cur.execute(
-                "SELECT id, username, role, is_active, password_changed_at, created_at, "
-                "created_by FROM admin_users ORDER BY id"
-            )
-            rows = await tx.cur.fetchall()
-        return {"items": [jsonable(row) for row in rows]}
-
-    @router.post("/api/admins", status_code=201)
-    async def create_admin(
-        body: AdminCreate, request: Request, actor: AdminActor = Depends(require_owner)
-    ) -> dict[str, Any]:
-        password_hash = await _hash(body.password)
-        async with AdminService.get_instance().transaction(actor, request) as tx:
-            try:
-                await tx.cur.execute(
-                    "INSERT INTO admin_users (username, password_hash, role, created_by) "
-                    "VALUES (%s, %s, %s, %s)",
-                    (body.username, password_hash, body.role, actor.user_id),
-                )
-            except aiomysql.IntegrityError:
-                raise HTTPException(status_code=409, detail="이미 있는 계정명입니다.") from None
-            admin_id = tx.cur.lastrowid
-            await tx.audit(
-                "admin", admin_id, "create", after={"username": body.username, "role": body.role}
-            )
-        return {"id": admin_id, "username": body.username, "role": body.role}
-
-    @router.patch("/api/admins/{admin_id}")
-    async def patch_admin(
-        admin_id: int,
-        body: _AdminEdit,
-        request: Request,
-        actor: AdminActor = Depends(require_owner),
-    ) -> dict[str, Any]:
-        """역할·활성 변경. 바뀌면 대상의 세션을 전부 폐기한다(같은 트랜잭션).
-
-        최후 owner 규칙: 계정 행 **전체를 PK로 먼저** 잠근 뒤 활성 owner를 센다. 두 owner가
-        동시에 서로를 강등하면 뒤 요청이 이 잠금에서 기다렸다가 앞 요청이 커밋한 상태를 보고
-        409가 된다. (role, is_active) 인덱스로 잠그면(WHERE로 좁히거나, 커버링이라 옵티마이저가
-        고르거나) 격리 MySQL에서 교착(1213 → 503)이 실측됐다 — 앞 요청의 UPDATE가 그 인덱스에 새
-        항목을 넣으려 뒤 요청이 기다리는 레코드 앞 갭을 요구한다. 그래서 PRIMARY를 강제한다.
-        운영자 한 자릿수라 전체 잠금이 싸다.
-        """
-        changes = body.changes.model_dump(exclude_unset=True)
-        service = AdminService.get_instance()
-        async with service.transaction(actor, request) as tx:
-            await tx.cur.execute(
-                "SELECT id, role, is_active FROM admin_users FORCE INDEX (PRIMARY) FOR UPDATE"
-            )
-            owners = {
-                row["id"]
-                for row in await tx.cur.fetchall()
-                if row["role"] == "owner" and row["is_active"]
-            }
-            before, after = await tx.edit_row(
-                "admin_users", admin_id, ("role", "is_active"), changes, body.expected
-            )
-            if after:
-                demoted = after.get("role", "owner") != "owner" or after.get("is_active") is False
-                if admin_id in owners and demoted and not owners - {admin_id}:
-                    raise HTTPException(status_code=409, detail=_LAST_OWNER)
-                await service.revoke_sessions(tx.cur, admin_id)
-                await tx.audit("admin", admin_id, "update", before, after)
-        return {"id": admin_id, "updated": sorted(after)}
-
-    @router.post("/api/admins/{admin_id}/password")
-    async def reset_password(
-        admin_id: int,
-        body: PasswordReset,
-        request: Request,
-        actor: AdminActor = Depends(require_owner),
-    ) -> dict[str, Any]:
-        password_hash = await _hash(body.new_password)
-        service = AdminService.get_instance()
-        async with service.transaction(actor, request) as tx:
-            await tx.cur.execute(PASSWORD_UPDATE, (password_hash, admin_id))
-            if tx.cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="대상을 찾을 수 없습니다.")
-            revoked = await service.revoke_sessions(tx.cur, admin_id)
-            await tx.audit("admin", admin_id, "password_reset")
-        return {"ok": True, "revoked_sessions": revoked}
 
     app.include_router(router)

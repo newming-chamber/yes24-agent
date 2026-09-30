@@ -902,6 +902,9 @@ class Settings(BaseSettings):
     # 수만큼 미리보기 조회가 따라붙어(인덱스 조회지만) 왕복이 늘므로 한 화면에 담기는 정도로
     # 둔다. 화면은 응답의 page_size로 이 값을 받는다(대화 목록 내려받기도 같은 단위로 넘긴다).
     admin_page_size: int = 50
+    # 대시보드 증감의 변화율(%)을 보일 이전 값 하한 — 이전 값이 이보다 작으면(예: 2 → 38 = +1,800%)
+    # 비율이 과장이라 절대 변화만 보인다. 비율 지표(%p)에는 적용하지 않는다. 화면은 /me로 받는다.
+    admin_change_min_base: float = 10
     admin_preview_max_chars: int = 140
     # page 쿼리 상한 — 거대값이 OFFSET 전체 스캔(503·DB 장애 로그)이 아니라 422로 떨어진다.
     admin_max_page: int = 10000

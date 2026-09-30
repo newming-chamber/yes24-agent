@@ -149,6 +149,12 @@ _USAGE_SUMS = (
 # 대시보드 '답변거절률'·통계 '답변거절수'·대화 목록 배지가 같은 정의를 쓴다. SQL은 상태별 수를
 # 상태 이름 열로 세고, 합계와 세부는 refusal_breakdown이 만든다(화면이 실패·중단을 나눠 보인다).
 REFUSED = ("failed", "interrupted")
+# 피드백 평가별 수 — 대시보드(기간 합계)와 통계 '피드백'(일별)이 같은 식을 쓴다.
+# 시각 기준은 updated_at(최신 평가).
+FEEDBACK_COUNTS = (
+    "COUNT(CASE WHEN rating = 'up' THEN 1 END) AS likes, "
+    "COUNT(CASE WHEN rating = 'down' THEN 1 END) AS dislikes"
+)
 _REFUSALS = ", ".join(
     f"COUNT(CASE WHEN status = '{status}' THEN 1 END) AS {status}" for status in REFUSED
 )
@@ -269,9 +275,7 @@ async def fetch_analytics(
     click_where, click_params = period_filter("created_at", spanned, hours)
     engagement = await _fetch(
         cur,
-        f"SELECT {local_day('updated_at', hours)} AS day, "
-        "COUNT(CASE WHEN rating = 'up' THEN 1 END) AS likes, "
-        "COUNT(CASE WHEN rating = 'down' THEN 1 END) AS dislikes, 0 AS clicks "
+        f"SELECT {local_day('updated_at', hours)} AS day, {FEEDBACK_COUNTS}, 0 AS clicks "
         f"FROM turn_feedback{sql_where(feedback_where)} GROUP BY day "
         f"UNION ALL SELECT {local_day('created_at', hours)} AS day, 0, 0, COUNT(*) "
         f"FROM turn_click{sql_where(click_where)} GROUP BY day",
@@ -420,7 +424,9 @@ def _stats(session_days, clicks: int) -> dict[str, Any]:
 
 
 async def fetch_stats(cur, settings: Settings, period: tuple[date, date]) -> dict[str, Any]:
-    """통계 탭 — 어드민 시간대 일별 세션·질의·링크·클릭(고객사 엑셀 11열) + 기간 요약 + 요일 평균.
+    """통계 탭 — 어드민 시간대 일별 세션·질의·링크·클릭(고객사 엑셀 11열) + 기간 요약 + 요일 평균
+    + RBTI 유형별 질의 수(적용률은 화면이 요약 질의 수로 나눈다 — 일별 표·엑셀 양식에는 넣지
+    않는다).
 
     SQL은 (날짜, 세션)까지만 묶고 나머지는 여기서 센다. 기간 요약은 일별 값을 더하거나
     평균하지 않고 같은 행에서 다시 센다 — 이틀에 걸친 세션·여러 날 온 사용자는 기간에 한 번이다.
@@ -447,6 +453,36 @@ async def fetch_stats(cur, settings: Settings, period: tuple[date, date]) -> dic
         params,
     )
     clicks = {row["day"]: int(row["clicks"]) for row in await cur.fetchall()}
+    # RBTI 유형별 질의 수(RBTI가 적용된 턴만, 많은 순) — 유형 목록은 데이터에 나온 코드뿐이다.
+    where, params = period_filter("started_at", period, hours)
+    await cur.execute(
+        "SELECT rbti_applied AS rbti, COUNT(*) AS turns "
+        f"FROM chat_turn{sql_where([*where, 'rbti_applied IS NOT NULL'])} "
+        "GROUP BY rbti_applied ORDER BY turns DESC, rbti",
+        params,
+    )
+    rbti = [jsonable(row) for row in await cur.fetchall()]
+    # 피드백 — 일별 좋아요·싫어요(최신 평가 시각 기준)와 의견이 달린 최근 피드백(질문 앞부분과
+    # 함께, 한 화면 분량 = admin_page_size).
+    where, params = period_filter("updated_at", period, hours)
+    await cur.execute(
+        f"SELECT {local_day('updated_at', hours)} AS day, {FEEDBACK_COUNTS} "
+        f"FROM turn_feedback{sql_where(where)} GROUP BY day",
+        params,
+    )
+    feedback_daily = [jsonable(row) for row in await cur.fetchall()]
+    where, params = period_filter("f.updated_at", period, hours)
+    where.append("TRIM(f.comment) <> ''")  # NULL도 여기서 빠진다
+    await cur.execute(
+        "SELECT f.updated_at, f.rating, f.comment, f.user_id, f.session_id, "
+        "LEFT(t.user_text, %s) AS question FROM turn_feedback f "
+        "LEFT JOIN chat_turn t ON t.app_name = f.app_name AND t.user_id = f.user_id "
+        "AND t.session_id = f.session_id AND t.turn_id = f.turn_id"
+        f"{sql_where(where)} "
+        "ORDER BY f.updated_at DESC, f.id DESC LIMIT %s",
+        [settings.admin_preview_max_chars, *params, settings.admin_page_size],
+    )
+    comments = [jsonable(row) for row in await cur.fetchall()]
 
     since, until = period
     days = [until - timedelta(days=i) for i in range((until - since).days + 1)]
@@ -472,4 +508,6 @@ async def fetch_stats(cur, settings: Settings, period: tuple[date, date]) -> dic
         "summary": _stats(session_days, sum(clicks.values())),
         "daily": daily,
         "weekday": weekday,
+        "rbti": rbti,
+        "feedback": {"daily": feedback_daily, "comments": comments},
     }

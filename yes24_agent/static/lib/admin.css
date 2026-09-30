@@ -45,13 +45,21 @@
     --crema-input-h: 53px;      /* Login.tsx:112 입력칸·버튼 높이 */
     --crema-page-x: 40px;       /* Statistics.tsx:392,583 본문 좌우 여백 */
     --crema-gap: 12px;          /* Statistics.tsx:584 카드 간격 */
+    --panel-w: min(420px, 100vw); /* 옆 패널(기록·편집) 폭 — 본문이 이만큼 비켜선다 */
 
     /* 어드민 공용 역할 이름 — 값은 crema 토큰이 정본이다(화면 규칙은 역할 이름을 쓴다). */
     --bg: var(--crema-grey-50);
     --panel: var(--crema-white);
     --border: var(--crema-grey-200);
     --text: var(--crema-grey-900);
-    --muted: var(--crema-grey-600);
+    /* 정보성 보조 글자(시각·메타·라벨·축·안내) — 흰 바탕 7.0:1, 회색 바탕(grey-50·100·선택 행)에서도
+       4.5:1(WCAG AA) 이상. grey-600은 흰 바탕만 통과(회색 바탕 4.2:1)라 쓰지 않고, grey-400·500·axis는
+       장식(아이콘·셰브런)에만 쓴다. */
+    --text-meta: var(--crema-grey-700);
+    /* 파랑·빨강 글자 — crema 파랑(#3182f6)은 흰 바탕 3.7:1·연한 바탕 3.3:1, 빨강 배지도 3.3:1이라 작은 글자는
+       한 단계 짙게(AA 4.7:1 이상). 색면(막대·테두리·강조 배경)은 crema 원색 그대로. */
+    --accent-text: #1b64da;
+    --badge-red: #d22030;
     --accent: var(--crema-blue);
     --accent-soft: var(--crema-blue-50);
     --error-bg: #ffeef0;
@@ -96,7 +104,7 @@
   .toolbar { display: grid; gap: 20px; padding: 18px 24px; border-bottom: 1px solid var(--crema-grey-100); }
   .toolbar button {
     display: flex; align-items: center; gap: 12px; padding: 8px 10px; border: 0; border-radius: var(--crema-radius-nav);
-    background: none; color: var(--crema-grey-600); font-size: var(--crema-fs-body); font-weight: 600; text-align: left;
+    background: none; color: var(--text-meta); font-size: var(--crema-fs-body); font-weight: 600; text-align: left;
   }
   .toolbar button svg { flex: none; width: 20px; height: 20px; fill: var(--crema-grey-400); }
   .toolbar button:hover { background: rgba(242, 244, 246, .5); }
@@ -109,13 +117,13 @@
   .profile .badge { flex: none; display: grid; place-items: center; width: 36px; height: 36px; border: 1px solid var(--crema-grey-200); border-radius: 12px; background: var(--crema-grey-300); }
   .profile .badge svg { height: 20px; }
   .account { display: grid; min-width: 0; font-weight: 600; color: var(--crema-grey-800); overflow-wrap: anywhere; }
-  .account small { font-size: var(--crema-fs-body); font-weight: 400; color: var(--crema-grey-500); }
+  .account small { font-size: var(--crema-fs-body); font-weight: 400; color: var(--text-meta); }
   /* 프로필 팝업(Sidebar.tsx:254-320) — 로그아웃은 구분선 아래 400. */
   .profile-menu {
     position: absolute; left: 20px; bottom: 76px; width: 200px; display: grid; gap: 18px; padding: 20px;
     background: var(--panel); border: 1px solid var(--crema-grey-200); border-radius: var(--crema-radius-card); box-shadow: var(--crema-shadow-menu);
   }
-  .profile-menu button { display: flex; align-items: center; gap: 12px; margin: 0 -8px; padding: 6px 8px; border: 0; border-radius: var(--crema-radius-nav); background: none; color: var(--crema-grey-600); font-size: var(--crema-fs-body); font-weight: 500; text-align: left; }
+  .profile-menu button { display: flex; align-items: center; gap: 12px; margin: 0 -8px; padding: 6px 8px; border: 0; border-radius: var(--crema-radius-nav); background: none; color: var(--text-meta); font-size: var(--crema-fs-body); font-weight: 500; text-align: left; }
   .profile-menu button:hover { background: var(--crema-grey-100); }
   .profile-menu #logout { position: relative; font-weight: 400; }
   .profile-menu #logout::before { content: ""; position: absolute; inset: -10px 8px auto; border-top: 1px solid var(--crema-grey-200); }
@@ -160,32 +168,49 @@
   button:disabled { opacity: .45; cursor: default; }
   button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-  .placeholder { color: var(--crema-grey-400); text-align: center; padding: 60px 0; }
-  .query-note { margin-block: 0 4px; color: var(--crema-grey-500); font-size: var(--crema-fs-axis); overflow-wrap: anywhere; }
-  .query-note.dirty { color: var(--error-text); }
+  .placeholder { color: var(--text-meta); text-align: center; padding: 60px 0; }
+  /* 적용 중인 조건 — 칩(×로 해제). 조건을 바꾸고 아직 적용 안 했으면 앞에 안내 한 줄. */
+  .query-note { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-block: 0 4px; color: var(--text-meta); font-size: var(--crema-fs-axis); overflow-wrap: anywhere; }
+  .query-note .dirty { color: var(--error-text); }
+  .chip { padding: 3px 8px; border: 1px solid var(--crema-grey-200); border-radius: 999px; background: var(--crema-grey-50); font-size: var(--crema-fs-axis); color: var(--text-meta); }
+  .chip::after { content: " ×"; font-weight: 600; }
+  .chip:hover { background: var(--crema-grey-100); color: var(--crema-grey-900); }
 
   /* 턴 종료 상태 배지(상세 턴 머리·목록 카드) — 실패는 오류색, 중단은 경고색, 미확인은 회색. */
   :is(.status-failed, .status-interrupted, .status-unknown) { padding: 2px 6px; border-radius: 4px; font-size: var(--crema-fs-axis); font-style: normal; font-weight: 600; }
-  .status-failed { background: var(--error-bg); color: var(--error-text); }
+  .status-failed { background: var(--error-bg); color: var(--badge-red); }
   .status-interrupted { background: var(--warn-bg); color: var(--warn-text); }
-  .status-unknown { background: var(--crema-grey-100); color: var(--crema-grey-600); }
+  .status-unknown { background: var(--crema-grey-100); color: var(--text-meta); }
+  /* RBTI·피드백 배지(대화 목록 카드·턴 머리) — 상태 배지와 같은 크기. */
+  :is(.rbti, em.feedback-up, em.feedback-down) { padding: 2px 6px; border-radius: 4px; background: var(--crema-grey-100); color: var(--text-meta); font-size: var(--crema-fs-axis); font-style: normal; font-weight: 600; }
+  /* 피드백 배지 — 좋아요는 파랑, 싫어요는 짙은 회색(실패의 빨강과 섞이지 않게). */
+  em.feedback-up { background: var(--crema-blue-50); color: var(--accent-text); }
+  em.feedback-down { color: var(--crema-grey-800); }
+  .feedback-comment { margin: 16px 0 0; padding: 12px 16px; border-left: 3px solid var(--crema-grey-300); border-radius: 0 var(--crema-radius-nav) var(--crema-radius-nav) 0; background: var(--crema-grey-50); }
+  .feedback-comment.feedback-up { border-left-color: var(--crema-blue); }
+  .feedback-comment b { font-size: var(--crema-fs-small); font-weight: 600; color: var(--text-meta); }
+  .feedback-comment p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--crema-grey-800); }
+  .kpi .kpi-links { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 8px; }
+  .link-button { padding: 0; border: 0; background: none; font-size: var(--crema-fs-axis); font-weight: 600; color: var(--accent-text); }
+  .link-button:hover { background: none; text-decoration: underline; }
 
   /* 로그인 게이트(crema Login.tsx) — 본문 셸 없이 가운데 한 열. */
   .gate { grid-column: 1 / -1; align-self: center; justify-self: center; width: min(420px, calc(100% - 40px)); display: grid; gap: 10px; justify-items: center; text-align: center; }
   .gate-logo { width: 64px; height: 64px; }
   .gate h1 { margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -.96px; color: var(--crema-grey-900); }
   .gate h1 b { color: var(--crema-blue); }
-  .gate-sub { margin: -2px 0 20px; font-size: var(--crema-fs-body); font-weight: 500; color: var(--crema-grey-400); }
+  .gate-sub { margin: -2px 0 20px; font-size: var(--crema-fs-body); font-weight: 500; color: var(--text-meta); }
   /* 입력칸(Login.tsx:112-181): 53px, 좌우 24, 앞 20px 아이콘(반투명). 테두리는 칸(label)이 갖는다. */
   .gate-field { display: flex; align-items: center; gap: 8px; width: 100%; height: var(--crema-input-h); padding: 0 24px; border: 1px solid var(--border); border-radius: var(--crema-radius-nav); background: var(--panel); }
   .gate-field:focus-within { border-color: var(--crema-grey-800); }
   .gate.failed .gate-field { border-color: var(--crema-red); }
   .gate-field svg { flex: none; width: 20px; height: 20px; fill: var(--crema-grey-400); opacity: .5; }
   .gate-field input, .gate-field input:focus { height: auto; padding: 0; border: 0; box-shadow: none; }
+  .gate-caps { justify-self: start; margin: 0; padding: 0 4px; font-size: var(--crema-fs-small); color: var(--text-meta); }
   .gate-error { justify-self: start; margin: 0; padding: 0 4px; font-size: var(--crema-fs-small); color: var(--crema-red); text-align: left; }
   .gate button.primary { width: 100%; height: var(--crema-input-h); margin-top: 4px; background: var(--crema-grey-900); font-size: var(--crema-fs-body); font-weight: 700; }
   .gate button.primary:hover { background: var(--crema-grey-800); }
-  .gate-foot { position: fixed; left: 0; right: 0; bottom: 32px; margin: 0; font-size: var(--crema-fs-axis); color: var(--crema-grey-500); }
+  .gate-foot { position: fixed; left: 0; right: 0; bottom: 32px; margin: 0; font-size: var(--crema-fs-axis); color: var(--text-meta); }
   .gate-foot b { font-weight: 500; color: var(--crema-grey-700); }
   .error { color: var(--error-text); background: var(--error-bg); border-radius: var(--crema-radius-nav); padding: 8px; }
   .notice { padding: 8px 12px; margin: 0; border-radius: 0; }
@@ -194,16 +219,18 @@
   .section { margin-bottom: 20px; }
   .section-head { display: flex; align-items: baseline; gap: 12px; margin: 20px 0 0; }
   .section-head h3 { flex: 1; margin: 0; white-space: nowrap; font-size: 18px; font-weight: 600; color: var(--crema-grey-800); }
-  .section-head span { font-size: var(--crema-fs-small); color: var(--crema-grey-500); }
+  .section-head span { font-size: var(--crema-fs-small); color: var(--text-meta); }
   .section .section-head { margin: 0 0 20px; }
   .dashboard-content { display: grid; gap: 20px; padding-top: 20px; }
   .dashboard-content.is-loading { opacity: .5; }
   /* 기간 지표 = StatCard(:84-134) — 제목 600 16px, 값 500 26px, 증감·보조 문구. */
+  .latency-today { display: flex; flex-wrap: wrap; gap: 8px 40px; color: var(--text-meta); }
+  .latency-today b { margin-left: 6px; font-size: var(--crema-fs-value); font-weight: 500; color: var(--crema-grey-800); }
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: var(--crema-gap); }
   .kpi, .analysis-card { padding: 18px 20px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); min-width: 0; }
   .kpi > span:first-child { font-size: 16px; font-weight: 600; color: var(--crema-grey-900); }
   .kpi strong { display: block; margin: 11px 0 6px; font-size: var(--crema-fs-value); font-weight: 500; line-height: 1.1; color: var(--crema-grey-800); }
-  .kpi span, .analysis-note { font-size: var(--crema-fs-axis); color: var(--crema-axis); }
+  .kpi span, .analysis-note { font-size: var(--crema-fs-axis); color: var(--text-meta); }
   .kpi .delta, .kpi .kpi-sub { display: block; margin-top: 2px; overflow-wrap: anywhere; }
   .kpi .delta.bad { color: var(--crema-red); }
   .kpi .delta.good { color: var(--crema-green); }
@@ -213,18 +240,37 @@
   /* 누적 현황 = SmallStatCard(:136-146) — 제목 600 16px 회색, 값 500 26px. 한 줄에 같은 폭(넘치면 말줄임 + title). */
   .stats { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: var(--crema-gap); }
   .stat { display: flex; flex-direction: column-reverse; gap: 11px; min-width: 0; padding: 18px 20px; border: 1px solid var(--border); border-radius: var(--radius); }
+  /* 누적 카드·KPI 타일이 버튼이면(그 숫자의 목록으로 간다) 카드 모양 그대로, 가리키면 테두리만 진하게. */
+  button:is(.stat, .kpi) { width: 100%; background: var(--panel); font: inherit; text-align: left; cursor: pointer; }
+  button.kpi { display: flex; flex-direction: column; justify-content: flex-start; }  /* 버튼 기본 세로 가운데 정렬을 풀어 div 타일과 줄을 맞춘다 */
+  button:is(.stat, .kpi):hover { background: var(--panel); border-color: var(--crema-grey-400); }
   .stat b, .stat span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .stat b { font-size: var(--crema-fs-value); font-weight: 500; line-height: 24px; color: var(--crema-grey-800); font-variant-numeric: tabular-nums; }
-  .stat span { font-size: 16px; font-weight: 600; color: var(--crema-grey-500); }
+  .stat span { font-size: 16px; font-weight: 600; color: var(--text-meta); }
 
   /* 표(crema QueryAnalysis.tsx:538-573) — 머리 44px 회색 바탕, 행 58px, 구분선 grey-100. 목록 표(.bleed 안)는 첫·끝 칸이 본문 여백을 갖는다. */
-  .table-wrap { max-width: 100%; overflow-x: auto; }
+  /* 가로로 넘치는 표는 오른쪽 끝에 그림자 — 남은 열이 있다는 신호. 끝까지 밀면 local 층이 덮어 사라진다(CSS만). */
+  .table-wrap {
+    max-width: 100%; overflow-x: auto;
+    background: linear-gradient(to left, var(--panel) 30%, transparent) right / 40px 100% no-repeat local,
+      linear-gradient(to left, rgb(0 0 0 / .14), transparent) right / 14px 100% no-repeat scroll;
+  }
   table { border-collapse: collapse; width: 100%; font-size: var(--crema-fs-body); text-align: left; }
   th, td { padding: 10px 12px; border-bottom: 1px solid var(--crema-grey-100); white-space: nowrap; }
   th { height: 44px; color: var(--crema-grey-700); background: var(--crema-grey-50); font-weight: 400; }
   td { height: 58px; font-variant-numeric: tabular-nums; max-width: 280px; overflow: hidden; text-overflow: ellipsis; color: var(--crema-grey-800); }
   .bleed > .table-wrap :is(th, td):first-child { padding-left: var(--crema-page-x); }
   .bleed > .table-wrap :is(th, td):last-child { padding-right: var(--crema-page-x); }
+  /* 정렬 머리 — 글자 버튼, 현재 정렬 열에 ▲(오름)·▼(내림). */
+  .sort-button { padding: 0; border: 0; background: none; font: inherit; color: inherit; cursor: pointer; }
+  .sort-button:hover { background: none; color: var(--crema-grey-900); }
+  th[aria-sort] .sort-button::after { content: " ⇅"; font-size: 10px; opacity: .45; }  /* 정렬할 수 있음 */
+  th[aria-sort="ascending"] .sort-button::after { content: " ▲"; opacity: 1; }
+  th[aria-sort="descending"] .sort-button::after { content: " ▼"; opacity: 1; }
+  th:is([aria-sort="ascending"], [aria-sort="descending"]) .sort-button { font-weight: 600; color: var(--crema-grey-900); }
+  /* RBTI 배지는 필터 버튼이기도 하다(회원 표·대화 카드). */
+  button.rbti { border: 0; line-height: inherit; }
+  :is(button.rbti, em.rbti):hover { cursor: pointer; background: var(--crema-grey-200); }
   tr[data-record]:hover, tr[data-record]:focus { background: var(--crema-row-hover); cursor: pointer; outline: none; }
   tr[data-record]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   #starters-tools { display: flex; gap: 8px; }
@@ -232,8 +278,11 @@
   /* 분석 차트(admin_charts.js). 마크는 클래스가 주는 --c 한 곳에서 칠한다. */
   .chart-card { margin: 0; }
   .chart-card .analysis-note { margin: 6px 0 0; }
-  .chart-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 0 0 8px; padding: 0; list-style: none; font-size: 12px; color: var(--muted); }
+  .chart-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 0 0 8px; padding: 0; list-style: none; font-size: 12px; color: var(--text-meta); }
   .chart-legend li { display: flex; align-items: center; gap: 6px; overflow-wrap: anywhere; }
+  .legend-toggle { display: flex; align-items: center; gap: 6px; padding: 0; border: 0; background: none; font: inherit; color: inherit; cursor: pointer; }
+  .legend-toggle:hover { background: none; color: var(--crema-grey-900); }
+  .legend-toggle[aria-pressed="false"] { opacity: .4; text-decoration: line-through; }
   .swatch { flex: none; width: 10px; height: 10px; border-radius: 2px; background: var(--c); }
   .swatch.key-line { width: 14px; height: 2px; border-radius: 1px; }
   .series-1 { --c: var(--series-1); } .series-2 { --c: var(--series-2); }
@@ -241,14 +290,15 @@
   .tone-red { --c: var(--crema-red); } .tone-yellow { --c: var(--crema-yellow); }
   .chart-plot { min-width: 0; }
   .chart { display: block; overflow: visible; font-size: 11px; }
-  .chart text { fill: var(--crema-grey-500); font-variant-numeric: tabular-nums; }
+  .chart text { fill: var(--text-meta); font-variant-numeric: tabular-nums; }
   .chart .grid { stroke: var(--crema-grid); stroke-width: 1; stroke-dasharray: 3.5 3.5; }
   .chart .bar, .chart .dot { fill: var(--c); }
   .chart .dot { stroke: var(--panel); stroke-width: 2; }
   .chart .line { fill: none; stroke: var(--c); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
   .chart .cursor { fill: var(--bg); }
-  .chart .crosshair { stroke: var(--muted); stroke-width: 1; }
+  .chart .crosshair { stroke: var(--text-meta); stroke-width: 1; }
   .chart .hit { fill: transparent; outline: none; }
+  .chart .hit.pickable { cursor: pointer; }  /* 누르면 그 칸의 목록으로(RBTI 유형 막대) */
   .chart .hit:focus-visible { stroke: var(--accent); stroke-width: 2; }
   .chart-tip { pointer-events: none; }
   .chart-tip rect { fill: var(--panel); stroke: var(--border); }
@@ -257,19 +307,19 @@
   .chart-notes { margin-top: 6px; }
   .chart-notes summary { cursor: pointer; }
   .chart-table { margin-top: 8px; }
-  .chart-table summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+  .chart-table summary { cursor: pointer; font-size: 12px; color: var(--text-meta); }
 
   /* crema 조작부 — 서브탭·기간 세그먼트·검색·다운로드(Statistics.tsx·QueryAnalysis.tsx 공통). */
   .crema-tabs { display: flex; gap: 30px; height: 56px; }
-  .crema-tabs button { position: relative; padding: 0; border: 0; background: none; font-size: var(--crema-fs-tab); font-weight: 600; color: var(--crema-grey-500); }
+  .crema-tabs button { position: relative; padding: 0; border: 0; background: none; font-size: var(--crema-fs-tab); font-weight: 600; color: var(--text-meta); }
   .crema-tabs button[aria-pressed="true"] { color: var(--crema-grey-900); }
   .crema-tabs button[aria-pressed="true"]::after { content: ""; position: absolute; left: 50%; bottom: 0; width: 26px; height: 2px; margin-left: -13px; border-radius: 3px; background: var(--crema-grey-900); }
   .crema-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding-block: 12px; font-size: var(--crema-fs-small); }
   .crema-segment { display: flex; padding: 0 1px; border-radius: var(--crema-radius-control); background: var(--crema-grey-100); }
-  .crema-segment button { padding: 8px 14px; border: 0; background: none; font-size: var(--crema-fs-small); font-weight: 500; color: var(--crema-grey-500); white-space: nowrap; }
+  .crema-segment button { padding: 8px 14px; border: 0; background: none; font-size: var(--crema-fs-small); font-weight: 500; color: var(--text-meta); white-space: nowrap; }
   .crema-segment button[aria-pressed="true"] { border-radius: 5px; background: var(--crema-white); color: var(--crema-grey-900); box-shadow: inset 0 0 0 1px var(--crema-grey-300); }
   .crema-period, .crema-custom { display: flex; align-items: center; gap: 5px; padding: 8px 10px; border: 1px solid var(--crema-grey-200); border-radius: var(--crema-radius-control); background: var(--crema-grey-100); color: var(--crema-grey-800); white-space: nowrap; }
-  .crema-period b { color: var(--crema-grey-500); font-weight: 600; }
+  .crema-period b { color: var(--text-meta); font-weight: 600; }
   .crema-custom { flex-wrap: wrap; padding: 4px 6px; background: var(--crema-white); }
   .crema-custom input { height: 30px; width: auto; }
   .crema-search { display: flex; align-items: center; gap: 6px; width: min(400px, 100%); height: 34px; padding: 0 10px; border: 1px solid var(--crema-grey-200); border-radius: var(--crema-radius-control); background: var(--panel); }
@@ -279,8 +329,8 @@
   .crema-button, .crema-download { display: inline-flex; align-items: center; gap: 6px; padding: 8px 10px; border: 0; border-radius: var(--crema-radius-control); background: var(--crema-grey-50); color: var(--crema-grey-900); font-size: var(--crema-fs-small); font-weight: 600; }
   .crema-button:hover, .crema-download:hover { background: var(--crema-grey-100); }
   .crema-icon { width: 18px; height: 18px; fill: var(--crema-grey-900); }
-  .crema-note { margin-block: 0 4px; font-size: var(--crema-fs-axis); color: var(--crema-axis); }
-  .crema-table-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 20px; margin-bottom: 10px; font-size: var(--crema-fs-small); color: var(--crema-grey-500); }
+  .crema-note { margin-block: 0 4px; font-size: var(--crema-fs-axis); color: var(--text-meta); }
+  .crema-table-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 20px; margin-bottom: 10px; font-size: var(--crema-fs-small); color: var(--text-meta); }
   .table-tools { display: flex; align-items: center; gap: 12px; }
 
   /* 통계(crema Statistics.tsx) */
@@ -294,21 +344,21 @@
   .crema-value { display: flex; align-items: flex-end; gap: 4px; }
   .crema-value strong { font-size: var(--crema-fs-value); font-weight: 500; line-height: 1.1; color: var(--crema-grey-800); }
   .crema-value span { font-size: var(--crema-fs-tab); font-weight: 600; color: var(--crema-grey-900); }
-  .crema-sub { margin-top: -8px; font-size: var(--crema-fs-small); line-height: 24px; color: var(--crema-grey-500); }
+  .crema-sub { margin-top: -8px; font-size: var(--crema-fs-small); line-height: 24px; color: var(--text-meta); }
   .crema-content .chart-card { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 0 40px; padding: 20px 24px; border-color: var(--crema-grey-200); border-radius: var(--crema-radius-panel); }
-  .crema-content .chart-card h3 { flex: 1; margin-bottom: 20px; white-space: nowrap; font-size: var(--crema-fs-axis); font-weight: 400; color: var(--crema-axis); }
+  .crema-content .chart-card h3 { flex: 1; margin-bottom: 20px; white-space: nowrap; font-size: var(--crema-fs-axis); font-weight: 400; color: var(--text-meta); }
   .crema-content .chart-card .chart-plot, .crema-content .chart-card .chart-table { flex-basis: 100%; }
   .crema-content .crema-bars { border-radius: var(--crema-radius-card); padding: 18px 20px; }
   .crema-content .crema-bars h3 { margin-bottom: 12px; font-size: var(--crema-fs-tab); font-weight: 600; color: var(--crema-grey-800); }
   .crema-content .chart-legend { gap: 6px 40px; font-size: var(--crema-fs-body); color: var(--crema-grey-800); }
   .crema-content .chart-legend .swatch { width: 12px; height: 12px; border-radius: 4px; }
-  .crema-content .chart text { fill: var(--crema-axis); font-size: var(--crema-fs-axis); }
+  .crema-content .chart text { fill: var(--text-meta); font-size: var(--crema-fs-axis); }
   .crema-content .chart .line { stroke-width: 3; }
   .crema-content .chart .dot { display: none; }
   .crema-insight { display: flex; align-items: center; gap: 20px; padding: 18px 20px; border: 1px solid var(--crema-grey-200); border-radius: var(--crema-radius-card); font-size: var(--crema-fs-body); }
   .crema-insight > span:first-child { flex: 1; color: var(--crema-grey-900); }
   .crema-insight strong { font-size: var(--crema-fs-tab); font-weight: 500; color: var(--crema-blue); }
-  .crema-metric { display: flex; gap: 8px; color: var(--crema-grey-500); }
+  .crema-metric { display: flex; gap: 8px; color: var(--text-meta); }
   .crema-metric b { font-size: var(--crema-fs-tab); font-weight: 500; color: var(--crema-grey-800); }
   .crema-table table { font-size: var(--crema-fs-body); text-align: center; }
   .crema-table th, .crema-table td { padding: 12px; border-bottom: 0; }
@@ -316,9 +366,11 @@
   .crema-table td { height: 65px; font-weight: 600; }
   .crema-table :is(th, td):first-child { padding-left: var(--crema-page-x); text-align: left; font-weight: 400; }
   .crema-table :is(th, td):last-child { padding-right: var(--crema-page-x); }
-  .crema-table td:nth-child(2) { font-weight: 400; color: var(--crema-grey-500); }
+  .crema-table td:nth-child(2) { font-weight: 400; color: var(--text-meta); }
   .crema-table :is(th, td):nth-child(-n+2) { width: 1%; } /* crema는 날짜 133px·요일 49px 고정, 지표 열이 나머지를 나눈다 */
   .crema-table tbody tr:hover { background: var(--crema-grey-50); }
+  /* 일별 표 맨 위 '기간 전체' 행 — 머리 안에 있어 정렬에 섞이지 않는다. */
+  thead .lead-row td { height: 48px; font-weight: 600; background: var(--crema-grey-50); color: var(--crema-grey-900); }
 
   /* 대화(crema QueryAnalysis.tsx 목록 · QueryDetail.tsx 상세): T자 — 위 조회 바가 전체 폭, 아래는 목록 2 | 상세 3 상시 분할.
      목록·상세가 각자 스크롤하고(막대는 얇게, 트랙은 투명하게 — 회색 홈이 칸 경계처럼 보이지 않게), 상세는 칸 폭(@container)에 맞춘다. */
@@ -334,18 +386,18 @@
   .query-row { display: grid; gap: 4px; width: 100%; min-height: 58px; padding: 16px var(--crema-page-x); border: 0; border-bottom: 1px solid var(--crema-grey-100); border-radius: 0; background: none; text-align: left; white-space: normal; font-weight: 400; }
   .query-row:hover, .query-row[aria-current="true"] { background: var(--crema-row-hover); }
   .q-top { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: var(--crema-fs-body); }
-  .q-id { color: var(--crema-blue); }
-  .q-time { margin-left: auto; white-space: nowrap; color: var(--crema-grey-500); }
-  :is(.q-time, .stamp) small { margin-left: 4px; font-size: var(--crema-fs-axis); color: var(--crema-grey-400); }
+  .q-id { color: var(--accent-text); }
+  .q-time { margin-left: auto; white-space: nowrap; color: var(--text-meta); }
+  :is(.q-time, .stamp) small { margin-left: 4px; font-size: var(--crema-fs-axis); color: var(--text-meta); }
   .query-row > b { font-size: 16px; font-weight: 700; color: var(--crema-grey-800); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
-  .query-row > b.empty { font-weight: 400; color: var(--crema-grey-400); }
+  .query-row > b.empty { font-weight: 400; color: var(--text-meta); }
   .query-row:hover :is(.q-id, b) { text-decoration: underline; }
-  .query-row > small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--crema-fs-body); color: var(--crema-grey-600); }
-  .query-row > small em { font-style: normal; font-weight: 500; color: var(--crema-blue); }
+  .query-row > small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--crema-fs-body); color: var(--text-meta); }
+  .query-row > small em { font-style: normal; font-weight: 500; color: var(--accent-text); }
   .q-user { display: flex; align-items: baseline; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
-  .q-user small { font-size: var(--crema-fs-axis); color: var(--crema-grey-400); }
+  .q-user small { font-size: var(--crema-fs-axis); color: var(--text-meta); }
   .crema-pager { display: flex; justify-content: center; gap: 4px; padding: 32px 0; }
-  .crema-pager button { width: 36px; height: 36px; padding: 0; border: 0; border-radius: var(--crema-radius-nav); background: none; color: var(--crema-grey-600); }
+  .crema-pager button { width: 36px; height: 36px; padding: 0; border: 0; border-radius: var(--crema-radius-nav); background: none; color: var(--text-meta); }
   .crema-pager button:hover { background: var(--crema-grey-100); }
   .crema-pager button[aria-current="page"] { border: 1px solid var(--crema-grey-300); background: var(--panel); color: var(--crema-grey-900); font-weight: 600; box-shadow: 0 1px 2px rgba(0, 0, 0, .06); }
   .crema-pager button:disabled { color: var(--crema-grey-300); opacity: 1; }
@@ -353,34 +405,34 @@
   /* 대화 상세 — 위에 붙는 막대(제목·세션·사용자) + 접힌 기본정보 + 질의내역 아코디언. 돌아가기(← 목록)는 한 칸 화면에서만. */
   .detail-bar { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 10px; height: var(--detail-bar-h); padding: 0 var(--crema-page-x); border-bottom: 1px solid var(--crema-grey-200); background: var(--panel); }
   .detail-bar h2 { margin: 0; font-size: var(--crema-fs-tab); font-weight: 700; color: var(--crema-grey-900); }
-  .detail-meta { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--crema-fs-small); color: var(--crema-grey-500); }
-  .detail-back { display: none; padding: 4px; border: 0; background: none; font-size: var(--crema-fs-tab); color: var(--crema-grey-500); }
+  .detail-meta { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--crema-fs-small); color: var(--text-meta); }
+  .detail-back { display: none; padding: 4px; border: 0; background: none; font-size: var(--crema-fs-tab); color: var(--text-meta); }
   .detail-back:hover { background: none; color: var(--crema-grey-800); }
   .section-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 37px; padding: 0 var(--crema-page-x); background: var(--crema-grey-100); border-top: 1px solid var(--crema-grey-200); font-weight: 500; color: var(--crema-grey-700); }
-  .section-bar small { font-size: inherit; font-weight: 400; color: var(--crema-grey-500); }
-  .copy-btn { padding: 2px 6px; border: 0; background: none; font-size: var(--crema-fs-axis); color: var(--crema-grey-400); }
-  .copy-btn:hover { background: none; color: var(--crema-grey-600); }
+  .section-bar small { font-size: inherit; font-weight: 400; color: var(--text-meta); }
+  .copy-btn { padding: 2px 6px; border: 0; background: none; font-size: var(--crema-fs-axis); color: var(--text-meta); }
+  .copy-btn:hover { background: none; color: var(--crema-grey-900); }
   .info-grid { display: grid; grid-template-columns: 124px minmax(0, 1fr); margin: 0; }
   .info-grid dt, .info-grid dd { display: flex; align-items: center; gap: 8px; min-height: 52px; margin: 0; padding: 0 16px; border-bottom: 1px solid var(--crema-grey-100); overflow-wrap: anywhere; }
-  .info-grid dt { font-size: var(--crema-fs-body); color: var(--crema-grey-500); }
+  .info-grid dt { font-size: var(--crema-fs-body); color: var(--text-meta); }
   .info-grid dd { color: var(--crema-grey-700); }
   /* 질의내역 = 대화 기록 아코디언(<details>). 질문 머리는 펼친 답변을 읽는 동안 위에 붙어 있다. */
   .fold { list-style: none; cursor: pointer; }
   .fold::-webkit-details-marker { display: none; }
   .fold::after { content: ''; flex: none; width: 7px; height: 7px; margin-left: auto; border: solid var(--crema-grey-400); border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); transition: transform .15s; }
   [open] > .fold::after { transform: rotate(225deg); }
-  .fold-all { padding: 2px 0; border: 0; background: none; font-size: var(--crema-fs-small); color: var(--crema-blue); }
+  .fold-all { padding: 2px 0; border: 0; background: none; font-size: var(--crema-fs-small); color: var(--accent-text); }
   .fold-all:hover { background: none; text-decoration: underline; }
   .turn, .turn-head { scroll-margin-top: var(--detail-bar-h); }
-  .turn-head { position: sticky; top: var(--detail-bar-h); z-index: 1; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 6px 10px; padding: 14px var(--crema-page-x); border-bottom: 1px solid var(--crema-grey-100); background: var(--panel); }
+  .turn-head { position: sticky; top: var(--detail-bar-h); z-index: 1; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 4px 10px; padding: 14px var(--crema-page-x); border-bottom: 1px solid var(--crema-grey-100); background: var(--panel); }
   .turn-head:hover { background: var(--crema-row-hover); }
-  .turn-head em { padding: 2px 6px; border-radius: 4px; background: var(--crema-blue-50); color: var(--crema-blue); font-size: var(--crema-fs-axis); font-style: normal; font-weight: 600; }
+  .turn-head > em { padding: 2px 6px; border-radius: 4px; background: var(--crema-blue-50); color: var(--accent-text); font-size: var(--crema-fs-axis); font-style: normal; font-weight: 600; }
   .turn-head b { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-line; overflow-wrap: anywhere; font-size: var(--crema-fs-tab); font-weight: 600; color: var(--crema-grey-800); }
   .turn[open] .turn-head b { display: block; }
-  .turn-head small { grid-column: 2; font-size: var(--crema-fs-small); color: var(--crema-grey-400); }
+  .turn-head small { grid-column: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 0 2px; font-size: var(--crema-fs-small); color: var(--text-meta); }
   .turn-head::after { grid-column: 3; grid-row: 1; margin-top: 6px; }
   .turn-tools { display: flex; justify-content: flex-end; gap: 4px; margin: -8px 0 4px; }
-  .answer .empty { color: var(--crema-grey-400); }
+  .answer .empty { color: var(--text-meta); }
   .sources > summary { display: flex; align-items: center; gap: 8px; padding: 16px 0 10px; font-weight: 500; color: var(--crema-grey-700); }
   .turn-body { padding: 16px var(--crema-page-x) 24px; overflow-wrap: anywhere; }
 
@@ -400,7 +452,7 @@
   .answer code.md-code { font-family: var(--mono); font-size: .9em; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
   .answer pre.md-pre { margin: 8px 0; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--crema-radius-nav); overflow-x: auto; }
   .answer pre.md-pre code { font-family: var(--mono); font-size: 12.5px; white-space: pre; }
-  .marker { display: inline-block; vertical-align: super; line-height: 1; margin: 0 0 0 1px; padding: 1px 3px; border-radius: 4px; background: var(--crema-blue-50); color: var(--crema-blue); font-size: .66em; font-weight: 700; text-decoration: none; cursor: pointer; }
+  .marker { display: inline-block; vertical-align: super; line-height: 1; margin: 0 0 0 1px; padding: 1px 3px; border-radius: 4px; background: var(--crema-blue-50); color: var(--accent-text); font-size: .66em; font-weight: 700; text-decoration: none; cursor: pointer; }
   .marker:hover { background: var(--crema-blue); color: var(--crema-white); }
   .marker + .marker { margin-left: 3px; }
 
@@ -414,27 +466,31 @@
   .source-card:hover { border-color: var(--crema-grey-300); }
   .source-card.is-target { border-color: var(--crema-blue); box-shadow: 0 0 0 2px var(--crema-blue-50); }
   .source-card > span { display: flex; gap: 6px; }
-  .source-card em { padding: 2px 5px; border-radius: 3px; background: var(--crema-grey-100); color: var(--crema-grey-600); font-size: var(--crema-fs-axis); font-style: normal; font-weight: 600; }
-  .source-card em.kind { background: var(--crema-blue-50); color: var(--crema-blue); }
+  .source-card em { padding: 2px 5px; border-radius: 3px; background: var(--crema-grey-100); color: var(--text-meta); font-size: var(--crema-fs-axis); font-style: normal; font-weight: 600; }
+  .source-card em.kind { background: var(--crema-blue-50); color: var(--accent-text); }
   .source-card a { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; color: var(--crema-grey-800); text-decoration: none; }
   .source-card a:hover { text-decoration: underline; }
-  .source-card p { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--crema-fs-small); color: var(--crema-grey-500); }
-  .source-card .rating { color: var(--crema-yellow); font-weight: 600; }
+  .source-card p { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--crema-fs-small); color: var(--text-meta); }
+  /* 평점 — 별(장식)만 crema 노랑, 숫자는 읽히는 색(노랑 글자는 흰 바탕 1.6:1). */
+  .source-card .rating { color: var(--crema-grey-800); font-weight: 600; }
+  .source-card .rating b { color: var(--crema-yellow); }
   /* 출처 묶음(도서·웹·안내) — 묶음 제목 아래 도서는 표지 카드, 웹·안내는 번호·제목·도메인 한 줄. */
-  .source-group { margin: 12px 0 8px; font-size: var(--crema-fs-small); font-weight: 600; color: var(--crema-grey-600); }
+  .source-group { margin: 12px 0 8px; font-size: var(--crema-fs-small); font-weight: 600; color: var(--text-meta); }
   .source-lines { display: grid; gap: 6px; }
   .source-line { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 8px 12px; border: 1px solid var(--crema-grey-200); border-radius: var(--crema-radius-nav); font-size: var(--crema-fs-small); }
-  .source-line em { flex: none; padding: 2px 5px; border-radius: 3px; background: var(--crema-grey-100); color: var(--crema-grey-600); font-size: var(--crema-fs-axis); font-style: normal; font-weight: 600; }
+  .source-line em { flex: none; padding: 2px 5px; border-radius: 3px; background: var(--crema-grey-100); color: var(--text-meta); font-size: var(--crema-fs-axis); font-style: normal; font-weight: 600; }
   .source-line a, .source-line > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; color: var(--crema-grey-800); text-decoration: none; }
   .source-line a:hover { text-decoration: underline; }
-  .source-line small { flex: none; margin-left: auto; color: var(--crema-grey-500); }
+  .source-line small { flex: none; margin-left: auto; color: var(--text-meta); }
   .source-line.is-target { border-color: var(--crema-blue); box-shadow: 0 0 0 2px var(--crema-blue-50); }
 
   /* 옆 패널(비모달 dialog) — 넓은 화면은 오른쪽 서랍, 좁은 화면(≤700px)은 아래 시트. 목록은 뒤에서 계속 누를 수 있다. */
-  dialog { position: fixed; inset: 0 0 0 auto; z-index: 30; width: min(420px, 100vw); height: 100dvh; max-height: none; margin: 0; padding: 0; overflow-y: auto; border: 0; border-left: 1px solid var(--border); color: var(--text); background: var(--panel); box-shadow: var(--crema-shadow-menu); }
+  /* 패널이 열리면 본문이 패널 폭만큼 비켜선다(겹쳐 가리지 않게 — 표 머리 버튼·오른쪽 열이 눌린다). */
+  body:has(#record-dialog[open]) main { margin-right: var(--panel-w); }
+  dialog { position: fixed; inset: 0 0 0 auto; z-index: 30; width: var(--panel-w); height: 100dvh; max-height: none; margin: 0; padding: 0; overflow-y: auto; border: 0; border-left: 1px solid var(--border); color: var(--text); background: var(--panel); box-shadow: var(--crema-shadow-menu); }
   .dialog-head { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; gap: 8px; padding: 16px 20px; background: var(--crema-grey-100); }
   .dialog-head h2 { flex: 1; margin: 0; overflow-wrap: anywhere; font-size: 20px; font-weight: 600; letter-spacing: -.96px; color: var(--crema-grey-900); }
-  #record-close { padding: 2px 8px; border: 0; background: none; font-size: 22px; line-height: 1; color: var(--crema-grey-500); }
+  #record-close { padding: 2px 8px; border: 0; background: none; font-size: 22px; line-height: 1; color: var(--text-meta); }
   #record-actions, #record-view { padding: 0 20px; }
   #record-actions > button { margin-top: 20px; }
   /* 기록 상세 — 라벨 · 값 표. 값은 줄바꿈해 전부 보인다(목록 표처럼 말줄임하지 않는다). */
@@ -442,16 +498,17 @@
   #record-view td { height: auto; }
   #record-view td { max-width: none; white-space: pre-wrap; overflow-wrap: anywhere; }
   #record-view td { vertical-align: top; }
-  #record-view td:first-child { width: 1%; white-space: nowrap; color: var(--crema-grey-500); }
+  #record-view td:first-child { width: 1%; white-space: nowrap; color: var(--text-meta); }
 
   /* 관리 폼(행 편집·계정·비밀번호) — 다이얼로그 안에서 한 열로 쌓는다. */
   .manage-form { display: grid; gap: 10px; margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--border); }
   .manage-form h3 { margin: 0; font-size: 16px; font-weight: 600; color: var(--crema-grey-800); }
   .manage-form:first-child { margin-top: 20px; padding-top: 0; border-top: 0; }
-  .manage-form label { display: grid; gap: 6px; font-size: var(--crema-fs-small); color: var(--crema-grey-600); }
+  .manage-form label { display: grid; gap: 6px; font-size: var(--crema-fs-small); color: var(--text-meta); }
   /* 선택 상자(crema 통계 드롭다운 모양) — 기본 모양을 지우고 화살표는 감싼 span이 그린다. */
   .select { position: relative; display: block; }
-  .select select { appearance: none; width: 100%; height: auto; padding: 10px 16px; border-color: var(--crema-grey-200); background: var(--panel); font-size: var(--crema-fs-body); font-weight: 600; color: var(--crema-grey-800); }
+  .select select { appearance: none; width: 100%; height: auto; padding: 10px 40px 10px 16px; border-color: var(--crema-grey-200); background: var(--panel); font-size: var(--crema-fs-body); font-weight: 600; color: var(--crema-grey-800); }
+  .crema-filters .select select { height: 34px; padding-block: 0; font-size: var(--crema-fs-small); font-weight: 500; }  /* 검색칸과 같은 높이 */
   .select::after { content: ""; position: absolute; right: 16px; top: 50%; width: 7px; height: 7px; border: solid var(--crema-grey-400); border-width: 0 1.5px 1.5px 0; transform: translateY(-70%) rotate(45deg); pointer-events: none; }
   .manage-form label.check { display: flex; align-items: center; gap: 8px; }
   .manage-form button.primary { justify-self: start; }
@@ -485,4 +542,5 @@
     .crema-row { display: contents; }
     .crema-sub:not(.crema-detail) { display: none; }
     dialog { inset: auto 0 0 0; width: 100%; height: 70dvh; border-left: 0; border-top: 1px solid var(--border); }
+    body:has(#record-dialog[open]) main { margin-right: 0; }  /* 아래 시트는 겹친다 */
   }
