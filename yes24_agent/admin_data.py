@@ -111,12 +111,27 @@ def local_day(column: str, offset_hours: int) -> str:
     return f"DATE{local_time(column, offset_hours)}"
 
 
+def excluded_condition(column: str, excluded: tuple[str, ...]) -> tuple[list[str], list[Any]]:
+    """내부·테스트 계정 제외(설정 admin_excluded_user_ids) — 조건과 인자. 비면 조건 없음.
+
+    NULL은 남긴다: usage_log의 서브콜 행은 user_id가 없고, NOT IN만 쓰면 NULL 행이 통째로 빠져
+    비용 합계가 줄어든다.
+    """
+    if not excluded:
+        return [], []
+    marks = ", ".join(["%s"] * len(excluded))
+    return [f"({column} IS NULL OR {column} NOT IN ({marks}))"], list(excluded)
+
+
 def period_filter(
     column: str,
     period: tuple[date | None, date | None],
     offset_hours: int,
+    excluded: tuple[str, ...] = (),
+    user_column: str = "user_id",
 ) -> tuple[list[str], list[Any]]:
-    """어드민 시간대 달력일 [since, until] 조건. until은 그날 하루를 통째로 포함한다."""
+    """어드민 집계 범위 — 어드민 시간대 달력일 [since, until](until은 그날 하루를 통째로 포함)
+    + 제외 계정(excluded가 있으면 user_column 기준, excluded_condition)."""
     since, until = period
     shift = f" - INTERVAL {int(offset_hours)} HOUR"
     where, params = [], []
@@ -126,7 +141,8 @@ def period_filter(
     if until and until < date.max:
         where.append(f"{column} < %s + INTERVAL 1 DAY{shift}")
         params.append(until)
-    return where, params
+    excluding, excluded_params = excluded_condition(user_column, excluded)
+    return [*where, *excluding], [*params, *excluded_params]
 
 
 def sql_where(conditions: list[str]) -> str:
@@ -228,7 +244,10 @@ async def _fetch(cur, sql: str, params: list[Any]) -> list[dict[str, Any]]:
 
 
 async def fetch_analytics(
-    cur, settings: Settings, period: tuple[date | None, date | None]
+    cur,
+    settings: Settings,
+    period: tuple[date | None, date | None],
+    excluded: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """대시보드(모든 역할) — 사용량·품질·시간대. 비용·토큰·내부 과정은 싣지 않는다(비용은 owner 전용
     fetch_cost). 모든 문장이 호출부(_query)의 같은 읽기 전용 스냅샷에서 돈다.
@@ -241,7 +260,7 @@ async def fetch_analytics(
     current, previous, stamp, spanned = _periods(settings, period)
 
     async def turn_summary(selected) -> dict[str, Any]:
-        where, params = period_filter("asked_at", selected, hours)
+        where, params = period_filter("asked_at", selected, hours, excluded)
         [row] = await _fetch(
             cur,
             f"SELECT COUNT(*) AS turns, {ACTIVE_USERS} AS users, {_REFUSALS}, "
@@ -252,7 +271,7 @@ async def fetch_analytics(
         )
         return {**jsonable(row), **refusal_breakdown([row])}
 
-    turn_where, turn_params = period_filter("asked_at", period, hours)
+    turn_where, turn_params = period_filter("asked_at", period, hours, excluded)
     daily = await _fetch(
         cur,
         f"SELECT day, {_LATENCY_QUANTILES} FROM ("
@@ -271,8 +290,8 @@ async def fetch_analytics(
         f"FROM chat_turns{sql_where(turn_where)} GROUP BY hour ORDER BY hour",
         turn_params,
     )
-    feedback_where, feedback_params = period_filter("updated_at", spanned, hours)
-    click_where, click_params = period_filter("created_at", spanned, hours)
+    feedback_where, feedback_params = period_filter("updated_at", spanned, hours, excluded)
+    click_where, click_params = period_filter("created_at", spanned, hours, excluded)
     engagement = await _fetch(
         cur,
         f"SELECT {local_day('updated_at', hours)} AS day, {FEEDBACK_COUNTS}, 0 AS clicks "
@@ -299,7 +318,10 @@ async def fetch_analytics(
 
 
 async def fetch_cost(
-    cur, settings: Settings, period: tuple[date | None, date | None]
+    cur,
+    settings: Settings,
+    period: tuple[date | None, date | None],
+    excluded: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """비용 패널(owner 전용 라우트) — 기간·비교 기간 비용, 일별 비용, 사용자별 비용 상위, 각주.
 
@@ -310,56 +332,58 @@ async def fetch_cost(
     since, _ = period
     hours = settings.admin_utc_offset_hours
     current, previous, stamp, spanned = _periods(settings, period)
-    usage_where, usage_params = period_filter("created_at", spanned, hours)
+    usage_where, usage_params = period_filter("created_at", spanned, hours, excluded)
     usage = attach_costs(
         await _fetch(
             cur,
+            # background = 사용자에 귀속되지 않은 행(초기 질문 생성 등 대화 밖 작업) — 열 값으로.
             f"SELECT DATE(created_at) AS day, {local_day('created_at', hours)} AS local_day, "
-            f"model, component, {_USAGE_SUMS} FROM usage_log{sql_where(usage_where)} "
-            "GROUP BY day, local_day, model, component",
+            f"model, component, user_id IS NULL AS background, {_USAGE_SUMS} "
+            f"FROM usage_log{sql_where(usage_where)} "
+            "GROUP BY day, local_day, model, component, background",
             usage_params,
         ),
         settings.llm_prices,
     )
-    # 사용자 귀속은 main 행뿐이다(서브콜은 턴 문맥이 없을 수 있다).
-    user_where, user_params = period_filter("created_at", period, hours)
+    # 사용자별 = 그 사용자에 귀속된 행 전부(대화 비용 — 요약 카드와 같은 정의), 질의는 main 행.
+    user_where, user_params = period_filter("created_at", period, hours, excluded)
     user_usage = attach_costs(
         await _fetch(
             cur,
-            f"SELECT user_id, DATE(created_at) AS day, model, {_USAGE_SUMS} "
-            f"FROM usage_log{sql_where([*user_where, 'component = %s', 'user_id IS NOT NULL'])} "
-            "GROUP BY user_id, day, model",
-            [*user_params, MAIN_COMPONENT],
+            f"SELECT user_id, DATE(created_at) AS day, model, component, {_USAGE_SUMS} "
+            f"FROM usage_log{sql_where([*user_where, 'user_id IS NOT NULL'])} "
+            "GROUP BY user_id, day, model, component",
+            user_params,
         ),
         settings.llm_prices,
     )
 
     def summary_of(rows) -> dict[str, Any]:
         main = total(r for r in rows if r["component"] == MAIN_COMPONENT)
+        chat = total(r for r in rows if not r["background"])
         return {
-            # 과금 턴 — 단가가 적용되고 측정된 main 행. 비용의 분모는 이것뿐이다(분자와 같은 모집단:
-            # 대화 삭제는 chat_turn만 지우고, 미등록·미측정 행은 금액에 없으니 분모에도 없다).
+            # 질의(분모) — 단가가 적용되고 측정된 main 행(대화 삭제는 chat_turn만 지우고,
+            # 미등록·미측정 행은 금액에 없으니 분모에도 없다). 분자는 대화 비용(사용자 귀속 행 전부
+            # — main과 그 턴의 서브콜), 대화 외 작업은 빼서 화면 정의 "대화 비용 ÷ 질의 수"와 같다.
             "priced_rows": main["priced_rows"],
             "cost_usd": total(rows)["cost_usd"],
-            "cost_per_turn_usd": per_turn(main["cost_usd"], main["priced_rows"]),
+            "cost_per_turn_usd": per_turn(chat["cost_usd"], main["priced_rows"]),
         }
 
     now, before = _split(usage, since, previous, "local_day")
     daily = [
-        # 단가 미등록 모델만 있는 날은 None(금액을 모름) — 0으로 바꾸지 않는다.
-        {"day": day, "cost_usd": total(rows)["cost_usd"]}
+        # 단가 미등록 모델만 있는 날은 None(금액을 모름) — 0으로 바꾸지 않는다. background_usd =
+        # 그중 대화 밖 작업(사용자 귀속 없음) 몫 — 질의 없는 날에도 비용이 있는 이유를 나눠 보인다.
+        {"day": day, "cost_usd": total(rows)["cost_usd"],
+         "background_usd": total(r for r in rows if r["background"])["cost_usd"]}
         for (day,), rows in sorted(_grouped(now, "local_day").items())
     ]
-    user_totals = {key: total(rows) for key, rows in _grouped(user_usage, "user_id").items()}
-    users = [
-        {
-            "user_id": user_id,
-            "priced_rows": group["priced_rows"],
-            "cost_usd": group["cost_usd"],
-            "cost_per_turn_usd": per_turn(group["cost_usd"], group["priced_rows"]),
-        }
-        for (user_id,), group in user_totals.items()
-    ]
+    users = []
+    for (user_id,), rows in _grouped(user_usage, "user_id").items():
+        cost = total(rows)["cost_usd"]
+        turns = total(r for r in rows if r["component"] == MAIN_COMPONENT)["priced_rows"]
+        users.append({"user_id": user_id, "priced_rows": turns, "cost_usd": cost,
+                      "cost_per_turn_usd": per_turn(cost, turns)})
     # 비용 내림차순, 단가 미등록(None)은 뒤로, 동률은 사용자 id순.
     users.sort(key=lambda u: (u["cost_usd"] is None, -(u["cost_usd"] or 0), u["user_id"]))
     users = users[: settings.admin_top_users]
@@ -377,12 +401,6 @@ async def fetch_cost(
             )
         }
         users = [with_nickname({**u, "nickname": nicknames.get(u["user_id"])}) for u in users]
-    turn_where, turn_params = period_filter("asked_at", period, hours)
-    [turns] = await _fetch(
-        cur, f"SELECT COUNT(*) AS turns FROM chat_turns{sql_where(turn_where)}", turn_params
-    )
-    coverage = total(now)
-    main_rows = total(r for r in now if r["component"] == MAIN_COMPONENT)["rows"]
     return {
         "period": current,
         "currency": {
@@ -396,7 +414,7 @@ async def fetch_cost(
         else None,
         "daily": daily,
         "users": users,
-        "notes": cost_notes(coverage, int(turns["turns"]), main_rows),
+        "notes": cost_notes(total(now)),
     }
 
 
@@ -423,7 +441,9 @@ def _stats(session_days, clicks: int) -> dict[str, Any]:
     }
 
 
-async def fetch_stats(cur, settings: Settings, period: tuple[date, date]) -> dict[str, Any]:
+async def fetch_stats(
+    cur, settings: Settings, period: tuple[date, date], excluded: tuple[str, ...] = ()
+) -> dict[str, Any]:
     """통계 탭 — 어드민 시간대 일별 세션·질의·링크·클릭(고객사 엑셀 11열) + 기간 요약 + 요일 평균
     + RBTI 유형별 질의 수(적용률은 화면이 요약 질의 수로 나눈다 — 일별 표·엑셀 양식에는 넣지
     않는다).
@@ -433,7 +453,7 @@ async def fetch_stats(cur, settings: Settings, period: tuple[date, date]) -> dic
     기록 없는 날도 0행으로 채운다. 일별 표는 최신 날짜가 먼저다.
     """
     hours = settings.admin_utc_offset_hours
-    where, params = period_filter("started_at", period, hours)
+    where, params = period_filter("started_at", period, hours, excluded)
     await cur.execute(
         f"SELECT {local_day('started_at', hours)} AS day, app_name, user_id, session_id, "
         "COUNT(*) AS queries, "
@@ -446,17 +466,18 @@ async def fetch_stats(cur, settings: Settings, period: tuple[date, date]) -> dic
     )
     session_days = await cur.fetchall()
     by_day = {key: rows for (key,), rows in _grouped(session_days, "day").items()}
-    where, params = period_filter("created_at", period, hours)
+    where, params = period_filter("created_at", period, hours, excluded)
     await cur.execute(
         f"SELECT {local_day('created_at', hours)} AS day, COUNT(*) AS clicks "
         f"FROM turn_click{sql_where(where)} GROUP BY day",
         params,
     )
     clicks = {row["day"]: int(row["clicks"]) for row in await cur.fetchall()}
-    # RBTI 유형별 질의 수(RBTI가 적용된 턴만, 많은 순) — 유형 목록은 데이터에 나온 코드뿐이다.
-    where, params = period_filter("started_at", period, hours)
+    # RBTI 유형별 질의 수·회원 수(그 유형으로 대화한 고유 사용자 — 기간 중 유형이 바뀐 회원은 두
+    # 유형에 모두 센다), RBTI가 적용된 턴만, 많은 순 — 유형 목록은 데이터에 나온 코드뿐이다.
+    where, params = period_filter("started_at", period, hours, excluded)
     await cur.execute(
-        "SELECT rbti_applied AS rbti, COUNT(*) AS turns "
+        "SELECT rbti_applied AS rbti, COUNT(*) AS turns, COUNT(DISTINCT user_id) AS users "
         f"FROM chat_turn{sql_where([*where, 'rbti_applied IS NOT NULL'])} "
         "GROUP BY rbti_applied ORDER BY turns DESC, rbti",
         params,
@@ -464,14 +485,14 @@ async def fetch_stats(cur, settings: Settings, period: tuple[date, date]) -> dic
     rbti = [jsonable(row) for row in await cur.fetchall()]
     # 피드백 — 일별 좋아요·싫어요(최신 평가 시각 기준)와 의견이 달린 최근 피드백(질문 앞부분과
     # 함께, 한 화면 분량 = admin_page_size).
-    where, params = period_filter("updated_at", period, hours)
+    where, params = period_filter("updated_at", period, hours, excluded)
     await cur.execute(
         f"SELECT {local_day('updated_at', hours)} AS day, {FEEDBACK_COUNTS} "
         f"FROM turn_feedback{sql_where(where)} GROUP BY day",
         params,
     )
     feedback_daily = [jsonable(row) for row in await cur.fetchall()]
-    where, params = period_filter("f.updated_at", period, hours)
+    where, params = period_filter("f.updated_at", period, hours, excluded, "f.user_id")
     where.append("TRIM(f.comment) <> ''")  # NULL도 여기서 빠진다
     await cur.execute(
         "SELECT f.updated_at, f.rating, f.comment, f.user_id, f.session_id, "

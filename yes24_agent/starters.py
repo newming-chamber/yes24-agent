@@ -20,6 +20,8 @@ import random
 import re
 import unicodedata
 import uuid
+from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import Annotated, Any
 
@@ -131,8 +133,14 @@ def _squash(value: Any) -> str:
     return " ".join(stripped.split())
 
 
-def pick_starters(pool: list[dict], n: int, rng: random.Random | Any) -> list[dict]:
-    """슬롯별 최대 하나를 뽑고 같은 상품·출처·문구를 가리키는 후보는 건너뛴다."""
+def pick_starters(
+    pool: list[dict], n: int, rng: random.Random | Any, skipped: Counter | None = None
+) -> list[dict]:
+    """슬롯별 최대 하나를 뽑고 같은 상품·출처·문구를 가리키는 후보는 건너뛴다.
+
+    skipped(선택)를 주면 중복이라 건너뛴 후보 id를 센다 — 어드민 미리보기가 '0인 이유'를 실제
+    건너뜀으로 판정하는 데 쓴다. 서빙은 넘기지 않는다(선택 결과는 같다).
+    """
     by_slot: dict[str, list[dict]] = {}
     for row in pool:
         by_slot.setdefault(row["slot"], []).append(row)
@@ -152,6 +160,8 @@ def pick_starters(pool: list[dict], n: int, rng: random.Random | Any) -> list[di
             goods_no, source_url = row.get("goods_no"), row.get("source_url")
             if (text in texts or (goods_no is not None and goods_no in goods)
                 or (source_url and source_url in sources)):
+                if skipped is not None:
+                    skipped[row["id"]] += 1
                 continue
             selected.append(row)
             texts.add(text)
@@ -161,6 +171,68 @@ def pick_starters(pool: list[dict], n: int, rng: random.Random | Any) -> list[di
                 sources.add(source_url)
             break
     return selected
+
+
+def live_predicate(today: dt.date, settings: Settings) -> tuple[str, tuple]:
+    """"지금 노출" 판정의 단일 정의 — SQL 조건과 인자(열 이름은 starters 표 그대로, 별칭 없음).
+
+    서빙 풀(`active_pool`)과 어드민 목록의 '지금 노출' 열이 이 식 하나를 쓴다 — 코드에서 날짜를
+    다시 거르지 않는다(같은 판정의 중복 구현 금지).
+
+    활성(active=1)과 유효기간 위에, 자동 생성분은 **생성일의 신선도**로 판정한다
+    (starter_pool_days). 슬롯 명단으로 거르면 오늘 회전에서 빠진 슬롯의 멀쩡한 문장이 통째로
+    사라지는데, 후보가 수십 개인 회전에서는 그게 풀의 대부분이다. 신선도 규칙 하나가 회전·설정
+    변경·폐지된 슬롯을 모두 덮는다. 수동 항목은 운영자가 소유한다.
+
+    예외는 화제·무엇이든 두 슬롯이다. 오늘의 뉴스에 매인 문장이라 어제 것은 서빙하지
+    않는다 — 이 판정만 슬롯 키를 직접 본다(키가 상수라 목록을 만들 필요가 없다).
+    """
+    clauses = live_clauses(today, settings)
+    return (
+        " AND ".join(sql for _, sql, _ in clauses),
+        tuple(param for _, _, params in clauses for param in params),
+    )
+
+
+def live_clauses(today: dt.date, settings: Settings) -> list[tuple[str, str, tuple]]:
+    """노출 판정의 조건들 — (사유 키, SQL, 인자). `live_predicate`는 이것의 AND다.
+
+    어드민이 "왜 지금 노출이 아닌가"를 첫 번째로 실패한 조건의 키로 보인다 — 사유 규칙을 따로
+    만들지 않고 판정 조건 자체를 쓴다. 순서가 곧 사유의 우선순위다.
+    """
+    dated = (_TREND_SLOT, _GENERAL_SLOT)
+    placeholders = ", ".join(["%s"] * len(dated))
+    return [
+        ("inactive", "active = 1", ()),
+        (
+            "out_of_window",
+            "(valid_from IS NULL OR valid_from <= %s) "
+            "AND (valid_until IS NULL OR valid_until >= %s)",
+            (today, today),
+        ),
+        (
+            "stale_auto",
+            "(source <> 'auto' OR (run_date IS NOT NULL AND run_date >= %s))",
+            (today - dt.timedelta(days=settings.starter_pool_days),),
+        ),
+        (
+            "not_today",
+            f"(source <> 'auto' OR slot NOT IN ({placeholders}) OR run_date = %s)",
+            (*dated, today),
+        ),
+    ]
+
+
+def pool_query(
+    today: dt.date, settings: Settings, slot: str | None = None
+) -> tuple[str, tuple]:
+    """그날 노출 풀 SELECT(`_POOL_COLUMNS` 순서) — 서빙과 어드민 미리보기가 같은 문장을 쓴다."""
+    condition, params = live_predicate(today, settings)
+    sql = f"SELECT {', '.join(_POOL_COLUMNS)} FROM starters WHERE {condition}"
+    if slot:
+        sql += " AND slot = %s"
+        params += (slot,)
+    return sql, params
 
 
 def _today() -> dt.date:
@@ -173,24 +245,31 @@ def _today() -> dt.date:
 
 
 def chip_label(row: dict, settings: Settings) -> str:
-    """칩에 표시할 라벨 — **행에 실린 것이 먼저**다. 어드민 초기 질문 목록도 같은 규칙으로 보인다.
+    """칩에 표시할 라벨 — 설정 라벨(운영자 지정)이 먼저, 그다음 **행에 실린 것**이다. 어드민
+    초기 질문 목록도 같은 규칙으로 보인다.
 
     슬롯 키는 예스24가 쓰는 코너·분야 이름을 담는다("특가"·"에세이"). 그 이름이 그대로
     칩에 올라가도 되는지는 이름마다 다르다 — "에세이"는 되고 "일별"은 무엇의 일별인지
-    모른다. 그래서 생성 때 이름을 보고 정해 행에 싣는다(`_chip_labels`).
+    모른다. 그래서 슬롯마다 한 번 이름을 정해 행에 싣는다(`_chip_labels`).
 
     행에 라벨이 없으면(수동 등록분·라벨 열이 생기기 전의 행) 키의 대상 부분에서 파생하고,
-    대상이 없는 고정 슬롯은 설정 라벨, 그것도 없으면 시드 표의 코너 이름을 쓴다.
+    대상이 없는 고정 슬롯은 시드 표의 코너 이름을 쓴다.
     """
     slot = row["slot"]
-    stored = _squash(row.get("label") or "")
-    if stored:
-        return stored
-    _, sep, target = slot.partition(TARGET_SEP)
-    if sep and target:
-        return settings.starter_labels.get(slot) or target
     seed = BROWSE_SEED_URLS.get(slot)
-    return settings.starter_labels.get(slot) or (seed["label"] if seed else slot)
+    return (settings.starter_labels.get(slot) or _squash(row.get("label") or "")
+            or slot.partition(TARGET_SEP)[2] or (seed["label"] if seed else slot))
+
+
+def slot_labels(rows: Iterable[dict]) -> dict[str, str]:
+    """슬롯 키 → 칩 이름에 쓸 행 라벨 — 그 슬롯에서 라벨이 실린 가장 최근(id) 행의 것.
+
+    칩 이름은 슬롯당 하나다(라벨 고정 전 행·라벨 없는 직접 등록 행이 섞여도). 서빙(`serve`)과
+    어드민(`admin._starter_slots`)이 이 함수 하나로 정하고, 결과는 `chip_label`의 행 라벨 자리에
+    들어간다(설정 라벨이 여전히 먼저).
+    """
+    return {row["slot"]: row["label"] for row in sorted(rows, key=lambda row: row["id"])
+            if row["label"]}
 
 
 def _failed(detail: str, dropped: int = 0) -> dict:
@@ -1277,33 +1356,8 @@ class StarterService(MysqlBackedService):
     # ── 서빙 ─────────────────────────────────────────────────────────────
 
     async def active_pool(self, today: dt.date, slot: str | None = None) -> list[dict]:
-        """활성 조건(active=1 + 유효기간)은 SQL이 판정한다 — 코드에서 날짜를 다시 거르지 않는다.
-
-        자동 생성분은 **생성일의 신선도**로 판정한다(starter_pool_days). 슬롯 명단으로
-        거르면 오늘 회전에서 빠진 슬롯의 멀쩡한 문장이 통째로 사라지는데, 후보가 수십 개인
-        회전에서는 그게 풀의 대부분이다. 신선도 규칙 하나가 회전·설정 변경·폐지된 슬롯을
-        모두 덮는다(같은 판정의 중복 구현 금지). 수동 항목은 운영자가 소유한다.
-
-        예외는 화제·무엇이든 두 슬롯이다. 오늘의 뉴스에 매인 문장이라 어제 것은 서빙하지
-        않는다 — 이 판정만 슬롯 키를 직접 본다(키가 상수라 목록을 만들 필요가 없다).
-        """
-        sql = (
-            f"SELECT {', '.join(_POOL_COLUMNS)} FROM starters WHERE active = 1 "
-            "AND (valid_from IS NULL OR valid_from <= %s) "
-            "AND (valid_until IS NULL OR valid_until >= %s)"
-        )
-        settings = get_settings()
-        params: tuple = (today, today)
-        sql += " AND (source <> 'auto' OR (run_date IS NOT NULL AND run_date >= %s))"
-        params += (today - dt.timedelta(days=settings.starter_pool_days),)
-        dated = (_TREND_SLOT, _GENERAL_SLOT)
-        placeholders = ", ".join(["%s"] * len(dated))
-        sql += f" AND (source <> 'auto' OR slot NOT IN ({placeholders}) OR run_date = %s)"
-        params += (*dated, today)
-        if slot:
-            sql += " AND slot = %s"
-            params += (slot,)
-        rows = await self._run(sql, params, fetch_all=True)
+        """오늘 서빙할 수 있는 풀 — 판정은 `live_predicate` 한 곳(어드민 '지금 노출'과 같은 식)."""
+        rows = await self._run(*pool_query(today, get_settings(), slot), fetch_all=True)
         return [dict(zip(_POOL_COLUMNS, row)) for row in rows or ()]
 
     async def recent_goods(
@@ -1340,7 +1394,12 @@ class StarterService(MysqlBackedService):
             f"starters served ids={[p['id'] for p in picked]} slots={[p['slot'] for p in picked]}"
         )
         self.ensure_generation(today)
-        return {"starters": [Starter.of(p, settings) for p in picked]}
+        # 칩 이름은 슬롯당 하나 — 라벨 고정 전에 생성된 행이 섞여 있어도 그 슬롯의 가장 최근
+        # 라벨로 부른다(slot_labels — 어드민 `_starter_slots`와 같은 함수).
+        names = slot_labels(pool)
+        return {"starters": [
+            Starter.of({**p, "label": names.get(p["slot"])}, settings) for p in picked
+        ]}
 
     async def refresh_loop(self) -> None:
         """GET과 같은 선점 경로로 미실행·실패·부족 슬롯을 주기적으로 갱신한다."""
@@ -1384,6 +1443,14 @@ class StarterService(MysqlBackedService):
         )
         return (token, force) if rowcount else None
 
+    async def _established_labels(self) -> dict[str, str]:
+        """슬롯 키 → 이미 정해진 칩 라벨 — 그 슬롯에서 라벨이 실린 가장 최근 행의 것."""
+        rows = await self._run(
+            "SELECT s.slot, s.label FROM starters s JOIN (SELECT MAX(id) AS id FROM starters "
+            "WHERE label <> '' GROUP BY slot) m ON m.id = s.id", (), fetch_all=True,
+        )
+        return {slot: _squash(label) for slot, label in rows or () if _squash(label)}
+
     async def run_generation(
         self, slots: list[str] | None, today: dt.date, *, force: bool = False
     ) -> dict[str, dict]:
@@ -1399,7 +1466,7 @@ class StarterService(MysqlBackedService):
             specs = {
                 spec.key: spec for spec in await build_slots(settings, get_client(settings), today)
             }
-            # 칩 라벨은 첫 선점 뒤에 한 번만 짓는다. 목록을 만들 때 지으면 오늘 생성이 끝난 뒤의
+            # 칩 라벨은 첫 선점 뒤에 한 번만 정한다. 목록을 만들 때 지으면 오늘 생성이 끝난 뒤의
             # 서빙마다 모델 콜이 나간다(2026-09-28 운영: 하루 5,644콜, LLM 비용의 62%).
             labels: dict | None = None
             if slots is None:
@@ -1428,8 +1495,12 @@ class StarterService(MysqlBackedService):
                         continue
                     token, replace_pool = claim
                     if labels is None:
-                        labels = await _chip_labels(
-                            list(specs.values()), settings, get_genai_client()
+                        # 슬롯 이름은 한 번 정하면 고정이다 — 실행마다 새로 지으면 같은 슬롯이
+                        # 날마다 '종합 베스트'·'종합 판매'로 바뀐다. 이름이 없는 슬롯만 묻는다.
+                        labels = await self._established_labels()
+                        labels |= await _chip_labels(
+                            [spec for key, spec in specs.items() if key not in labels],
+                            settings, get_genai_client(),
                         )
                     exclude = await self.recent_goods(
                         [slot], today, settings.starter_repeat_window_days
@@ -1656,6 +1727,14 @@ class StarterService(MysqlBackedService):
         valid_from: dt.date | None,
         valid_until: dt.date | None,
     ) -> int:
+        # 새 분야는 이름이 곧 키이자 칩 라벨이다(chip_label) — 키 구분자(TARGET_SEP)가 들어가면
+        # 라벨이 뒤쪽만 잘리고 자동 생성 키 체계('pick:…')에 끼어든다. 칩 라벨 상한도 여기서 지킨다.
+        await tx.cur.execute("SELECT 1 FROM starters WHERE slot = %s LIMIT 1", (slot,))
+        if not await tx.cur.fetchone():
+            if TARGET_SEP in slot:
+                raise HTTPException(422, f"새 분야 이름에는 '{TARGET_SEP}'를 쓸 수 없습니다.")
+            if len(slot) > _CHIP_LABEL_MAX_CHARS:
+                raise HTTPException(422, f"새 분야 이름은 {_CHIP_LABEL_MAX_CHARS}자까지입니다.")
         await tx.cur.execute(
             "INSERT INTO starters (slot, text, source, pinned, valid_from, valid_until) "
             "VALUES (%s, %s, %s, %s, %s, %s)",

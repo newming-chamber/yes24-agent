@@ -3,17 +3,17 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>크레마 AI 관리자</title>
-<link rel="stylesheet" href="/static/lib/admin.css?v=24" />
+<link rel="stylesheet" href="/static/lib/admin.css?v=48" />
 <!-- 로고(crema 마스코트)가 파비콘을 겸한다 — 자기 출처 정적 파일이라 /favicon.ico 401 콘솔 오류도 없다. -->
 <link rel="icon" href="/static/lib/admin-logo.svg" type="image/svg+xml" />
 
 <div class="app" id="app">
   <!-- 인증 전: 로그인 게이트만 보인다(데이터 요청은 세션 쿠키 없이는 401). crema-ai-admin Login.tsx 화면 구성. -->
-  <form class="gate" id="gate" hidden>
+  <form class="gate" id="gate" novalidate hidden>
     <img class="gate-logo" src="/static/lib/admin-logo.svg" alt="" />
     <h1>Crema AI <b>ADMIN</b></h1>
     <p class="gate-sub">크레마 AI 관리자</p>
-    <label class="gate-field"><svg viewBox="-1.25 -3.75 20 20" aria-hidden="true"><path d="M0 0.625L0.625 0H16.875L17.5 0.625V11.875L16.875 12.5H0.625L0 11.875V0.625ZM1.25 1.91875V11.25H16.25V1.92L9.1375 7.375H8.375L1.25 1.91875ZM15.0375 1.25H2.4625L8.75 6.08625L15.0375 1.25Z" /></svg><input id="username" aria-label="계정명" placeholder="계정명" required autocomplete="username" autocapitalize="none" /></label>
+    <label class="gate-field"><svg viewBox="-3 -3 20 20" aria-hidden="true"><path d="M7 7a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zm0 1.5c-2.3 0-7 1.2-7 3.5V14h14v-2c0-2.3-4.7-3.5-7-3.5z" /></svg><input id="username" aria-label="계정명" placeholder="계정명" required autocomplete="username" autocapitalize="none" /></label>
     <label class="gate-field"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16.6667 10C16.6667 9.08083 15.9192 8.33333 15 8.33333H14.1667V5.83333C14.1667 3.53583 12.2975 1.66667 10 1.66667C7.7025 1.66667 5.83333 3.53583 5.83333 5.83333V8.33333H5C4.08083 8.33333 3.33333 9.08083 3.33333 10V16.6667C3.33333 17.5858 4.08083 18.3333 5 18.3333H15C15.9192 18.3333 16.6667 17.5858 16.6667 16.6667V10ZM7.5 5.83333C7.5 4.455 8.62167 3.33333 10 3.33333C11.3783 3.33333 12.5 4.455 12.5 5.83333V8.33333H7.5V5.83333Z" /></svg><input type="password" id="password" aria-label="비밀번호" placeholder="비밀번호" required autocomplete="current-password" /></label>
     <p class="gate-caps" id="gate-caps" role="status" hidden>Caps Lock이 켜져 있습니다.</p>
     <p class="gate-error" id="gate-error" role="alert" hidden></p>
@@ -52,7 +52,7 @@
       <!-- 전체 현황(누적) — crema 대시보드 '오늘 사용 현황' 자리. 섹션 제목 + 우측 보조 문구. -->
       <section class="section"><div class="section-head"><h3>전체 사용 현황</h3><span>전체 기간 누적</span></div><div class="stats" id="stats"></div></section>
       <form id="dashboard-filters" class="crema-filters">
-        <span class="crema-segment" role="group" aria-label="기간 선택"><button type="button" data-range="1" aria-pressed="false">오늘</button><button type="button" data-range="7" aria-pressed="true">최근 7일</button><button type="button" data-range="30" aria-pressed="false">최근 30일</button><button type="button" data-range="month" aria-pressed="false">이번 달</button><button type="button" data-range="last-month" aria-pressed="false">지난 달</button><button type="button" data-range="custom" aria-pressed="false">직접</button></span>
+        <span class="crema-segment period-presets" role="group" aria-label="기간 선택"></span>
         <span class="crema-period"><b>기간</b><span id="dashboard-range"></span></span>
         <span class="crema-custom" id="dashboard-custom" hidden><input id="dashboard-since" type="date" aria-label="시작일" required /> ~ <input id="dashboard-until" type="date" aria-label="종료일" required /><button class="crema-button" type="submit">조회</button></span>
       </form>
@@ -64,7 +64,7 @@
       <div class="workspace-head"><h2>통계</h2></div>
       <div class="crema-tabs" id="statistics-views" role="group" aria-label="지표 묶음"><button data-view="all" aria-pressed="true">전체</button><button data-view="session" aria-pressed="false">세션</button><button data-view="query" aria-pressed="false">질의</button><button data-view="click" aria-pressed="false">클릭</button><button data-view="rbti" aria-pressed="false">RBTI</button><button data-view="feedback" aria-pressed="false">피드백</button></div>
       <form id="statistics-filters" class="crema-filters">
-        <span class="crema-segment" role="group" aria-label="기간 선택"><button type="button" data-range="1" aria-pressed="false">오늘</button><button type="button" data-range="7" aria-pressed="true">최근 7일</button><button type="button" data-range="30" aria-pressed="false">최근 30일</button><button type="button" data-range="month" aria-pressed="false">이번 달</button><button type="button" data-range="last-month" aria-pressed="false">지난 달</button><button type="button" data-range="custom" aria-pressed="false">직접</button></span>
+        <span class="crema-segment period-presets" role="group" aria-label="기간 선택"></span>
         <span class="crema-period"><b>기간</b><span id="statistics-range"></span></span>
         <span class="crema-custom" id="statistics-custom" hidden><input id="statistics-since" type="date" aria-label="시작일" required /> ~ <input id="statistics-until" type="date" aria-label="종료일" required /><button class="crema-button" type="submit">조회</button></span>
       </form>
@@ -76,32 +76,71 @@
       <div class="workspace-head"><h2>회원</h2></div>
       <form class="crema-filters" id="users-filters">
         <label class="crema-search"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8.5 3a5.5 5.5 0 0 1 4.38 8.83l3.65 3.64-1.06 1.06-3.64-3.65A5.5 5.5 0 1 1 8.5 3zm0 1.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" /></svg><input type="search" id="users-q" aria-label="회원 검색" placeholder="닉네임 또는 회원번호 검색" /></label>
-        <label class="select"><select id="users-rbti" aria-label="RBTI 필터"><option value="">RBTI 전체</option><option value="any">RBTI 있음</option><option value="none">RBTI 없음</option></select></label>
+        <label class="select"><select id="users-rbti" aria-label="RBTI 필터"><option value="">RBTI 전체</option></select></label>
         <label class="select"><select id="users-nick" aria-label="닉네임 필터"><option value="">닉네임 전체</option><option value="any">닉네임 있음</option></select></label>
       </form>
       <p class="crema-note">한 번이라도 대화한 회원 · 회원번호로 검색하면 전체에서 찾습니다 · 시각은 <span class="tz"></span> 기준입니다.</p>
-      <div class="crema-table-head"><span id="users-info"></span><span class="table-tools"><button class="crema-download" id="users-csv" type="button">엑셀 다운로드</button></span></div>
+      <div class="crema-table-head"><span id="users-info"></span><span class="table-tools"><button class="crema-download" id="users-csv" type="button">CSV 다운로드</button></span></div>
       <div class="bleed" id="users" aria-live="polite"></div>
       <nav class="crema-pager" id="users-pager" aria-label="페이지"></nav>
     </section>
-    <!-- 초기 질문: 풀 목록(노출 중 먼저). 행을 누르면 옆 패널에서 편집, editor 이상은 수동 추가·지금 생성. -->
+    <!-- 초기 질문: 첫 화면 미리보기(서빙과 같은 풀·선택) + 풀 목록(지금 노출·사용 수). 행을 누르면 옆 패널에서 편집, editor 이상은 수동 추가·지금 생성. -->
     <section class="workspace-pane" id="starters-pane" hidden>
       <div class="workspace-head"><h2>초기 질문</h2></div>
+      <div class="crema-tabs" id="starters-views" role="group" aria-label="보기"><button data-view="calendar" aria-pressed="true">캘린더</button><button data-view="list" aria-pressed="false">목록</button><button data-view="popular" aria-pressed="false">인기 질문</button></div>
+      <!-- 캘린더: 월 격자(좁은 화면은 주 단위 목록). 칸 = 오늘 노출·미래 수동·과거 생성 기록, 막대 = 기간을 정한 수동 질문. 날짜를 누르면 옆 패널. -->
+      <div class="bleed pad" id="starters-calendar">
+        <div class="cal-toolbar">
+          <span class="cal-nav"><button type="button" id="cal-prev" aria-label="이전 달">‹</button><b id="cal-month"></b><button type="button" id="cal-next" aria-label="다음 달">›</button></span>
+          <button class="crema-button" type="button" id="cal-today">이번 달</button>
+          <button class="crema-button primary-soft" type="button" id="cal-add" hidden>+ 기간 질문 추가</button>
+          <!-- 읽는 법(범례 포함)은 '?' 안에 — 달력 위 줄을 늘리지 않는다. -->
+          <details class="cal-help"><summary aria-label="캘린더 읽는 법">?</summary><div class="cal-help-body">
+            <p><span class="cal-key pinned">고정</span> <span class="cal-key">기간 질문</span> 막대는 노출 기간을 정한 직접 등록 질문입니다. 진한 막대는 고정(이 분야에서 항상 먼저)이고, 누르면 그 질문을 엽니다.</p>
+            <p><b>오늘 '노출 중 N'</b> 지금 첫 화면에 나올 수 있는 질문 수입니다(분야 수는 칸에 마우스를 올리면 보입니다).</p>
+            <p><b>과거 '자동 N'</b> 그날 자동으로 만든 질문 수입니다. 그날 실제로 첫 화면에 나온 것을 재현한 것은 아닙니다.</p>
+            <p><b>미래</b> 기간 질문 막대만 보입니다. 기간 없이 매일 나오는 직접 등록 질문은 위 안내 줄에서 목록으로 볼 수 있고, 자동 생성 질문은 그날 만들어져 미리 알 수 없습니다.</p>
+            <p><b>'+N개 더'</b> 칸에 다 못 그린 막대 수입니다. 날짜를 누르면 그날 질문을 봅니다.</p>
+          </div></details>
+          <span class="cal-range" id="cal-range" role="status" hidden><span id="cal-range-note"></span><button class="crema-button" type="button" id="cal-range-add" hidden>이 기간에 질문 추가</button><button class="crema-button" type="button" id="cal-range-clear">선택 해제</button></span>
+        </div>
+        <div class="cal-always" id="cal-always"></div>
+        <p class="cal-note" id="cal-note" role="note" hidden></p>
+        <div id="calendar" aria-live="polite"></div>
+      </div>
+      <div class="bleed pad" id="starters-list" hidden>
+      <form class="crema-filters" id="starters-filters">
+        <label class="crema-search"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8.5 3a5.5 5.5 0 0 1 4.38 8.83l3.65 3.64-1.06 1.06-3.64-3.65A5.5 5.5 0 1 1 8.5 3zm0 1.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" /></svg><input type="search" id="starters-q" aria-label="초기 질문 검색" placeholder="문장 또는 분야 이름 검색" /></label>
+        <!-- 기본 = 지금 노출 중(data-default), 칩을 풀면 전체(data-clear) — 주소에는 기본과 다를 때만 남는다. -->
+        <label class="select"><select id="starters-status" aria-label="노출 상태" data-default="live" data-clear="all"><option value="live" selected>지금 노출 중</option><option value="stopped">노출 안 됨</option><option value="all">노출 상태 전체</option></select></label>
+        <button class="crema-button more-toggle" type="button" id="starters-more" aria-controls="starters-filters">필터 더 보기</button>
+        <label class="select more"><select id="starters-source" aria-label="등록 방식"><option value="">등록 방식 전체</option><option value="auto">자동 생성</option><option value="manual">직접 등록</option></select></label>
+        <label class="select more"><select id="starters-term" aria-label="노출 기간"><option value="">노출 기간 전체</option><option value="none">기간 없음(매일)</option><option value="set">기간 있음</option></select></label>
+        <label class="select more"><select id="starters-slot" aria-label="분야"><option value="">분야 전체</option></select></label>
+        <input type="hidden" id="starters-id" />
+      </form>
       <div class="crema-table-head"><span id="starters-info"></span><span class="table-tools" id="starters-tools"></span></div>
       <div class="bleed" id="starters" aria-live="polite"></div>
       <nav class="crema-pager" id="starters-pager" aria-label="페이지"></nav>
+      </div>
+      <!-- 인기 질문: 칩이 아닌 첫 질문 중 자주 나온 것(칩 후보). 운영자 이상은 행에서 수동 추가 폼을 문장 채운 채 연다. -->
+      <div class="bleed pad" id="starters-popular" hidden>
+        <form class="crema-filters" id="popular-filters"><span class="crema-segment" id="popular-days" role="group" aria-label="기간"></span></form>
+        <p class="crema-note" id="popular-note"></p>
+        <div class="bleed" id="popular" aria-live="polite"></div>
+      </div>
     </section>
     <!-- 감사 로그(관리자 전용): 누가 언제 무엇을 바꿨는지 — 작업 종류·계정 필터, 행을 누르면 옆 패널에 바뀐 필드 전체. -->
     <section class="workspace-pane" id="audit-pane" hidden>
       <div class="workspace-head"><h2>감사 로그</h2></div>
       <form class="crema-filters" id="audit-filters">
-        <span class="crema-segment" id="audit-range" role="group" aria-label="기간 선택"><button type="button" data-days="" aria-pressed="true">전체 기간</button><button type="button" data-days="1" aria-pressed="false">오늘</button><button type="button" data-days="7" aria-pressed="false">최근 7일</button><button type="button" data-days="30" aria-pressed="false">최근 30일</button><button type="button" data-days="custom" aria-pressed="false">직접</button></span>
+        <span class="crema-segment period-presets" id="audit-range" role="group" aria-label="기간 선택" data-all="전체 기간"></span>
         <span class="crema-custom" hidden><input id="audit-since" type="date" aria-label="시작일" data-segment="audit-range" /> ~ <input id="audit-until" type="date" aria-label="종료일" data-segment="audit-range" /><button class="crema-button" type="submit">조회</button></span>
-        <span class="crema-segment" id="audit-target" role="group" aria-label="작업 종류"><button type="button" data-value="" aria-pressed="true">작업 전체</button><button type="button" data-value="login" aria-pressed="false">로그인</button><button type="button" data-value="admin" aria-pressed="false">계정 관리</button><button type="button" data-value="user" aria-pressed="false">회원</button><button type="button" data-value="starter" aria-pressed="false">초기 질문</button></span><input type="hidden" id="audit-kind" data-segment="audit-target" />
+        <span class="crema-segment" id="audit-target" role="group" aria-label="작업 종류"><button type="button" data-value="" aria-pressed="true">변경 작업</button><button type="button" data-value="all" aria-pressed="false">로그인 포함 전체</button><button type="button" data-value="login" aria-pressed="false">로그인</button><button type="button" data-value="admin" aria-pressed="false">계정 관리</button><button type="button" data-value="user" aria-pressed="false">회원</button><button type="button" data-value="starter" aria-pressed="false">초기 질문</button></span><input type="hidden" id="audit-kind" data-segment="audit-target" />
         <label class="select"><select id="audit-actor" aria-label="계정"><option value="">모든 계정</option></select></label>
       </form>
       <p class="crema-note">시각은 <span class="tz"></span> 기준입니다. 비밀번호·키 같은 민감값은 기록되지 않습니다.</p>
-      <div class="crema-table-head"><span id="audit-info"></span><span class="table-tools"><button class="crema-download" id="audit-csv" type="button">엑셀 다운로드</button></span></div>
+      <div class="crema-table-head"><span id="audit-info"></span><span class="table-tools"><button class="crema-download" id="audit-csv" type="button">CSV 다운로드</button></span></div>
       <div class="bleed" id="audit" aria-live="polite"></div>
       <nav class="crema-pager" id="audit-pager" aria-label="페이지"></nav>
     </section>
@@ -110,14 +149,14 @@
       <div id="sessions-top" class="bleed pad">
         <div class="workspace-head"><h2>대화</h2></div>
         <form class="crema-filters" id="filters">
-          <span class="crema-segment" id="sessions-range" role="group" aria-label="기간 선택"><button type="button" data-days="" aria-pressed="true">전체 기간</button><button type="button" data-days="1" aria-pressed="false">오늘</button><button type="button" data-days="7" aria-pressed="false">최근 7일</button><button type="button" data-days="30" aria-pressed="false">최근 30일</button><button type="button" data-days="custom" aria-pressed="false">직접</button></span>
+          <span class="crema-segment period-presets" id="sessions-range" role="group" aria-label="기간 선택" data-all="전체 기간"></span>
           <span class="crema-segment" id="sessions-rating" role="group" aria-label="피드백"><button type="button" data-value="" aria-pressed="true">피드백 전체</button><button type="button" data-value="up" aria-pressed="false">좋아요</button><button type="button" data-value="down" aria-pressed="false">싫어요</button></span><input type="hidden" id="rating" data-segment="sessions-rating" />
           <span class="crema-segment" id="sessions-status" role="group" aria-label="답변 상태"><button type="button" data-value="" aria-pressed="true">상태 전체</button><button type="button" data-value="refused" aria-pressed="false">거절(실패·중단)</button></span><input type="hidden" id="status" data-segment="sessions-status" />
-          <label class="select"><select id="sessions-rbti" aria-label="RBTI 필터"><option value="">RBTI 전체</option><option value="any">RBTI 있음</option></select></label>
+          <label class="select"><select id="sessions-rbti" aria-label="RBTI 필터"><option value="">RBTI 전체</option></select></label>
           <span class="crema-custom" hidden><input id="since" type="date" aria-label="시작일" data-segment="sessions-range" /> ~ <input id="until" type="date" aria-label="종료일" data-segment="sessions-range" /><button class="crema-button" type="submit">조회</button></span>
           <label class="crema-search"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8.5 3a5.5 5.5 0 0 1 4.38 8.83l3.65 3.64-1.06 1.06-3.64-3.65A5.5 5.5 0 1 1 8.5 3zm0 1.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" /></svg><input type="search" id="q" aria-label="대화 검색" placeholder="세션 id·회원번호·닉네임 또는 대화 내용 검색" /></label>
         </form>
-        <div class="crema-table-head"><span id="page-info"></span><span class="table-tools"><label class="select"><select id="sessions-sort" aria-label="정렬"><option value="">최근순</option><option value="update_time:asc">오래된순</option><option value="turn_count:desc">질의 많은순</option></select></label><button class="crema-download" id="sessions-csv" type="button">엑셀 다운로드</button></span></div>
+        <div class="crema-table-head"><span id="page-info"></span><span class="table-tools"><label class="select"><select id="sessions-sort" aria-label="정렬"><option value="">최근순</option><option value="update_time:asc">오래된순</option><option value="turn_count:desc">질의 많은순</option></select></label><button class="crema-download" id="sessions-csv" type="button">CSV 다운로드</button></span></div>
         <p class="crema-note">기간은 대화의 최근 갱신 시각(<span class="tz"></span>) 기준입니다.</p>
       </div>
       <div id="sessions-list" class="bleed pad">
@@ -135,10 +174,21 @@
   <div id="record-view"></div>
 </dialog>
 
+<!-- 확인 대화상자(모달) — 브라우저 confirm() 대신. 무엇이 바뀌는지(영향)를 본문에 적는다. -->
+<dialog id="confirm-dialog" aria-labelledby="confirm-title">
+  <h2 id="confirm-title"></h2>
+  <p id="confirm-message"></p>
+  <div class="confirm-actions"><button type="button" class="crema-button" id="confirm-cancel">취소</button><button type="button" class="primary" id="confirm-ok">확인</button></div>
+</dialog>
+<!-- 알림(토스트) — 끝난 동작과 되돌리기. -->
+<div class="toast" id="toast" role="status" aria-live="polite" hidden><span id="toast-message"></span><button type="button" class="link-button" id="toast-action" hidden></button></div>
+
 <!-- 차트 SVG 뿌리 — admin_charts.js가 복제하고 네임스페이스를 여기서 파생한다(URL 리터럴 없이). -->
 <template id="chart-template"><svg class="chart"></svg></template>
-<!-- 엑셀 다운로드 아이콘(crema-ai-admin Statistics.tsx DownloadIcon 경로). -->
+<!-- 고정 핀 아이콘(이모지 대신 SVG) — 캘린더 막대·상시 고정 띠·날짜 패널. -->
+<template id="pin-icon"><svg class="pin-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M9.8 1.2l5 5-1.1 1.1-.8-.5-2.9 2.9.4 3.1-1.1 1.1-2.9-2.9-3.8 3.8-.7-.7 3.8-3.8-2.9-2.9 1.1-1.1 3.1.4 2.9-2.9-.5-.8z" /></svg></template>
+<!-- CSV 다운로드 아이콘(crema-ai-admin Statistics.tsx DownloadIcon 경로). -->
 <template id="download-icon"><svg class="crema-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="M9 11.625L5.625 8.25L6.6375 7.2L8.25 8.8125V3H9.75V8.8125L11.3625 7.2L12.375 8.25L9 11.625ZM4.5 15C4.0875 15 3.73438 14.8531 3.44063 14.5594C3.14688 14.2656 3 13.9125 3 13.5V11.25H4.5V13.5H13.5V11.25H15V13.5C15 13.9125 14.8531 14.2656 14.5594 14.5594C14.2656 14.8531 13.9125 15 13.5 15H4.5Z" /></svg></template>
 
-<script type="module" src="/static/lib/admin.js?v=33"></script>
+<script type="module" src="/static/lib/admin.js?v=63"></script>
 </html>

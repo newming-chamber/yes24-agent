@@ -1,5 +1,12 @@
 """어드민 분석의 비용 추정 — usage_log 집계 행에 단가를 붙이고 합산하는 순수 함수(DB 없음).
 
+핵심 정의(화면 각주의 근거 — 상세는 docs/admin-operations.md §7, docs는 저장소 밖):
+- 금액 = 사용량(토큰) × 표준 단가(settings.llm_prices, 행의 UTC 날짜에 유효한 구간). 예상치다.
+- 대화 / 대화 외 = usage_log.user_id가 있는 행 / 없는 행(user_id IS NULL — 초기 질문 자동
+  생성처럼 사용자 귀속이 없는 작업). 구성요소 이름 목록으로 가르지 않는다.
+- 금액을 모르는 기록(단가 미등록 모델·토큰 미측정 행)은 0으로 치지 않고 합계에서 뺀다 — 그런
+  행이 있으면 각주가 그 사실만 알린다(cost_notes). 그날 행이 전부 그렇다면 그날 금액은 None.
+
 과금 토큰은 세 갈래다(docs/admin-analytics-design-20260914.md §2.2):
     input_uncached = prompt − cached,  input_cached = cached,  output_billed = total − prompt
 사고 토큰 열은 쓰지 않는다 — Gemini는 response에 사고가 없고 LiteLLM은 있어서, response+thinking은
@@ -87,70 +94,15 @@ def per_turn(cost_usd: float | None, turns: int) -> float | None:
     return cost_usd / turns if cost_usd is not None and turns else None
 
 
-# 비용 각주 — 사용자에게 보이는 문장이라 config가 아니라 여기 둔다. 모델명은 싣지 않는다(운영자
-# 화면에 모델을 내지 않는다, 2026-09-28 사용자 결정). direction: basis(산정 기준)·
-# excluded(금액에서 빠짐)·over(실제보다 많게)·under(실제보다 적게). 목록 순서가 표시 순서다.
-_FIXED_BASIS = (
-    "유료 등급 표준 단가(USD) 기준 추정입니다. 무료 등급 키라면 실제 청구액은 0입니다.",
-    "출력은 total − prompt 토큰(사고·reasoning 포함)으로, 단가는 기록 날짜(UTC)에 유효한 값으로 "
-    "계산합니다. 턴당 비용은 과금 턴(usage_log에서 단가가 적용되고 토큰이 측정된 main 행) 수로 "
-    "나눕니다. 모델 호출 전 끊긴 0토큰 요청도 셉니다.",
-)
-_GROUNDING_EXCLUDED = (
-    "Google Search 그라운딩 요청료는 금액에 넣지 않았습니다. 무료 한도가 같은 API 키의 "
-    "전체 사용량 기준(모델 계열에 따라 월 또는 일 단위)이라 이 DB로 초과 여부를 판정할 수 "
-    "없고, 요청 1건이 검색 쿼리 여러 건으로 과금될 수 있어 web_grounding 행 수(요청 수)는 과금 "
-    "건수의 하한입니다."
-)
-_GROUNDING_OVER = (
-    "web_grounding 행은 검색 결과가 입력으로 되돌아온 토큰이 출력 단가로 잡혀 실제보다 약간 "
-    "많습니다."
-)
-_FIXED_UNDER = (
-    "일부 모델의 캐시 쓰기 할증은 usage_log에 캐시 쓰기 토큰이 없어 반영하지 않았습니다.",
-    "장문 구간 할증(프롬프트가 일정 길이를 넘으면 오르는 단가)은 한 턴의 여러 콜이 합산 기록돼 "
-    "콜별 프롬프트 크기를 알 수 없어 기본 구간 단가를 적용했습니다.",
-)
+# 비용 각주 — 사용자에게 보이는 문장이라 config가 아니라 여기 둔다. 산식·제외·과대/과소 요인의
+# 상세는 운영 문서(docs/admin-operations.md '비용 계산 방법')에 있고, 화면은 예상치라는 사실과
+# '대화 외'의 뜻만 말한다(개발 용어 없이). 모델명은 싣지 않는다(2026-09-28 사용자 결정).
+_ESTIMATE = "모델 사용량에 표준 단가를 곱한 예상치(USD)예요. 실제 청구액과 다를 수 있어요."
+_BACKGROUND = "‘대화 외’는 초기 질문 자동 생성·AI 오버뷰처럼 특정 사용자의 대화가 아닌 작업의 비용이에요."
+_PARTIAL = "일부 기록은 금액을 알 수 없어 합계에서 빠졌어요."
 
 
-def cost_notes(coverage: Mapping[str, int], turns: int, main_rows: int) -> list[dict[str, str]]:
-    """커버리지 카운터(0보다 클 때만)와 고정 요금 조건에서 비용 각주를 만든다.
-
-    각주 문장의 판단은 여기 한 곳뿐이다 — 프론트는 받은 순서대로 보이기만 한다."""
-    notes = [("basis", text) for text in _FIXED_BASIS]
-    if turns != main_rows:
-        notes.append(
-            (
-                "basis",
-                f"대화 턴 {turns:,}개와 비용 기록 {main_rows:,}건이 다릅니다. 차이는 삭제되었거나 "
-                "기록이 없는 턴입니다.",
-            )
-        )
-    if coverage["unpriced_rows"]:
-        notes.append(
-            (
-                "excluded",
-                f"단가 미등록 모델 {coverage['unpriced_rows']:,}행·"
-                f"{coverage['unpriced_tokens']:,}토큰은 금액과 턴당 비용에서 빠졌습니다.",
-            )
-        )
-    if coverage["unmeasured_rows"]:
-        notes.append(
-            (
-                "excluded",
-                f"토큰이 측정되지 않은 {coverage['unmeasured_rows']:,}행은 금액과 턴당 비용에서 "
-                "빠졌습니다.",
-            )
-        )
-    notes.append(("excluded", _GROUNDING_EXCLUDED))
-    if coverage["cache_unknown_rows"]:
-        notes.append(
-            (
-                "over",
-                f"캐시 토큰이 기록되지 않은 {coverage['cache_unknown_rows']:,}행은 캐시 할인 없이 "
-                "계산해 실제보다 많을 수 있습니다.",
-            )
-        )
-    notes.append(("over", _GROUNDING_OVER))
-    notes.extend(("under", text) for text in _FIXED_UNDER)
-    return [{"direction": direction, "text": text} for direction, text in notes]
+def cost_notes(coverage: Mapping[str, int]) -> list[str]:
+    """화면 각주 — 예상치 안내 · '대화 외' 정의 · (있을 때만) 금액을 모르는 기록이 빠졌다는 말."""
+    partial = coverage["unpriced_rows"] or coverage["unmeasured_rows"]
+    return [_ESTIMATE, _BACKGROUND, *([_PARTIAL] if partial else [])]

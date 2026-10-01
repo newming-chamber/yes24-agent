@@ -867,6 +867,19 @@ class Settings(BaseSettings):
     # 스타터 서비스 커넥션 풀 상한. 서빙은 요청당 SELECT 2건, 생성은 하루 1회 트랜잭션이라
     # user_data와 같은 최소 크기다(격벽 근거도 같다 — user_data_pool_max 주석).
     starter_pool_max: int = 2
+    # 어드민 초기 질문 보기. 사용 수 = 최근 N일 새 세션 중 첫 질문이 칩 문장과 같은 세션 수(인기
+    # 질문도 같은 창을 기본으로 쓴다). 미리보기는 오늘~N일 뒤만 받고(과거 풀은 재현할 수 없다),
+    # 행별 노출 확률은 서빙 선택(pick_starters)을 이만큼 반복해 센다 — 2000번이면 확률 ±1%p 안팎.
+    starter_uses_days: int = 30
+    starter_preview_max_days: int = 90
+    starter_preview_draws: int = 2000
+    # 인기 질문 = 칩이 아닌 첫 질문 중 이 횟수 이상 나온 문장(정규화로 합친 뒤), 많은 순 상한.
+    starter_popular_min_sessions: int = 2
+    starter_popular_limit: int = 50
+    # 이보다 짧은 인기 질문은 흐리게 보인다("ㅎㅇ"·"테스트" 같은 시험 입력 — 후보로 약하다).
+    starter_popular_min_chars: int = 6
+    # 인기 질문 화면의 기간 선택지(일). 기본 기간은 starter_uses_days다.
+    starter_popular_day_options: tuple[int, ...] = (7, 30, 90)
 
     # 대화 목록(GET /chat/sessions) 응답 세션 수 상한(최근 갱신순 앞에서 자름). ADK
     # list_sessions는 사용자 전체를 돌려주므로 장수 사용자의 목록 한 장이 무한히 크지 않게
@@ -902,6 +915,9 @@ class Settings(BaseSettings):
     # 수만큼 미리보기 조회가 따라붙어(인덱스 조회지만) 왕복이 늘므로 한 화면에 담기는 정도로
     # 둔다. 화면은 응답의 page_size로 이 값을 받는다(대화 목록 내려받기도 같은 단위로 넘긴다).
     admin_page_size: int = 50
+    # 운영 지표·목록에서 뺄 내부·테스트 계정(chat_turn.user_id 값). 값은 환경(.env)에서만 넣는다 —
+    # 계정 id를 코드에 박지 않는다. 비면 화면의 '포함해서 보기' 토글도 숨는다.
+    admin_excluded_user_ids: tuple[str, ...] = ()
     # 대시보드 증감의 변화율(%)을 보일 이전 값 하한 — 이전 값이 이보다 작으면(예: 2 → 38 = +1,800%)
     # 비율이 과장이라 절대 변화만 보인다. 비율 지표(%p)에는 적용하지 않는다. 화면은 /me로 받는다.
     admin_change_min_base: float = 10

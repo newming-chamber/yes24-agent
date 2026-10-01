@@ -45,6 +45,7 @@ from pydantic_core import PydanticCustomError
 from yes24_agent.admin_data import BOOL_DECODERS, jsonable
 from yes24_agent.config import Settings, get_settings
 from yes24_agent.db import MysqlBackedService
+from yes24_agent.rbti.persona import get_archetype_name, matrix_codes
 from yes24_agent.session_service import mysql_pool_kwargs
 
 logger = logging.getLogger(__name__)
@@ -645,6 +646,8 @@ def register_admin_auth(app: FastAPI, settings: Settings) -> None:
         timezone = 어드민 표시 시간대(오프셋·라벨) — 화면의 시각 표기·기간 프리셋의 '오늘'이 따른다.
         password_min_length = 비밀번호 변경 폼의 안내·사전 검사(판정은 서버 검증이 정본).
         change_min_base = 대시보드 증감에서 변화율(%)을 보일 이전 값 하한(설정값 — 화면 표시 규칙).
+        excluded_accounts = 지표에서 빼는 내부·테스트 계정 수(0이면 토글을 숨긴다, id는 없음).
+        rbti_names = RBTI 코드 → 유형 이름(rbti.persona가 정본 — 화면이 이름표를 따로 들지 않게).
         """
         return {
             "username": actor.username,
@@ -656,6 +659,8 @@ def register_admin_auth(app: FastAPI, settings: Settings) -> None:
             },
             "password_min_length": settings.admin_password_min_length,
             "change_min_base": settings.admin_change_min_base,
+            "excluded_accounts": len(settings.admin_excluded_user_ids),
+            "rbti_names": {code: get_archetype_name(code) for code in matrix_codes()},
         }
 
     @app.exception_handler(RequestValidationError)

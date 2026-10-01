@@ -11,6 +11,8 @@ const TOP = 10, PLOT_H = 180, AXIS_H = 24, LEFT = 56, RIGHT = 16, BAR_MAX = 24, 
 const DAY_LABEL_W = 44;
 const EMPTY = '선택한 기간에 기록이 없습니다.';
 const KEYS = { ArrowLeft: -1, ArrowRight: 1, Home: -Infinity, End: Infinity };
+// 칸을 눌러 그 날짜·칸의 목록으로 갈 수 있을 때 툴팁 끝줄.
+const PICK_HINT = '눌러서 대화 보기';
 
 export function initCharts({ template, el, table }) {
   const svgNS = template.content.firstElementChild.namespaceURI;
@@ -93,10 +95,10 @@ export function initCharts({ template, el, table }) {
   }
 
   /** y 눈금 라벨을 먼저 재서 왼쪽 여백을 정한다. 시계열 차트끼리 x축이 맞도록 LEFT가 하한. */
-  function yAxis(svg, width, right, ticks, top, format) {
+  function yAxis(svg, width, right, ticks, top, format, plotH = PLOT_H) {
     const labels = ticks.map((tick) => node(svg, 'text', { 'text-anchor': 'end' }, null, format(tick)));
     const left = Math.max(LEFT, Math.ceil(Math.max(...labels.map((label) => label.getComputedTextLength()))) + 10);
-    const y = (value) => TOP + PLOT_H - (value / top) * PLOT_H;
+    const y = (value) => TOP + plotH - (value / top) * plotH;
     ticks.forEach((tick, i) => {
       const at = Math.round(y(tick)) + 0.5;
       node(svg, 'line', { x1: left, x2: width - right, y1: at, y2: at }, 'grid');
@@ -107,11 +109,11 @@ export function initCharts({ template, el, table }) {
   }
 
   /** 날짜 라벨은 마지막 날부터 거꾸로 솎는다 — 가장 최근 날짜가 항상 보인다. tick은 칸 라벨(기본 MM-DD). */
-  function xAxis(svg, categories, left, band, tick = (category) => category.slice(5)) {
+  function xAxis(svg, categories, left, band, tick = (category) => category.slice(5), plotH = PLOT_H) {
     const stride = Math.max(1, Math.ceil(DAY_LABEL_W / band));
     categories.forEach((category, i) => {
       if ((categories.length - 1 - i) % stride) return;
-      node(svg, 'text', { x: left + band * (i + 0.5), y: TOP + PLOT_H + 16, 'text-anchor': 'middle' }, null, tick(category));
+      node(svg, 'text', { x: left + band * (i + 0.5), y: TOP + plotH + 16, 'text-anchor': 'middle' }, null, tick(category));
     });
   }
 
@@ -121,13 +123,14 @@ export function initCharts({ template, el, table }) {
     const box = node(group, 'rect', { rx: 6 });
     const lines = node(group, 'g');
     return {
-      show(anchor, head, rows) {
+      show(anchor, head, rows, foot) {
         lines.replaceChildren();
         node(lines, 'text', { x: 10, y: LINE_H }, 'tip-head', head);
+        if (foot) rows = [...rows, { value: '', label: foot, foot: true }];
         rows.forEach((row, i) => {
           const y = LINE_H * (i + 2);
           if (row.className) node(lines, 'line', { x1: 10, x2: 20, y1: y - 4, y2: y - 4 }, `key ${row.className}`);
-          const text = node(lines, 'text', { x: row.className ? 26 : 10, y });
+          const text = node(lines, 'text', { x: row.className ? 26 : 10, y }, row.foot ? 'tip-foot' : null);
           node(text, 'tspan', {}, 'tip-value', row.value);
           if (row.label) node(text, 'tspan', {}, null, ` ${row.label}`);
         });
@@ -179,7 +182,7 @@ export function initCharts({ template, el, table }) {
   };
 
   /** 날짜별 누적 막대. 첫 시리즈가 기준선에 붙는다. 날짜가 아닌 칸(요일·시각)은 tick·axisTitle로 그린다. */
-  function stackedBars({ title, note, notes, categories, series, unit, format, tick, axisTitle = '날짜', onPick }) {
+  function stackedBars({ title, note, notes, categories, series, unit, format, tick, axisTitle = '날짜', onPick, pickHint = PICK_HINT }) {
     // null(미측정·단가 미등록)은 0이 아니다 — 막대는 그리지 않고 표·툴팁엔 포맷터의 null 표기로 간다.
     // 칸 이름 — tick(축 라벨 서식)이 있으면 툴팁·낭독·표도 같은 이름(예: 13 → '13시'). 날짜는 원문 그대로.
     const name = (category) => (tick ? tick(category) : category);
@@ -221,7 +224,7 @@ export function initCharts({ template, el, table }) {
           // 계열이 하나면 값 한 줄뿐 — 계열명(제목·범례가 이미 말함)·합계 줄을 붙이면 '100질의 질의 / 100질의 합계'로 겹친다.
           const rows = single ? [{ value: format(totals[i]), className: series[0].className }]
             : [...series.filter((item) => item.values[i] > 0).map((item) => ({ value: format(item.values[i]), label: item.label, className: item.className })), { value: format(totals[i]), label: '합계' }];
-          tooltip.show(left + band * (i + 0.5), name(categories[i]), rows);
+          tooltip.show(left + band * (i + 0.5), name(categories[i]), rows, onPick && pickHint);
           return `${name(categories[i])} ${rows.map((row) => [row.label, row.value].filter(Boolean).join(' ')).join(', ')}`;
         },
         hide: () => { highlight.setAttribute('display', 'none'); tooltip.hide(); },
@@ -241,24 +244,25 @@ export function initCharts({ template, el, table }) {
 
   /** 날짜별 선. null은 선을 끊는다(0으로 잇지 않음). 범례를 눌러 계열을 끄면 남은 계열로 y축을 다시 잡는다
    *  (마지막 하나는 끄지 않는다). */
-  function lines({ title, note, categories, series: all, format }) {
+  function lines({ title, note, categories, series: all, format, height = PLOT_H, onPick, pickHint = PICK_HINT }) {
     const present = all.flatMap((item) => item.values).filter((value) => value != null);
     const hidden = new Set();
     const draw = (svg, width) => {
       const series = all.filter((item) => !hidden.has(item));
       const lastIndex = series.map((item) => item.values.findLastIndex((value) => value != null));
       const shown = series.flatMap((item) => item.values).filter((value) => value != null);
-      size(svg, width, TOP + PLOT_H + AXIS_H);
+      const plotH = height;
+      size(svg, width, TOP + plotH + AXIS_H);
       const { top, ticks } = scale(Math.max(...shown), false);
       // 끝 라벨이 서로 겹칠 만큼 가까우면 라벨을 버리고 범례·툴팁에 맡긴다(밀어 붙이지 않는다).
-      const ends = series.map((item, k) => (lastIndex[k] < 0 ? null : (item.values[lastIndex[k]] / top) * PLOT_H));
+      const ends = series.map((item, k) => (lastIndex[k] < 0 ? null : (item.values[lastIndex[k]] / top) * plotH));
       const crowded = ends.some((a, i) => a !== null && ends.some((b, j) => i < j && b !== null && Math.abs(a - b) < LINE_H));
       const endLabels = crowded ? [] : series.map((item, k) => (lastIndex[k] < 0 ? null : node(svg, 'text', {}, null, item.label)));
       const right = Math.max(RIGHT, ...endLabels.filter(Boolean).map((label) => Math.ceil(label.getComputedTextLength()) + 14));
-      const { left, y } = yAxis(svg, width, right, ticks, top, format);
+      const { left, y } = yAxis(svg, width, right, ticks, top, format, plotH);
       const band = (width - left - right) / categories.length;
       const x = (i) => left + band * (i + 0.5);
-      const crosshair = node(svg, 'line', { y1: TOP, y2: TOP + PLOT_H, display: 'none' }, 'crosshair');
+      const crosshair = node(svg, 'line', { y1: TOP, y2: TOP + plotH, display: 'none' }, 'crosshair');
       series.forEach((item, k) => {
         node(svg, 'path', { d: path(item.values, x, y) }, `line ${item.className}`);
         endLabels[k]?.setAttribute('x', x(lastIndex[k]) + 10);
@@ -272,8 +276,8 @@ export function initCharts({ template, el, table }) {
         const beneath = series.slice(0, k).filter((other) => other.values[i] === value).length;
         node(svg, 'circle', { cx: x(i), cy: y(value), r: 4 + 4 * beneath }, `dot ${className}`);
       }));
-      xAxis(svg, categories, left, band);
-      const layer = node(svg, 'rect', { x: left, y: TOP, width: width - left - right, height: PLOT_H }, 'hit');
+      xAxis(svg, categories, left, band, undefined, plotH);
+      const layer = node(svg, 'rect', { x: left, y: TOP, width: width - left - right, height: plotH }, 'hit');
       const tooltip = tip(svg, width);
       cursor(svg, layer, {
         count: categories.length,
@@ -284,10 +288,11 @@ export function initCharts({ template, el, table }) {
           crosshair.setAttribute('x2', x(i));
           crosshair.removeAttribute('display');
           const rows = series.map((item) => ({ value: format(item.values[i]), label: item.label, className: item.className }));
-          tooltip.show(x(i), categories[i], rows);
+          tooltip.show(x(i), categories[i], rows, onPick && pickHint);
           return `${categories[i]} ${rows.map((row) => `${row.label} ${row.value}`).join(', ')}`;
         },
         hide: () => { crosshair.setAttribute('display', 'none'); tooltip.hide(); },
+        choose: onPick && ((i) => onPick(categories[i])),
       });
     };
     return card({

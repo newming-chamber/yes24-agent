@@ -33,14 +33,14 @@ const jsonBody = (method, body) => ({ method, headers: { 'Content-Type': 'applic
 /** 편집 요청 한 벌 — 초기 질문 PATCH의 {changes, expected} 본문. */
 const editBody = (changes, expected) => jsonBody('PATCH', { changes, expected });
 
-export function initManage({ api, el, table, valueText, state, openDialog, showRecord, reload }) {
+export function initManage({ api, el, table, valueText, state, openDialog, showRecord, reload, onCreated, slotLabel, generateStatus, errorText, chanceText, slotProbability: slotChance, todayPreview }) {
   const $ = (id) => document.getElementById(id);
   // 역할 순서는 서버 정본(/me의 roles, 낮은 권한 → 높은 권한)을 쓴다.
   const can = (role) => state.roles.indexOf(state.role) >= state.roles.indexOf(role);
   const actions = () => $('record-actions');
 
   /** fields: [{key, label, kind}]. values로 채운 폼과 상태 줄을 만든다.
-   *  form.dirty()는 마지막으로 채운 값과 다른지 — 옆 패널을 떠날 때 확인에 쓴다(admin.js canLeavePanel). */
+   *  form.dirty()는 마지막으로 채운 값과 다른지 — 옆 패널을 떠날 때 확인에 쓴다(admin.js panelDirty). */
   function buildForm(title, fields, values, submitLabel) {
     const form = el('form', 'manage-form');
     const nodes = {};
@@ -48,8 +48,10 @@ export function initManage({ api, el, table, valueText, state, openDialog, showR
     for (const field of fields) {
       nodes[field.key] = KINDS[field.kind].make(field);
       const label = el('label', field.kind === 'checkbox' ? 'check' : null, field.label);
-      label.append(nodes[field.key]);
+      // 체크박스는 상자를 앞에(라벨 전체가 누르는 자리), 나머지 칸은 라벨 아래.
+      if (field.kind === 'checkbox') label.prepend(nodes[field.key]); else label.append(nodes[field.key]);
       form.append(label);
+      if (field.help) form.append(el('small', 'field-help', field.help));  // 개념 설명 한 줄(체크박스 바로 아래)
     }
     const button = el('button', 'primary', submitLabel);
     button.type = 'submit';
@@ -71,7 +73,7 @@ export function initManage({ api, el, table, valueText, state, openDialog, showR
         button.disabled = true;
         status.textContent = '처리하는 중…';
         try { status.textContent = await submit(read()); }
-        catch (error) { if (error.name !== 'AbortError') status.textContent = recover(error) || error.message; }
+        catch (error) { if (error.name !== 'AbortError') status.textContent = recover(error) || errorText(error, '저장하지 못했습니다. 다시 시도해 주세요.'); }
         finally { button.disabled = false; }
       };
     };
@@ -111,60 +113,139 @@ export function initManage({ api, el, table, valueText, state, openDialog, showR
   // ── 초기 질문 행 패널 ────────────────────────────────────────────────────
   const STARTER_FIELDS = [
     { key: 'text', label: '문장', kind: 'textarea' },
-    { key: 'pinned', label: '고정', kind: 'checkbox' },
-    { key: 'active', label: '노출', kind: 'checkbox' },
+    { key: 'pinned', label: '고정(이 분야에서 항상 먼저)', kind: 'checkbox', help: '이 분야가 첫 화면에 뽑히면 이 질문이 항상 나와요. 같은 분야의 다른 질문은 대신 안 나와요. 분야가 뽑힐지는 확률이에요.' },
+    { key: 'active', label: '노출 켜기', kind: 'checkbox' },
     { key: 'valid_from', label: '노출 시작일', kind: 'date' },
-    { key: 'valid_until', label: '노출 종료일', kind: 'date' },
+    { key: 'valid_until', label: '노출 종료일', kind: 'date', help: '시작일·종료일을 비워 두면 매일 노출돼요.' },
   ];
+
+  // 고정의 영향 — 행 패널·직접 등록 폼(체크 순간)과 날짜 패널(고정 확인 줄)이 같은 말을 쓴다. data = 그날
+  // 미리보기(rows·slots). 같은 분야에 고정이 이미 있으면 서빙은 고정 질문끼리 무작위로 고른다(교체가 아니다).
+  function pinImpact(data, slot, id, live = true) {
+    // 지금 노출 중이 아닌 행(목록 판정 live=false, 또는 그날 풀에 없음)은 고정해도 첫 화면에 나오지 않는다 — 수치를 보이지 않는다.
+    if (!live || (id != null && !data?.rows?.some((row) => row.id === id))) return '지금 노출 중이 아니라 고정해도 첫 화면에 나오지 않아요.';
+    const siblings = (data?.rows ?? []).filter((row) => row.slot === slot && row.id !== id), pinned = siblings.filter((row) => row.pinned);
+    // 머리말과 같은 값(질문 수 ÷ 분야 수) — 풀에 없는 새 분야면 분야가 하나 늘어난 분모로.
+    const slotProbability = slotChance(data, data?.slots?.some((item) => item.slot === slot) ? 0 : 1);
+    const current = data?.rows?.find((row) => row.id === id)?.probability;
+    // 고정 후 = 분야 확률을 고정 질문끼리 나눈 값(기존 고정이 없으면 분야 확률 그대로).
+    const change = slotProbability == null ? '' : `이 질문 ${current == null ? '예상 ' : current === 0 ? '지금 안 나옴 → ' : `${chanceText(current)} → `}${chanceText(slotProbability / (pinned.length + 1))}${pinned.length ? '(고정 질문끼리 나눠 가져요)' : ''}.`;
+    const effect = pinned.length ? `이미 고정된 "${pinned[0].text}"${pinned.length > 1 ? ` 외 ${pinned.length - 1}개` : ''}와 번갈아 나와요(교체되지 않아요).`
+      : siblings.length ? `같은 분야의 다른 질문 ${siblings.length}개는 첫 화면에서 가려져요.` : '';
+    return [change, effect].filter(Boolean).join(' ');
+  }
+  const pinNotice = (data, slot, id) => `이 분야가 첫 화면에 뽑히면 이 질문이 항상 나와요. ${pinImpact(data, slot, id)}`.trim();
+  /** 고정 체크 — 설명(도움말)과 영향은 체크했을 때만 보인다. 영향은 오늘 미리보기(state.preview)로 센다.
+   *  slot()·id = 지금 폼의 분야 키와 자기 행 id(새 질문은 null). */
+  function pinWarning(built, slot, id, live) {
+    const line = el('small', 'field-warn'), help = built.nodes.pinned.closest('label').nextElementSibling;
+    line.setAttribute('role', 'status');
+    help.after(line);  // 도움말 줄 다음
+    const update = () => {
+      const on = built.nodes.pinned.checked;
+      help.hidden = !on;
+      line.textContent = on ? pinImpact(state.preview, slot(), id, live) : '';
+    };
+    built.nodes.pinned.addEventListener('change', update);
+    update();
+    return update;
+  }
 
   function starterPanel(row) {
     if (!can('editor')) return;
-    actions().append(editForm({
+    const built = editForm({
       title: '초기 질문 편집', fields: STARTER_FIELDS, row,
       path: `/admin/starters/${encodeURIComponent(row.id)}`,
-    }).form);
+    });
+    pinWarning(built, () => row.slot, row.id, row.live);
+    actions().append(built.form);
   }
 
   // 슬롯 선택지 = 풀에 있는 슬롯(목록 응답 slots — 키는 값으로만, 운영자에겐 칩 라벨).
   const slotOptions = () => state.starterSlots.map(({ slot, label }) => [slot, label]);
 
-  // 수동 추가는 기존 슬롯 외에 새 슬롯 키도 받는다(형식 판정은 서버 검증 그대로).
+  // 새 분야는 이름(첫 화면 칩에 그대로 보이는 글자) 하나만 받는다 — 이름이 곧 분야 키다(키가 라벨이 되는
+  // 규칙은 starters.chip_label). 이미 있는 분야 이름을 치면 새로 만들지 않고 그 분야로 등록한다.
   const NEW_SLOT = '\u0000new';
-  function openStarterCreate() {
-    if (!openDialog('초기 질문 수동 추가')) return;
+  /** prefill.text가 있으면(인기 질문의 '칩으로 추가') 문장을 채워 열고 개인정보 확인을 안내한다.
+   *  estimate가 있으면(캘린더 기간 추가) 슬롯·고정·시작일을 바꿀 때마다 등록 전 예상 노출 확률을 보인다. */
+  async function openStarterCreate(prefill = {}, { estimate } = {}) {
+    if (!(await openDialog('첫 화면 질문 직접 등록'))) return;
+    // 분야 선택지는 지금 노출 중인 분야가 먼저(오늘 미리보기의 분야), 나머지는 '(지금 노출 없음)'을 붙여 뒤에.
+    await todayPreview();
+    const live = new Set((state.preview?.slots ?? []).map((item) => item.slot));
+    const options = [...slotOptions().filter(([key]) => live.has(key)), ...slotOptions().filter(([key]) => !live.has(key)).map(([key, label]) => [key, `${label} (지금 노출 없음)`])];
     const built = buildForm('새 초기 질문', [
-      { key: 'slot', label: '슬롯', kind: 'select', options: [['', '슬롯 선택'], ...slotOptions(), [NEW_SLOT, '새 슬롯 직접 입력']] },
-      { key: 'new_slot', label: '새 슬롯 키', kind: 'text' },
+      { key: 'slot', label: '분야', kind: 'select', options: [['', '분야 선택'], ...options, [NEW_SLOT, '+ 새 분야 만들기']] },
+      { key: 'new_slot', label: '새 분야 이름', kind: 'text', help: '첫 화면 질문 위에 그대로 보이는 이름이에요(예: 가을 이벤트).' },
       ...STARTER_FIELDS.filter((field) => field.key !== 'active'),
-    ], {}, '추가');
+    ], prefill, '추가');
+    if (prefill.text) built.form.querySelector('h3').after(el('p', 'analysis-note notice', '사용자가 직접 입력한 문장입니다 — 이름·연락처·주문 정보 같은 개인정보가 없는지 확인하고, 첫 화면 질문에 맞게 다듬어 등록하세요.'));
     const { slot, new_slot: typed } = built.nodes;
+    // 새 분야 이름은 칩 라벨이 된다 — 서버와 같은 상한(미리보기 응답 slot_name_max), ':'는 서버가 거른다.
+    if (state.preview?.slot_name_max) typed.maxLength = state.preview.slot_name_max;
     slot.required = true;
-    const syncNew = () => { typed.closest('label').hidden = slot.value !== NEW_SLOT; typed.required = slot.value === NEW_SLOT; };
+    const syncNew = () => {
+      const label = typed.closest('label'), shown = slot.value === NEW_SLOT;
+      label.hidden = label.nextElementSibling.hidden = !shown;  // 칸과 그 도움말 줄
+      typed.required = shown;
+    };
     slot.addEventListener('change', syncNew);
     syncNew();
-    built.onSubmit(async ({ new_slot: newSlot, ...values }) => {
-      if (values.slot === NEW_SLOT) values.slot = newSlot.trim();
+    const slotKey = () => (slot.value === NEW_SLOT ? state.starterSlots.find((item) => item.label === typed.value.trim())?.slot ?? typed.value.trim() : slot.value);
+    const warn = pinWarning(built, slotKey, null);
+    slot.addEventListener('change', warn);
+    // 이 분야의 지금 질문 — 같은 뜻의 질문이 이미 있는지 운영자가 직접 본다(문구 비교로 판정하지 않는다). 접어 둔다.
+    const current = el('details', 'slot-current');
+    slot.closest('label').after(current);
+    const listCurrent = () => {
+      const rows = (state.preview?.rows ?? []).filter((row) => row.slot === slotKey());
+      current.hidden = !slotKey();
+      const summary = el('summary', null, `이 분야의 지금 질문 ${rows.length}개`), list = el('ul');
+      list.append(...rows.map((row) => el('li', null, row.text)));
+      current.replaceChildren(summary, ...(rows.length ? [list] : [el('p', null, '지금 노출 중인 질문이 없어요.')]));
+    };
+    for (const node of [slot, typed]) node.addEventListener('change', listCurrent);
+    listCurrent();
+    if (estimate) {
+      const line = el('p', 'analysis-note', '분야를 고르면 첫 화면에 뜰 확률(예상치)을 보입니다.');
+      line.setAttribute('role', 'status');
+      built.form.querySelector('button.primary').before(line);
+      let asked = 0;
+      const update = async () => {
+        const key = slotKey();
+        if (!key) { line.textContent = '분야를 고르면 첫 화면에 뜰 확률(예상치)을 보입니다.'; return; }
+        const ticket = ++asked;
+        try {
+          const result = await estimate({ slot: key, pinned: built.nodes.pinned.checked, date: built.nodes.valid_from.value });
+          if (ticket === asked) line.textContent = `첫 화면에 뜰 확률 ${chanceText(result.probability)} (${result.date} 기준 · 등록 전 예상치)`;
+        } catch (error) { if (ticket === asked) line.textContent = `예상 확률을 계산하지 못했습니다: ${errorText(error, '다시 시도해 주세요.')}`; }
+      };
+      for (const node of [slot, typed, built.nodes.pinned, built.nodes.valid_from]) node.addEventListener('change', update);
+    }
+    built.onSubmit(async ({ new_slot: _typed, ...values }) => {  // 새 분야 이름은 slotKey()가 읽는다
+      values.slot = slotKey();
       const created = await api('/admin/starters', jsonBody('POST', values));
-      reload();
-      built.fill({});
-      syncNew();
-      return `추가했습니다 (id ${created.id}).`;
+      built.fill({});  // 기준값을 비워 두어 패널을 닫을 때 묻지 않는다
+      onCreated(created);  // 화면이 패널을 닫고 알림·새 행 강조를 맡는다
+      return '추가했습니다.';
     });
     actions().append(built.form);
   }
 
-  function openStarterGenerate() {
-    if (!openDialog('초기 질문 지금 생성')) return;
-    const built = buildForm('즉시 생성', [{ key: 'slot', label: '슬롯', kind: 'select', options: [['', '전체 자동 슬롯'], ...slotOptions()] }, { key: 'force', label: '오늘 실행분이 있어도 다시 생성', kind: 'checkbox' }], {}, '생성 실행');
+  async function openStarterGenerate() {
+    if (!(await openDialog('초기 질문 지금 생성'))) return;
+    const built = buildForm('즉시 생성', [{ key: 'slot', label: '분야', kind: 'select', options: [['', '자동 생성 분야 전체'], ...slotOptions()] }, { key: 'force', label: '오늘 실행분이 있어도 다시 생성', kind: 'checkbox' }], {}, '생성 실행');
     built.onSubmit(async (values) => {
       const params = new URLSearchParams({ force: values.force ? '1' : '0' });
       if (values.slot) params.set('slot', values.slot);
       built.status.textContent = '생성하는 중… 수십 초 걸릴 수 있습니다.';
       const result = await api(`/admin/starters/generate?${params}`, { method: 'POST' });
-      showRecord(result, null);
+      // 결과는 분야 키별 {status, inserted} — 분야 이름 · 결과 한 줄로(키·JSON을 그대로 보이지 않는다).
+      showRecord(Object.fromEntries(Object.entries(result).map(([key, item]) => [slotLabel(key), `${generateStatus[item.status] ?? item.status} · 새 질문 ${item.inserted ?? 0}개${item.status === 'failed' && item.detail ? ` — ${item.detail}` : ''}`])), null);
       built.fill(values);  // 실행한 값이 새 기준 — 패널을 떠나도 묻지 않는다
       reload();  // 지금 화면(초기 질문)의 목록을 다시 읽는다
-      return '생성을 마쳤습니다. 슬롯별 결과는 위 표입니다.';
+      return '생성을 마쳤습니다. 분야별 결과는 위 표입니다.';
     });
     actions().append(built.form);
   }
@@ -172,17 +253,17 @@ export function initManage({ api, el, table, valueText, state, openDialog, showR
   function starterTools(tools) {
     tools.replaceChildren();
     if (!can('editor')) return;
-    const add = el('button', 'crema-button', '수동 추가');
-    add.onclick = openStarterCreate;
+    const add = el('button', 'crema-button', '직접 등록');
+    add.onclick = () => openStarterCreate();  // 클릭 이벤트가 채울 값(prefill)으로 넘어가지 않게
     const generate = el('button', 'crema-button', '지금 생성');
-    generate.onclick = openStarterGenerate;
+    generate.onclick = () => openStarterGenerate();
     tools.append(add, generate);
   }
 
   // ── 본인 비밀번호 ──────────────────────────────────────────────────────
   /** 새 비밀번호는 확인 칸과 같아야 하고 최소 길이(서버 설정 /me password_min_length)를 안내·사전 검사한다 — 판정은 서버. */
-  function openPasswordChange() {
-    if (!openDialog('비밀번호 변경')) return;
+  async function openPasswordChange() {
+    if (!(await openDialog('비밀번호 변경'))) return;
     const min = state.passwordMin;
     const built = buildForm('내 비밀번호', [
       { key: 'current_password', label: '현재 비밀번호', kind: 'password' },
@@ -192,6 +273,18 @@ export function initManage({ api, el, table, valueText, state, openDialog, showR
     built.nodes.current_password.autocomplete = 'current-password';
     for (const node of Object.values(built.nodes)) node.required = true;
     built.nodes.new_password.minLength = built.nodes.confirm_password.minLength = min;
+    // 입력하는 동안 길이·일치를 바로 알린다(제출 전 — 판정은 여전히 서버).
+    const live = el('p', 'analysis-note password-live');
+    live.setAttribute('aria-live', 'polite');
+    built.form.querySelector('button.primary').before(live);
+    const check = () => {
+      const next = built.nodes.new_password.value, again = built.nodes.confirm_password.value;
+      if (!next && !again) { live.textContent = ''; return; }
+      const length = next.length >= min ? `길이 ${next.length}자 ✓` : `길이 ${next.length}/${min}자`;
+      live.textContent = again ? `${length} · ${again === next ? '두 칸이 같습니다 ✓' : '두 칸이 다릅니다'}` : length;
+      live.classList.toggle('ok', next.length >= min && again === next);
+    };
+    for (const node of [built.nodes.new_password, built.nodes.confirm_password]) node.addEventListener('input', check);
     built.onSubmit(async ({ confirm_password: confirmed, ...values }) => {
       if (confirmed !== values.new_password) throw new Error('새 비밀번호와 확인이 다릅니다.');
       await api('/admin/api/me/password', jsonBody('POST', values));
@@ -201,5 +294,5 @@ export function initManage({ api, el, table, valueText, state, openDialog, showR
     actions().append(built.form);
   }
 
-  return { starterPanel, starterTools, openPasswordChange };
+  return { starterPanel, starterTools, openStarterCreate, openPasswordChange, pinNotice };
 }
