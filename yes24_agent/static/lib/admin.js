@@ -1130,9 +1130,14 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   /** 칸 요약 글자 — 날짜 종류마다 뜻이 다르다(패널 머리가 자세히 설명한다). */
   function daySummary(cell) {
     const box = el('span', 'cal-sum');
-    // 오늘 = 지금 노출 중인 질문 수(분야 수는 툴팁), 과거 = 그날 자동 생성 수(0은 비운다 — 노이즈), 미래 = 막대만.
-    if (cell.kind === 'today') { box.append(el('b', null, `노출 중 ${num(cell.live)}`)); box.title = `지금 첫 화면에 나올 수 있는 질문 ${num(cell.live)}개 · 분야 ${num(cell.slots)}개`; }
-    else if (cell.generated) { box.append(`자동 ${num(cell.generated)}`); box.title = `이날 자동으로 만든 질문 ${num(cell.generated)}개`; }
+    // 오늘 = 지금 노출 중인 질문 수(분야 수는 툴팁) + 오늘 자동 생성 수, 과거 = 그날 자동 생성 수
+    // (0은 비운다 — 노이즈), 미래 = 막대만. 생성 수의 정의(툴팁)는 오늘·과거·앞뒤 달 칸이 같다.
+    const made = `이날 자동으로 만든 질문 ${num(cell.generated)}개`;
+    if (cell.kind === 'today') {
+      box.append(el('b', null, `노출 중 ${num(cell.live)}`), ...(cell.generated ? [`오늘 자동 ${num(cell.generated)}`] : []));
+      box.title = [`지금 첫 화면에 나올 수 있는 질문 ${num(cell.live)}개 · 분야 ${num(cell.slots)}개`,
+        ...(cell.generated ? [`${made} — 오늘 생성이 진행 중이면 늘어날 수 있어요.`] : [])].join('\n');
+    } else if (cell.generated) { box.append(`자동 ${num(cell.generated)}`); box.title = made; }
     return box;
   }
   const inRange = (iso) => state.range?.end && iso >= state.range.start && iso <= state.range.end;
@@ -1159,7 +1164,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     $('cal-note').replaceChildren(...note);
     $('cal-note').hidden = !note.length;
     syncRange();
-    const cells = new Map(data.days.map((cell) => [cell.date, cell]));
+    const cells = new Map(data.days.map((cell) => [cell.date, cell])), outside = new Map(data.outside.map((cell) => [cell.date, cell.generated]));
     const first = data.days[0].date, last = data.days.at(-1).date;
     const weeks = [];
     for (let start = addDays(first, -weekdayOf(first)); start <= last; start = addDays(start, 7)) weeks.push(start);
@@ -1173,7 +1178,8 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
         const iso = addDays(weekStart, i), cell = cells.get(iso);
         // 이 달 밖 날짜는 흐린 날짜만(수치는 그 달 화면 몫) — 막대는 그 칸까지 잇는다.
         const box = cell ? dayButton(cell, 'cal-cell') : el('div', 'cal-cell outside');
-        if (!cell) box.append(el('span', 'cal-date', iso.slice(5).replace('-', '/')), el('span', 'cal-sum'));
+        // 앞뒤 달 칸도 생성 기록 수는 보인다(흐린 칸, 누르지 않음 — 그 달 화면에서 연다).
+        if (!cell) box.append(el('span', 'cal-date', iso.slice(5).replace('-', '/')), daySummary({ kind: 'past', generated: outside.get(iso) }));
         const here = placed.filter((bar) => bar.start <= iso && bar.end >= iso);
         for (let lane = 0; lane < LANES; lane++) {
           const bar = here.find((b) => b.lane === lane), line = el('span', bar ? `cal-bar${bar.item.pinned ? ' pinned' : ''}` : 'cal-bar empty');
@@ -1215,7 +1221,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     if (cell.kind === 'today') head.append(el('em', null, '오늘'));
     const summary = daySummary(cell);
     box.append(head, summary);
-    box.setAttribute('aria-label', `${cell.date} ${daySummary(cell).textContent}${summary.title ? ` · ${summary.title}` : ''}`);
+    box.setAttribute('aria-label', `${cell.date} ${[...summary.childNodes].map((node) => node.textContent).join(' · ')}${summary.title ? ` · ${summary.title}` : ''}`);
     box.onclick = () => dayClicked(cell.date);
     box.onkeydown = (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); dayClicked(cell.date); } };
     return box;

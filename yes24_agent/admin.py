@@ -759,21 +759,30 @@ async def fetch_starter_calendar(
 ) -> dict[str, Any]:
     """월 달력 — 날짜 칸 수치 + 기간 막대(수동 기간 질문) + 상시 고정 띠 + 상단 한 줄.
 
-    칸 수치는 두 종류다(모두 서버 today 기준): 오늘 = 지금 노출 풀(live_predicate의 수·슬롯 수,
-    목록 summary와 같은 식), 과거 = 그날 생성된 자동 행 수(생성 기록 — 그날의 실제 노출 재현이
-    아니다). 미래 칸은 기간 막대만 그린다. ongoing = 기간 없이 오늘 노출 중인 수동 행의 수와
+    칸 수치(모두 서버 today 기준): 오늘 = 지금 노출 풀(live_predicate의 수·슬롯 수, 목록 summary와
+    같은 식) + 오늘 생성된 자동 행 수, 과거 = 그날 생성된 자동 행 수(생성 기록 — 그날의 실제 노출
+    재현이 아니다). 미래 칸은 기간 막대만 그린다. 생성 수는 달력에 보이는 앞뒤 달 칸(그 주의
+    월~일)까지 센다(outside). ongoing = 기간 없이 오늘 노출 중인 수동 행의 수와
     분야 라벨(상단 한 줄 — 기간 없는 행은 막대가 없어 달력에 안 보인다).
     """
     today = _today()
     first = month.replace(day=1)
     last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
     days = [first + timedelta(days=i) for i in range((last - first).days + 1)]
+    # 화면 격자 = 첫 주 월요일 ~ 마지막 주 일요일(앞뒤 달 칸 포함) — 생성 수는 오늘까지 한 번에.
+    grid_start = first - timedelta(days=first.weekday())
+    grid_end = last + timedelta(days=6 - last.weekday())
     await cur.execute(
         "SELECT run_date, COUNT(*) AS `generated` FROM starters WHERE source = 'auto' "
         "AND run_date BETWEEN %s AND %s GROUP BY run_date",
-        [first, min(last, today - timedelta(days=1))],
+        [grid_start, min(grid_end, today)],
     )
     generated = {row["run_date"]: row["generated"] for row in await cur.fetchall()}
+    outside = [
+        {"date": day.isoformat(), "generated": generated.get(day, 0)}
+        for day in (grid_start + timedelta(days=i) for i in range((grid_end - grid_start).days + 1))
+        if not first <= day <= last and day <= today
+    ]
     live_sql, live_params = live_predicate(today, settings)
     counted = None
     if first <= today <= last:
@@ -792,7 +801,8 @@ async def fetch_starter_calendar(
         elif day > today:
             cell.update(kind="future")
         else:
-            cell.update(kind="today", live=counted["n"], slots=counted["slots"])
+            cell.update(kind="today", live=counted["n"], slots=counted["slots"],
+                        generated=generated.get(day, 0))
         cells.append(cell)
     columns = "id, slot, label, text, pinned, active, valid_from, valid_until"
     await cur.execute(
@@ -825,7 +835,7 @@ async def fetch_starter_calendar(
     return {
         "today": today.isoformat(),
         "month": first.strftime("%Y-%m"), "days": cells,
-        "pinned_always": always, "schedules": schedules,
+        "outside": outside, "pinned_always": always, "schedules": schedules,
         "ongoing": {"count": sum(row["n"] for row in ongoing),
                     "slots": [{"label": row["label"], "n": row["n"]} for row in ongoing]},
         # 기간 선택 → 수동 추가 폼의 슬롯 선택지(목록을 거치지 않고 캘린더만 열어도).
