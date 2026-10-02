@@ -32,6 +32,7 @@ from yes24_agent.yes24.parsers import (
     parse_product,
     product_fields,
 )
+from yes24_agent.yes24.selectors import PAGE_CHROME
 
 logger = logging.getLogger(__name__)
 
@@ -369,7 +370,7 @@ def _parse_generic_page(
     잘린 뒷부분의 특정 정보를 추가 fetch 한 번으로 읽을 수 있게 한다.
     """
     soup = BeautifulSoup(html, "lxml")
-    for tag in soup(_NOISE_TAGS):
+    for tag in [*soup(_NOISE_TAGS), *soup.select(PAGE_CHROME)]:
         tag.decompose()
 
     title = _text_or_none(soup.title) or url

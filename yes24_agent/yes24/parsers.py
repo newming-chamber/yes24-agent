@@ -885,9 +885,12 @@ def _context_first(pages: list[dict], page_url: str | None) -> list[dict]:
 
     page_url이 없으면 원래(DOM 등장) 순서를 그대로 유지한다. 있으면 두 키로 정렬한다.
 
-    1) 맥락: 현재 페이지 경로(자기 자신 포함)의 하위를 가리키는 링크를 앞으로 당긴다.
-       FAQ 하위 정책 링크는 경로가 현재 페이지와 같고 쿼리스트링만 다르므로
-       (예: `/Mall/Help/FAQ?faqGb=34`) "자기 자신 경로" 일치로 잡힌다.
+    1) 맥락: 현재 페이지와 같은 호스트에서 그 경로(자기 자신 포함)의 하위를 가리키는 링크를
+       앞으로 당긴다. FAQ 하위 정책 링크는 경로가 현재 페이지와 같고 쿼리스트링만 다르므로
+       (예: `/Mall/Help/FAQ?faqGb=34`) "자기 자신 경로" 일치로 잡힌다. 현재 페이지가 호스트
+       루트면 그 호스트 전체가 맥락이다 — 서브도메인 첫 화면(이벤트 목록 홈)의 고유 링크는
+       전부 자기 호스트에 있고, 앞을 채우는 공통 GNB는 www로 간다(실측 2026-09-28: 루트를
+       맥락 없음으로 두면 DOM 순서 그대로라 GNB 47건이 상한 48을 채워 이벤트 링크가 0건).
     2) 경로 다양성: 같은 경로의 n번째 링크는 n번째 순번으로 밀린다. 즉 서로 다른
        경로가 한 번씩 다 나온 뒤에야 같은 경로의 두 번째 링크가 나온다.
 
@@ -904,16 +907,17 @@ def _context_first(pages: list[dict], page_url: str | None) -> list[dict]:
     if not pages or not page_url:
         return pages
 
-    context_prefix = urlparse(page_url).path.lower().rstrip("/")
-    if not context_prefix:  # 현재 페이지가 사이트 루트면 맥락 기준이 없다
-        return pages
+    context = urlparse(page_url)
+    context_prefix = context.path.lower().rstrip("/")
 
     seen_in_group: dict[tuple[int, str, str], int] = {}
     ranked: list[tuple[tuple[int, int], dict]] = []
     for entry in pages:
         parsed = urlparse(entry["url"])
         link_path = parsed.path.lower().rstrip("/")
-        in_context = link_path == context_prefix or link_path.startswith(context_prefix + "/")
+        in_context = parsed.hostname == context.hostname and (
+            link_path == context_prefix or link_path.startswith(context_prefix + "/")
+        )
         group = 0 if in_context else 1
         # 다양성 판정 단위는 host+path다. 서브도메인 첫 화면들(ticket./global./cn.)은
         # 경로가 다 같은 빈 문자열이라 host를 빼면 서로 중복으로 몰려 뒤로 밀린다.

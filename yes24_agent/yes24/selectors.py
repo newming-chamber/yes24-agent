@@ -330,15 +330,21 @@ CREMACLUB_ORIGINAL_EPISODE_INFO = ".info_pub"
 # 캡처 그룹 1은 goods_no다(urls.goods_no_from_url이 판형 링크에서 eBook 판 번호를 읽는다).
 LINK_PRODUCT_PATH_RE = rf"(?i)^{GOODS_PATH}(\d+)"
 
-# yes24.com 계열 서브도메인이지만 콘텐츠 탐색에 쓸모없는 노이즈로 실측 확인된 것들
-# (goods_paper.html/bestseller_domestic_sample.html의 모든 <a href> 전수 조사 기준).
-#   - event.yes24.com: docs/browse-scout-report.md 정찰에서 이미 "페이지마다 완전히
-#     다른 프로모션 템플릿"이라 공통 목록 셀렉터가 없다고 확인됨 — 예측 불가능한
-#     마케팅 랜딩 페이지라 에이전트가 따라가도 유의미한 도서 콘텐츠를 못 얻는다.
+# yes24.com 계열 서브도메인이지만 콘텐츠 탐색에 쓸모없는 노이즈로 실측 확인된 것.
 #   - ssl.yes24.com: 실측 결과 이 서브도메인의 모든 링크가 장바구니(Cart/Cart)·
 #     주문내역(MyPageOrderList/MyPageOrderClaimList)뿐이었다 — 전부 로그인 필요한
 #     계정/거래 페이지.
-LINK_NOISE_SUBDOMAINS = frozenset({"event.yes24.com", "ssl.yes24.com"})
+# event.yes24.com은 여기서 뺐다(2026-09-28 실측). "공통 목록 셀렉터가 없는 프로모션 템플릿"은
+# 파서 전용 셀렉터를 못 만든다는 뜻이지 본문이 없다는 뜻이 아니었다 — 이벤트 페이지는 범용
+# 본문 추출로 읽힌다(/readingKids: 선정위원 12명 이름·소속과 추천사가 SSR, 목록 홈: 진행 중
+# 이벤트 제목·기간). 이 필터가 있으면 이벤트 목록 홈을 열어도 이어서 열 이벤트 링크가 0개였다.
+LINK_NOISE_SUBDOMAINS = frozenset({"ssl.yes24.com"})
+
+# 사이트 공통 크롬(www GNB·간이 GNB·이벤트 헤더·푸터·카트 팝업). 범용 본문 추출은 이것을
+# 본문으로 세지 않는다 — 본문을 JS로 그리는 이벤트 페이지(/chulcheck)는 SSR 텍스트가 크롬뿐인데
+# (1,075자) 크롬을 세면 실질 본문 임계값을 넘겨 빈 성공으로 등록됐다(2026-09-28 실측, 모델이
+# 같은 턴 웹 발췌의 사실을 이 출처에 인용). 링크 추출은 원문 HTML에서 따로 하므로 영향이 없다.
+PAGE_CHROME = "#yesHeaderArea, #yConciseGnbWrap, .yesEventHeaderArea, #yesFooter, #dPop_cart"
 
 # 경로에 아래 문자열이 포함되면(소문자 비교) 콘텐츠와 무관한 페이지로 보고 제외한다.
 # goods_paper.html 실측 기준. **이것은 안전장치가 아니라 신호 대 잡음비 필터다** — 수집 금지

@@ -194,6 +194,15 @@ POLICY_SEEDS: dict[str, dict[str, str]] = {
         "url": "https://cremaclub.yes24.com/BookClub/Guide",
         "role": "document",
     },
+    # 이벤트 목록 홈(진행 중 이벤트의 제목·기간 SSR, 각 이벤트 링크 동반). 입구가 없으면 모델은
+    # 자사 이벤트를 web_search로 찾아 근거가 검색 발췌·보도자료가 됐다(2026-09-28 실측: 이벤트
+    # 4문항 8런에서 event.yes24.com을 yes24_fetch로 연 적 0회). 목록은 사이트가 고른 모음이라
+    # 연중 캠페인(/readingKids)처럼 여기 없는 이벤트도 있다.
+    "event": {
+        "label": "이벤트·기획전 목록(진행 중 이벤트 모음)",
+        "url": EVENT_LIST_URL,
+        "role": "directory",
+    },
 }
 
 
