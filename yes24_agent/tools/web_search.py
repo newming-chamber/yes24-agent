@@ -530,7 +530,6 @@ async def _grounded_search(
             source_type="web",
             snippet=snippet,
             checked_at=checked_at,
-            meta={"published_at": None, "last_updated": None},
             invocation_id=getattr(tool_context, "invocation_id", None),
         )
         results.append(

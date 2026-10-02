@@ -44,6 +44,7 @@ from yes24_agent.tools.cremaclub import aclose_club_client, observe_cremaclub
 from yes24_agent.yes24.client import Yes24Client, Yes24FetchError, Yes24TextCache
 from yes24_agent.yes24.parsers import (
     ParseError,
+    drop_listed_ebooks,
     parse_search,
     product_fields,
 )
@@ -270,12 +271,14 @@ async def yes24_search(
         result_count=0이다. 섹션을 한정했는데 0건인
         각도는 통합 검색으로 한 번 더 자동 재검색되며, 그 항목은 searches에 expanded_from으로
         표시된다(원 각도의 0건 항목도 함께 남는다). 상한을 넘겨 검색하지 않은
-        각도가 있으면 dropped_count·dropped_queries로 명시한다. 전자책 행의 in_cremaclub과
-        종이책 행의 ebook_edition(그 eBook 판의 url·in_cremaclub, None이면 eBook 판 없음)은
-        크레마클럽 등록 여부이고, 등록이면 cremaclub_url이 함께 온다 — in_cremaclub 키가 없으면
-        확인하지 못한 것이지 클럽에 없는 것이 아니다. 모든 각도가 실패했을 때만
-        status="error"와 error_type("empty_query"|"fetch"|"parse"), message에 더해
-        result_count=0을 담은 dict.
+        각도가 있으면 dropped_count·dropped_queries로 명시한다. 종이책 행 other_formats에
+        실린 eBook 판은 별도 행으로 오지 않는다(그 값은 종이책 행으로 인용).
+        cremaclub은 이 책의 크레마클럽 등록 여부다 — `cremaclub: false`일 때만 미등록으로 말한다
+        (키 없음=미확인). 등록이면 other_formats에 "크레마클럽" 항목(url=클럽 상세)도 있다.
+        종이책 행의 판정은 other_formats eBook 항목의 goods_no로 클럽 상세를 조회한 관측이라, 그
+        eBook 상세를 다시 열어도 클럽 판정과 eBook 판매가(그 항목의 sale_price)는 같다.
+        모든 각도가 실패했을 때만 status="error"와 error_type("empty_query"|"fetch"|"parse"),
+        message에 더해 result_count=0을 담은 dict.
     """
     settings = get_settings()
 
@@ -381,6 +384,8 @@ async def yes24_search(
             {"query": query, "status": "ok", "result_count": len(outcome["parsed"]), **widened}
         )
 
+    drop_listed_ebooks(merged)
+
     # 1.5) 크레마클럽 관측: 등록 **전에** 행 필드에 실어야 반환 행과 출처 meta가 한 값이 된다.
     if budget.observe_cremaclub:
         await observe_cremaclub([row["fields"] for row in merged.values()], settings)
@@ -395,7 +400,6 @@ async def yes24_search(
             title=item["title"],
             url=item["url"],
             source_type="search_result",
-            snippet=item.get("author"),
             checked_at=checked_at,
             meta=fields,
             invocation_id=getattr(tool_context, "invocation_id", None),

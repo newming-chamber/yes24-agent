@@ -233,9 +233,9 @@ thinking/refs는 done.process.steps에 저장되지 않는다. 복원 시 thinki
   섞으면 내용이 같은 `done.meta`도 변경으로 오인한다. 실제 내용이 같으면 카드/후속 질문 DOM을 유지한다.
 - `sale_price`가 숫자면 표시하며 **0도 유효**하다. 없음/null을 0원으로 바꾸지 않는다.
 - `other_formats` 없음 = 미관측, `[]` = 관측했으나 없음. 판형의 `sale_price:null`은 가격 미상이다.
-- 크레마클럽 여부는 `in_cremaclub`(그 상품) 또는 `ebook_edition.in_cremaclub`(연결 eBook 판) 한 곳에만 있다. 두 키 모두 없으면 **확인하지 않은 것**이지 "클럽에 없음"이 아니다.
-- 크레마클럽 링크는 등록(`in_cremaclub:true`)일 때만 같은 객체의 `cremaclub_url`로 온다(종이책은 `ebook_edition.cremaclub_url`, 전자책은 최상위 `cremaclub_url`). 프론트가 URL을 조립하지 않는다 — 키가 없으면 클럽 링크를 그리지 않는다. 성인 상품은 등록돼 있어도 `false`로 올 수 있다(서버가 확인할 수 없는 사각).
-  다른 판형 링크만 관측했다고 별도 인용 번호가 생기지 않는다.
+- 크레마클럽 등록은 최상위 `cremaclub`이다 — `true` 등록, `false` 클럽 조회 결과 미등록, **키 없음 = 미확인**(조회 실패·예산 초과·대상 아님 — "클럽에 없음"으로 단정하지 않는다). "이 책을 크레마클럽에서 볼 수 있다"는 작품 단위 의미라 종이책 출처는 그 eBook 판 기준이다. `true`면 `other_formats`에도 판형 항목 `{format:"크레마클럽", url:<클럽 상세>, sale_price:null}`이 하나 붙는다(판형 이름으로 뱃지를 그리는 기존 소비자 호환). 프론트가 URL을 조립하지 않는다 — 항목이 없으면 클럽 링크를 그리지 않는다. 성인 상품은 등록돼 있어도 항목이 없을 수 있다(서버가 확인할 수 없는 사각).
+  다른 판형 링크만 관측했다고 별도 인용 번호가 생기지 않는다. 종이책·eBook 상세를 둘 다 열어 인용했어도
+  같은 작품이면 **카드 1장**(대표=종이책, eBook은 `other_formats` 항목)·표시 번호 하나로 합쳐 나간다.
 - 자료 탭은 **질문별로 해당 턴 sources를 그룹화**한다. 전체/도서/문서/웹 필터와 종류별 건수,
   빈 상태를 제공한다. 데스크톱 3열·모바일 1열은 내장 HTML의 표시 정책이지 서버 계약은 아니다.
 - HTML/Markdown은 안전하게 렌더링하고 링크·이미지 URL 스킴을 검증한다. 외부 링크는 새 창과
@@ -275,11 +275,9 @@ thinking/refs는 done.process.steps에 저장되지 않는다. 복원 시 thinki
 | pub_date, published_at, last_updated, checked_at | string / null | 출간/게시/갱신/확인 시각. 값이 있을 때만 표시 |
 | author_no, kind | string / null | 저자 식별·사이트 분류 참고. kind로 카드 템플릿을 재판정하지 않음 |
 | is_book, is_ebook | boolean / null | 관측 속성 참고. 렌더링 선택은 card_type 사용 |
+| cremaclub | boolean | 크레마클럽 등록(true)·미등록(false). 키 없음은 미확인 |
 | sale_index, page_count, rank | number / null | 판매지수·쪽수·순위. 관측됐을 때만 제공 |
-| other_formats | 배열 / null | `{format?:string|null,url?:string|null,sale_price?:number|null}` 목록 |
-| ebook_edition | 객체 / null | 종이책 출처에 붙는 연결 eBook 판. `{url, in_cremaclub?, cremaclub_url?}` — `ebook_edition` 자체가 `null`이면 eBook 판이 없는 것, 키 자체가 없으면 미관측. `{url}`만이면 클럽 여부 미확인, `in_cremaclub:false`는 미등록, `true`면 `cremaclub_url`이 함께 온다 |
-| in_cremaclub | boolean | 전자책 출처 자신의 크레마클럽 등록 여부. 키 없음 = 미확인 |
-| cremaclub_url | string | 전자책 출처가 크레마클럽에 등록됐을 때만 오는 클럽 상세 링크 |
+| other_formats | 배열 / null | `{format?:string|null,url?:string|null,sale_price?:number|null}` 목록. 크레마클럽 등록이면 `format:"크레마클럽"`(url=클럽 상세, sale_price=null) 항목도 하나 |
 
 키 생략과 null은 모두 표시할 값을 제공하지 않는 경우다. `0`과 `false`를 결측으로 지우지 않는다.
 가격의 표시 여부는 `typeof sale_price === "number"`로 확인한다. 내부 snippet은 받지 않는다.

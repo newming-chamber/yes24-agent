@@ -34,6 +34,7 @@ from yes24_agent.tools.yes24_search import get_client, observes_cremaclub
 from yes24_agent.yes24.client import Yes24Client, Yes24FetchError
 from yes24_agent.yes24.parsers import (
     ParseError,
+    drop_listed_ebooks,
     parse_browse_list,
     parse_browse_page_meta,
     parse_category_links,
@@ -249,8 +250,8 @@ async def yes24_browse(
     Returns:
         코너 중 하나라도 열람에 성공하면 status="ok"와 results 목록(모든 코너의 결과를 상품
         기준으로 병합·중복제거, 각 항목에 인용용 source_id, 어느 코너들에서 나왔는지 sections,
-        위치 position(1부터)과 순위 rank 포함 — 둘 다 sections의 **첫 코너** 기준이며 다른 코너의
-        순위는 싣지 않는다), 코너별 성공/실패/결과 수·목록의
+        위치 position(1부터)과 순위 rank(순위 코너만) — 둘 다 sections의 **첫 코너** 기준이며
+        다른 코너의 순위는 싣지 않는다), 코너별 성공/실패/결과 수·목록의
         정렬 order·적용된 category_number·해석된 분야명 category_label을 담은 browses 요약
         (browses에는 코너가 명시한 집계 기간 period·period_note도 실린다 — 페이지 원문, 표기한
         코너만), 페이지들이 노출한 분야 목록 categories([{name, number}]), 검색 시각 checked_at
@@ -258,10 +259,12 @@ async def yes24_browse(
         집계 기간 period를 기준으로 말한다),
         result_count를 담은 dict. 상한을
         넘겨 열람하지 않은 코너가 있으면 dropped_count·dropped_sections로 명시한다.
-        전자책 행의 in_cremaclub과 종이책 행의 ebook_edition(그 eBook 판의 url·in_cremaclub,
-        None이면 eBook 판 없음)은 크레마클럽 등록 여부이고, 등록이면 cremaclub_url이 함께 온다 —
-        in_cremaclub 키가 없으면 확인하지 못한 것이지 클럽에 없는 것이 아니다. 모든 코너가
-        실패했을 때만 status="error"와 error_type, message, result_count=0을 담은 dict —
+        종이책 행 other_formats에 실린 eBook 판은 별도 행으로 오지 않는다(그 값은 종이책 행으로
+        인용). cremaclub은 이 책의 크레마클럽 등록 여부다 — `cremaclub: false`일 때만 미등록으로
+        말한다(키 없음=미확인). 등록이면 other_formats에 "크레마클럽" 항목(url=클럽 상세)도 있다.
+        종이책 행의 판정은 other_formats eBook 항목의 goods_no로 클럽 상세를 조회한 관측이라, 그
+        eBook 상세를 다시 열어도 클럽 판정과 eBook 판매가(그 항목의 sale_price)는 같다.
+        모든 코너가 실패했을 때만 status="error"와 error_type, message, result_count=0을 담은 dict —
         잘못된 코너 코드는 error_type="invalid_section", 잘못된 분야 번호·미지원 섹션
         좁히기는 "invalid_category", 이름 미매칭은 "category_not_found"(categories 동봉),
         다중 매칭은 "category_ambiguous"(candidates 동봉), 그 외 실패는 "fetch"|"parse".
@@ -350,6 +353,8 @@ async def yes24_browse(
                 if row["fields"].get(name) is None:
                     row["fields"][name] = value
 
+    drop_listed_ebooks(rows)
+
     # 1.5) 크레마클럽 관측: 코너 목록 마크업엔 클럽 여부가 없어 행마다 클럽 상세를 조회한다
     #      (tools.cremaclub — 쿠키 없는 경량 요청이라 상한 없이 전 행). 등록 **전에** 실어야
     #      행의 fields와 출처 meta가 한 값이 된다. 매트릭스 셀은 싣지 않는다(observes_cremaclub).
@@ -360,16 +365,17 @@ async def yes24_browse(
     # 2) 등록(순차): 병합된 행마다 한 번만 등록한다 — source_id 유일·단조.
     results: list[dict] = []
     for row in rows.values():
-        # 검색·상세와 같은 필드 집합(product_fields) + 이 도구 고유의 rank.
+        # 검색·상세와 같은 필드 집합(product_fields) + 이 도구 고유의 rank. 순위 마커가 없는
+        # 코너(신간·오리지널)의 rank는 관측 불가라 키를 싣지 않는다(_item_fields 규약).
         fields = row["fields"]
+        rank = {"rank": row["rank"]} if row.get("rank") is not None else {}
         source_id = register_source(
             tool_context.state,
             title=row["title"],
             url=row["url"],
             source_type="browse",
-            snippet=row.get("author"),
             checked_at=checked_at,
-            meta={**fields, "rank": row.get("rank"), "position": row["position"]},
+            meta={**fields, **rank, "position": row["position"]},
             invocation_id=getattr(tool_context, "invocation_id", None),
         )
         results.append(
@@ -377,7 +383,7 @@ async def yes24_browse(
                 "source_id": source_id,
                 "cite_as": cite_marker(source_id),
                 "type": "browse",
-                "rank": row.get("rank"),
+                **rank,
                 "position": row["position"],
                 "sections": row["sections"],
                 "title": row["title"],

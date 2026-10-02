@@ -152,18 +152,12 @@ _PUBLIC_SOURCE_TYPE: dict[str, str] = {
 # 공개 DTO에 **목록**으로 실리는 유일한 예외와 그 항목 스키마 — 필드명 → 항목의 공개 스칼라 키.
 # 프론트가 책 카드에 "eBook 13,600원" 칩을 그리는 값이다(2026-09-08). 판형은 그 값을 관측한
 # 페이지(출처)의 필드이지 별도 출처가 아니다. QA 하네스(qa/live_capture)도 이 선언을 읽는다.
+# 선언하지 않은 구조 값은 스칼라 필터에 걸려 공개 DTO뿐 아니라 **레지스트리 레코드
+# (settle_sources)에서도** 사라져 다음 턴이 그 관측을 잃는다 — 항목 키 추가는 여기서 한다.
+# 크레마클럽 등록도 같은 스키마의 항목 하나다(parsers.cremaclub_format). 3상태 판정 자체는 스칼라
+# `cremaclub`이라 이 선언 밖에서 그대로 통과한다.
 PUBLIC_RECORD_LIST_FIELDS: dict[str, tuple[str, ...]] = {
     "other_formats": ("format", "url", "sale_price"),
-}
-# 목록이 아니라 **레코드 하나**로 실리는 필드와 그 항목 스키마. 값은 그 레코드이거나
-# None(관측했으나 없음)이다. 형태를 값이 아니라 **선언**이 정하는 이유: 목록 필드에 dict가
-# 오면 그건 파손이라 걸러야 하고(2026-08-04 유출 사고의 가드), 레코드 필드에 None이 오면
-# 그건 사실이라 실어야 한다. 선언하지 않으면 dict가 스칼라 필터에 걸려 공개 DTO뿐 아니라
-# **레지스트리 레코드(settle_sources)에서도** 통째로 사라져 다음 턴이 그 관측을 잃는다
-# (2026-09-15 QA 감사가 지적한 계약 누락 — 2026-09-16 실측으로 확인하고 여기서 닫는다).
-# cremaclub_url은 in_cremaclub이 True일 때만 관측값으로 실린다 — 키 생략이 "클럽 링크 없음"이다.
-PUBLIC_RECORD_FIELDS: dict[str, tuple[str, ...]] = {
-    "ebook_edition": ("url", "in_cremaclub", "cremaclub_url"),
 }
 
 
@@ -213,15 +207,14 @@ def project_public_source(source: dict) -> dict:
 def _project_observation(source: dict) -> dict:
     """내부 출처를 공개 DTO **형태**로 투영하되 `type`은 내부 어휘 그대로 둔다.
 
-    공개 DTO 계약은 기본 필드 + **선택적 스칼라 또는 선언된 레코드(목록 또는 하나)**다
+    공개 DTO 계약은 기본 필드 + **선택적 스칼라 또는 선언된 레코드 목록**이다
     (qa/README 판정 절). 필드 이름이 선언에 있어도 값이 선언된 형태가 아니면 싣지 않는다 —
     `_PUBLIC_SOURCE_FIELDS`는 `GROUNDING_FIELDS`에서 파생되는데, 그 상류(`_ITEM_FIELDS`)는
     도구 결과·접지용이라 구조 값이 들어올 수 있다(2026-08-04 실사고: `other_formats` 리스트가
     여기로 **의도치 않게** 새어 다른 상품의 가격·URL이 공개 페이로드에 실렸다). 사고의 본질은
-    임의 구조 유출이라, 두 선언(`PUBLIC_RECORD_LIST_FIELDS`·`PUBLIC_RECORD_FIELDS`)이 이름과
-    항목 스키마를 못 박은 것만 항목 키를 추려 통과시키고 나머지 구조 값은 형태로 거른다.
-    빈 목록과 레코드 필드의 None은 그대로 싣는다 — 상세를 열어 "판형 없음"·"eBook 판 없음"을
-    관측한 것이고, 키-생략(관측 불가)과는 다른 사실이다.
+    임의 구조 유출이라, 선언(`PUBLIC_RECORD_LIST_FIELDS`)이 이름과 항목 스키마를 못 박은
+    것만 항목 키를 추려 통과시키고 나머지 구조 값은 형태로 거른다. 빈 목록은 그대로 싣는다 —
+    상세를 열어 "판형 없음"을 관측한 것이고, 키-생략(관측 불가)과는 다른 사실이다.
     """
     meta = source.get("meta") if isinstance(source.get("meta"), dict) else {}
     event = {
@@ -238,17 +231,11 @@ def _project_observation(source: dict) -> dict:
         else:
             continue
         list_keys = PUBLIC_RECORD_LIST_FIELDS.get(field)
-        record_keys = PUBLIC_RECORD_FIELDS.get(field)
         if list_keys is not None:
             if isinstance(value, list):
                 event[field] = [
                     _public_record(item, list_keys) for item in value if isinstance(item, dict)
                 ]
-        elif record_keys is not None:
-            if isinstance(value, dict):
-                event[field] = _public_record(value, record_keys)
-            elif value is None:
-                event[field] = None
         elif _is_public_scalar(value):
             event[field] = value
     return event
