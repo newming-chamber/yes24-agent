@@ -61,13 +61,22 @@ from yes24_agent.starters import (
     _CHIP_LABEL_MAX_CHARS,
     _POOL_COLUMNS,
     _SLOT_MAX_CHARS,
+    GLOBAL_PIN_WHERE,
+    PIN_NONE,
     TARGET_SEP,
+    _pin_input,
     _squash,
     _today,
     chip_label,
+    global_pin_limit,
+    global_pin_params,
+    global_pins,
     live_clauses,
     live_predicate,
+    pick_probabilities,
     pick_starters,
+    pin_name,
+    pin_value,
     pool_query,
     slot_labels,
 )
@@ -621,6 +630,7 @@ async def fetch_starters(
     names = {slot["slot"]: slot["label"] for slot in slots}
     for item in page_data["items"]:
         item["label"] = names.get(item["slot"]) or chip_label(item, settings)
+        item["pinned"] = pin_name(item["pinned"])
         item["live"], item["uses_shared"] = bool(item["live"]), bool(item["uses_shared"])
     await _split_inactive(cur, page_data["items"])
     return {**page_data, "slots": slots, "summary": {"pool_days": settings.starter_pool_days}}
@@ -661,7 +671,7 @@ async def fetch_starter_preview(
     n: int,
     seed: int,
     add_slot: str = "",
-    add_pinned: bool = False,
+    add_pinned: int = PIN_NONE,
 ) -> dict[str, Any]:
     """그날 첫 화면 미리보기 — 서빙과 같은 풀 판정(`live_predicate`)과 선택(`pick_starters`).
 
@@ -693,33 +703,49 @@ async def fetch_starter_preview(
             [*manual_params, *auto_params],
         )
     pool = list(await cur.fetchall())
-    counts, skipped, sample, expected = Counter(), Counter(), [], None
-    draws = settings.starter_preview_draws
+    skipped, sample, expected, probabilities = Counter(), [], None, {}
+    limit = global_pin_limit(settings, n)
+    pins = global_pins(pool, limit)
     if mode != "record":
         virtual = {"id": -1, "slot": add_slot, "text": "", "pinned": add_pinned,
                    "goods_no": None, "source_url": None}
         candidates = [*pool, virtual] if add_slot else pool
-        # 예시 한 벌만 요청 시드('다른 예시 보기'), 확률은 날짜에서 정한 시드 — 같은 날 같은 풀이면
-        # 패널을 다시 열어도, 목록·행 패널에서도 같은 값이다(시드마다 표본 오차로 흔들리지 않게).
-        sample = pick_starters(pool, n, random.Random(seed))
-        rng = random.Random(day.toordinal())
-        for _ in range(draws):
-            picked = pick_starters(candidates, n, rng, skipped)
-            counts.update(row["id"] for row in picked)
-        expected = counts[virtual["id"]] / draws if add_slot else None
-    pinned_slots = {row["slot"] for row in pool if row["pinned"]}
+        # 확률은 해석식(pick_probabilities — 서빙 규칙의 셈) 하나 — 목록·행 패널·날짜 패널·영향
+        # 문구가 같은 값을 본다. 추첨은 같은 문구·상품·출처 건너뜀(해석식에 없는 효과)을 찾는 데만
+        # 쓴다 — 한 번도 안 뽑히고 건너뛴 적이 있는 행은 0 + '중복'. 날짜 시드라 다시 열어도 같다.
+        probabilities = pick_probabilities(candidates, n, limit)
+        expected = probabilities[virtual["id"]] if add_slot else None
+        sample = pick_starters(pool, n, random.Random(seed), global_limit=limit)
+        drawn, rng = Counter(), random.Random(day.toordinal())
+        for _ in range(settings.starter_preview_draws):
+            drawn.update(row["id"] for row in pick_starters(candidates, n, rng, skipped,
+                                                            global_limit=limit))
+        for row in pool:
+            if not drawn[row["id"]] and skipped[row["id"]]:
+                probabilities[row["id"]] = 0.0
+    pinned_slots = {row["slot"] for row in pool if pin_value(row["pinned"]) != PIN_NONE}
+    hidden_slots = pinned_slots | {row["slot"] for row in pins}
     rows = [
         {"id": row["id"], "slot": row["slot"], "label": chip_label(row, settings),
-         "text": row["text"], "source": row["source"], "pinned": bool(row["pinned"]),
-         "probability": None if mode == "record" else counts[row["id"]] / draws,
-         "zero_reason": None if mode == "record" or counts[row["id"]]
-         else zero_reason(bool(row["pinned"]), row["slot"] in pinned_slots, skipped[row["id"]])}
+         "text": row["text"], "source": row["source"], "pinned": pin_name(row["pinned"]),
+         "probability": None if mode == "record" else probabilities[row["id"]],
+         "zero_reason": None if mode == "record" or probabilities[row["id"]]
+         else zero_reason(row["slot"] in hidden_slots, skipped[row["id"]])}
         for row in pool
     ]
-    # 분야별 확률은 싣지 않는다 — 분야는 균등하게 섞여 n / 분야 수로 같고(추첨 표본의 흔들림만
-    # 남는다), 화면은 그 값 하나를 머리말·고정 예상에 쓴다. 분야 이름은 목록·필터와 같은 출처
-    # (_starter_slots), 그 밖(꺼진 슬롯의 기록)은 행의 칩 라벨.
+    # 첫 화면 고정 — items·count = 등록 상한 검사(422)와 같은 식(GLOBAL_PIN_WHERE)으로 고른 쓰는
+    # 중인 행('n/상한 사용 중'·초과 시 해제 목록), used·slots = 한 벌에 먼저 들어가는 행
+    # (global_pins — 분야 확률 (n − used) ÷ (분야 수 − slots)의 분자·분모, 해석식과 같은 값).
     names = {slot["slot"]: slot["label"] for slot in await _starter_slots(cur, settings)}
+    await cur.execute(
+        f"SELECT id, slot, label, text FROM starters WHERE {GLOBAL_PIN_WHERE} ORDER BY id",
+        global_pin_params(today),
+    )
+    current = [{"id": row["id"], "label": names.get(row["slot"]) or chip_label(row, settings),
+                "text": row["text"]} for row in await cur.fetchall()]
+    global_info = {"count": len(current), "items": current, "used": len(pins),
+                   "slots": len({r["slot"] for r in pins}), "limit": global_pin_limit(settings)}
+    # 분야 이름은 목록·필터와 같은 출처(_starter_slots), 그 밖(꺼진 슬롯의 기록)은 행의 칩 라벨.
     slots = [
         {"slot": slot, "label": names.get(slot)
          or chip_label(next(r for r in pool if r["slot"] == slot), settings),
@@ -728,30 +754,32 @@ async def fetch_starter_preview(
     ]
     rows.sort(key=lambda row: (-(row["probability"] or 0), row["slot"], row["id"]))
     return {
-        "date": day.isoformat(), "n": n, "mode": mode, "draws": draws, "pool_size": len(pool),
+        "date": day.isoformat(), "n": n, "mode": mode, "pool_size": len(pool),
         # 직접 등록 폼의 새 분야 이름 상한 = 칩 라벨 상한(서버 검증과 같다).
         "slot_name_max": _CHIP_LABEL_MAX_CHARS,
         "slot_count": len({row["slot"] for row in pool}),
         "sample": [
-            {"id": row["id"], "label": chip_label(row, settings), "text": row["text"]}
+            {"id": row["id"], "label": chip_label(row, settings), "text": row["text"],
+             "pinned": pin_name(row["pinned"])}
             for row in sample
         ],
         "rows": rows,
         "slots": slots,
+        "global_pins": global_info,
         "expected_probability": expected,
     }
 
 
-def zero_reason(pinned: bool, slot_has_pinned: bool, skipped: int) -> str:
-    """후보인데 추첨에서 한 번도 뽑히지 않은 질문의 이유 — 문구를 보지 않고 선택의 사실로 가른다.
+def zero_reason(slot_taken: bool, skipped: int) -> str:
+    """첫 화면에 안 나오는(0) 노출 중 질문의 이유 — 문구를 보지 않고 선택의 사실로 가른다.
 
-    분야에 고정 질문이 있으면 그 분야는 고정 질문 중에서만 고른다(pinned_sibling). 같은 상품·출처·
-    문구를 가리키는 질문이 이미 뽑혀 실제로 건너뛴 적이 있으면 duplicate(pick_starters가 센 수).
-    둘 다 아니면 표본에서 안 나왔을 뿐 아주 드물게 나온다(rare — 1/draws 미만).
+    pinned_sibling = 같은 분야의 고정(분야 대표·첫 화면)이 그 분야 칸을 쓴다. duplicate = 같은
+    상품·출처·문구를 가리키는 다른 질문과 겹쳐 추첨에서 늘 건너뛰었다. no_room = 첫 화면 고정이
+    칸을 다 채워 무작위 칸이 없다.
     """
-    if slot_has_pinned and not pinned:
+    if slot_taken:
         return "pinned_sibling"
-    return "duplicate" if skipped else "rare"
+    return "duplicate" if skipped else "no_room"
 
 
 async def fetch_starter_calendar(
@@ -814,12 +842,6 @@ async def fetch_starter_calendar(
     )
     schedules = [jsonable(row) for row in await cur.fetchall()]
     await cur.execute(
-        f"SELECT {columns} FROM starters WHERE {live_sql} AND pinned = 1 "
-        "AND valid_from IS NULL AND valid_until IS NULL ORDER BY slot, id",
-        live_params,
-    )
-    always = [jsonable(row) for row in await cur.fetchall()]
-    await cur.execute(
         f"SELECT slot, MAX(label) AS label, COUNT(*) AS n FROM starters WHERE {live_sql} "
         "AND source = 'manual' AND valid_from IS NULL AND valid_until IS NULL "
         "GROUP BY slot ORDER BY n DESC, slot",
@@ -828,14 +850,14 @@ async def fetch_starter_calendar(
     ongoing = await cur.fetchall()
     slots = await _starter_slots(cur, settings)
     names = {slot["slot"]: slot["label"] for slot in slots}
-    for row in (*schedules, *always, *ongoing):
+    for row in (*schedules, *ongoing):
         row["label"] = names.get(row["slot"]) or chip_label(row, settings)
-    for row in (*schedules, *always):
-        row["pinned"], row["active"] = bool(row["pinned"]), bool(row["active"])
+    for row in schedules:
+        row["pinned"], row["active"] = pin_name(row["pinned"]), bool(row["active"])
     return {
         "today": today.isoformat(),
         "month": first.strftime("%Y-%m"), "days": cells,
-        "outside": outside, "pinned_always": always, "schedules": schedules,
+        "outside": outside, "schedules": schedules,
         "ongoing": {"count": sum(row["n"] for row in ongoing),
                     "slots": [{"label": row["label"], "n": row["n"]} for row in ongoing]},
         # 기간 선택 → 수동 추가 폼의 슬롯 선택지(목록을 거치지 않고 캘린더만 열어도).
@@ -1113,7 +1135,7 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
         day: date | None = Query(default=None, alias="date"),
         seed: int | None = Query(default=None, ge=0),
         add_slot: str = Query(default="", max_length=_SLOT_MAX_CHARS),
-        add_pinned: bool = False,
+        add_pinned: str = Query(default="", max_length=8),
     ) -> Any:
         """그날 첫 화면 미리보기(서빙과 같은 풀·선택·개수, 서빙 로그·생성 트리거 없음).
 
@@ -1128,10 +1150,14 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
                 status_code=422, detail=f"미리보기 날짜는 {max_date}까지입니다."
             )
         seed = random.randrange(2**31) if seed is None else seed
+        try:  # 이름·옛 화면의 true/false — 요청 모델과 같은 관용 변환(starters._pin_input)
+            pin = _pin_input(add_pinned)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
         return await _query(
             lambda cur: fetch_starter_preview(
                 cur, settings, day=day, n=settings.starter_count, seed=seed,
-                add_slot=add_slot.strip(), add_pinned=add_pinned,
+                add_slot=add_slot.strip(), add_pinned=pin,
             )
         )
 

@@ -21,9 +21,12 @@ from yes24_agent.config import Settings
 
 # admin 접속(읽기 전용 조회·AdminService 풀) 공통 디코더 — BOOLEAN 열을 bool로 싣는다.
 # 열 이름이 아니라 결과 열 타입(TINY)으로 판정하므로 뷰·조인을 거쳐도 같다. 파생값(SUM(a=1)
-# DECIMAL, (1=1)·a+0 LONGLONG)은 TINY가 아니라 int로 남는다(격리 MySQL 실측). 스키마의
-# TINYINT 열은 전부 BOOLEAN(TINYINT(1))이다 — 수치 TINYINT 열이 생기면 이 판정을 다시 볼 것.
-BOOL_DECODERS = {**decoders, FIELD_TYPE.TINY: lambda value: value != "0"}
+# DECIMAL, (1=1)·a+0 LONGLONG)은 TINY가 아니라 int로 남는다(격리 MySQL 실측). TINYINT 열은
+# 0/1이면 bool, 그 밖의 값은 수로 남긴다 — starters.pinned는 0/1/2(없음·분야 고정·첫 화면 고정,
+# starters.PIN_*)라 2를 True로 접으면 첫 화면 고정이 분야 고정으로 읽힌다(True == 1 == PIN_SLOT).
+BOOL_DECODERS = {
+    **decoders, FIELD_TYPE.TINY: lambda value: value == "1" if value in ("0", "1") else int(value)
+}
 
 
 def _nickname(keys: str, match: str) -> str:

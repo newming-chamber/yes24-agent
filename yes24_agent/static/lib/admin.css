@@ -264,10 +264,6 @@
   .primary-soft { background: var(--accent-soft); color: var(--accent-text); }
   .primary-soft:hover { background: var(--accent); color: var(--crema-white); }
   .cal-key { white-space: nowrap; padding: 1px 6px; border-radius: 3px; background: var(--accent-soft); color: var(--accent-text); }
-  .cal-key.pinned { background: var(--accent-text); color: var(--crema-white); }
-  .cal-always { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-bottom: 10px; font-size: var(--crema-fs-small); }
-  .cal-always-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; padding: 4px 10px; border-radius: 999px; background: var(--accent-text); color: var(--crema-white); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .pin-icon { flex: none; width: 12px; height: 12px; margin-right: 3px; fill: currentColor; vertical-align: -1px; }
   .cal-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); border-top: 1px solid var(--crema-grey-200); border-left: 1px solid var(--crema-grey-200); }
   .cal-weekday { padding: 6px 8px; border-right: 1px solid var(--crema-grey-200); border-bottom: 1px solid var(--crema-grey-200); background: var(--crema-grey-50); font-size: var(--crema-fs-axis); color: var(--text-meta); }
   .cal-cell { display: flex; flex-direction: column; gap: 3px; min-width: 0; min-height: 118px; padding: 6px 0 8px; border-right: 1px solid var(--crema-grey-200); border-bottom: 1px solid var(--crema-grey-200); background: var(--panel); cursor: pointer; }
@@ -291,6 +287,29 @@
   .cal-grid .cal-bar:not(.empty) { cursor: pointer; }
   .cal-grid .cal-bar { display: flex; align-items: center; height: 18px; padding: 0 6px; overflow: hidden; white-space: nowrap; font-size: var(--crema-fs-axis); background: var(--accent-soft); color: var(--accent-text); }
   .cal-grid .cal-bar.pinned { background: var(--accent-text); color: var(--crema-white); }
+  .cal-grid .cal-bar.pin-global, .cal-bar-line.pin-global { background: var(--crema-grey-900); color: var(--crema-white); }
+  .bar-tag { margin-right: 4px; padding: 0 4px; border-radius: 3px; background: rgb(255 255 255 / .22); font-size: 10px; font-weight: 700; }
+  /* 고정 배지 — 첫 화면 고정(진한 회색)과 분야 고정(파랑)을 이름으로 구분한다(같은 아이콘을 쓰지 않는다). */
+  .pin-badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: var(--crema-fs-axis); font-style: normal; font-weight: 600; white-space: nowrap; }
+  .pin-badge.pin-slot { background: var(--accent-soft); color: var(--accent-text); }
+  .pin-badge.pin-global { background: var(--crema-grey-900); color: var(--crema-white); }
+  .pin-select { height: 28px; padding: 0 6px; font-size: var(--crema-fs-axis); }
+  /* 달력 위 '지금 첫 화면' — 한 덩어리(머리 한 줄 + 칩), 칩 글자는 한 줄 말줄임. */
+  .cal-now { margin-bottom: 12px; padding: 10px 12px; border: 1px solid var(--crema-grey-200); border-radius: var(--radius); }
+  .now-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-bottom: 8px; font-size: var(--crema-fs-small); }
+  .now-meta { color: var(--text-meta); font-size: var(--crema-fs-axis); }
+  .now-head .link-button { margin-left: auto; }
+  .now-chips { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr)); gap: 6px; }
+  .now-chip { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 6px 10px; border: 1px solid var(--crema-grey-200); border-radius: 12px; background: var(--crema-grey-50); font-size: var(--crema-fs-small); }
+  .now-chip small { flex: none; color: var(--text-meta); font-size: var(--crema-fs-axis); }
+  .now-chip > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--crema-grey-900); }
+  .now-chip.pin-global { border-color: var(--crema-grey-900); }
+  .now-chip > span:last-child { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; white-space: normal; }  /* 두 줄까지(모든 폭), 전체 문장은 툴팁 */
+  .pin-blockers { flex: 1 1 100%; margin: 0; padding-left: 18px; font-size: var(--crema-fs-small); color: var(--crema-grey-800); }
+  .pin-blockers li { margin: 2px 0; }
+  .pin-confirm .error { flex: 1 1 100%; margin: 0; }
+  .day-row.flash { animation: flash-row 1.6s ease-out; }  /* 저장 뒤 바뀐 행 */
+  @keyframes flash-row { 0%, 50% { background: var(--warn-bg); } 100% { background: transparent; } }
   .cal-grid .cal-bar.empty { background: none; }
   .cal-grid .cal-bar.start { margin-left: 4px; border-top-left-radius: 4px; border-bottom-left-radius: 4px; }
   .cal-grid .cal-bar.end { margin-right: 4px; border-top-right-radius: 4px; border-bottom-right-radius: 4px; }

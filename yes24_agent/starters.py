@@ -31,6 +31,7 @@ from google.genai import types
 from pydantic import (
     AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     StringConstraints,
@@ -43,6 +44,7 @@ from yes24_agent.admin_auth import (
     AdminTx,
     EditBody,
     EditChanges,
+    EditConflict,
     admin_enabled,
     require_editor,
 )
@@ -133,44 +135,134 @@ def _squash(value: Any) -> str:
     return " ".join(stripped.split())
 
 
-def pick_starters(
-    pool: list[dict], n: int, rng: random.Random | Any, skipped: Counter | None = None
-) -> list[dict]:
-    """슬롯별 최대 하나를 뽑고 같은 상품·출처·문구를 가리키는 후보는 건너뛴다.
+# 고정 — starters.pinned(TINYINT) 값. 0 없음 · 1 분야 고정(그 분야가 뽑히면 이 질문) · 2 첫 화면
+# 고정(매번 첫 화면에 넣는다, 상한 global_pin_limit). 판정은 이 상수로만 한다 — truthy로 읽으면
+# 2가 분야 고정으로도 읽힌다. 어드민 JSON은 이름(PIN_NAMES)으로 주고받는다(숫자를 화면이 모르게).
+PIN_NONE, PIN_SLOT, PIN_GLOBAL = 0, 1, 2
+PIN_NAMES = {PIN_NONE: "", PIN_SLOT: "slot", PIN_GLOBAL: "global"}
 
+
+def pin_value(value: Any) -> int:
+    """DB·요청 값 → 고정 상수. 어드민 연결은 0/1을 bool로 읽고(BOOL_DECODERS) 옛 클라이언트는 bool을
+    보낸다 — True는 분야 고정(1)이다. 이름("slot"·"global")도 받는다."""
+    if isinstance(value, str):
+        return {name: pin for pin, name in PIN_NAMES.items()}[value]
+    return int(value or 0)
+
+
+def pin_name(value: Any) -> str:
+    return PIN_NAMES[pin_value(value)]
+
+
+def global_pin_limit(settings: Settings, n: int | None = None) -> int:
+    """첫 화면 고정 상한 — 설정(starter_global_pin_max), 없으면 starter_count − 1(기본 한 벌에서
+    최소 한 칸은 무작위로 돈다). 상한은 기본 한 벌 기준으로 고정하고, 요청 n이 더 작으면 n까지만
+    넣는다(?n=1·3이어도 등록된 첫 화면 고정이 n이 허락하는 만큼은 나간다 — 등록 한도와 서빙이 같은
+    수를 본다). 서빙·미리보기·등록 검사가 이 함수 하나를 쓴다."""
+    configured = settings.starter_global_pin_max
+    limit = settings.starter_count - 1 if configured is None else configured
+    return max(0, limit if n is None else min(limit, n))
+
+
+# 첫 화면 고정의 '쓰는 중' 판정 — 등록 상한 검사(422)와 어드민 '첫 화면 고정 n/상한' 표시가 같은
+# 식을 쓴다. 끝난 기간(valid_until < 오늘)은 서빙되지 않으니 세지 않는다(시작 전은 센다).
+GLOBAL_PIN_WHERE = "active = 1 AND pinned = %s AND (valid_until IS NULL OR valid_until >= %s)"
+
+
+def global_pin_params(today: dt.date) -> tuple:
+    return (PIN_GLOBAL, today)
+
+
+def global_pins(pool: Iterable[dict], limit: int) -> list[dict]:
+    """한 벌에 먼저 들어갈 첫 화면 고정 행 — id순, 분야당 하나, limit개. 같은 분야의 두 번째부터와
+    상한 초과분은 보통 후보로 돌아간다(/chat/starters 계약: 유형별 최대 1개). 음수 id(어드민
+    미리보기의 가상 행)는 맨 뒤 — 등록 전 예상이 기존 고정을 밀어내지 않는다."""
+    picked: list[dict] = []
+    for row in sorted((row for row in pool if pin_value(row.get("pinned")) == PIN_GLOBAL),
+                      key=lambda row: (row["id"] < 0, row["id"])):
+        if len(picked) < limit and all(row["slot"] != other["slot"] for other in picked):
+            picked.append(row)
+    return picked
+
+
+def pick_starters(
+    pool: list[dict], n: int, rng: random.Random | Any, skipped: Counter | None = None,
+    global_limit: int | None = None,
+) -> list[dict]:
+    """첫 화면 한 벌 — 첫 화면 고정을 먼저 넣고, 남은 칸은 분야별 최대 하나를 무작위로 뽑는다.
+
+    1) 첫 화면 고정(PIN_GLOBAL) 행을 id순으로 global_limit개까지 넣는다(초과분은 고정 아님으로
+       돌아가 그 분야의 보통 후보가 된다). 2) 넣은 행의 분야는 소진 — 다시 뽑지 않는다.
+    3) 남은 분야를 섞어 분야마다 하나, 분야 고정(PIN_SLOT)이 있으면 그중에서 고른다.
+    같은 상품·출처·문구를 가리키는 후보는 어느 단계에서든 건너뛴다. global_limit None = n − 1
+    (서빙·미리보기는 global_pin_limit을 넘긴다).
     skipped(선택)를 주면 중복이라 건너뛴 후보 id를 센다 — 어드민 미리보기가 '0인 이유'를 실제
     건너뜀으로 판정하는 데 쓴다. 서빙은 넘기지 않는다(선택 결과는 같다).
     """
-    by_slot: dict[str, list[dict]] = {}
-    for row in pool:
-        by_slot.setdefault(row["slot"], []).append(row)
-    slots = list(by_slot.values())
-    rng.shuffle(slots)
-    selected = []
+    pins = global_pins(pool, max(0, n - 1) if global_limit is None else min(global_limit, n))
+    pinned_ids = {row["id"] for row in pins}
+    selected: list[dict] = []
     goods: set[int] = set()
     sources: set[str] = set()
     texts: set[str] = set()
+
+    def take(row: dict) -> bool:
+        text = _squash(row["text"])
+        goods_no, source_url = row.get("goods_no"), row.get("source_url")
+        if (text in texts or (goods_no is not None and goods_no in goods)
+                or (source_url and source_url in sources)):
+            if skipped is not None:
+                skipped[row["id"]] += 1
+            return False
+        selected.append(row)
+        texts.add(text)
+        if goods_no is not None:
+            goods.add(goods_no)
+        if source_url:
+            sources.add(source_url)
+        return True
+
+    used_slots = {row["slot"] for row in pins if take(row)}
+    by_slot: dict[str, list[dict]] = {}
+    for row in pool:
+        if row["slot"] not in used_slots and row["id"] not in pinned_ids:
+            by_slot.setdefault(row["slot"], []).append(row)
+    slots = list(by_slot.values())
+    rng.shuffle(slots)
     for rows in slots:
         if len(selected) >= n:
             break
-        candidates = [row for row in rows if row.get("pinned")] or list(rows)
+        candidates = [row for row in rows if pin_value(row.get("pinned")) == PIN_SLOT] or list(rows)
         rng.shuffle(candidates)
         for row in candidates:
-            text = _squash(row["text"])
-            goods_no, source_url = row.get("goods_no"), row.get("source_url")
-            if (text in texts or (goods_no is not None and goods_no in goods)
-                or (source_url and source_url in sources)):
-                if skipped is not None:
-                    skipped[row["id"]] += 1
-                continue
-            selected.append(row)
-            texts.add(text)
-            if goods_no is not None:
-                goods.add(goods_no)
-            if source_url:
-                sources.add(source_url)
-            break
+            if take(row):
+                break
     return selected
+
+
+def pick_probabilities(
+    pool: list[dict], n: int, global_limit: int | None = None
+) -> dict[int, float]:
+    """pick_starters가 각 행을 한 벌에 넣을 확률(해석식) — 같은 규칙을 셈으로 옮긴 것.
+
+    첫 화면 고정(global_pins) = 1. 그 분야의 다른 행 = 0. 남은 칸 k = n − 고정 수를 남은 분야 S가
+    고르게 나눠 분야마다 min(1, k/S), 분야 안에서는 분야 고정이 있으면 그 행들끼리, 없으면 모든 행이
+    똑같이 나눠 갖는다. 같은 상품·출처·문구 건너뜀은 넣지 않는다 — 그 효과는 어드민 미리보기가
+    추첨 표본으로 따로 판정한다(이유 표시). 표본 오차가 없어 미리 보인 값과 저장 뒤 값이 같다.
+    """
+    pins = global_pins(pool, max(0, n - 1) if global_limit is None else min(global_limit, n))
+    probabilities = {row["id"]: 0.0 for row in pool} | {row["id"]: 1.0 for row in pins}
+    used, pinned_ids = {row["slot"] for row in pins}, {row["id"] for row in pins}
+    by_slot: dict[str, list[dict]] = {}
+    for row in pool:
+        if row["slot"] not in used and row["id"] not in pinned_ids:
+            by_slot.setdefault(row["slot"], []).append(row)
+    share = min(1.0, max(0, n - len(pins)) / len(by_slot)) if by_slot else 0.0
+    for rows in by_slot.values():
+        candidates = [row for row in rows if pin_value(row.get("pinned")) == PIN_SLOT] or rows
+        for row in candidates:
+            probabilities[row["id"]] = share / len(candidates)
+    return probabilities
 
 
 def live_predicate(today: dt.date, settings: Settings) -> tuple[str, tuple]:
@@ -1388,7 +1480,7 @@ class StarterService(MysqlBackedService):
         """서빙 세트 1건 — 선택 → 서빙 로그 한 줄 → (필요 시) 백그라운드 생성 기동 → 즉답."""
         settings = get_settings()
         pool = await self.active_pool(today, slot)
-        picked = pick_starters(pool, n, rng or random)
+        picked = pick_starters(pool, n, rng or random, global_limit=global_pin_limit(settings, n))
         # 응답에는 싣지 않지만 운영 추적은 필요하다 — 무엇이 나갔는지는 여기 남는다.
         logger.info(
             f"starters served ids={[p['id'] for p in picked]} slots={[p['slot'] for p in picked]}"
@@ -1723,7 +1815,7 @@ class StarterService(MysqlBackedService):
         *,
         slot: str,
         text: str,
-        pinned: bool,
+        pinned: int,
         valid_from: dt.date | None,
         valid_until: dt.date | None,
     ) -> int:
@@ -1738,16 +1830,34 @@ class StarterService(MysqlBackedService):
         await tx.cur.execute(
             "INSERT INTO starters (slot, text, source, pinned, valid_from, valid_until) "
             "VALUES (%s, %s, %s, %s, %s, %s)",
-            (slot, text, "manual", int(pinned), valid_from, valid_until),
+            (slot, text, "manual", pinned, valid_from, valid_until),
         )
+        if pinned == PIN_GLOBAL:
+            await _check_global_pins(tx, slot)
         return tx.cur.lastrowid
 
     @staticmethod
     async def update_item(
         tx: AdminTx, item_id: int, fields: dict, expected: dict | None
     ) -> tuple[dict, dict]:
-        """실린 필드만 갱신한다 — 행 잠금·404·expected 409·같은 값 제거는 edit_row 한 벌."""
-        return await tx.edit_row("starters", item_id, _EDITABLE, fields, expected)
+        """실린 필드만 갱신한다 — 행 잠금·404·expected 409·같은 값 제거는 edit_row 한 벌.
+
+        고정은 DB 값(0/1/2, 어드민 연결은 0/1을 bool로 읽는다)을 이름으로 바꿔 돌려준다 — 감사 기록·
+        409 현재값이 화면과 같은 말("slot"·"global")을 쓴다.
+        """
+        try:
+            before, after = await tx.edit_row("starters", item_id, _EDITABLE, fields, expected)
+        except EditConflict as conflict:
+            raise EditConflict(_named_pin(conflict.current)) from None
+        # 결과 행이 쓰는 중인 첫 화면 고정이 되는 변경(고정·다시 켜기·기간 연장)이면 상한·분야당
+        # 하나를 검사한다 — 바뀐 열이 아니라 잠근 행의 바뀐 뒤 값으로 판정한다.
+        if after.keys() & {"pinned", "active", "valid_from", "valid_until"}:
+            await tx.cur.execute("SELECT slot, pinned, active FROM starters WHERE id = %s",
+                                 (item_id,))
+            row = await tx.cur.fetchone()
+            if pin_value(row["pinned"]) == PIN_GLOBAL and row["active"]:
+                await _check_global_pins(tx, row["slot"])
+        return _named_pin(before), _named_pin(after)
 
     @staticmethod
     async def deactivate_item(tx: AdminTx, item_id: int, expected: dict | None) -> dict:
@@ -1755,7 +1865,7 @@ class StarterService(MysqlBackedService):
         before, _ = await tx.edit_row(
             "starters", item_id, _EDITABLE, {"active": False}, expected
         )
-        return before
+        return _named_pin(before)
 
 
 def start_starter_refresh(app, settings: Settings) -> None:
@@ -1862,10 +1972,52 @@ def _check_valid_range(item: Any) -> Any:
     return item
 
 
+def _pin_input(value: Any) -> int:
+    """요청의 고정 값 — 이름(""·"slot"·"global")·bool(옛 화면: True = 분야 고정, 쿼리 문자열
+    "true"·"false" 포함)·0/1/2."""
+    if isinstance(value, str) and value in ("true", "false"):
+        value = value == "true"
+    if value is None or (isinstance(value, str) and value not in PIN_NAMES.values()):
+        raise ValueError(f"고정은 {sorted(PIN_NAMES.values())} 중 하나입니다")
+    return pin_value(value)
+
+
+# 고정 = PIN_* 상수(요청은 이름으로) — 범위 밖 숫자는 422.
+_Pin = Annotated[int, BeforeValidator(_pin_input), Field(ge=PIN_NONE, le=PIN_GLOBAL)]
+
+
+def _named_pin(row: dict) -> dict:
+    """행 dict의 pinned를 이름으로(없으면 그대로) — 어드민 응답·감사 기록 공용."""
+    return {**row, "pinned": pin_name(row["pinned"])} if "pinned" in row else row
+
+
+async def _check_global_pins(tx: AdminTx, slot: str) -> None:
+    """첫 화면 고정 검사 — 상한(global_pin_limit) 초과·같은 분야 두 개면 422. 방금 쓴 행을 포함해
+    센다(같은 트랜잭션이라 롤백된다). 동시 요청 둘이 함께 통과할 수는 있다(행 잠금 없이 센다 —
+    pinned 범위 FOR UPDATE는 갭 잠금 교착을 부른다). 그래도 서빙이 초과분·같은 분야 둘째를 잘라
+    보통 후보로 돌리므로 첫 화면 계약은 깨지지 않는다."""
+    limit = global_pin_limit(get_settings())
+    await tx.cur.execute(
+        f"SELECT COUNT(*) AS n, COALESCE(SUM(slot = %s), 0) AS in_slot FROM starters "
+        f"WHERE {GLOBAL_PIN_WHERE}",
+        (slot, *global_pin_params(_today())),
+    )
+    counted = await tx.cur.fetchone()
+    if int(counted["in_slot"]) > 1:
+        raise HTTPException(
+            422, "이 분야엔 이미 첫 화면 고정이 있어요 — 분야당 하나까지입니다(첫 화면엔 분야마다 "
+            "질문 하나가 나옵니다)."
+        )
+    if int(counted["n"]) > limit:
+        raise HTTPException(
+            422, f"첫 화면 고정은 최대 {limit}개입니다 — 다른 첫 화면 고정을 먼저 풀어 주세요."
+        )
+
+
 class StarterCreate(BaseModel):
     slot: _SlotText
     text: _StarterText
-    pinned: bool = False
+    pinned: _Pin = PIN_NONE
     valid_from: dt.date | None = None
     valid_until: dt.date | None = None
 
@@ -1881,7 +2033,7 @@ class _StarterExpected(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     text: str | None = None
-    pinned: bool | None = None
+    pinned: _Pin | None = None
     active: bool | None = None
     valid_from: dt.date | None = None
     valid_until: dt.date | None = None
@@ -1902,7 +2054,7 @@ class StarterChanges(EditChanges):
     """
 
     text: _StarterText = None
-    pinned: bool = None
+    pinned: _Pin = None
     active: bool = None
     valid_from: dt.date | None = None
     valid_until: dt.date | None = None
@@ -1968,8 +2120,8 @@ def register_starters(app: FastAPI, settings: Settings) -> None:
         item = body.model_dump()
         async with AdminService.get_instance().transaction(actor, request) as tx:
             new_id = await StarterService.add_item(tx, **item)
-            await tx.audit("starter", new_id, "create", after=item)
-        return {"id": new_id, **item}
+            await tx.audit("starter", new_id, "create", after=_named_pin(item))
+        return {"id": new_id, **_named_pin(item)}
 
     @app.patch("/admin/starters/{item_id}", include_in_schema=False)
     async def admin_update(

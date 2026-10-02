@@ -848,6 +848,10 @@ class Settings(BaseSettings):
     starter_per_slot: int = 7
     # 한 번에 서빙하는 칩 수의 기본값(GET /chat/starters의 n 기본). NN/g 2024/2025: 3~5개.
     starter_count: int = 4
+    # 첫 화면 고정(starters.pinned = PIN_GLOBAL)을 한 벌에 넣는 상한. None = starter_count − 1
+    # (최소 한 칸은 무작위로 돈다). 등록·수정은 이 수를 넘기면 422, 서빙은 초과분을 id순으로
+    # 잘라 보통 후보로 돌린다.
+    starter_global_pin_max: int | None = None
     # 문장 길이 상한(문자). 자동 생성분은 출구에서 초과분을 **폐기**하고(절단 금지 — 누르면 그대로
     # 전송되는 문장이다), 수동 추가는 422로 거절한다. 이 값은 문장이 담아야 할 것들의 합이다:
     # 순위(7자)+『제목』(2자+제목)+사람이 말하듯 끝맺는 질문. 좁히면 그 셋이 서로를 밀어낸다 —

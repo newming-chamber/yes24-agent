@@ -33,7 +33,7 @@ const jsonBody = (method, body) => ({ method, headers: { 'Content-Type': 'applic
 /** 편집 요청 한 벌 — 초기 질문 PATCH의 {changes, expected} 본문. */
 const editBody = (changes, expected) => jsonBody('PATCH', { changes, expected });
 
-export function initManage({ api, el, table, valueText, state, openDialog, showRecord, reload, onCreated, slotLabel, generateStatus, errorText, chanceText, slotProbability: slotChance, todayPreview }) {
+export function initManage({ api, el, table, valueText, state, openDialog, showRecord, reload, onCreated, slotLabel, generateStatus, errorText, chanceText, slotProbability: slotChance, todayPreview, pins }) {
   const $ = (id) => document.getElementById(id);
   // 역할 순서는 서버 정본(/me의 roles, 낮은 권한 → 높은 권한)을 쓴다.
   const can = (role) => state.roles.indexOf(state.role) >= state.roles.indexOf(role);
@@ -111,40 +111,74 @@ export function initManage({ api, el, table, valueText, state, openDialog, showR
   }
 
   // ── 초기 질문 행 패널 ────────────────────────────────────────────────────
+  // 고정은 세 갈래 선택(PINS 이름 — '' · slot · global). 선택 아래 한 줄은 고른 종류의 설명이다.
   const STARTER_FIELDS = [
     { key: 'text', label: '문장', kind: 'textarea' },
-    { key: 'pinned', label: '고정(이 분야에서 항상 먼저)', kind: 'checkbox', help: '이 분야가 첫 화면에 뽑히면 이 질문이 항상 나와요. 같은 분야의 다른 질문은 대신 안 나와요. 분야가 뽑힐지는 확률이에요.' },
+    { key: 'pinned', label: '고정', kind: 'select', options: Object.entries(pins).map(([kind, { label }]) => [kind, label]), help: ' ' },
     { key: 'active', label: '노출 켜기', kind: 'checkbox' },
     { key: 'valid_from', label: '노출 시작일', kind: 'date' },
     { key: 'valid_until', label: '노출 종료일', kind: 'date', help: '시작일·종료일을 비워 두면 매일 노출돼요.' },
   ];
 
-  // 고정의 영향 — 행 패널·직접 등록 폼(체크 순간)과 날짜 패널(고정 확인 줄)이 같은 말을 쓴다. data = 그날
-  // 미리보기(rows·slots). 같은 분야에 고정이 이미 있으면 서빙은 고정 질문끼리 무작위로 고른다(교체가 아니다).
-  function pinImpact(data, slot, id, live = true) {
+  // 고정의 영향 — 행 패널·직접 등록 폼(고르는 순간)과 날짜 패널(고정 확인 줄)이 같은 말을 쓴다. data = 그날
+  // 미리보기(rows·slots·global_pins). kind = 거는 고정('slot' · 'global').
+  // 분야 고정: 같은 분야에 분야 고정이 이미 있으면 서빙은 그 질문들끼리 무작위로 고른다(교체가 아니다).
+  // 첫 화면 고정: 매번 먼저 들어가므로 100%, 그 분야의 다른 질문은 첫 화면에 안 나온다(분야 칸을 쓴다).
+  function pinImpact(data, slot, id, live = true, kind = 'slot') {
     // 지금 노출 중이 아닌 행(목록 판정 live=false, 또는 그날 풀에 없음)은 고정해도 첫 화면에 나오지 않는다 — 수치를 보이지 않는다.
     if (!live || (id != null && !data?.rows?.some((row) => row.id === id))) return '지금 노출 중이 아니라 고정해도 첫 화면에 나오지 않아요.';
-    const siblings = (data?.rows ?? []).filter((row) => row.slot === slot && row.id !== id), pinned = siblings.filter((row) => row.pinned);
-    // 머리말과 같은 값(질문 수 ÷ 분야 수) — 풀에 없는 새 분야면 분야가 하나 늘어난 분모로.
-    const slotProbability = slotChance(data, data?.slots?.some((item) => item.slot === slot) ? 0 : 1);
+    const siblings = (data?.rows ?? []).filter((row) => row.slot === slot && row.id !== id);
     const current = data?.rows?.find((row) => row.id === id)?.probability;
-    // 고정 후 = 분야 확률을 고정 질문끼리 나눈 값(기존 고정이 없으면 분야 확률 그대로).
-    const change = slotProbability == null ? '' : `이 질문 ${current == null ? '예상 ' : current === 0 ? '지금 안 나옴 → ' : `${chanceText(current)} → `}${chanceText(slotProbability / (pinned.length + 1))}${pinned.length ? '(고정 질문끼리 나눠 가져요)' : ''}.`;
-    const effect = pinned.length ? `이미 고정된 "${pinned[0].text}"${pinned.length > 1 ? ` 외 ${pinned.length - 1}개` : ''}와 번갈아 나와요(교체되지 않아요).`
+    const from = current == null ? '예상 ' : current === 0 ? '지금 안 나옴 → ' : `${chanceText(current)} → `;
+    if (kind === 'global') {
+      // 결과 먼저 — 이 분야 칸은 이 질문이 쓴다. 사용 수는 서버 등록 검사(422)와 같은 셈(global_pins.count).
+      const { count = 0, limit = 0 } = data?.global_pins ?? {}, already = data?.rows?.find((row) => row.id === id)?.pinned === 'global';
+      const sameSlot = siblings.find((row) => row.pinned === 'global');
+      if (sameSlot) return `이 분야엔 이미 첫 화면 고정 "${sameSlot.text}"이 있어요 — 분야당 하나까지라 저장할 수 없어요. 아래에서 풀고 다시 고르세요.`;
+      const after = count + (already ? 0 : 1);
+      if (after > limit) return `첫 화면 고정은 최대 ${limit}개예요(지금 ${count}개) — 아래에서 하나를 풀면 저장할 수 있어요.`;
+      // 다른 분야 — 첫 화면 고정이 칸 하나·분야 하나를 더 쓰면 남은 칸 ÷ 남은 분야가 바뀐다(pick_probabilities와 같은 식).
+      const pins = data?.global_pins ?? { used: 0, slots: 0 }, slotTaken = (data?.rows ?? []).some((row) => row.slot === slot && row.pinned === 'global');
+      const others = already || slotTaken ? '' : `다른 분야가 뽑힐 확률 ${chanceText(slotChance(data) ?? 0)} → ${chanceText(slotChance({ ...data, global_pins: { ...pins, used: (pins.used ?? 0) + 1, slots: (pins.slots ?? 0) + 1 } }) ?? 0)}.`;
+      return [`이 분야는 이 질문으로 고정돼요${siblings.length ? ` — 같은 분야의 다른 질문 ${siblings.length}개는 나오지 않아요` : ''}.`,
+        `이 질문 ${from}100% · 첫 화면 고정 ${after}/${limit}개.`, others].filter(Boolean).join(' ');
+    }
+    // 그 분야에 첫 화면 고정이 있으면 분야 칸은 그 질문이 쓴다 — 분야 고정은 효과가 없다.
+    const global = siblings.find((row) => row.pinned === 'global');
+    if (global) return `이 분야엔 첫 화면 고정 "${global.text}"이 있어 분야 고정은 효과가 없어요(그 질문이 이 분야 칸을 씁니다).`;
+    const pinned = siblings.filter((row) => row.pinned === 'slot');
+    // 머리말과 같은 값(남은 칸 ÷ 남은 분야) — 풀에 없는 새 분야면 분야가 하나 늘어난 분모로.
+    const slotProbability = slotChance(data, data?.slots?.some((item) => item.slot === slot) ? 0 : 1);
+    const change = slotProbability == null ? '' : `이 질문 ${from}${chanceText(slotProbability / (pinned.length + 1))}${pinned.length ? '(분야 고정 질문끼리 나눠 가져요)' : ''}.`;
+    const effect = pinned.length ? `이미 분야 고정된 "${pinned[0].text}"${pinned.length > 1 ? ` 외 ${pinned.length - 1}개` : ''}와 번갈아 나와요(교체되지 않아요).`
       : siblings.length ? `같은 분야의 다른 질문 ${siblings.length}개는 첫 화면에서 가려져요.` : '';
     return [change, effect].filter(Boolean).join(' ');
   }
-  const pinNotice = (data, slot, id) => `이 분야가 첫 화면에 뽑히면 이 질문이 항상 나와요. ${pinImpact(data, slot, id)}`.trim();
-  /** 고정 체크 — 설명(도움말)과 영향은 체크했을 때만 보인다. 영향은 오늘 미리보기(state.preview)로 센다.
+  /** 고정을 막는 첫 화면 고정 목록 — 같은 분야의 첫 화면 고정이나(분야당 하나) 상한이 찼을 때의 지금 목록.
+   *  날짜 패널 확인 줄이 확인 버튼을 끄고 각각 '해제'를 붙인다. 막히지 않으면 null. */
+  function pinBlockers(data, slot, id, kind) {
+    if (kind !== 'global') return null;
+    const { count = 0, limit = 0, items = [] } = data?.global_pins ?? {};
+    const sameSlot = (data?.rows ?? []).find((row) => row.slot === slot && row.id !== id && row.pinned === 'global');
+    if (sameSlot) return items.filter((item) => item.id === sameSlot.id);
+    const already = data?.rows?.find((row) => row.id === id)?.pinned === 'global';
+    return count + (already ? 0 : 1) > limit ? items : null;
+  }
+  /** 고정 종류 설명 한 줄 — 분야 대표는 지금 분야 확률, 첫 화면 고정은 상한을 붙인다(같은 함수 값). */
+  const pinHelp = (kind) => (kind === 'global' ? `${pins.global.help}(최대 ${state.preview?.global_pins?.limit ?? '-'}개).`
+    : kind === 'slot' ? `${pins.slot.help}(지금 분야가 뽑힐 확률 ${chanceText(slotChance(state.preview) ?? 0)}).` : '');
+  const pinNotice = (data, slot, id, kind) => `${pinHelp(kind)} ${pinImpact(data, slot, id, true, kind)}`.trim();
+  /** 고정 선택 — 고른 종류의 설명(도움말 줄)과 영향은 고정을 골랐을 때만 보인다. 영향은 오늘 미리보기(state.preview).
    *  slot()·id = 지금 폼의 분야 키와 자기 행 id(새 질문은 null). */
   function pinWarning(built, slot, id, live) {
     const line = el('small', 'field-warn'), help = built.nodes.pinned.closest('label').nextElementSibling;
     line.setAttribute('role', 'status');
     help.after(line);  // 도움말 줄 다음
     const update = () => {
-      const on = built.nodes.pinned.checked;
-      help.hidden = !on;
-      line.textContent = on ? pinImpact(state.preview, slot(), id, live) : '';
+      const kind = built.nodes.pinned.value;
+      help.hidden = !kind;
+      help.textContent = pinHelp(kind);
+      line.textContent = kind ? pinImpact(state.preview, slot(), id, live, kind) : '';
     };
     built.nodes.pinned.addEventListener('change', update);
     update();
@@ -217,7 +251,7 @@ export function initManage({ api, el, table, valueText, state, openDialog, showR
         if (!key) { line.textContent = '분야를 고르면 첫 화면에 뜰 확률(예상치)을 보입니다.'; return; }
         const ticket = ++asked;
         try {
-          const result = await estimate({ slot: key, pinned: built.nodes.pinned.checked, date: built.nodes.valid_from.value });
+          const result = await estimate({ slot: key, pinned: built.nodes.pinned.value, date: built.nodes.valid_from.value });
           if (ticket === asked) line.textContent = `첫 화면에 뜰 확률 ${chanceText(result.probability)} (${result.date} 기준 · 등록 전 예상치)`;
         } catch (error) { if (ticket === asked) line.textContent = `예상 확률을 계산하지 못했습니다: ${errorText(error, '다시 시도해 주세요.')}`; }
       };
@@ -294,5 +328,5 @@ export function initManage({ api, el, table, valueText, state, openDialog, showR
     actions().append(built.form);
   }
 
-  return { starterPanel, starterTools, openStarterCreate, openPasswordChange, pinNotice };
+  return { starterPanel, starterTools, openStarterCreate, openPasswordChange, pinNotice, pinBlockers };
 }

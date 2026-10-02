@@ -1,10 +1,10 @@
-import { initManage, roleLabel } from "/static/lib/admin_manage.js?v=28";
+import { initManage, roleLabel } from "/static/lib/admin_manage.js?v=33";
 import { initCharts } from "/static/lib/admin_charts.js?v=9";
 import { renderBody } from "/static/lib/md.js";
 import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceDomain, sourceTitle, CARD_LABELS } from "/static/lib/sources.js";
 
   const $ = (id) => document.getElementById(id);
-  const state = { page: 0, tz: null, tab: 'dashboard', statistics: null, statisticsView: 'all', startersView: 'calendar', usersPage: 0, startersPage: 0, auditPage: 0, sort: {}, applied: {}, currentSession: null, listScroll: 0, username: null, role: null, roles: [], passwordMin: 0, changeMinBase: 0, excludedAccounts: 0, rbtiNames: {}, includeInternal: false, starterSlots: [], starterSummary: null, preview: null, openSlots: new Set(), slotQuery: '', pinnedSlotsOnly: false, popularShown: 20, calendar: null, calMonth: null, range: null, pendingMember: null, pendingStarter: null, periodFrom: null };
+  const state = { page: 0, tz: null, tab: 'dashboard', statistics: null, statisticsView: 'all', startersView: 'calendar', usersPage: 0, startersPage: 0, auditPage: 0, sort: {}, applied: {}, currentSession: null, listScroll: 0, username: null, role: null, roles: [], passwordMin: 0, changeMinBase: 0, excludedAccounts: 0, rbtiNames: {}, includeInternal: false, starterSlots: [], starterSummary: null, preview: null, openSlots: new Set(), slotQuery: '', pinnedSlotsOnly: false, popularShown: 20, calendar: null, calMonth: null, range: null, pendingMember: null, pendingStarter: null, dayRestore: null, pendingPin: null, periodFrom: null };
   const queryForms = {
     sessions: {form: 'filters', page: 'page', fields: {q: 'q', since: 'since', until: 'until', rating: 'rating', status: 'status', rbti: 'sessions-rbti'}},
     users: {form: 'users-filters', page: 'usersPage', fields: {q: 'users-q', rbti: 'users-rbti', nickname: 'users-nick'}},
@@ -872,6 +872,16 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   const day = (value) => value ?? '-';
   const flag = (on, yes, no = '-') => (on ? yes : no);
   const SOURCE_KINDS = { auto: '자동 생성', manual: '직접 등록' };
+  /** 고정 종류(서버 starters.PIN_NAMES의 이름) — 이름·한 줄 설명·순위 한 곳. 첫 화면 고정과 분야 고정은
+   *  같은 아이콘을 쓰지 않고 이 이름(배지)으로 구분한다. */
+  const PINS = {
+    '': { label: '고정 안 함', rank: 0 },
+    // 이름에 조건을 담는다 — 분야 대표는 그 분야가 뽑힌 날에만, 첫 화면 고정은 날마다(둘 다 '항상'이라 쓰지 않는다).
+    slot: { label: '분야 대표 고정', rank: 1, help: '분야가 뽑힌 날에만 그 분야 대표로 나와요' },
+    global: { label: '첫 화면 고정', rank: 2, help: '날마다 첫 화면에 반드시 나와요' },
+  };
+  const pinRank = (row) => PINS[row.pinned]?.rank ?? 0;  // 모르는 값(재기동 전 옛 응답)은 고정 아님
+  const pinBadge = (kind) => (PINS[kind]?.rank ? el('em', `pin-badge pin-${kind}`, PINS[kind].label) : null);
   /** RBTI 배지 버튼 — 누르면 그 유형으로 거른다(행 클릭과 겹치지 않게 전파를 막는다). */
   function rbtiButton(name, code) {
     const button = el('button', 'rbti', code);
@@ -900,7 +910,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     { key: 'label', label: '분야', sort: true }, { key: 'text', label: '문장' }, { key: 'source', label: '등록 방식', format: (v) => SOURCE_KINDS[v] ?? v },
     // 자동 = 생성 실행일, 직접 등록 = 등록 시각의 날짜(서버 정렬도 같은 값).
     { key: 'run_date', label: '생성·등록일', sort: true, text: (row) => row.run_date ?? (row.created_at ? stamp(row.created_at).slice(0, 10) : '-') },
-    { key: 'pinned', label: '고정', format: (v) => flag(v, '고정'), sort: true }, { key: 'live', label: '지금 노출', sort: true, text: (row) => (row.live ? '노출 중' : notLiveReason(row.not_live_reason)) },
+    { key: 'pinned', label: '고정', format: (v) => pinBadge(v) ?? '-', sort: true }, { key: 'live', label: '지금 노출', sort: true, text: (row) => (row.live ? '노출 중' : notLiveReason(row.not_live_reason)) },
     { key: 'probability', label: '첫 화면 확률', hint: PROBABILITY_HINT, text: (row) => listProbability(row) },
     { key: 'uses', label: '사용 수', format: (v) => (typeof v === 'number' ? num(v) : v), sort: true, hint: METRIC_HINTS.uses },
   ];
@@ -914,26 +924,29 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   })[key] ?? (key ? key : '-');
   const percentText = (p) => (p == null ? '-' : `${(p * 100).toFixed(1)}%`);
   /** 첫 화면 확률 글자 — 소수 한 자리(확률은 날짜 시드라 흔들리지 않는다), 1% 미만은 '<1%'. */
-  const chanceText = (p) => (p > 0 && p < 0.01 ? '<1%' : percentText(p));
-  /** 분야 하나가 그날 첫 화면에 뽑힐 확률 — 미리보기 응답의 질문 수 ÷ 분야 수(날짜 패널 머리말·고정 예상이 같은 값).
-   *  added = 그 풀에 아직 없는 새 분야가 하나 더해질 때 1(분모가 하나 는다). */
-  const slotProbability = (data, added = 0) => (data?.slot_count ? Math.min(1, data.n / (data.slot_count + added)) : null);
+  const chanceText = (p) => (p >= 1 ? '100%' : p > 0 && p < 0.01 ? '<1%' : percentText(p));
+  /** 분야 하나가 그날 첫 화면에 뽑힐 확률 — 첫 화면 고정이 먼저 차지한 칸·분야를 뺀 남은 칸 ÷ 남은 분야
+   *  (날짜 패널 머리말·고정 예상이 같은 값). added = 그 풀에 아직 없는 새 분야가 하나 더해질 때 1. */
+  const slotProbability = (data, added = 0) => {
+    const pins = data?.global_pins ?? { used: 0, slots: 0 }, slots = (data?.slot_count ?? 0) - pins.slots + added;
+    return slots > 0 ? Math.min(1, Math.max(0, data.n - pins.used) / slots) : null;
+  };
   /** 확률이 0인 노출 중 질문의 이유(서버 preview zero_reason — 고정에 가려짐·실제 중복 건너뜀·표본에 안 나옴). 0% 대신 이것. */
   const ZERO_REASONS = {
-    pinned_sibling: () => '같은 분야의 고정 질문이 대신 나와요',
-    duplicate: () => '같은 책을 가리키는 다른 질문과 겹쳐 빠져요',
-    rare: (draws) => `아주 드물게 나와요(${(100 / draws).toFixed(2)}% 미만)`,  // 추첨 draws번 중 한 번도 안 나옴
+    pinned_sibling: '같은 분야의 고정 질문(분야 대표·첫 화면)이 대신 나와요',
+    duplicate: '같은 책을 가리키는 다른 질문과 겹쳐 빠져요',
+    no_room: '첫 화면 고정이 칸을 모두 차지해요',
   };
-  /** 확률 칸 글자 — 0보다 크면 %, 0이면 이유. row = preview 행({probability, zero_reason}), draws = 추첨 횟수. */
-  const probabilityText = (row, draws) => (row.probability > 0 ? chanceText(row.probability) : ZERO_REASONS[row.zero_reason]?.(draws) ?? '-');
+  /** 확률 칸 글자 — 0보다 크면 %, 0이면 이유. row = preview 행({probability, zero_reason}). */
+  const probabilityText = (row) => (row.probability > 0 ? chanceText(row.probability) : ZERO_REASONS[row.zero_reason] ?? '-');
   /** 목록 칸의 확률 — 오늘 미리보기(state.preview)의 그 행 값. 0이면 이유 약자 + 툴팁(전체 이유), 노출 안 됨은 '-'. */
-  const ZERO_SHORT = { pinned_sibling: '고정에 가려짐', duplicate: '중복 제외', rare: '아주 드묾' };
+  const ZERO_SHORT = { pinned_sibling: '고정에 가려짐', duplicate: '중복 제외', no_room: '칸 없음' };
   function listProbability(row) {
     const hit = row.live && state.preview?.rows.find((item) => item.id === row.id);
     if (!hit) return '-';
     if (hit.probability > 0) return chanceText(hit.probability);
     const cell = el('span', 'dim', ZERO_SHORT[hit.zero_reason] ?? '-');
-    cell.title = probabilityText(hit, state.preview.draws);
+    cell.title = probabilityText(hit);
     return cell;
   }
   // 패널엔 슬롯 내부 키를 싣지 않는다 — 운영자에겐 칩 라벨('슬롯')이 이름이다. 확률은 미리보기(날짜·개수)의 행별 값.
@@ -1023,7 +1036,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       head.hidden = record;
       chips.replaceChildren(...data.sample.map((chip) => {
         const node = el('span', 'preview-chip');
-        node.append(el('small', null, chip.label), el('span', null, chip.text));
+        node.append(el('small', null, chip.label), ...(chip.pinned === 'global' ? [' ', pinBadge('global')] : []), el('span', null, chip.text));
         node.title = chip.text;
         return node;
       }));
@@ -1087,19 +1100,39 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   const narrow = matchMedia('(max-width: 720px)');
   narrow.addEventListener('change', () => { if (state.calendar && state.startersView === 'calendar') renderCalendar(); });
   const monthText = (month) => `${month.slice(0, 4)}년 ${Number(month.slice(5))}월`;
-  const pinIcon = () => $('pin-icon').content.firstElementChild.cloneNode(true);
   const addDays = (iso, n) => new Date(Date.parse(`${iso}T00:00:00Z`) + n * 864e5).toISOString().slice(0, 10);
   const weekdayOf = (iso) => (new Date(`${iso}T00:00:00Z`).getUTCDay() + 6) % 7;  // 월 = 0
 
+  /** 달력 위 '지금 첫 화면' — 오늘 미리보기 한 벌(칩) + 다른 예시 보기 + 첫 화면 고정 사용 수.
+   *  확률은 날짜 시드라 시드와 무관해 이 응답이 목록 확률 칸·고정 경고의 state.preview도 된다.
+   *  첫 화면 고정은 늘 들어가므로 따로 줄을 두지 않고 칩의 배지로 보인다(옛 '고정 · 기간 없음' 줄은
+   *  분야 고정을 전역처럼 보여 헷갈렸다). */
+  function loadNow(seed = newSeed()) {
+    return request('cal-now', `/admin/api/starters/preview?seed=${seed}`, (data) => {
+      state.preview = data;
+      const box = $('cal-now'), chips = el('div', 'now-chips'), redraw = el('button', 'link-button', '다른 예시 보기');
+      redraw.type = 'button';
+      redraw.onclick = () => loadNow();
+      chips.append(...data.sample.map((chip) => {
+        const node = el('span', `now-chip${chip.pinned === 'global' ? ' pin-global' : ''}`);
+        node.append(...(chip.pinned === 'global' ? [pinBadge('global')] : []), el('small', null, chip.label), el('span', null, chip.text));
+        node.title = `${chip.pinned === 'global' ? '첫 화면 고정 · ' : ''}${chip.label} · ${chip.text}`;
+        return node;
+      }));
+      const { count = 0, limit = 0 } = data.global_pins ?? {}, head = el('div', 'now-head');
+      // 사용 수 = 등록 검사(422)와 같은 셈(끝나지 않은 첫 화면 고정) — 상한을 넘으면(설정을 낮춘 경우 등) 서빙이 먼저 등록한 것부터 자른다.
+      head.append(el('b', null, '지금 첫 화면'), el('span', 'now-meta', `첫 화면 고정 ${num(count)}/${num(limit)}개`), redraw);
+      box.replaceChildren(head, chips, ...(count > limit ? [el('p', 'notice-warn', `첫 화면 고정이 ${num(count)}개라 상한 ${num(limit)}개를 넘었어요 — 먼저 등록한 ${num(limit)}개만 나와요.`)] : []));
+    });
+  }
   function loadCalendar() {
     return request('calendar', `/admin/api/starters/calendar${state.calMonth ? `?month=${state.calMonth}` : ''}`, (data) => {
       state.calendar = data;
       state.calMonth = data.month;
       state.starterSlots = data.slots;
-      // 편집 폼의 '다른 질문 n개가 가려집니다'가 셀 후보 — 목록·날짜 패널을 열지 않았어도 오늘 후보를 한 번 받아 둔다.
-      todayPreview();
       writeHash();
       renderCalendar();
+      loadNow();
     });
   }
   /** 막대 조각 — 한 주(또는 한 줄) 안에서 [시작, 끝] 날짜로 잘린 기간. 열린 끝은 멀리 둔다. */
@@ -1121,12 +1154,12 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   /** 막대 글자 — (핀) 라벨 · 문장, 끝을 넘으면 → (좁은 화면은 '~종료일'). */
   function barLabel(item, compact) {
     const text = el('span', 'cal-bar-text');
-    if (item.pinned) text.append(pinIcon());
+    if (PINS[item.pinned]?.rank) text.append(el('b', `bar-tag pin-${item.pinned}`, item.pinned === 'global' ? '첫 화면' : '분야 대표'));
     text.append(`${item.label} · ${item.text}`);
     if (compact) text.append(` ${item.valid_until ? `~${item.valid_until.slice(5)}` : '~계속'}`);
     return text;
   }
-  const barTitle = (item) => `${item.pinned ? '고정 · ' : ''}${item.label} · ${item.text} (${item.valid_from ?? '처음부터'} ~ ${item.valid_until ?? '계속'})`;
+  const barTitle = (item) => `${PINS[item.pinned]?.rank ? `${PINS[item.pinned].label} · ` : ''}${item.label} · ${item.text} (${item.valid_from ?? '처음부터'} ~ ${item.valid_until ?? '계속'})`;
   /** 칸 요약 글자 — 날짜 종류마다 뜻이 다르다(패널 머리가 자세히 설명한다). */
   function daySummary(cell) {
     const box = el('span', 'cal-sum');
@@ -1145,13 +1178,6 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   function renderCalendar() {
     const data = state.calendar, editor = hasRole('editor');
     $('cal-month').textContent = monthText(data.month);
-    $('cal-always').replaceChildren(...(data.pinned_always.length ? [el('b', null, '고정 · 기간 없음'), ...data.pinned_always.map((item) => {
-      const chip = el('span', 'cal-always-chip');
-      chip.append(pinIcon(), `${item.label} · ${item.text}`);
-      chip.title = barTitle(item);
-      return chip;
-    })] : []));
-    $('cal-always').hidden = !data.pinned_always.length;
     // 상단 안내 한 문단 — 기간 없는 직접 등록(막대가 없어 달력에 안 보인다)은 늘, 기간 질문 0개 안내는 그때만.
     const { count, slots } = data.ongoing, note = [];
     if (count) {
@@ -1182,7 +1208,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
         if (!cell) box.append(el('span', 'cal-date', iso.slice(5).replace('-', '/')), daySummary({ kind: 'past', generated: outside.get(iso) }));
         const here = placed.filter((bar) => bar.start <= iso && bar.end >= iso);
         for (let lane = 0; lane < LANES; lane++) {
-          const bar = here.find((b) => b.lane === lane), line = el('span', bar ? `cal-bar${bar.item.pinned ? ' pinned' : ''}` : 'cal-bar empty');
+          const bar = here.find((b) => b.lane === lane), line = el('span', bar ? `cal-bar${PINS[bar.item.pinned]?.rank ? ` pinned pin-${bar.item.pinned}` : ''}` : 'cal-bar empty');
           if (bar) {
             // 글자는 주마다 조각의 첫 칸에 반복. 끝 모양이 기간을 말한다 — 실제 시작·종료 칸만 둥글고, 이어지면 각지다.
             if (iso === bar.start) line.append(barLabel(bar.item));
@@ -1204,7 +1230,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     state.flashId = null;  // 강조는 등록 직후 한 번
   }
   /** 막대를 누르면 그 질문 패널 — 운영자 이상은 편집 폼(문장·우선 노출·사용·기간), 뷰어는 읽기. 저장하면 캘린더를 다시 읽는다. */
-  const SCHEDULE_DETAIL = [{ key: 'label', label: '분야' }, { key: 'text', label: '문장' }, { key: 'pinned', label: '고정(이 분야에서 항상 먼저)', format: (v) => flag(v, '고정') },
+  const SCHEDULE_DETAIL = [{ key: 'label', label: '분야' }, { key: 'text', label: '문장' }, { key: 'pinned', label: '고정', format: (v) => PINS[v]?.label ?? '-' },
     { key: 'valid_from', label: '노출 시작일', format: (v) => v ?? '처음부터' }, { key: 'valid_until', label: '노출 종료일', format: (v) => v ?? '계속' }];
   async function openSchedule(item) {
     const editor = hasRole('editor');
@@ -1240,7 +1266,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
         head.textContent = `${cell.date.slice(5)} (${WEEKDAYS[weekdayOf(cell.date)]})`;
         if (cell.kind === 'today') head.append(el('em', null, '오늘'));
         for (const bar of placed.filter((b) => b.start === cell.date)) {
-          const line = el('span', `cal-bar-line${bar.item.pinned ? ' pinned' : ''}`);
+          const line = el('span', `cal-bar-line${PINS[bar.item.pinned]?.rank ? ` pinned pin-${bar.item.pinned}` : ''}`);
           line.append(barLabel(bar.item, true));
           row.append(line);
         }
@@ -1314,8 +1340,17 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     const cell = state.calendar.days.find((day) => day.date === iso);
     if (!(await openDialog(`${iso} · ${DAY_KINDS[cell.kind]}`))) return;
     // 개요(분야 목록) → 예시(첫 화면 한 벌) → 동작(기간 선택) 순. 분야 목록은 미리보기 응답으로 채운다.
-    const box = $('record-actions'), pool = el('div', 'day-pool');
-    box.append(pool, previewView(iso, 'day-preview', (data) => pool.replaceChildren(...dayPool(data, () => openDayPanel(iso)))));
+    // 저장 뒤 다시 읽은 패널은 같은 스크롤 자리로 돌아간다(state.dayRestore — setPin이 남긴다, 한 번 쓰고 지운다).
+    const box = $('record-actions'), pool = el('div', 'day-pool'), fill = (data) => {
+      pool.replaceChildren(...dayPool(data, () => openDayPanel(iso)));
+      if (state.dayRestore) { $('record-dialog').scrollTop = state.dayRestore.scroll; state.dayRestore = null; }
+    };
+    // 오늘의 첫 화면 예시는 달력 위 '지금 첫 화면'이 늘 보인다 — 패널엔 분야 목록만(같은 예시를 두 번 두지 않는다).
+    if (cell.kind === 'today') {
+      pool.id = 'day-pool';  // request()가 오류 문구·다시 시도를 여기에 그린다
+      box.append(pool);
+      request('day-pool', `/admin/api/starters/preview?${new URLSearchParams({ date: iso, seed: 1 })}`, fill);
+    } else box.append(pool, previewView(iso, 'day-preview', fill));
     if (hasRole('editor') && cell.kind !== 'past') {
       const tools = el('div', 'day-tools'), pick = el('button', 'crema-button', '이 날부터 기간 선택');
       pick.type = 'button';
@@ -1346,13 +1381,18 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     for (const row of data.rows) (bySlot.get(row.slot) ?? bySlot.set(row.slot, []).get(row.slot)).push(row);
     // 분야는 이름순(분야 확률은 균등 추첨이라 거의 같아 순서 정보가 없다 — 머리말에 한 번만 쓴다),
     // 분야 안 질문은 확률 내림차순(같으면 고정 먼저 · 문장). 확률이 날짜 시드라 열 때마다 같은 순서다.
-    for (const rows of bySlot.values()) rows.sort((a, b) => (b.probability ?? 0) - (a.probability ?? 0) || b.pinned - a.pinned || a.text.localeCompare(b.text, 'ko'));
+    for (const rows of bySlot.values()) rows.sort((a, b) => (b.probability ?? 0) - (a.probability ?? 0) || pinRank(b) - pinRank(a) || a.text.localeCompare(b.text, 'ko'));
     const slots = [...data.slots].sort((a, b) => a.label.localeCompare(b.label, 'ko'));
     // 분야 확률 = 하루 질문 수 ÷ 분야 수(분야는 균등하게 섞인다 — 중복 건너뜀 같은 드문 경우만 조금 다르다).
     const slotChance = slotProbability(data);
     const head = el('div', 'slot-head'), count = el('h4', 'day-heading'), list = el('div', 'slot-list');
     head.append(count);
-    const rule = record ? null : el('p', 'slot-rule', `매일 분야 ${num(slots.length)}개 중 ${num(Math.min(data.n, slots.length))}개가 무작위로 뽑히고(분야마다 약 ${chanceText(slotChance)}), 뽑힌 분야에서 질문 하나가 나와요. 고정 질문이 있으면 그 질문이 나와요.`);
+    // 뽑히는 규칙 한 줄 — 첫 화면 고정이 먼저 칸을 차지하고, 남은 칸을 남은 분야에서 무작위로(분야 고정이 있으면 그 질문).
+    const used = data.global_pins?.used ?? 0, freeSlots = slots.length - (data.global_pins?.slots ?? 0);
+    // '분야마다 약 x%'는 첫 화면 고정이 있을 때만 강조해 보인다(그때 값이 n/분야 수에서 달라진다). 분야 줄마다는 싣지 않는다(모두 같다).
+    const rule = record ? null : el('p', 'slot-rule', `${used ? `첫 화면 고정 ${num(used)}개가 날마다 먼저 나오고, 나머지 ` : '매일 '}분야 ${num(freeSlots)}개 중 ${num(Math.min(Math.max(0, data.n - used), freeSlots))}개가 무작위로 뽑혀요`);
+    if (rule && used) rule.append(' — ', el('b', null, `분야마다 약 ${chanceText(slotChance)}`));
+    rule?.append('. 뽑힌 분야에서 질문 하나가 나오고, 분야 대표 고정이 있으면 그 질문이 나와요.');
     const tools = el('div', 'slot-tools'), search = el('input'), pinnedOnly = el('input'), pinnedLabel = el('label', 'check');
     search.type = 'search';
     search.placeholder = '분야 이름 검색';
@@ -1382,12 +1422,12 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       const name = el('span', 'slot-name');
       name.append(el('span', 'slot-caret'), el('b', null, slot.label), el('small', null, `질문 ${num(rows.length)}`));
       toggle.append(name);
-      const pinned = rows.filter((row) => row.pinned);
+      const pinned = rows.filter(pinRank).sort((a, b) => pinRank(b) - pinRank(a));
       if (pinned.length) {
         const mark = el('span', 'slot-pin');
-        mark.append(pinIcon(), el('span', null, pinned[0].text));
+        mark.append(pinBadge(pinned[0].pinned), el('span', null, pinned[0].text));
         if (pinned.length > 1) mark.append(` 외 ${num(pinned.length - 1)}`);
-        mark.title = `고정 · ${pinned.map((row) => row.text).join(' / ')} — 이 분야가 뽑히면 고정 질문이 나와요.`;
+        mark.title = pinned.map((row) => `${PINS[row.pinned].label} · ${row.text}`).join(' / ');
         toggle.append(mark);
       }
       const sync = () => {
@@ -1396,7 +1436,12 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
         toggle.setAttribute('aria-expanded', String(open));
         body.hidden = !open;
         // 질문 줄은 처음 펼칠 때 만든다(분야가 수십 개라 미리 다 그리지 않는다).
-        if (open && !body.childElementCount) body.append(...rows.map(rowLine));
+        if (open && !body.childElementCount) {
+          body.append(...rows.map(rowLine));
+          // 하던 고정 확인(상한 목록에서 다른 고정을 푼 뒤 다시 읽은 경우 등)은 같은 행에 다시 띄운다.
+          const pending = state.pendingPin && rows.find((row) => row.id === state.pendingPin.id);
+          if (pending) confirmPin(pending, body.querySelector(`.day-row[data-id="${pending.id}"]`), state.pendingPin.kind);
+        }
       };
       toggle.onclick = () => { state.openSlots[state.openSlots.has(slot.slot) ? 'delete' : 'add'](slot.slot); sync(); };
       sync();
@@ -1405,16 +1450,20 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     }
     /** 질문 한 줄 — 문장 · 확률(0이면 이유, 기록은 등록 방식) · (운영자) 관리 ▾. */
     function rowLine(row) {
-      const line = el('div', `day-row${row.pinned ? ' pinned' : ''}`), text = el('span', 'day-text'), side = el('span', 'day-side');
-      if (row.pinned) text.append(pinIcon());
+      const line = el('div', `day-row${pinRank(row) ? ' pinned' : ''}${state.dayRestore?.flash === row.id ? ' flash' : ''}`), text = el('span', 'day-text'), side = el('span', 'day-side');
+      line.dataset.id = row.id;
+      if (pinRank(row)) text.append(pinBadge(row.pinned), ' ');
       text.append(row.text);
-      side.append(probabilityCell('day-prob', row.probability, row.probability == null ? SOURCE_KINDS[row.source] ?? row.source : probabilityText(row, data.draws)));
+      side.append(probabilityCell('day-prob', row.probability, row.probability == null ? SOURCE_KINDS[row.source] ?? row.source : probabilityText(row)));
       line.append(text, side);
       // 주 동작(고정/고정 해제)은 바로 보이는 버튼, 노출 끄기는 작은 보조 링크(메뉴 단계 없이).
       if (editable) {
-        const pin = el('button', 'crema-button small', row.pinned ? '고정 해제' : '고정'), stop = el('button', 'link-button subtle', '노출 끄기');
-        pin.type = stop.type = 'button';
-        pin.onclick = () => (row.pinned ? togglePinned(row, reopen) : confirmPin(row, line));
+        // 고정은 작은 선택 하나(고정 안 함 · 분야 고정 · 첫 화면 고정) — 거는 쪽은 그 자리에서 영향을 보이고 확인받는다.
+        const pin = el('select', 'pin-select'), stop = el('button', 'link-button subtle', '노출 끄기');
+        pin.setAttribute('aria-label', '고정');
+        pin.append(...Object.entries(PINS).map(([kind, { label }]) => new Option(label, kind, false, kind === row.pinned)));
+        stop.type = 'button';
+        pin.onchange = () => { const kind = pin.value; pin.value = row.pinned; kind ? confirmPin(row, line, kind) : setPin(row, kind, reopen); };
         stop.onclick = () => stopStarter(row, reopen);
         const actions = el('span', 'day-actions');
         actions.append(pin, stop);
@@ -1423,33 +1472,56 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       return line;
     }
     /** 고정 확인 — 그 줄 바로 아래에서 무엇이 바뀌는지(목록 편집 패널과 같은 문구) 보이고 확인받는다. */
-    function confirmPin(row, line) {
-      if (line.nextElementSibling?.classList.contains('pin-confirm')) return;
-      const box = el('div', 'pin-confirm'), ok = el('button', 'crema-button primary', '고정'), cancel = el('button', 'crema-button', '취소');
+    function confirmPin(row, line, kind) {
+      if (line.nextElementSibling?.classList.contains('pin-confirm')) line.nextElementSibling.remove();
+      // 확인 중인 선택은 상태에 남긴다 — 다시 읽어도(다른 고정 해제 뒤) 같은 선택·확인 박스로 돌아온다.
+      state.pendingPin = { id: row.id, kind };
+      const select = line.querySelector('.pin-select');
+      if (select) select.value = kind;
+      const box = el('div', 'pin-confirm'), ok = el('button', 'crema-button primary', PINS[kind].label), cancel = el('button', 'crema-button', '취소');
       box.setAttribute('role', 'group');
       box.setAttribute('aria-label', '고정 확인');
       ok.type = cancel.type = 'button';
-      ok.onclick = () => togglePinned(row, reopen);
-      cancel.onclick = () => box.remove();
-      box.append(el('p', null, manage.pinNotice(data, row.slot, row.id)), ok, cancel);
+      const error = el('p', 'error');  // 저장 오류는 이 자리에(맨 위 띠가 아니라)
+      error.hidden = true;
+      ok.onclick = () => setPin(row, kind, reopen, (message) => { error.textContent = message; error.hidden = false; });
+      cancel.onclick = () => { state.pendingPin = null; if (select) select.value = row.pinned; box.remove(); };
+      box.append(el('p', null, manage.pinNotice(data, row.slot, row.id, kind)), error);
+      // 상한·분야당 하나에 걸리면 확인은 끄고, 지금 첫 화면 고정을 그 자리에서 풀 수 있게 보인다.
+      const blockers = manage.pinBlockers(data, row.slot, row.id, kind);
+      if (blockers) {
+        ok.disabled = true;
+        const list = el('ul', 'pin-blockers');
+        list.append(...blockers.map((item) => {
+          const li = el('li', null, `${item.label} · ${item.text} `), release = el('button', 'link-button', '해제');
+          release.type = 'button';
+          release.onclick = () => setPin({ id: item.id, pinned: 'global' }, '', reopen, (message) => { error.textContent = message; error.hidden = false; });
+          li.append(release);
+          return li;
+        }));
+        box.append(list);
+      }
+      box.append(ok, cancel);
       line.after(box);
-      ok.focus();
+      (blockers ? cancel : ok).focus();
     }
   }
   /** 패널의 쓰기 — 기존 편집 API(expected 동봉). 성공하면 캘린더와 패널을 다시 읽고, 실패는 서버 문구. */
-  async function starterWrite(path, method, body, reopen) {
+  async function starterWrite(path, method, body, reopen, report = showError) {
     try {
       await api(path, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       state.preview = null;  // 오늘 확률·고정 경고가 바뀐 풀로 다시 계산되게
       await loadCalendar();
       reopen();
       return true;
-    } catch (error) { if (error.name !== 'AbortError') showError(errorText(error, '저장하지 못했습니다. 다시 시도해 주세요.')); return false; }
+    } catch (error) { if (error.name !== 'AbortError') report(errorText(error, '저장하지 못했습니다. 다시 시도해 주세요.')); return false; }
   }
-  /** 고정/해제 — 끝나면 TOAST_MS 동안 '되돌리기'(같은 API로 반대 값, expected 동봉). */
-  async function togglePinned(row, reopen) {
-    const flip = (from) => starterWrite(`/admin/starters/${row.id}`, 'PATCH', { changes: { pinned: !from }, expected: { pinned: from } }, reopen);
-    if (await flip(row.pinned)) showToast(row.pinned ? '고정을 풀었습니다.' : '고정했습니다.', { label: '되돌리기', run: () => flip(!row.pinned) });
+  /** 고정 바꾸기(이름 — '' · slot · global) — 끝나면 TOAST_MS 동안 '되돌리기'(같은 API로 이전 값, expected 동봉). */
+  async function setPin(row, kind, reopen, report) {
+    if (state.pendingPin?.id === row.id) state.pendingPin = null;  // 확인한 그 행을 저장하면 하던 확인은 끝
+    // 다시 읽은 패널이 같은 자리(스크롤·펼친 분야)로 돌아오고 바뀐 행을 잠깐 강조한다(openDayPanel이 쓴다).
+    const write = (from, to) => { state.dayRestore = { scroll: $('record-dialog').scrollTop, flash: row.id }; return starterWrite(`/admin/starters/${row.id}`, 'PATCH', { changes: { pinned: to }, expected: { pinned: from } }, reopen, report); };
+    if (await write(row.pinned, kind)) showToast(kind ? `${PINS[kind].label}했습니다.` : '고정을 풀었습니다.', { label: '되돌리기', run: () => write(kind, row.pinned) });
   }
   /** 노출 끄기 — 영향(첫 화면 후보에서 빠짐·다시 켜는 곳)을 먼저 보이고 확인받는다. */
   async function stopStarter(row, reopen) {
@@ -1476,7 +1548,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     username: '계정명', role: '역할', is_active: '활성', note: '메모', text: '문장', pinned: '고정', active: '노출 설정', valid_from: '노출 시작일', valid_until: '노출 종료일',
     slot: '분야', status: '결과', inserted: '추가 수', force: '다시 생성', user_id: '회원번호', turns: '질의 수', deleted_at: '삭제 요청 시각', app_name: '앱',
   };
-  const auditValue = (field, value) => (value == null ? '-' : field === 'role' ? roleLabel(value) : field === 'slot' ? slotLabel(value) : field === 'status' ? GENERATE_STATUS[value] ?? value : field === 'active' ? (value ? '켜짐' : '꺼짐') : typeof value === 'boolean' ? (value ? '예' : '아니오') : typeof value === 'object' ? JSON.stringify(value) : String(value));
+  const auditValue = (field, value) => (value == null ? '-' : field === 'role' ? roleLabel(value) : field === 'slot' ? slotLabel(value) : field === 'status' ? GENERATE_STATUS[value] ?? value : field === 'active' ? (value ? '켜짐' : '꺼짐') : field === 'pinned' ? PINS[value === true ? 'slot' : value === false ? '' : value]?.label ?? String(value) : typeof value === 'boolean' ? (value ? '예' : '아니오') : typeof value === 'object' ? JSON.stringify(value) : String(value));
   /** 바뀐 필드 — [라벨, 이전, 이후]. 'by'(CLI 표시)는 계정 칸이 말하므로 뺀다. */
   const auditChanges = (row) => [...new Set([...Object.keys(row.before ?? {}), ...Object.keys(row.after ?? {})])].filter((field) => field !== 'by')
     .map((field) => [AUDIT_FIELDS[field] ?? field, row.before && field in row.before ? auditValue(field, row.before[field]) : null, row.after && field in row.after ? auditValue(field, row.after[field]) : null]);
@@ -1546,7 +1618,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     const summary = el('div', `status-banner${row.live ? ' live' : ''}`), status = el('p');
     status.append(el('b', null, row.live ? '지금 노출 중' : '노출 안 됨'), row.live ? ' · 첫 화면 확률 ' : ` — ${notLiveReason(row.not_live_reason)}`);
     if (row.live) status.append(listProbability(row), infoMark(PROBABILITY_HINT));
-    summary.append(status, el('p', 'status-meta', `${row.label} · ${row.pinned ? '고정됨(이 분야에서 항상 먼저)' : '고정 안 됨'}`));
+    summary.append(status, el('p', 'status-meta', `${row.label} · ${PINS[row.pinned]?.label ?? '고정 안 함'}`));
     $('record-actions').prepend(summary);
   }
 
@@ -1878,7 +1950,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   }
 
 
-  const manage = initManage({ api, el, table, valueText, state, openDialog, showRecord, reload: () => { state.preview = null; loaders[state.tab](); }, onCreated: starterCreated, slotLabel, generateStatus: GENERATE_STATUS, errorText, chanceText, slotProbability, todayPreview });
+  const manage = initManage({ api, el, table, valueText, state, openDialog, showRecord, reload: () => { state.preview = null; loaders[state.tab](); }, onCreated: starterCreated, slotLabel, generateStatus: GENERATE_STATUS, errorText, chanceText, slotProbability, todayPreview, pins: PINS });
   /** 직접 등록 성공 — 패널을 닫고 알림, 다시 읽은 화면에서 새 질문(캘린더 막대)을 잠깐 강조한다. */
   function starterCreated(created) {
     closePanel();
@@ -1916,6 +1988,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   };
   $('record-close').onclick = closePanel;
   $('record-dialog').onclose = () => {
+    state.pendingPin = null;  // 패널을 닫으면 하던 고정 확인도 끝
     $('record-view').replaceChildren();
     $('record-actions').replaceChildren();
     for (const row of document.querySelectorAll('tr[aria-current]')) row.removeAttribute('aria-current');
