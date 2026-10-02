@@ -115,6 +115,39 @@ def goods_no_from_url(url: str) -> str | None:
     return match.group(1) if match else None
 
 
+def edition_folds(records) -> dict:
+    """같은 작품의 eBook 판 → 종이책 판 키 매핑(`{eBook 키: 종이책 키}`) — 판 접기의 단일 판정.
+
+    `records`는 `(키, 레코드)` 쌍이고 레코드는 `is_ebook`·`other_formats`·`goods_no`(없으면
+    `url`에서 읽는다)를 가진 평평한 dict다. 신호는 구조 하나 — **종이책(is_ebook False) 레코드의
+    other_formats[].url goods_no == eBook(is_ebook True) 레코드의 goods_no**. 방향을 종이책 쪽
+    판형 목록으로 고정한 이유: 접힌 eBook의 링크·가격을 공개 카드에 남기는 곳이 대표(종이책)
+    카드의 other_formats라, 그 목록에 eBook 항목이 없으면 접는 순간 eBook 관측이 화면에서
+    사라진다. eBook 쪽 목록에만 종이책이 있으면(종이책 판형 위젯 미관측) 접지 않는다. 판형
+    미관측(is_ebook None) 레코드는 어느 쪽으로도 쓰지 않는다.
+
+    목록 도구의 eBook 행 제거(parsers.drop_listed_ebooks)와 공개 표시층의 카드 합치기
+    (postprocess.assign_display_numbers)가 이 한 함수를 쓴다 — 같은 판정을 두 벌 두지 않는다.
+    """
+    records = list(records)
+    by_goods = {}
+    for key, record in records:
+        goods_no = record.get("goods_no") or goods_no_from_url(record.get("url") or "")
+        if record.get("is_ebook") is True and goods_no is not None:
+            by_goods.setdefault(str(goods_no), key)
+    folds = {}
+    for key, record in records:
+        if record.get("is_ebook") is not False:
+            continue
+        for fmt in record.get("other_formats") or ():
+            if not isinstance(fmt, dict):
+                continue
+            ebook = by_goods.get(goods_no_from_url(fmt.get("url") or "") or "")
+            if ebook is not None and ebook != key:
+                folds.setdefault(ebook, key)
+    return folds
+
+
 # 정책/CS 시드 URL 맵. docs/m2-scout-report.md 라이브 조사 기준으로 확정.
 # 클라이언트 도메인 검증 제약상 반드시 www.yes24.com 절대 URL이어야 한다.
 #

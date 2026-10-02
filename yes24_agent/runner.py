@@ -43,8 +43,10 @@ from yes24_agent.logctx import update as log_update
 from yes24_agent.postprocess import (
     StreamRenumberer,
     build_done_payload,
+    display_cards,
     finalize_answer,
     finalize_text,
+    source_folds,
     validate_citations,
 )
 from yes24_agent.rbti.persona import axis_label, is_valid_code
@@ -163,25 +165,26 @@ def _display_frames(
 
     `streamed`에는 실제로 흘린 조각만 쌓는다(원칙 4b의 "delta 합계 == done.text" 대조본).
     `round`는 이 조각(과 refs 힌트)이 속한 LLM 라운드다. 본문 역할은 content가 명시한다.
+
+    같은 작품의 두 판은 출구와 같은 규칙(`source_folds`·`display_cards`)으로 한 번호·카드
+    1장이 된다 — refs도 그 번호의 **카드가 된 출처**로만 낸다(접힌 eBook url이 대표 카드의
+    힌트를 덮지 않게).
     """
+    folds = source_folds(known_sources.values())
     chunk, assigned = renumberer.feed(
-        "".join(raw_body), known_sources.keys(), final=final
+        "".join(raw_body), known_sources.keys(), folds=folds, final=final
     )
     frames: list[str] = []
-    if assigned:
-        frames.append(
-            sse_status(
-                "refs",
-                "",
-                refs=[
-                    project_source_ref({**known_sources[old], "id": new})
-                    for old, new in assigned.items()
-                ],
-                round=round,
-            )
-        )
+    cards = display_cards(renumberer.mapping, known_sources, folds)
+    refs = [
+        project_source_ref({**known_sources[old], "id": new})
+        for old, new in assigned.items()
+        if cards.get(new) is known_sources.get(old)
+    ]
+    if refs:
+        frames.append(sse_status("refs", "", refs=refs, round=round))
     if preview_sources is not None and assigned:
-        frames.extend(_preview_source_frames(preview_sources, known_sources, assigned))
+        frames.extend(_preview_source_frames(preview_sources, cards))
     if chunk:
         streamed.append(chunk)
         phase = process.content_event("provisional")
@@ -191,17 +194,13 @@ def _display_frames(
     return frames
 
 
-def _preview_source_frames(
-    preview_sources: dict[int, dict], known_sources: dict[int, dict], assigned: dict[int, int]
-) -> list[str]:
+def _preview_source_frames(preview_sources: dict[int, dict], cards: dict[int, dict]) -> list[str]:
+    """표시 번호당 카드 1장의 미리보기(`preview_sources`는 표시 번호 → 공개 카드)."""
     changed = False
-    for old, new in assigned.items():
-        preview_sources[old] = {"id": new}
-        changed = True
-    for old, previous in list(preview_sources.items()):
-        source = project_public_source({**known_sources[old], "id": previous["id"]})
-        if source != previous:
-            preview_sources[old] = source
+    for new, source in cards.items():
+        card = project_public_source({**source, "id": new})
+        if preview_sources.get(new) != card:
+            preview_sources[new] = card
             changed = True
     return [sse_sources(list(preview_sources.values()), final=False)] if changed else []
 
@@ -901,7 +900,14 @@ async def run_agent_stream(
                                 known_sources[source["id"]] = settle_sources(
                                     [previous] if previous else [], [source]
                                 )[0]
-                            for frame in _preview_source_frames(preview_sources, known_sources, {}):
+                            for frame in _preview_source_frames(
+                                preview_sources,
+                                display_cards(
+                                    renumberer.mapping,
+                                    known_sources,
+                                    source_folds(known_sources.values()),
+                                ),
+                            ):
                                 yield frame
                         continue
 

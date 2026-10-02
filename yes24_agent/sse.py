@@ -60,11 +60,11 @@ data: <JSON>
 일반 웹 카드다. `book_detail` 같은 수집 경로는 도서 판정 근거가 아니다.
 `preview`는 관측 원문의 첫 비어 있지 않은 문단이며 길이가 고정된 요약은 아니다.
 접지 원문 `snippet`은 내부에 보존하고 공개하지 않는다. `other_formats`는 관측하지 않으면
-생략, 관측했지만 없으면 `[]`, 가격 미상이면 항목의 `sale_price:null`이다. 종이책 출처의
-`ebook_edition`은 함께 관측한 eBook 판 `{url, in_cremaclub?, cremaclub_url?}`이다 — 키 생략은
-미관측, `null`은 eBook 판 없음, `{url}`만이면 크레마클럽 여부 미확인, `in_cremaclub:false`는
-미등록, `true`면 `cremaclub_url`(클럽 상세 링크)이 함께 온다. 전자책 출처는 같은 의미를 최상위
-`in_cremaclub`(키 생략은 미확인)·`cremaclub_url`(등록일 때만)로 싣는다. 코너 행 텍스트
+생략, 관측했지만 없으면 `[]`, 가격 미상이면 항목의 `sale_price:null`이다. 크레마클럽 등록은
+최상위 `cremaclub`(true 등록·false 미등록·키 없음 미확인, "이 책을 크레마클럽에서 볼 수 있다" —
+종이책은 그 eBook 판 기준)이고, true면 판형 항목 `{format:"크레마클럽", url:<클럽 상세>,
+sale_price:null}`도 하나 붙는다. 같은 작품의 다른 판 출처(종이책·eBook 상세를 둘 다 인용)는 카드
+1장·표시 번호 하나로 합쳐 공개한다(대표=종이책, eBook은 `other_formats` 항목). 코너 행 텍스트
 (`episode_info`, 오늘의 책의 `intro_excerpt` — 상세 책소개 첫 문단 발췌)는 그 코너가 실을 때만
 키가 있는 공개 스칼라다(2026-09-22).
 

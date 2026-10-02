@@ -49,7 +49,7 @@ async def fetch_many(items: list[dict], tool_context: ToolContext) -> dict:
         인용 대상(source_id)이 된다. 상한을 넘겨 열지 않은 항목이 있으면 dropped_count·
         dropped_urls·message로 무엇을 안 열었는지 명시한다. items 자체가 목록이 아니거나
         비었거나 전체 열람이 실패하면 status="error"이며, result_count는 성공 건수다.
-        상품 상세의 크레마클럽 여부(in_cremaclub·ebook_edition·cremaclub_url)는 yes24_fetch와 같다.
+        상품 상세의 cremaclub·other_formats "크레마클럽" 항목은 yes24_fetch와 같다.
     """
     return await fetch_pages(items, tool_context, observe_formats=observes_cremaclub())
 

@@ -195,6 +195,13 @@ PRODUCT_PAGE_COUNT_FIELD = "쪽수"
 PRODUCT_GOODS_NO_JS_RE = r"g_GoodsNo\s*=\s*'(\d+)'"
 PRODUCT_GOODS_NAME_JS_RE = r"g_GoodsName\s*=\s*'([^']+)'"
 PRODUCT_IS_EBOOK_JS_RE = r"g_isEbook\s*=\s*'([YN])'"
+# 오디오북은 사이트가 eBook 도메인으로 다뤄 g_isEbook='Y'가 실린다(종이책 판형 위젯·관련상품 줄도
+# 이 상품을 "eBook"이라 부른다). 목록 라벨은 "[오디오북]"이라 같은 상품의 판형이 출처마다 갈렸다
+# (실측 2026-10-01 goods 110677754). 상세에서 둘을 가르는 구조 신호는 표지 영역의 오디오북
+# 스티커다 — 오디오북 상세 24/24에 있고 eBook·도서 상세 120건엔 없다. 분류 코드는 쓰지
+# 않는다: goodsSortNo·g_GoodsDispNo는 오디오북이 다른 분류 가지(어학 004008·도서 001005)에도
+# 걸려 eBook과 갈리지 않았다.
+PRODUCT_AUDIOBOOK_STICKER = "#yDetailTopWrap span.gd_ico.ico_audio"
 PRODUCT_SALE_PRICE_JS_RE = r"g_GoodsSalePrice\s*=\s*([\d.]+)"
 # 정가(할인 전 가격). 목록의 취소선 표기(ITEM_LIST_PRICE)와 같은 값이며, 같은 이유로 뽑는다.
 # 할인 폭 전역(g_GoodsDiscountShopPrice)은 두 값의 차라 뽑지 않는다 — 변수명이 이 패턴의
@@ -206,8 +213,11 @@ PRODUCT_LIST_PRICE_JS_RE = r"g_GoodsShopPrice\s*=\s*([\d.]+)"
 # 컨테이너로 잡는 이유: 이 값을 범용 관련상품 링크로 흘리면 앵커 텍스트에 금액만 남고
 # 임자가 사라져, 모델이 열람 중인 상품의 출처에 그 금액을 건다(실측 2026-08-03 —
 # links[0].title="eBook 12,000원 이동"을 종이책 출처 [1]에 인용). 가격은 판형 링크마다
-# em.txC_blue 하나로, 없는 판형(중고상품)도 있으므로 없으면 None으로 둔다. 링크 셀렉터는
-# 컨테이너로 스코프된 한 줄이다 — 목록판(ITEM_FORMAT_LINK)과 같은 꼴이라 파서가 헬퍼 하나로
+# em.txC_blue 하나이고 없으면 None으로 둔다. 같은 위젯에 판형이 아닌 a.formatLnk도 온다 —
+# 중고상품 판매요청 폼(`/24/usedshop/usedgoodsdemand/requestform?goodsNo=…`, 가격 없음)이
+# other_formats에 "중고상품 판매요청하기" 판형으로 실렸다(실측 2026-10-01 goods 189413175).
+# 그래서 목록판(ITEM_FORMAT_LINK)과 같이 href를 상품 경로(GOODS_PATH)로 스코프한다 — 앵커
+# 문구가 아니라 링크 목적지 구조로 가른다. 두 셀렉터가 같은 꼴이라 파서가 헬퍼 하나로
 # 두 마크업을 읽는다. 컨테이너 상수는 extract_links가 위젯을 통째로 걷어낼 때 따로 쓴다.
 # 컨테이너는 **클래스**로 잡는다: id `divFormatInfo`는 종이책 상세에만 붙고 전자책 상세의 같은
 # 위젯("종이책 13,500원 이동")은 id 없는 `div.gd_formatInfo`다(2026-09-30 실측 저장본 125건:
@@ -215,7 +225,7 @@ PRODUCT_LIST_PRICE_JS_RE = r"g_GoodsShopPrice\s*=\s*([\d.]+)"
 # other_formats는 늘 빈 목록이었다 — 관측 못 한 것을 "판형 없음"으로 접은 결함이다. 위젯이
 # 있고 링크가 없으면(빈 ul, 56건) 그것이 진짜 "판형 없음"이다.
 PRODUCT_FORMAT_CONTAINER = "div.gd_formatInfo"
-PRODUCT_FORMAT_LINK = f"{PRODUCT_FORMAT_CONTAINER} a.formatLnk"
+PRODUCT_FORMAT_LINK = f"{PRODUCT_FORMAT_CONTAINER} a.formatLnk[href^='{GOODS_PATH}']"
 PRODUCT_FORMAT_PRICE = "em.txC_blue"
 
 # 책소개/목차/출판사리뷰 블록. 실제 본문은
@@ -288,7 +298,14 @@ CREMACLUB_GOODS_NO_LINK = "a.btn_addBC[data-goods-no]"
 CREMACLUB_TITLE_LINK = "a.gd_name"
 CREMACLUB_RANK = "div.info_row.info_rank em"
 CREMACLUB_AUTHOR = "span.authPub.info_auth"
+# 평점·리뷰 수를 감싼 행 영역 — 인기 목록엔 있고 오리지널 목록엔 없다(fixture 24/24 · 0/47).
+CREMACLUB_RATING_AREA = "div.info_row.info_rating"
 CREMACLUB_RATING = ".rating_grade em.yes_b"
+# 크레마클럽 등록을 싣는 판형 항목(other_formats[].format)의 이름 — 사이트 서비스명 그대로다.
+# 등록은 별도 키가 아니라 "이 책을 이 서비스에서 볼 수 있다"는 판형 항목 하나(url=클럽 상세)라,
+# 소비자는 eBook·종이책 항목과 같은 경로로 뱃지·링크를 그린다(외부 프론트 crema-ai-web의
+# 판형 정규화가 이 이름을 '크레마클럽' 판형으로 읽는다 — 2026-10-01 사용자 결정).
+CREMACLUB_FORMAT_LABEL = "크레마클럽"
 
 # 크레마클럽 오리지널 전체 보기(urls.BROWSE_SEED_URLS["cremaclub_original"], 2026-09-14 실측
 # fixture): SSR 단일 목록이고 li 안쪽은 위 CREMACLUB_* 필드 마크업과 같다 — 다른 것은 목록을

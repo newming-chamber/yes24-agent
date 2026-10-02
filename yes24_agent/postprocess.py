@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass
 
 from yes24_agent.event_translate import project_public_source
+from yes24_agent.yes24.urls import edition_folds
 
 logger = logging.getLogger(__name__)
 
@@ -345,8 +346,14 @@ def renumber_markers(
     *,
     code_ranges: list[tuple[int, int]] | None = None,
     offset: int = 0,
+    after: str | None = None,
 ) -> str:
     """프로즈 인용을 표시 번호로 바꾼다. 범위 외에는 구분자·공백 표기를 보존한다.
+
+    판 접기로 두 내부 id가 한 표시 번호가 되면 같은 번호가 겹친다. 마커 안의 중복은 하나로
+    (`[1, 1]`→`[1]`), 사이에 아무 문자 없이 **붙어 반복되는 같은 마커**는 뒤엣것을 지운다
+    (`[1][1]`→`[1]`). 앞엣것은 절대 지우지 않으므로 스트림 방출본이 append-only로 남는다 —
+    조각 경계에 걸친 반복은 `after`(직전 조각이 마커로 끝났으면 그 표시 마커)가 잇는다.
 
     코드 스팬 안의 `[n]`은 배열 인덱스·수식이므로 검증과 **같은 눈**으로 건너뛴다
     (`code_span_ranges`) — 판정을 두 벌 두면 한 벌만 고치는 실수가 반복된다.
@@ -356,24 +363,30 @@ def renumber_markers(
     """
     if code_ranges is None:
         code_ranges = code_span_ranges(text)
+    previous = {"end": 0 if after else -1, "marker": after}
+
+    def _render(body: str) -> str:
+        if "-" in body:
+            ids, _ = _marker_ids(body, mapping)
+            numbers = [mapping[source_id] for source_id in ids if source_id in mapping]
+        else:
+            numbers = [mapping.get(int(part), int(part)) for part in re.findall(r"\d+", body)]
+            if len(set(numbers)) == len(numbers):  # 겹침 없음 — 구분자·공백 표기 보존
+                digits = iter(numbers)
+                return "[" + re.sub(r"\d+", lambda _: str(next(digits)), body) + "]"
+        rendered = list(dict.fromkeys(str(number) for number in numbers))
+        return f"[{', '.join(rendered)}]" if rendered else ""
 
     def _replace(match: re.Match) -> str:
         if _within_code_span(match.start() + offset, code_ranges):
             return match.group(0)
-        if "-" in match.group(1):
-            ids, _ = _marker_ids(match.group(1), mapping)
-            rendered = list(
-                dict.fromkeys(
-                    str(mapping[source_id]) for source_id in ids if source_id in mapping
-                )
-            )
-            return f"[{', '.join(rendered)}]" if rendered else ""
-        inner = re.sub(
-            r"\d+",
-            lambda digits: str(mapping.get(int(digits.group()), int(digits.group()))),
-            match.group(1),
-        )
-        return f"[{inner}]"
+        rendered = _render(match.group(1))
+        if rendered and match.start() == previous["end"] and rendered == previous["marker"]:
+            rendered = ""
+        else:
+            previous["marker"] = rendered
+        previous["end"] = match.end()
+        return rendered
 
     return MARKER_PATTERN.sub(_replace, text)
 
@@ -383,6 +396,7 @@ def assign_display_numbers(
     valid_ids,
     mapping: dict[int, int] | None = None,
     *,
+    folds: dict[int, int] | None = None,
     code_ranges: list[tuple[int, int]] | None = None,
     offset: int = 0,
 ) -> dict[int, int]:
@@ -395,18 +409,61 @@ def assign_display_numbers(
     `mapping`을 주면 그 위에 이어서 배정한다(스트림이 청크를 넘어 배정을 이어가는 경로).
     `valid_ids`에 없는 id는 배정하지 않는다 — 인용 검증이 지울 후보라 번호를 먹이면
     뒤 번호가 통째로 밀린다.
+
+    `folds`(`source_folds` — eBook id → 종이책 id)로 묶인 같은 작품의 두 판은 **한 번호**를
+    받는다: 먼저 등장한 쪽이 번호를 열고 다른 판은 그 번호를 잇는다. 그래서 매핑은 여러 id가
+    한 번호를 가질 수 있고(다대일), 새 번호는 개수가 아니라 최댓값 + 1이다. 짝 판정이 출처의
+    구조 필드만 보므로 스트림이 sources만으로 출구와 같은 배정을 낸다(마감 reset 없음).
     """
     if code_ranges is None:
         code_ranges = code_span_ranges(text)
     if mapping is None:
         mapping = {}
+    folds = folds or {}
     for match in MARKER_PATTERN.finditer(text):
         if _within_code_span(match.start() + offset, code_ranges):
             continue
         for source_id in _marker_ids(match.group(1), valid_ids)[0]:
             if source_id in valid_ids and source_id not in mapping:
-                mapping[source_id] = len(mapping) + 1
+                work = folds.get(source_id, source_id)
+                # 잇는 상대는 짝(종이책↔eBook)의 한쪽이 종이책 자신일 때만 — 같은 종이책에 접히는
+                # 서로 다른 eBook끼리 한 번호를 받으면 뒤 eBook 카드가 사라진다.
+                mapping[source_id] = next(
+                    (
+                        number
+                        for old, number in mapping.items()
+                        if folds.get(old, old) == work and work in (old, source_id)
+                    ),
+                    max(mapping.values(), default=0) + 1,
+                )
     return mapping
+
+
+def source_folds(sources) -> dict[int, int]:
+    """출처 목록에서 같은 작품의 eBook id → 종이책 id(판정은 `urls.edition_folds` 하나)."""
+    return edition_folds(
+        (source["id"], {**(source.get("meta") or {}), **source})
+        for source in sources
+        if source.get("id") is not None
+    )
+
+
+def display_cards(
+    mapping: dict[int, int], by_id: dict[int, dict], folds: dict[int, int] | None = None
+) -> dict[int, dict]:
+    """표시 번호 → 그 번호의 카드가 될 내부 출처 **하나**(번호 순서).
+
+    한 번호에 같은 작품의 두 판이 모이면 대표는 종이책이다 — 접히는 쪽(`folds`의 키, eBook)은
+    이미 자리 잡은 카드를 밀어내지 못한다. eBook만 인용됐으면 eBook이 그대로 카드다(인용되지
+    않은 종이책을 공개 집합에 끌어오지 않는다 — 원칙 4의 인용분 한정). 접힌 eBook의 링크·가격은
+    대표 카드의 other_formats 항목에 이미 있다(`edition_folds`가 그 항목을 짝 신호로 쓴다).
+    """
+    folds = folds or {}
+    cards: dict[int, dict] = {}
+    for old, new in mapping.items():
+        if old in by_id and (new not in cards or old not in folds):
+            cards[new] = by_id[old]
+    return dict(sorted(cards.items()))
 
 
 # 표시 번호 배정·정규화가 아직 흔들릴 수 있는 꼬리 — 청크 경계에 걸려 아직 **어떤 형태로
@@ -454,6 +511,9 @@ def _stable_prefix(text: str) -> str:
     return text[:cut]
 
 
+_TRAILING_MARKER = re.compile(MARKER_PATTERN.pattern + r"\Z")
+
+
 class StreamRenumberer:
     """스트리밍 델타의 마커를 표시 번호로 **증분 치환**하는 변환기(배정 규칙은 출구와 공유).
 
@@ -468,11 +528,17 @@ class StreamRenumberer:
     """
 
     def __init__(self) -> None:
-        self._mapping: dict[int, int] = {}
+        self.mapping: dict[int, int] = {}
         self._consumed = 0  # 표시 번호로 확정·방출한 **정규화** 본문 길이
+        self._last_marker: str | None = None  # 방출본이 마커로 끝났으면 그 표시 마커
 
     def feed(
-        self, raw_text: str, valid_ids, *, final: bool = False
+        self,
+        raw_text: str,
+        valid_ids,
+        *,
+        folds: dict[int, int] | None = None,
+        final: bool = False,
     ) -> tuple[str, dict[int, int]]:
         """누적 원시 본문을 받아 `(이번에 흘릴 표시 본문 조각, 새로 배정된 매핑)`을 돌려준다.
 
@@ -494,21 +560,36 @@ class StreamRenumberer:
             return "", {}
         code_ranges = code_span_ranges(stable)
         segment = stable[self._consumed :]
-        assigned_before = set(self._mapping)
+        assigned_before = set(self.mapping)
         assign_display_numbers(
-            segment, valid_ids, self._mapping, code_ranges=code_ranges, offset=self._consumed
+            segment,
+            valid_ids,
+            self.mapping,
+            folds=folds,
+            code_ranges=code_ranges,
+            offset=self._consumed,
         )
         rendered = renumber_markers(
-            segment, self._mapping, code_ranges=code_ranges, offset=self._consumed
+            segment,
+            self.mapping,
+            code_ranges=code_ranges,
+            offset=self._consumed,
+            after=self._last_marker,
         )
+        tail = _TRAILING_MARKER.search(segment)
+        if tail is None or _within_code_span(tail.start() + self._consumed, code_ranges):
+            self._last_marker = None
+        elif rendered:
+            ended = _TRAILING_MARKER.search(rendered)
+            self._last_marker = ended.group(0) if ended else None
         self._consumed = len(stable)
         return rendered, {
-            old: new for old, new in self._mapping.items() if old not in assigned_before
+            old: new for old, new in self.mapping.items() if old not in assigned_before
         }
 
 
 def renumber_for_display(
-    citation: CitationResult, sources: list[dict]
+    citation: CitationResult, sources: list[dict], folds: dict[int, int] | None = None
 ) -> tuple[CitationResult, list[dict]]:
     """세션 누적 id를 **이번 답변의 등장 순서 1..n**으로 갈아끼운다(공개 표시층).
 
@@ -527,14 +608,14 @@ def renumber_for_display(
     동일해지고, 마감 reset이 나지 않는다.
 
     반환하는 출처 목록은 **공개용 사본**이다(내부 레지스트리·세션 state는 손대지 않는다).
+    `folds`가 묶은 같은 작품의 두 판은 한 번호·카드 1장으로 나간다(`display_cards`).
     """
-    mapping = assign_display_numbers(citation.text, {source["id"] for source in sources})
-    if all(old == new for old, new in mapping.items()):
-        return citation, sources
-
+    mapping = assign_display_numbers(
+        citation.text, {source["id"] for source in sources}, folds=folds
+    )
     by_id = {source["id"]: source for source in sources}
     public_sources = [
-        {**by_id[old], "id": new} for old, new in mapping.items() if old in by_id
+        {**source, "id": new} for new, source in display_cards(mapping, by_id, folds).items()
     ]
     renumbered = validate_citations(renumber_markers(citation.text, mapping), public_sources)
     renumbered.removed_markers = [*citation.removed_markers, *renumbered.removed_markers]
@@ -562,7 +643,7 @@ def finalize_answer(
     """
     citation = validate_citations(text or "", sources)
     # 검증이 끝난 **뒤에만** 공개 번호를 1..n으로 다시 매긴다(renumber_for_display docstring).
-    citation, sources = renumber_for_display(citation, sources)
+    citation, sources = renumber_for_display(citation, sources, source_folds(sources))
     payload = build_done_payload(
         sources=sources,
         used_source_ids=citation.used_source_ids,

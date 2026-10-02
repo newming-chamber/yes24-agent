@@ -96,11 +96,12 @@ async def yes24_fetch(
         type="book_detail"로 줄거리·목차·출판사 서평·주간리뷰를, 공지 페이지는
         type="notice"로 text를 담는다. 본문이 상한보다 길어 잘렸으면 truncated=True와
         total_chars(전체 길이)가 함께 온다.
-        상품 상세의 other_formats는 이 페이지가 함께 렌더한 **다른 판형**(eBook·중고 등)의
+        상품 상세의 other_formats는 이 페이지가 함께 렌더한 **다른 판형**(eBook·종이책 등)의
         판형명·판매가·url이다(이 페이지에서 관측한 값이라 이 source_id로 인용한다).
-        전자책 상세의 in_cremaclub과 종이책 상세의 ebook_edition(그 eBook 판의 url·in_cremaclub,
-        None이면 eBook 판 없음)은 크레마클럽 등록 여부이고, 등록이면 cremaclub_url이 함께 온다 —
-        in_cremaclub 키가 없으면 확인하지 못한 것이지 클럽에 없는 것이 아니다.
+        cremaclub은 이 책의 크레마클럽 등록 여부다 — `cremaclub: false`일 때만 미등록으로 말한다
+        (키 없음=미확인). 등록이면 other_formats에 "크레마클럽" 항목(url=클럽 상세)도 있다.
+        종이책 상세의 판정은 other_formats eBook 항목의 goods_no로 클럽 상세를 조회한 관측이라, 그
+        eBook 상세를 다시 열어도 클럽 판정과 eBook 판매가(그 항목의 sale_price)는 같다.
         함께 오는 links는 이 페이지에서 더 볼 수 있는 다른 Yes24 페이지 후보
         목록이다(아직 열지 않은 페이지 — 인용 대상이 아니며, 필요하면 그 url로 다시
         yes24_fetch를 호출해 이어서 열람할 수 있다). 실패 시 status="error"와

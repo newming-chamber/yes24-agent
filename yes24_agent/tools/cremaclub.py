@@ -1,4 +1,9 @@
-"""크레마클럽 등록 관측 — Yes24 결과 행에 eBook 판의 클럽 여부를 제자리로 싣는다.
+"""크레마클럽 등록 관측 — Yes24 결과 행에 클럽 등록 여부를 제자리로 싣는다.
+
+판정은 행의 최상위 `cremaclub`(True 등록·False 미등록·키 없음 미확인)이다. 등록이면 other_formats
+에도 클럽 항목(parsers.cremaclub_format — format "크레마클럽", url=클럽 상세)이 붙는다(외부
+프론트가 판형 이름으로 뱃지·링크를 그린다). 작품 단위 의미다("이 책을 크레마클럽에서 볼 수
+있다") — 종이책 행은 그 eBook 판이, 전자책 행은 자기 자신이 등록이면 같은 모양이다.
 
 판정은 클럽 상세 경로(`settings.cremaclub_detail_url_template`)를 eBook goods_no로 GET한 문서다
 (2026-09-28 실측: eBook 상세 배지와 123/123 일치). 등록 eBook이면 상품 상세 문서가
@@ -12,11 +17,16 @@
   문서에서 **eBook으로 관측한** goods_no뿐이다(전자책 행 자신, 종이책 행의 판형 위젯이 eBook이라
   부른 링크). 없는 id·종이책 id가 섞여 거절 응답을 "클럽 아님"으로 오독하는 길을 입구에서 막는다.
   성인인증 eBook은 이 판정이 False로 떨어지는 알려진 사각이다(인증 없이는 거절 응답만 준다).
-- 그 밖 전부(비200·204·3xx·빈 본문·점검 안내 같은 낯선 문서·예외·예산 초과) → 키 생략(미확인).
+  판형 위젯·관련상품 줄은 텍스트 eBook이 없는 작품의 **오디오북**도 "eBook"이라 부르고 링크
+  마크업에 둘을 가르는 구조가 없다(2026-10-01 실측 goods 8759796 → 110677754). 그 조회는
+  클럽 거절(오디오북 11/11)로 False가 되는데, "이 작품은 클럽에 없다"로 사실과 같아 막지 않는다.
+- 그 밖 전부(비200·204·3xx·빈 본문·점검 안내 같은 낯선 문서·예외·예산 초과) → `cremaclub` 키
+  생략(미확인).
   "확인 못 함"을 "클럽 아님"으로 접지 않는다.
 
 클럽 코너 목록의 행은 조회하지 않는다 — 목록 마크업("북클럽에 담기" 버튼)이 이미 등록을 관측해
-in_cremaclub이 실려 온다(parsers._cremaclub_converter). 이미 관측된 행은 다시 판정하지 않는다.
+`cremaclub: True`와 클럽 항목이 실려 온다(parsers._cremaclub_converter). `cremaclub` 키가 이미
+있는 행은 다시 판정하지 않는다.
 
 판정 단위는 goods_no다 — 오리지널 클럽 전용판처럼 goods_no가 다른 같은 작품은 이 신호로
 알 수 없다. 쓰지 않는 신호: braze `cremaclubGoodsYn`(클럽 28/143이 'N'), 해시태그
@@ -31,8 +41,11 @@ from bs4 import BeautifulSoup, Tag
 
 from yes24_agent.config import Settings
 from yes24_agent.yes24.client import Yes24Client, Yes24FetchError, Yes24TextCache
-from yes24_agent.yes24.parsers import is_product_detail
-from yes24_agent.yes24.selectors import ITEM_EBOOK_LABEL, ITEM_FORMAT_LABEL_DECORATION
+from yes24_agent.yes24.parsers import cremaclub_format, is_product_detail
+from yes24_agent.yes24.selectors import (
+    ITEM_EBOOK_LABEL,
+    ITEM_FORMAT_LABEL_DECORATION,
+)
 from yes24_agent.yes24.urls import goods_no_from_url
 
 logger = logging.getLogger(__name__)
@@ -98,41 +111,34 @@ async def aclose_club_client() -> None:
 
 
 def _targets(records: list[dict]) -> list[tuple[dict, str]]:
-    """관측 대상 (클럽 여부를 실을 객체, eBook goods_no) 목록 — 종이책 행엔 ebook_edition을 만든다.
+    """관측 대상 (클럽 항목을 덧붙일 행, 조회할 eBook goods_no) 목록.
 
-    전자책 행은 자기 자신이 대상이다(최상위 in_cremaclub). 종이책 행은 판형 위젯의 eBook 레코드가
-    대상이고, 그 결과는 `ebook_edition`에만 실린다. other_formats를 관측했는데 eBook이 없으면
-    `ebook_edition=None`(판 없음), other_formats 자체가 미관측이면 키를 만들지 않는다.
-    is_ebook이 미관측인 행은 무엇의 판인지 모르므로 건드리지 않는다.
+    전자책 행은 자기 goods_no, 종이책 행은 판형 위젯의 eBook 항목 url의 goods_no로 조회한다.
+    종이책 행의 other_formats가 미관측이거나 eBook 항목이 없으면 대상이 없다. is_ebook이
+    미관측인 행은 무엇의 판인지 모르므로 건드리지 않는다.
     """
     targets = []
     for record in records:
-        if "in_cremaclub" in record:
+        if "cremaclub" in record:
             continue  # 목록에서 이미 관측됨(클럽 코너 행)
+        formats = record.get("other_formats") or ()
         is_ebook = record.get("is_ebook")
         if is_ebook is True:
-            if record.get("goods_no"):
-                targets.append((record, record["goods_no"]))
-            continue
-        # other_formats가 없거나 None이면 미관측이다 — "판 없음"으로 접지 않는다.
-        if is_ebook is not False or record.get("other_formats") is None:
-            continue
-        ebook_url = next(
-            (
-                fmt["url"]
-                for fmt in record["other_formats"]
-                if fmt.get("format") == _EBOOK_FORMAT and fmt.get("url")
-            ),
-            None,
-        )
-        if ebook_url is None:
-            record["ebook_edition"] = None
-            continue
-        edition = {"url": ebook_url}
-        record["ebook_edition"] = edition
-        goods_no = goods_no_from_url(ebook_url)
+            goods_no = record.get("goods_no")
+        elif is_ebook is False:
+            ebook_url = next(
+                (
+                    fmt["url"]
+                    for fmt in formats
+                    if fmt.get("format") == _EBOOK_FORMAT and fmt.get("url")
+                ),
+                None,
+            )
+            goods_no = goods_no_from_url(ebook_url) if ebook_url else None
+        else:
+            goods_no = None
         if goods_no:
-            targets.append((edition, goods_no))
+            targets.append((record, goods_no))
     return targets
 
 
@@ -184,11 +190,10 @@ async def _club_status(client: Yes24Client, cache: Yes24TextCache, url: str) -> 
 
 
 async def observe_cremaclub(records: list[dict], settings: Settings) -> None:
-    """결과 행(필드 dict)들에 크레마클럽 여부를 **제자리로** 싣는다(등록 전에 호출한다).
+    """결과 행(필드 dict)들에 크레마클럽 등록을 **제자리로** 싣는다(등록 전에 호출한다).
 
-    실리는 형태: 전자책 행은 최상위 `in_cremaclub`(True면 `cremaclub_url`도), 종이책 행은
-    `ebook_edition = {"url", "in_cremaclub"?, "cremaclub_url"?}` 또는 None. 미확인이면
-    in_cremaclub 키가 없다. 같은 eBook은 한 번만 조회한다.
+    판정된 행엔 `cremaclub`(True/False)이 실리고, 등록(True)이면 other_formats 끝에 클럽 항목도
+    붙는다. 미확인은 행을 건드리지 않는다(키 없음). 같은 eBook은 한 번만 조회한다.
 
     배치 전체에 벽시계 예산(settings.cremaclub_budget_s, 세마포어 대기 포함)을 건다. 예산 안에
     끝난 행만 싣고 남은 조회는 취소해 미확인으로 둔다 — wait_for로 통째로 끊으면 이미 받은 판정까지
@@ -227,13 +232,13 @@ async def observe_cremaclub(records: list[dict], settings: Settings) -> None:
             )
         elif task.result() is not None:
             status[goods_no] = task.result()
-    for holder, goods_no in targets:
+    for record, goods_no in targets:
         if goods_no not in status:
             continue
-        holder["in_cremaclub"] = status[goods_no]
+        record["cremaclub"] = status[goods_no]
         if status[goods_no]:
-            holder["cremaclub_url"] = urls[goods_no]
-    logger.info(
-        f"cremaclub observed={len(status)}/{len(urls)} "
-        f"in_club={sum(status.values())}"
-    )
+            record["other_formats"] = [
+                *(record.get("other_formats") or ()),
+                cremaclub_format(urls[goods_no]),
+            ]
+    logger.info(f"cremaclub observed={len(status)}/{len(urls)} in_club={sum(status.values())}")

@@ -46,43 +46,31 @@ export function isSafeUrl(url) {
   return typeof url === "string" && /^https?:\/\//i.test(url);
 }
 
-// 판매가 표기 — sale_price가 정본, 평면 price는 개명 전 스냅샷 호환 폴백. 숫자면 천단위
-// 콤마+"원", 문자열이면 그대로 둔다("원"을 덧붙이면 "12,000원원"). 표기할 값이 없으면 null.
+// 판매가 표기(sale_price) — 숫자면 천단위 콤마+"원", 문자열이면 그대로 둔다("원"을 덧붙이면
+// "12,000원원"). 표기할 값이 없으면 null.
 export function formatPrice(src) {
-  const raw = src && [src.sale_price, src.price].find((v) => v != null && v !== "");
-  if (raw == null) return null;
+  const raw = src?.sale_price;
+  if (raw == null || raw === "") return null;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? n.toLocaleString("ko-KR") + "원" : String(raw);
 }
 
-// 판형 칩 목록 [{label, url, sale_price, own?}] — 순서는 종이책 → eBook → 크레마클럽, 확인된 것만.
-// 카드 자신의 판형도 카드 url·가격으로 넣어(own: true) 판형들이 한 줄에 보이게 한다. 라벨은
-// 목록 판형 kind(도서·eBook·외서·클래스24 …) 그대로이고 "도서"만 "종이책"으로 부른다. kind가
-// 없으면 is_ebook으로 eBook/종이책을 가리고, 둘 다 침묵이면 자기 칩은 없다. 다른 판형이 하나도
-// 없으면 가격 줄과 중복이라 빈 목록이다. 종이책 카드의 eBook 판은 other_formats에 같은 url로
-// 이미 있으면 거기 가격을 쓰고, 없을 때만 따로 넣는다. 클럽 칩은 in_cremaclub === true와
-// cremaclub_url이 모두 있을 때만(미확인·false는 그리지 않는다) — 최상위 in_cremaclub은 전자책
-// 카드의 것, ebook_edition의 것은 종이책 카드가 연 eBook 판의 것이다. 카드 url이 곧 클럽 상세면
-// (오리지널 코너 행) 같은 문서라 자기 칩을 생략한다. 클릭 기록의 출처 매칭도 이 목록을 쓴다.
+// 판형 칩 목록 [{label, url, sale_price, own?}] — 카드 자신의 판형(own) 뒤에 other_formats 순서.
+// 자기 판형도 카드 url·가격으로 넣어(own: true) 판형들이 한 줄에 보이게 한다. 라벨은 목록 판형
+// kind(도서·eBook·외서·클래스24 …) 그대로이고 "도서"만 "종이책"으로 부른다. kind가 없으면
+// is_ebook으로 eBook/종이책을 가리고, 둘 다 침묵이면 자기 칩은 없다. 다른 판형이 하나도 없으면
+// 가격 줄과 중복이라 빈 목록이다. 크레마클럽도 서버가 등록 관측일 때만 싣는 판형 항목이라 특수
+// 처리가 없다. 카드 url과 같은 url의 항목이 있으면(오리지널 코너 행 — 카드가 곧 클럽 상세) 같은
+// 문서라 자기 칩을 생략한다. 클릭 기록의 출처 매칭도 이 목록을 쓴다.
 export function editionLinks(src) {
   const kind = typeof src?.kind === "string" && src.kind ? src.kind : null;
   const self = kind ? (kind === "도서" ? "종이책" : kind)
     : src?.is_ebook === true ? "eBook" : src?.is_ebook === false ? "종이책" : null;
-  const edition = src?.ebook_edition && typeof src.ebook_edition === "object" ? src.ebook_edition : null;
   const links = (Array.isArray(src?.other_formats) ? src.other_formats : [])
     .filter((f) => f && f.format && isSafeUrl(f.url))
     .map((f) => ({ label: f.format, url: f.url, sale_price: f.sale_price }));
-  if (edition && isSafeUrl(edition.url) && !links.some((l) => l.url === edition.url)) {
-    links.push({ label: "eBook", url: edition.url });
-  }
-  const club = src?.in_cremaclub === true ? src : edition;
-  const clubUrl = club?.in_cremaclub === true && isSafeUrl(club.cremaclub_url) ? club.cremaclub_url : null;
-  if (clubUrl) links.push({ label: "크레마클럽", url: clubUrl });
-  if (!links.length) return links;
-  if (self && isSafeUrl(src.url) && src.url !== clubUrl) {
-    const own = { label: self, url: src.url, sale_price: src.sale_price ?? src.price, own: true };
-    // eBook 카드의 other_formats는 종이책 등이라 자기 칩을 그 뒤(클럽 앞)에, 그 밖의 판형은 맨 앞에.
-    links.splice(self === "eBook" ? links.length - (clubUrl ? 1 : 0) : 0, 0, own);
+  if (links.length && self && isSafeUrl(src.url) && !links.some((l) => l.url === src.url)) {
+    links.unshift({ label: self, url: src.url, sale_price: src.sale_price, own: true });
   }
   return links;
 }
