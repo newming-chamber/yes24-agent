@@ -467,6 +467,11 @@ class Settings(BaseSettings):
     matrix_http_rps: float = 16.0
     http_max_retries: int = 2  # 429/5xx 지수 백오프 횟수
     http_backoff_base_s: float = 0.5  # 지수 백오프 기준 간격(backoff_base_s * 2**attempt)
+    # 공유(채팅·매트릭스) Yes24Client의 쿠키 저장 여부. 저장하면 Yes24가 같은 ASP.NET 세션의
+    # 동시 요청을 서버 쪽에서 직렬화한다 — 프로세스의 모든 사용자가 쿠키 하나를 공유하므로 남의
+    # 요청과도 줄을 선다. 2026-10-02 A/B: fetch_many 중앙 2.06→0.93s, 검색 p90 3.6→1.0s, 52개
+    # URL 파싱 결과 동일(19금 상품은 두 경우 모두 로그인 요구), 품질 비열등. 되돌리려면 true.
+    yes24_persist_cookies: bool = False
     # 200-위장 서버 오류 리다이렉트 신호(2026-07-27 실측): Yes24는 장애 시 5xx 대신
     # 302 → error_500.html?aspxerrorpath=<원경로> → 200을 돌려줘 상태코드 기반 재시도를
     # 통째로 우회한다. 리다이렉트 대상 query에 이 파라미터가 있으면 5xx와 동급의 재시도

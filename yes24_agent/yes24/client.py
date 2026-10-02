@@ -304,7 +304,7 @@ class Yes24Client:
         transport: httpx.AsyncBaseTransport | None = None,
         timeout_s: float | None = None,
         max_retries: int | None = None,
-        persist_cookies: bool = True,
+        persist_cookies: bool | None = None,
     ) -> "Yes24Client":
         """`Settings` 값을 생성자 파라미터로 매핑하는 편의 팩토리.
 
@@ -314,7 +314,7 @@ class Yes24Client:
         주입한다 — 채팅·매트릭스 클라이언트가 **같은 캐시 인스턴스**를 공유해야 하므로
         여기서 새로 만들지 않는다(미주입이면 캐시 없음 = 기존 동작). `timeout_s`·
         `max_retries`·`persist_cookies`는 곁가지 관측(크레마클럽 조회) 같은 전용 경로가 자기
-        정책을 주입하는 자리다(미지정이면 settings 기본·쿠키 유지).
+        정책을 주입하는 자리다(미지정이면 settings 기본).
         """
         return cls(
             base_url=settings.yes24_base_url,
@@ -332,7 +332,9 @@ class Yes24Client:
             burst=burst,
             cache=cache,
             transport=transport,
-            persist_cookies=persist_cookies,
+            persist_cookies=(
+                settings.yes24_persist_cookies if persist_cookies is None else persist_cookies
+            ),
         )
 
     async def get_text(self, url: str, *, cache_ttl_s: float | None = None) -> str:
