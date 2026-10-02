@@ -166,6 +166,32 @@ def normalize_marker_dialects(text: str) -> str:
     return _DIALECT_MARKER_PATTERN.sub(_replace, text)
 
 
+# 인라인 코드로 감싼 인용(`` `[102]` ``·`` `[101][102]` ``)은 백틱을 벗겨 프로즈 마커로 되돌린다
+# (2026-09-30 라이브 "인용 번호 `[102]`" — 코드 스팬 예외가 검증·재번호를 건너뛰어 내부
+# source_id가 공개 본문에 샜다). 판정은 **형태가 아니라 존재**다: `[0]`·`[1, 2]` 같은 리터럴은
+# 형태로 마커와 구분되지 않으므로, 스팬 안 id가 **전부 인용 가능 출처에 실재할 때만** 벗긴다.
+# 내부 id는 source_id_base(101)부터 발급돼 리터럴의 작은 수와 겹치지 않는다. 실재하지 않는
+# id의 백틱 마커는 리터럴로 남는다 — 가리킬 출처가 없으니 샐 내부 id도 아니다.
+_MARKER_ONLY_CODE = re.compile(r"(`+)[ \t]*((?:" + MARKER_PATTERN.pattern + r"[ \t]*)+)\1")
+
+
+def _unwrap_cited_code(text: str, valid_ids, start: int = 0) -> str:
+    """`start` 이후의 인용 전용 인라인 코드만 벗긴다(스트림은 이미 흘린 구간을 다시 보지 않는다)."""
+    parts, cursor = [text[:start]], start
+    for span_start, span_end in sorted(code_span_ranges(text)):
+        match = span_start >= start and _MARKER_ONLY_CODE.fullmatch(text, span_start, span_end)
+        if match and all(
+            ids and not invalid and set(ids) <= valid_ids
+            for ids, invalid in (
+                _marker_ids(marker.group(1), valid_ids)
+                for marker in MARKER_PATTERN.finditer(match.group(2))
+            )
+        ):
+            parts += [text[cursor:span_start], match.group(2).rstrip()]
+            cursor = span_end
+    return "".join(parts) + text[cursor:]
+
+
 _PUNCT = re.compile(r"[^\w\s]")
 
 
@@ -235,8 +261,8 @@ def validate_citations(text: str, sources: list[dict]) -> CitationResult:
     검증 전에 마커 방언(`[source:6]` 등)을 canonical 형태로 정규화한다
     (`normalize_marker_dialects`) — 표기가 무엇이든 검증·제거 규칙은 하나다.
     """
-    text = normalize_marker_dialects(text)
     valid_ids = {source["id"] for source in sources}
+    text = _unwrap_cited_code(normalize_marker_dialects(text), valid_ids)
     code_ranges = code_span_ranges(text)
 
     cleaned_parts: list[str] = []
@@ -558,6 +584,8 @@ class StreamRenumberer:
         stable = normalize_marker_dialects(raw_text if final else _stable_prefix(raw_text))
         if len(stable) <= self._consumed:
             return "", {}
+        consumed = len(stable)
+        stable = _unwrap_cited_code(stable, set(valid_ids), self._consumed)
         code_ranges = code_span_ranges(stable)
         segment = stable[self._consumed :]
         assigned_before = set(self.mapping)
@@ -582,7 +610,7 @@ class StreamRenumberer:
         elif rendered:
             ended = _TRAILING_MARKER.search(rendered)
             self._last_marker = ended.group(0) if ended else None
-        self._consumed = len(stable)
+        self._consumed = consumed
         return rendered, {
             old: new for old, new in self.mapping.items() if old not in assigned_before
         }
@@ -600,8 +628,9 @@ def renumber_for_display(
 
     순서가 중요하다: 검증(`validate_citations`)은 모델이 실제로 쓴 내부 id로 해야 하고,
     재번호는 그 **이후**에만 성립한다(먼저 바꾸면 대조할 id 집합이 사라진다). 재번호한
-    본문을 다시 검증에 통과시켜 support 인덱스를 새 본문 길이에 맞춘다 — `[30]`→`[1]`은
-    길이가 줄어 인덱스가 밀리므로, 인덱스 보정을 손으로 하지 않고 같은 함수에 맡긴다.
+    본문을 검증에 **다시 통과시키지 않는다** — 공개 번호 1..n은 리터럴의 작은 수와 겹쳐
+    `` `[1]` `` 같은 코드 리터럴을 인용으로 벗겨 버린다(`_unwrap_cited_code`). 검증을 마친
+    본문은 모든 프로즈 마커가 유효하므로 재번호는 id를 매핑할 뿐이고, 개수 필드는 불변이다.
 
     배정 규칙 자체는 `assign_display_numbers`가 소유하고 **스트림도 같은 함수를 쓴다** —
     무효 마커 제거가 없는 턴이면 두 경로의 배정이 같아 정본이 스트리밍 본문과 바이트
@@ -617,8 +646,13 @@ def renumber_for_display(
     public_sources = [
         {**source, "id": new} for new, source in display_cards(mapping, by_id, folds).items()
     ]
-    renumbered = validate_citations(renumber_markers(citation.text, mapping), public_sources)
-    renumbered.removed_markers = [*citation.removed_markers, *renumbered.removed_markers]
+    renumbered = CitationResult(
+        text=renumber_markers(citation.text, mapping),
+        meaningful_supports=citation.meaningful_supports,
+        # 판 접기로 두 내부 id가 한 번호가 될 수 있다 — 필드 계약(중복 제거)을 지킨다.
+        used_source_ids=list(dict.fromkeys(mapping[i] for i in citation.used_source_ids)),
+        removed_markers=citation.removed_markers,
+    )
     return renumbered, public_sources
 
 
