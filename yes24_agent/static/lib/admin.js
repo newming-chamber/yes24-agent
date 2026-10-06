@@ -1742,7 +1742,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   const counted = (key, label, excel, unit, tone) => ({ key, label, excel, unit, tone, format: num, csv: String });
   const STAT_COLUMNS = [
     { key: 'day', label: '날짜', excel: '날짜', format: String, csv: (day) => day.replaceAll('-', '.') }, { key: 'weekday', label: '요일', excel: '요일', format: String },
-    counted('sessions', `${TERMS.sessions} 수`, '세션수', '개', 'tone-blue'), counted('users', TERMS.users, '활성사용자수', '명', 'tone-green'), counted('queries', TERMS.turns, '질의수', '회', 'tone-grey'),
+    counted('users', TERMS.users, '활성사용자수', '명', 'tone-green'), counted('sessions', `${TERMS.sessions} 수`, '세션수', '개', 'tone-blue'), counted('queries', TERMS.turns, '질의수', '회', 'tone-grey'),
     { key: 'queries_per_session', label: `${TERMS.sessions}당 평균 ${TERMS.turns}`, excel: '세션당 평균 질의수', unit: '회', format: fixed2 }, { key: 'avg_session_seconds', label: `평균 ${TERMS.sessions} 시간`, excel: '평균 세션시간(초)', format: minutes, csv: (value) => String(Math.round(value)) },
     { ...counted('refusals', '답변거절 수', '답변거절수', '회', 'tone-red'), detail: (row) => refusedText(row.refused), hint: REFUSAL_HINT }, counted('links', '링크 제공 수', '링크제공수', '회', 'tone-blue'), counted('clicks', TERMS.clicks, '클릭수', '회', 'tone-yellow'),
     { key: 'click_rate', label: '클릭률', excel: '클릭률', format: (value) => value == null ? '-' : `${value.toFixed(2)}%` },
@@ -1758,8 +1758,8 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     click_rate: { label: '클릭률', format: percent, value: (row) => row.click_rate, tone: 'tone-yellow' },
   };
   const STAT_VIEWS = {
-    all: { cards: [['sessions', 'queries', 'links'], ['users', 'queries_per_session', 'clicks']], series: ['sessions', 'queries'], columns: STAT_COLUMNS.map((column) => column.key) },
-    session: { cards: [['sessions', 'users', 'avg_session_seconds']], series: ['sessions'], below: 'users', columns: [...LEAD, 'sessions', 'users', 'avg_session_seconds'],
+    all: { cards: [['users', 'queries', 'links'], ['sessions', 'queries_per_session', 'clicks']], series: ['sessions', 'queries'], columns: STAT_COLUMNS.map((column) => column.key) },
+    session: { cards: [['users', 'sessions', 'avg_session_seconds']], series: ['sessions'], below: 'users', columns: [...LEAD, 'users', 'sessions', 'avg_session_seconds'],
       weekday: { key: 'sessions', title: '요일별 평균 세션 수', insight: '세션이 가장 많이 발생된 요일' } },
     query: { cards: [['queries', 'queries_per_session', 'refusals']], series: ['queries'], below: 'refusal_rate', columns: [...LEAD, 'queries', 'queries_per_session', 'refusals'],
       weekday: { key: 'queries', title: '요일별 평균 질의 수', insight: '질의가 가장 많은 요일' } },
