@@ -125,6 +125,23 @@ class Settings(BaseSettings):
     # meta 서브콜에 싣는 직전 턴 답변의 앞부분 길이. 맥락 힌트라 전문이 필요 없고, 본문
     # 전량을 실으면 서브콜 토큰이 턴마다 답변 길이만큼 는다. 배터리 재생은 600으로 돌렸다.
     enrichment_prior_answer_chars: int = 600
+    # 긴 대화의 이력 압축(history_compaction.py — ADK 네이티브 token-threshold compaction을 턴
+    # 마감 뒤 백그라운드로). 매 턴 세션 이력 전체가 프롬프트로 재전송되는 구조라 비용이 턴 수에
+    # 비례한다 — 운영 DB 실측(2026-10-06): 회원 1명이 한 대화에서 343턴·320턴을 써 턴당 프롬프트가
+    # 1만→165만 토큰으로 자랐고 10-03 이후 main 비용 $167 중 $106(64%)이 이 한 명이었다. 요약은
+    # "이미 흘러간 대화의 구조화"라 깊은 추론이 불필요하다 — enrichment와 같은 경량 유틸 모델 관례.
+    # 빈 문자열이면 압축 전체 비활성(구조적 off 스위치).
+    history_compaction_model: str = "gemini-3.1-flash-lite"
+    # 발동 임계값 — 턴의 **마지막 LLM 콜** prompt_token_count(다음 턴이 재전송할 이력 크기).
+    # 같은 실측에서 정상 사용자는 대화당 1~3턴, 턴당 프롬프트 중앙값 5~6만·p90 15~18만 토큰이라
+    # p90을 건드리지 않는 20만에서 출발한다(그 위는 사실상 장기 대화뿐).
+    history_compaction_token_threshold: int = 200_000
+    # 압축 뒤 원문 그대로 남길 최근 이벤트 수(ADK event_retention_size — 턴이 아니라 이벤트 단위).
+    # 이벤트 = 사용자 발화·함수콜·도구 응답·모델 본문·state 쓰기 각 1건 — 운영 실측 턴당 이벤트
+    # p50 4·p90 8이라 24면 최근 3~6턴이 원문으로 남아 "방금 그 책" 류 후속이 요약이 아닌 원문을
+    # 본다.
+    # 함수콜↔응답 짝은 ADK가 가르지 않으므로 실제 보존 수는 이 값 이상일 수 있다.
+    history_compaction_retention_events: int = 24
     # 세션 제목 표시 상한(문자). 목록 한 줄에 담기는 길이 — status_detail_max_chars와는
     # 다른 축이라 따로 둔다(우연히 비슷해도 서로 따라가면 안 된다).
     session_title_max_chars: int = 60

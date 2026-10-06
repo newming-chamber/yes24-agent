@@ -526,7 +526,9 @@ def _assemble_turns(events: list) -> list[dict[str, Any]]:
     ADK는 non-partial 이벤트만 영속하므로 모델 텍스트 이벤트는 LLM 콜(라운드)당 1건이다.
     라운드 사이 문단 구분은 스트림과 **같은 규칙**(_round_boundary_prefix — 도구가 돈 뒤의
     이어붙는 텍스트에만, 경계에 공백이 없을 때만)을 쓴다. invocation_id 없는 이벤트(러너의
-    state_delta 시스템 write)는 대화가 아니므로 건너뛴다.
+    state_delta 시스템 write)는 대화가 아니므로 건너뛴다. 이력 압축 요약 이벤트
+    (`actions.compaction`, history_compaction.py)도 같다 — 모델 입력용 요약일 뿐 대화가 아닌데,
+    ADK가 고유 invocation_id를 붙이므로 구조 신호로 거르지 않으면 발화 없는 유령 턴이 복원된다.
 
     공개 스냅샷이 있는 턴은 사용자 발화·시각만 읽는다. 스냅샷 없는 구 턴만
     라이브와 같은 TurnProcess로 재조립하며, 구 타이밍 메타데이터는 본문에서 제외한다.
@@ -541,7 +543,7 @@ def _assemble_turns(events: list) -> list[dict[str, Any]]:
     turns: dict[str, dict[str, Any]] = {}
     for event in events:
         invocation_id = event.invocation_id
-        if not invocation_id or event.partial:
+        if not invocation_id or event.partial or event.actions.compaction:
             continue
         turn = turns.get(invocation_id)
         if turn is None:

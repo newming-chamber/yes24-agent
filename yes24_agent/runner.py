@@ -39,6 +39,7 @@ from yes24_agent.event_translate import (
     project_source_ref,
     settle_sources,
 )
+from yes24_agent.history_compaction import schedule_history_compaction
 from yes24_agent.logctx import update as log_update
 from yes24_agent.postprocess import (
     StreamRenumberer,
@@ -659,6 +660,9 @@ async def run_agent_stream(
         # 사고·캐시 토큰도 센다 — 이 둘이 없으면 금액이 안 나온다(실측: total-prompt-response가
         # 턴당 964토큰으로 기록된 출력 661보다 컸다 — 과금되는 사고 토큰이 통째로 누락).
         usage_thoughts = usage_cached = 0
+        # 마지막 LLM 콜의 프롬프트 토큰 — 이력 압축 발동 판정 재료(history_compaction). 합계가
+        # 아니라 마지막 콜인 이유: 다음 턴이 재전송할 이력의 크기를 대표하는 값이 그것이다.
+        last_prompt_tokens = 0
         # 모델이 쓴 **원시** 본문 조각(세션 누적 id 그대로). 인용 검증의 입력이다.
         raw_body: list[str] = []
         # 화면에 흘린 **표시 번호** 본문 조각. 마감의 4b 대조(_emit_final_body)가 이 값 위에
@@ -837,6 +841,7 @@ async def run_agent_stream(
                         usage_cached += (
                             event.usage_metadata.cached_content_token_count or 0
                         )
+                        last_prompt_tokens = event.usage_metadata.prompt_token_count or 0
 
                     if not event.partial and event.error_code:
                         final_text = _event_text(event) or final_text
@@ -1117,6 +1122,15 @@ async def run_agent_stream(
                     user_text=message, started_at=request_started_at,
                 )
                 completion.update(saved=final_done["history_saved"], sent=True)
+                # 이력 압축 예약(임계값 미만이면 no-op). done **앞**에서 예약하는 이유: done 뒤의
+                # 코드는 클라이언트가 done을 받고 끊으면(GeneratorExit) 실행되지 않는다. 예약만
+                # 하고 실행은 이 턴이 세션 락을 놓은 뒤 백그라운드라 done·스트림 종료는 밀리지
+                # 않는다. 정상 마감 경로에만 둔다 — 실패 턴의 이력은 다음 정상 턴이 같은 판정으로
+                # 접는다(멱등).
+                schedule_history_compaction(
+                    service, resolved_session_id, session_user_id, agent,
+                    prompt_tokens=last_prompt_tokens,
+                )
                 yield sse_done(final_done)
                 break
 
