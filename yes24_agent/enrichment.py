@@ -3,6 +3,10 @@
 답변 본문과 별도의 경량 서브콜로 "프론트가 구조로 쓰는 부가 정보"를 뽑는다: 답변이
 책·상품을 추천했다면 **추천 항목 단위**의 이유(카드용 한 줄 — 출처 나열이 아니다),
 사용자가 이어서 누를 후속 질문, 세션에 아직 제목이 없다면 대화 제목.
+모델은 항목마다 그 항목에 속한 출처 id를 전부 `ids`로 묶고(같은 작품의 판형·같은 잡지의
+호·같은 시리즈의 권), 서버가 묶음의 모든 id에 같은 reason을 붙여 공개 계약 `{id, reason}`
+배열로 펼친다 — 묶음은 모델이, 펼치기는 서버가(2026-10-06 사용자 결정). 공개 계약 모양은
+불변이며 같은 항목의 카드는 같은 이유를 공유한다.
 `thought_translation.py`와 같은 경량 유틸 계열이다(전용 config 필드, 실패 시 폴백).
 
 계약:
@@ -59,7 +63,9 @@ _EXTRACT_INSTRUCTION = (
     "내용은 전부 답변 본문에서 가져온다). "
     "책의 매력과 질문에 맞는 이유에 집중하고, 줄거리 나열이나 본문에 없는 이유 창작, "
     "검색·출처·시스템 동작 언급은 하지 않는다. "
-    "한 항목이 여러 출처로 인용됐으면 대표 출처 id 하나만 쓴다. "
+    "한 항목이 여러 출처로 인용됐으면(같은 작품의 다른 판형, 같은 잡지의 다른 호, 같은 "
+    "시리즈의 여러 권) 그 출처 id를 전부 ids에 넣는다. 서로 다른 작품·상품은 한 항목으로 "
+    "묶지 않는다. "
     "follow_ups는 사용자가 이 답변을 읽고 이어서 물을 법한 질문이다. 사용자가 그대로 눌러 "
     "보낼 수 있도록 사용자의 말투로 쓴 완결된 한국어 질문이다. "
     "적어도 하나는 답변이 이름만 대고 지나간 구체적인 항목(작품·인물·사건·수치·조건 중 "
@@ -96,10 +102,14 @@ def _response_schema(want_title: bool, *, has_prior_turn: bool) -> types.Schema:
         items=types.Schema(
             type=types.Type.OBJECT,
             properties={
-                "id": types.Schema(type=types.Type.INTEGER),
+                "ids": types.Schema(
+                    type=types.Type.ARRAY,
+                    items=types.Schema(type=types.Type.INTEGER),
+                    min_items=1,
+                ),
                 "reason": types.Schema(type=types.Type.STRING),
             },
-            required=["id", "reason"],
+            required=["ids", "reason"],
         ),
     )
     required = list(properties)
@@ -136,8 +146,15 @@ def _clip_title(title: str, max_chars: int) -> str:
 def _validated_meta(raw: dict, cited_ids: list[int], want_title: bool) -> dict | None:
     """모델 출력의 출구 검증 — 인용 집합 밖 id·빈 이유·중복을 버리고, 전부 비면 None.
 
-    추천의 정렬·상한은 여기서 하지 않는다 — 이월 합성(`carry_recommendation_reasons`)이
-    저장소에서 채운 항목까지 합친 뒤 한 곳에서 정한다(같은 판정의 중복 구현 금지).
+    항목은 `{ids: [...], reason}` 묶음이다 — id별로 펼쳐 같은 reason을 붙이고, 정렬은 이월
+    합성(`carry_recommendation_reasons`)이 본문 인용 순서로 한다. 인용 밖 id는 그 id만 빠지고
+    묶음의 나머지는 남으며, 묶음 전체가 인용 밖이거나 ids가 비었거나 리스트가 아니거나 이유가
+    비면 항목을 버린다. 같은 id가 두 묶음에 있으면 첫 묶음이 이긴다.
+
+    개수 상한은 없다: 추천 id는 이번 턴 인용 집합 안에서만 유효(이 출구 검증)하고 권유 여부는
+    is_recommendation이 가르며 출력 토큰 예산이 2차 상한이라, 별도 개수 상한은 권한 항목의
+    이유를 자르는 효과만 남아 2026-10-06 삭제했다(옛 crema-ai 카드 5장 계약의 잔재 — 기준선
+    QA에서 서로 다른 상품 9장을 권한 답변의 4장이 빈 카드가 됐다).
     """
     settings = get_settings()
     order = set(cited_ids)
@@ -147,14 +164,22 @@ def _validated_meta(raw: dict, cited_ids: list[int], want_title: bool) -> dict |
     # 설명이 추천으로 새던 경로(2026-08-20 실측)를 출구에서 구조로 닫는다.
     items = raw.get("recommendations") or [] if raw.get("is_recommendation") else []
     for item in items:
-        source_id = item.get("id") if isinstance(item, dict) else None
+        ids = item.get("ids") if isinstance(item, dict) else None
         reason = " ".join(str(item.get("reason") or "").split()) if isinstance(item, dict) else ""
-        if source_id not in order or not reason or source_id in by_id:
-            dropped.append(source_id)
+        kept = (
+            [i for i in ids if isinstance(i, int) and i in order and i not in by_id]
+            if isinstance(ids, list)
+            else []
+        )
+        if not kept or not reason:
+            dropped.append(ids)
             continue
-        by_id[source_id] = {"id": source_id, "reason": reason}
+        for source_id in kept:
+            by_id[source_id] = {"id": source_id, "reason": reason}
     if dropped:
-        logger.warning(f"meta 추천에서 인용 밖 id·빈 이유·중복 {len(dropped)}건 제거: {dropped}")
+        logger.warning(
+            f"meta 추천에서 인용 밖·빈 이유·중복 묶음 {len(dropped)}건 제거: {dropped}"
+        )
 
     meta: dict = {}
     if by_id:
@@ -191,13 +216,13 @@ def carry_recommendation_reasons(
     돌려주는 것은 `(recommendations, 갱신된 저장소)`다. 저장소는 입력을 변이하지 않은 새 dict이며
     삽입 순서가 곧 최근 순서다: 이번 턴에 이유가 붙은(새로 또는 갱신된) 책은 끝으로 옮기고,
     `enrichment_reason_memory_max`를 넘으면 앞(가장 오래된 것)부터 버린다. 상한 근거: 세션이
-    길어져도 state 행이 무한히 크지 않게 하는 안전 상한일 뿐 의미 경계가 아니다 — 카드 폭
-    (max_recommendations)의 10배면 한 세션의 추천 회전을 넉넉히 덮는다.
+    길어져도 state 행이 무한히 크지 않게 하는 안전 상한일 뿐 의미 경계가 아니다.
 
-    결과 정렬은 **본문 인용 등장 순서**(cited_sources 순서 = done.sources 순서)이고 상한은
-    `enrichment_max_recommendations`다 — 프론트 카드 줄과 어긋나지 않는 정렬·폭 규약(crema-ai
-    카드 계약 이식, 2026-08-20). 이월은 enrichment 성공 여부와 독립이다: `fresh`가 비어도
-    (실패·None·비권유 판정) 저장소에 있는 책은 실린다.
+    결과 정렬은 **본문 인용 등장 순서**(cited_sources 순서 = done.sources 순서)다 — 프론트
+    카드 줄과 어긋나지 않는 정렬 규약(crema-ai 카드 계약 이식, 2026-08-20). 개수로는 자르지
+    않는다(`_validated_meta` docstring의 상한 삭제 근거 — 한 번 이유가 붙은 책은 계속 붙는다,
+    2026-09-09). 이월은 enrichment 성공 여부와 독립이다: `fresh`가 비어도(실패·None·비권유
+    판정) 저장소에 있는 책은 실린다.
     """
     settings = get_settings()
     fresh_by_id = {item["id"]: item["reason"] for item in fresh}
@@ -213,12 +238,6 @@ def carry_recommendation_reasons(
             reason = memory.get(url)
         if reason:
             recommendations.append({"id": source_id, "reason": reason})
-    if len(recommendations) > settings.enrichment_max_recommendations:
-        logger.warning(
-            f"meta 추천 {len(recommendations)}건이 상한을 넘어 "
-            f"{settings.enrichment_max_recommendations}건으로 자릅니다."
-        )
-        recommendations = recommendations[: settings.enrichment_max_recommendations]
     overflow = len(memory) - settings.enrichment_reason_memory_max
     if overflow > 0:
         for url in list(memory)[:overflow]:

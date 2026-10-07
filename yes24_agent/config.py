@@ -110,13 +110,9 @@ class Settings(BaseSettings):
     enrichment_timeout_s: float = 10.0
     # 추천 이유 여러 건 + 제목의 JSON 출력 예산. 이유는 한 줄 요약이라 넉넉한 천장이다.
     enrichment_max_output_tokens: int = 1024
-    # meta 추천 항목 수 상한(출구에서 초과 꼬리 제거). crema-ai의 카드 5권 계약 이식 —
-    # 프론트 카드 줄과 1:1이 보장되는 폭이다. 정렬은 본문 인용 등장 순서(출구 검증이 소유).
-    enrichment_max_recommendations: int = 5
     # 추천 이유 이월 저장소(`{url: reason}`, 세션 state)의 항목 상한 — 넘으면 오래된 것부터
     # 버린다(enrichment.carry_recommendation_reasons). 세션 state 행이 대화 길이에 비례해 무한히
-    # 크지 않게 하는 안전 상한이지 의미 경계가 아니다 — 카드 폭(위 5)의 10배면 한 세션의 추천
-    # 회전을 넉넉히 덮는다.
+    # 크지 않게 하는, 한 세션의 추천 회전을 덮는 안전 상한이지 의미 경계가 아니다.
     enrichment_reason_memory_max: int = 50
     # meta 후속 질문(follow_ups) 개수. 프롬프트 문구가 아니라 스키마 min_items/max_items로
     # 강제하고, 출구에서 한 번 더 자른다. 0이면 필드 자체가 스키마에서 빠진다(구조적 off —

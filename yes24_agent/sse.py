@@ -160,6 +160,8 @@ round가 없다.
   중단된 턴은 best-effort 영속하고 히스토리의 `status:interrupted`로 구분한다.
 - `done.meta`는 항상 객체이며 `recommendations/follow_ups`는 항상 배열이다. 메타 생성 실패가
   본문 성공을 바꾸지 않는다. 추천 도서가 아닌 도서 출처는 recommendations에 넣지 않는다.
+  같은 추천 항목에 속한 카드(같은 작품의 판형·같은 잡지의 호)는 같은 reason을 공유하며 각자
+  `{id, reason}` 행으로 온다 — 계약 모양은 그대로다.
 - `history_saved:false`면 최종 스냅샷 영속에 실패한 것이다. `done`이 없는 EOF는 완료가 아니다.
 - `reset`이 없으면 **`delta` 합계 == `done.text`**. `reset`이 오면 그 뒤 `delta`만 정본이다.
 - 본문의 `[n]` 마커는 **반드시** `done.sources`의 `id`에 매핑된다(무매핑 마커는 서버가 지운다).
