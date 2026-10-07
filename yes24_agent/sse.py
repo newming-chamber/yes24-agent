@@ -55,9 +55,9 @@ data: <JSON>
 
 **PublicSource** — 공통 `id/title/url/type/card_type`에 관측된 평면 필드가 붙는다.
 `id`는 턴 안의 인용 번호이며 턴 간에는 `(turn_id,id)`로 구분한다. `type`은 호환용
-`product/notice/web`이고, 렌더링은 `card_type`으로 한다: `book`은 사이트의 도서 분류 또는
-도서 구조 데이터를 관측한 자료, `document`는 현재 Yes24 공지·FAQ 계열, `link`는 나머지의
-일반 웹 카드다. `book_detail` 같은 수집 경로는 도서 판정 근거가 아니다.
+`product/notice/web`이고, 렌더링은 `card_type`으로 한다: `book`은 Yes24 상품 카드(도서·잡지·
+DVD·음반·문구 등 상품 전부 — 종류 라벨은 `kind`), `document`는 현재 Yes24 공지·FAQ 계열,
+`link`는 웹 출처의 일반 링크 카드다. `card_type`은 카드 템플릿이지 도서 판정이 아니다.
 `preview`는 관측 원문의 첫 비어 있지 않은 문단이며 길이가 고정된 요약은 아니다.
 접지 원문 `snippet`은 내부에 보존하고 공개하지 않는다. `other_formats`는 관측하지 않으면
 생략, 관측했지만 없으면 `[]`, 가격 미상이면 항목의 `sale_price:null`이다. 크레마클럽 등록은

@@ -420,8 +420,8 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     return row;
   }
 
-  // 인용 출처 묶음 — 출처의 구조 분류(sources.js sourceCardType: card_type·type)로 나눈다. 도서는 표지 카드, 나머지는 한 줄.
-  const SOURCE_GROUPS = [['book', '도서', sourceCard, 'source-cards'], ['link', '웹', sourceLine, 'source-lines'], ['document', 'Yes24 안내', sourceLine, 'source-lines']];
+  // 인용 출처 묶음 — 출처의 구조 분류(sources.js sourceCardType: card_type·type)로 나눈다. Yes24 상품은 표지 카드, 나머지는 한 줄.
+  const SOURCE_GROUPS = [['book', '상품', sourceCard, 'source-cards'], ['link', '웹', sourceLine, 'source-lines'], ['document', 'Yes24 안내', sourceLine, 'source-lines']];
 
   /** 질의내역 한 칸 — 머리(질문·시각·지표)를 누르면 그 자리에 답변(md.js 렌더 + 인용 마커)과 출처 카드가 펼쳐진다. */
   function turnBlock(t, i) {

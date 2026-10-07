@@ -4,7 +4,8 @@
 
 export const WEB_TYPES = new Set(["web"]);
 
-export const CARD_LABELS = Object.freeze({ book: "도서", document: "문서", link: "웹" });
+// book은 Yes24 상품 카드 전부(도서·잡지·DVD·음반·문구)의 템플릿이다 — 종류 라벨은 src.kind(2026-10-06).
+export const CARD_LABELS = Object.freeze({ book: "상품", document: "문서", link: "웹" });
 
 export function sourceCardType(src) {
   return Object.hasOwn(CARD_LABELS, src?.card_type) ? src.card_type

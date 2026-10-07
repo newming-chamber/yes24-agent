@@ -203,7 +203,7 @@ class SourceCard(BaseModel):
     url: str = Field(description="원문 링크. URL만으로 카드 분류를 추측하지 않는다")
     type: str = Field(description="기존 공개 분류 product | notice | web. 클릭 기록에도 사용한다")
     card_type: Literal["book", "document", "link"] = Field(
-        description="관측 정보로 정한 카드 템플릿. product라고 반드시 book인 것은 아니다"
+        description="카드 템플릿. Yes24 상품은 book(도서·잡지·DVD 등 전부), 종류는 kind"
     )
     preview: str | None = Field(default=None, description="표시용 발췌. 전체 원문이 아니다")
     goods_no: str | int | None = Field(

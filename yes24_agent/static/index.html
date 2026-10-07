@@ -1695,7 +1695,8 @@
         num.textContent = src.id;
         const type = document.createElement("span");
         type.className = "type";
-        type.textContent = CARD_LABELS[kind];
+        // 상품 카드는 사이트 종류 라벨(kind: 도서·잡지·Blu-ray…)을 그대로 쓰고, 없으면 템플릿 라벨.
+        type.textContent = (kind === "book" && typeof src.kind === "string" && src.kind.trim()) || CARD_LABELS[kind];
         top.append(num, type);
         const title = document.createElement("div");
         title.className = "title";

@@ -210,16 +210,17 @@ thinking/refs는 done.process.steps에 저장되지 않는다. 복원 시 thinki
 ## 5. 카드와 자료 탭
 
 `type`은 기존 분류(`product/notice/web`), **렌더링 기준은 `card_type`**이다.
-`product`나 내부 수집 이름 `book_detail`만으로 책인지 추측하지 않는다.
+`card_type`은 카드 템플릿이며 `book`은 "Yes24 상품 카드"다 — 도서라는 뜻이 아니다.
+상품 종류(도서·잡지·DVD·음반·문구 등)는 `kind`(사이트 라벨 원형)로 표시한다.
 
 | card_type | 표시 | 결측 처리 |
 |---|---|---|
-| `book` | 도서 표지·제목·저자·출판사·관측 가격/평점·추천 이유·판형 | 없는 행 숨김, 이미지 실패는 대체 영역 |
+| `book` | Yes24 상품 카드(도서·잡지·DVD·음반·문구 등 전부): 표지·제목·저자/아티스트·출판사·관측 가격/평점·추천 이유·판형, 종류 라벨은 `kind` | 없는 행 숨김, 이미지 실패는 대체 영역 |
 | `document` | 공지/FAQ 제목·발췌·출처 | 발췌 없으면 해당 영역 숨김 |
 | `link` | 일반 웹 카드: 제목·도메인·발췌 | 빈 제목은 도메인, 잘못된 URL은 비활성 |
 
-- 책 분류는 실제 사이트 도서 분류/도서 구조 데이터에 근거한다. `link`에는 책으로 확인되지
-  않은 상품도 포함된다. 웹 검색에서 왔다는 뜻이 아니라 **일반 링크 템플릿**이라는 뜻이다.
+- Yes24 상품은 종류와 무관하게 전부 `book`이다(2026-10-06). `link`는 웹 출처의 **일반 링크
+  템플릿**이고, `document`는 Yes24 공지·FAQ다. 상품이 `link`로 오는 경우는 없다.
 - `preview`는 관측 원문의 첫 비어 있지 않은 문단이다. 고정 길이 요약/추천 이유가 아니다.
   서버의 페이로드 안전 상한을 넘으면 일부와 말줄임표만 올 수 있으므로 전문으로 취급하지 않는다.
   내부 접지 원문 `snippet`은 공개하지 않는다. 화면에서는 줄 수로 제한하고 원문 링크를 제공한다.
@@ -236,7 +237,7 @@ thinking/refs는 done.process.steps에 저장되지 않는다. 복원 시 thinki
 - 크레마클럽 등록은 최상위 `cremaclub`이다 — `true` 등록, `false` 클럽 조회 결과 미등록, **키 없음 = 미확인**(조회 실패·예산 초과·대상 아님 — "클럽에 없음"으로 단정하지 않는다). "이 책을 크레마클럽에서 볼 수 있다"는 작품 단위 의미라 종이책 출처는 그 eBook 판 기준이다. `true`면 `other_formats`에도 판형 항목 `{format:"크레마클럽", url:<클럽 상세>, sale_price:null}`이 하나 붙는다(판형 이름으로 뱃지를 그리는 기존 소비자 호환). 프론트가 URL을 조립하지 않는다 — 항목이 없으면 클럽 링크를 그리지 않는다. 성인 상품은 등록돼 있어도 항목이 없을 수 있다(서버가 확인할 수 없는 사각).
   다른 판형 링크만 관측했다고 별도 인용 번호가 생기지 않는다. 종이책·eBook 상세를 둘 다 열어 인용했어도
   같은 작품이면 **카드 1장**(대표=종이책, eBook은 `other_formats` 항목)·표시 번호 하나로 합쳐 나간다.
-- 자료 탭은 **질문별로 해당 턴 sources를 그룹화**한다. 전체/도서/문서/웹 필터와 종류별 건수,
+- 자료 탭은 **질문별로 해당 턴 sources를 그룹화**한다. 전체/상품/문서/웹 필터와 종류별 건수,
   빈 상태를 제공한다. 데스크톱 3열·모바일 1열은 내장 HTML의 표시 정책이지 서버 계약은 아니다.
 - HTML/Markdown은 안전하게 렌더링하고 링크·이미지 URL 스킴을 검증한다. 외부 링크는 새 창과
   `noopener noreferrer`를 사용한다. 자료 탭과 채팅이 각각 별도 출처 복사본을 소유하지 않게 한다.
@@ -273,8 +274,8 @@ thinking/refs는 done.process.steps에 저장되지 않는다. 복원 시 thinki
 | list_price, sale_price, rating, review_count | number / null | 정가·판매가·평점·리뷰 수 |
 | goods_no | string / number / null | 상품 식별 참고. 출처 id를 대체하지 않음 |
 | pub_date, published_at, last_updated, checked_at | string / null | 출간/게시/갱신/확인 시각. 값이 있을 때만 표시 |
-| author_no, kind | string / null | 저자 식별·사이트 분류 참고. kind로 카드 템플릿을 재판정하지 않음 |
-| is_book, is_ebook | boolean / null | 관측 속성 참고. 렌더링 선택은 card_type 사용 |
+| author_no, kind | string / null | 저자 식별·사이트 종류 라벨(도서·잡지·Blu-ray 등). `book` 카드의 종류 표시에 쓰고, 카드 템플릿을 재판정하지 않음 |
+| is_book, is_ebook | boolean / null | 관측 속성 참고. 렌더링 선택은 card_type 사용(is_book=false여도 book 카드) |
 | cremaclub | boolean | 크레마클럽 등록(true)·미등록(false). 키 없음은 미확인 |
 | sale_index, page_count, rank | number / null | 판매지수·쪽수·순위. 관측됐을 때만 제공 |
 | other_formats | 배열 / null | `{format?:string|null,url?:string|null,sale_price?:number|null}` 목록. 크레마클럽 등록이면 `format:"크레마클럽"`(url=클럽 상세, sale_price=null) 항목도 하나 |

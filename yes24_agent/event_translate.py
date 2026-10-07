@@ -161,6 +161,10 @@ PUBLIC_RECORD_LIST_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 
+# 공개 type → 카드 템플릿. 사전에 없는 공개 type(product)은 Yes24 상품 카드(book)다.
+_CARD_TYPES: dict[str, str] = {"notice": "document", "web": "link"}
+
+
 def _is_public_scalar(value: object) -> bool:
     return value is None or isinstance(value, (str, int, float, bool))
 
@@ -173,25 +177,13 @@ def project_public_source(source: dict) -> dict:
     """
     event = _project_observation(source)
     event["type"] = _PUBLIC_SOURCE_TYPE.get(event["type"], event["type"])
-    if event["type"] == "notice":
-        event["card_type"] = "document"
-    else:
-        # 판형은 **관측됐을 때만** 판정을 뒤집는다. 신호의 권위 순서는 is_book(상세 주문
-        # JSON의 resource_key — 외서·오디오북까지 도서로 답한다) > kind(목록 판형 라벨) >
-        # is_ebook이고, 셋 다 침묵이면 Yes24 상품은 책이다(웹·공지는 아니다).
-        # 침묵을 "책 아님"으로 접던 옛 판정이 2026-09-18 사고의 원인이다: 판형 라벨
-        # (span.gd_res)이 없는 코너 목록(크레마클럽 인기)의 행이 전부 link로 나갔고,
-        # 프론트는 card_type != "book"이면 인라인 인용 칩을 지우고 책 카드도 만들지 않아
-        # 정상 인용된 책이 링크 없이 보였다(dev 코퍼스 09-10~ 실측: product 출처 3,646건 중
-        # link 562건, 그중 558건이 침묵이고 실제 비도서 관측은 4건뿐).
-        is_book = event.get("is_book")
-        if is_book is None and event.get("kind") is not None:
-            is_book = event["kind"] in ("도서", "eBook")
-        if is_book is None and event.get("is_ebook"):
-            is_book = True
-        if is_book is None:
-            is_book = event["type"] == "product"
-        event["card_type"] = "book" if is_book else "link"
+    # card_type은 카드 **템플릿**이다: notice → document, web → link, 그 외(Yes24 상품) → book.
+    # `book`은 도서·잡지·DVD·음반·문구 등 Yes24 상품 전부의 카드이고, 종류는 `kind`(사이트 라벨
+    # 원형)가 싣는다(2026-10-06 사용자 결정). is_book·kind·is_ebook 3단 판정으로 비도서를 link로
+    # 접던 옛 규칙은 두 프론트에서 블루레이·잡지를 표지·가격 없는 "웹" 링크로 그리게 했고,
+    # 2026-09-18 사고(판형 침묵 → link)도 같은 뿌리였다. 외부 프론트(chat.yes24.com) 매퍼가
+    # card_type === 'book'만 카드로 그리므로 값 이름은 바꾸지 않는다.
+    event["card_type"] = _CARD_TYPES.get(event["type"], "book")
     snippet = event.pop("snippet", None)
     if isinstance(snippet, str):
         preview = next((part.strip() for part in snippet.split("\n\n") if part.strip()), "")
