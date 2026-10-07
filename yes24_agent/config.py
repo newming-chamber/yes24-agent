@@ -773,6 +773,10 @@ class Settings(BaseSettings):
     # 개발 키가 가장할 사용자 번호. 실 회원과 겹치지 않게 9자리 대역을 쓴다 — 대화·피드백이
     # 이 번호 밑에만 쌓여 실사용자 데이터와 섞이지 않는다.
     dev_api_user_no: str = "990000001"
+    # Yes24 백엔드→서버 조회 API(`POST /partner/chat-activity`)의 공유 비밀 — **비우면 라우트
+    # 미등록(404)**이 배포 기본이다(overview_model 관례의 구조적 off 스위치). 호출자가 회원 쿠키가
+    # 없는 Yes24 백엔드라 x-api-key(회원 식별)와 다른 헤더 `x-partner-key`로 받는다.
+    partner_api_key: str = Field(default="", repr=False)
     # 인증 DB 커넥션 풀 상한. 세션 DB 풀(SQLAlchemy)과 별도로 잡히는 aiomysql 풀이라,
     # 요청당 짧은 조회 몇 건이 전부인 용도에 맞춰 작게 둔다.
     auth_pool_max: int = 5

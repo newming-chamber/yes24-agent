@@ -226,6 +226,27 @@ class UserDataService(MysqlBackedService):
             )
         )
 
+    async def question_activity(
+        self, *, app_name: str, user_id: str, since: datetime | None, until: datetime | None
+    ) -> tuple[int, datetime | None, datetime | None]:
+        """[since, until) UTC 구간에 시작한 이 사용자의 턴 수와 첫·마지막 시작 시각(UTC).
+
+        None인 끝은 열린 구간이다(분기 대신 `%s IS NULL OR` — 인덱스는 어차피 (app_name,
+        user_id) 등치까지만 타므로 실행 계획이 같다).
+
+        소프트 삭제한 대화도 센다 — "질문했는가"는 사실의 기록이고, 사용자가 나중에 대화를
+        지웠다고 참여가 사라지면 안 된다. 보존 기한 뒤 파기된 세션은 행이 없으므로 안 잡힌다.
+        """
+        rows = await self._run(
+            "SELECT COUNT(*), MIN(started_at), MAX(started_at) FROM chat_turn "
+            "WHERE app_name = %s AND user_id = %s "
+            "AND (%s IS NULL OR started_at >= %s) AND (%s IS NULL OR started_at < %s)",
+            (app_name, user_id, since, since, until, until),
+            fetch_all=True,
+        )
+        count, first, last = rows[0]
+        return int(count), first, last
+
     @staticmethod
     def _turn_record(row: tuple, session_id: str) -> dict[str, Any]:
         def decoded(value):

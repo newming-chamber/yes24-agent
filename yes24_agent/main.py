@@ -57,6 +57,7 @@ from yes24_agent.overview import (
     start_overview,
     warm_search,
 )
+from yes24_agent.partner import register_partner, require_partner
 from yes24_agent.rbti.persona import is_valid_code
 from yes24_agent.rbti.profile import fetch_user_rbti
 from yes24_agent.rbti.routes import register_rbti
@@ -611,6 +612,7 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
             if key_routes is None:
                 key_routes = route_cache["routes"] = _key_checking_routes(app)
                 route_cache["admin"] = _delegating_routes(app, require_admin)
+                route_cache["partner"] = _delegating_routes(app, require_partner)
                 logger.info(
                     "로그인월: x-api-key 통과 허용 경로 "
                     f"{sorted(r.path for r in key_routes)} / 관리자 세션 위임 경로 "
@@ -623,7 +625,8 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
             ):
                 return await call_next(request)
             # 운영자 세션 쿠키의 유효성은 라우트 의존성 체인의 require_admin이 판정한다.
-            if _key_route_matches(route_cache["admin"], request):
+            # 파트너 키(Yes24 백엔드)도 같은 위임이다 — 판정은 require_partner가 한다.
+            if _key_route_matches(route_cache["admin"] + route_cache["partner"], request):
                 return await call_next(request)
             if path in _ACCESS_EXEMPT_PATHS or any(
                 token_valid(cookie, pw) for pw in wall_passwords
@@ -1080,6 +1083,9 @@ def create_app() -> FastAPI:
     # 집합에 자동으로 파생된다(_key_checking_routes). include_router가 아니라 직접 등록인
     # 이유는 history.py 라우트 절 주석 참조(지연 프록시가 통과 집합 파생을 가린다).
     register_history(app)
+
+    # Yes24 백엔드 조회(POST /partner/chat-activity). partner_api_key가 비면 미등록(404).
+    register_partner(app, settings)
 
     # 초기 질문 회전 풀(GET /chat/starters·/admin/starters/*). starter_model이 빈 값이면 미등록
     # (404 — overview_model 관례). 라우트·풀·생성의 소유자는 starters.py다.
