@@ -61,6 +61,9 @@ from yes24_agent.yes24.selectors import (
     NO_RESULTS_MARKER,
     PRODUCT_AUDIOBOOK_STICKER,
     PRODUCT_AUTHOR,
+    PRODUCT_EVENT_ITEM,
+    PRODUCT_EVENT_PERIOD,
+    PRODUCT_EVENT_TITLE_LINK,
     PRODUCT_FORMAT_CONTAINER,
     PRODUCT_FORMAT_LINK,
     PRODUCT_FORMAT_PRICE,
@@ -80,6 +83,7 @@ from yes24_agent.yes24.selectors import (
     PRODUCT_PUB_DATE,
     PRODUCT_PUB_REVIEW,
     PRODUCT_PUBLISHER,
+    PRODUCT_PURCHASE_BENEFIT,
     PRODUCT_RATING,
     PRODUCT_REVIEW_WEEK_CONTAINER,
     PRODUCT_REVIEW_WEEK_FULL_TEXT,
@@ -399,6 +403,8 @@ def parse_product(html: str, *, base_url: str) -> dict:
     image_url(str|None), sale_status(str — 판매 상태 문구 원형, 표시 없으면 키 없음),
     other_formats(list[dict]), intro, toc, pub_review, weekly_reviews(list[str]),
     info_tables(dict — 캡션→{라벨: 값}, 표가 없으면 빈 dict).
+    extras(dict — 상세 부가 관측 묶음. 관측된 것만 키로 싣고 없으면 키 없음):
+    purchase_benefits(list[str]), events(list[{title, url, period}] — 사이트가 펼친 항목).
     텍스트 블록(intro/toc/pub_review)은 없으면 None, weekly_reviews는 없으면 빈 리스트.
     other_formats는 판형 위젯이 있고 다른 판형이 없으면 빈 리스트(관측했으나 없음), 위젯
     자체가 없는 문서(크레마클럽 상세 등)면 키가 없다(관측 불가 — 빈 목록으로 접지 않는다).
@@ -476,7 +482,49 @@ def parse_product(html: str, *, base_url: str) -> dict:
         "pub_review": _extract_infoset_text(soup, PRODUCT_PUB_REVIEW),
         "weekly_reviews": _extract_weekly_reviews(soup),
         "info_tables": _extract_info_tables(soup),
+        "extras": _detail_extras(soup, base_url),
     }
+
+
+def _detail_extras(soup: BeautifulSoup, base_url: str) -> dict:
+    """상세 부가 관측(selectors '상세 부가 관측' 블록) — **관측된 것만 키로 싣는다**.
+
+    섹션이 없거나 글자 없는 빈 껍데기면 키를 뺀다. 구매혜택은 26문서 중 9건에만 있고, 빈 목록으로
+    되채우면 "혜택 있음"으로 세어져 근거 없는 서술의 발판이 된다(_prose_or_none과 같은 이유).
+    """
+    values = {
+        "purchase_benefits": [
+            text for el in soup.select(PRODUCT_PURCHASE_BENEFIT) if (text := _prose_text(el))
+        ],
+        "events": [
+            event for item in soup.select(PRODUCT_EVENT_ITEM) if (event := _event(item, base_url))
+        ],
+    }
+    return {key: value for key, value in values.items() if value}
+
+
+def _event(item, base_url: str) -> dict | None:
+    """이벤트 항목 하나 → {title, url, period}. 제목 없는 항목은 버리고, 마크업에 없는 필드는
+    키를 뺀다(표본 26문서 전 항목에 기간이 있었다 — 그래도 없으면 지어내지 않는다)."""
+    anchor = item.select_one(PRODUCT_EVENT_TITLE_LINK)
+    title = _prose_text(anchor)
+    if title is None:
+        return None
+    href = (anchor.get("href") or "").strip()
+    event = {"title": title}
+    if href:
+        event["url"] = urljoin(base_url, href)
+    period = _prose_text(item.select_one(PRODUCT_EVENT_PERIOD))
+    if period:
+        event["period"] = period
+    return event
+
+
+def _prose_text(el) -> str | None:
+    """요소 텍스트를 공백 정규화해 글자가 있으면 반환한다(없거나 빈 껍데기면 None)."""
+    if el is None:
+        return None
+    return _prose_or_none(_normalize_whitespace(el.get_text(" ", strip=True)))
 
 
 def _book_fields(node) -> dict:

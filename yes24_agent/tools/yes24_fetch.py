@@ -273,6 +273,10 @@ def _parse_product_page(
         "pub_review": pub_review,
         "weekly_reviews": weekly_reviews,
         "info_tables": product.get("info_tables"),
+        # 설명 본문 밖의 페이지 관측(이벤트·구매혜택 — selectors '상세 부가 관측'). 상품 필드
+        # (fields → meta)가 아니라 공개 DTO로 새지 않고, snippet에도 섞지 않는다(공개 preview·
+        # 오버뷰 발췌 불변). 키 목록은 파서(_detail_extras) 한 곳에만 있다.
+        "extras": product.get("extras") or {},
         # 상품 상세의 page 링크는 전 페이지 공통 GNB(국내도서·카테고리 트리 …)라 정보가 0이다
         # (실측 48건 중 35건). 공지·목록 페이지에서는 같은 kind가 정책 내비의 근간이므로
         # 공지 경로는 전부 유지한다 — 걸러내는 기준은 페이지 유형이지 링크 문구가 아니다.
@@ -334,6 +338,8 @@ def _register_product(page: dict, tool_context: ToolContext) -> dict:
         # 등 — selectors.PRODUCT_INFO_TABLES 주석)을 {캡션: {라벨: 값}} 그대로 싣는다.
         # 표가 없는 상품은 키 자체가 없다(관측 불가 표시 규약).
         detail["info_tables"] = page["info_tables"]
+    # 가법 필드: 관측된 부가 키(events·purchase_benefits)만 최상위로 싣는다(없으면 키 없음).
+    detail.update(page["extras"])
     if content is None:
         # 페이지는 열렸고 가격·평점 등 구조 필드는 실제로 관측됐으므로 status=error로 버리지
         # 않는다(그러면 정당한 가격 인용까지 사라진다). 대신 없는 것을 없다고 명시한다 —
