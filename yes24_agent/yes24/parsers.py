@@ -51,6 +51,7 @@ from yes24_agent.yes24.selectors import (
     ITEM_REVIEW_COUNT,
     ITEM_SALE_INDEX,
     ITEM_SALE_PRICE,
+    ITEM_SALE_STATUS,
     ITEM_TAG,
     ITEM_TAG_DECORATION,
     ITEM_TITLE_LINK,
@@ -84,6 +85,7 @@ from yes24_agent.yes24.selectors import (
     PRODUCT_REVIEW_WEEK_FULL_TEXT,
     PRODUCT_REVIEW_WEEK_ITEM,
     PRODUCT_SALE_PRICE_JS_RE,
+    PRODUCT_SALE_STATUS,
     PRODUCT_SPECIFICATION_LABEL,
     PRODUCT_SPECIFICATION_ROWS,
     PRODUCT_SPECIFICATION_VALUE,
@@ -133,6 +135,8 @@ _ITEM_FIELDS = (
     "is_book",
     "kind",
     "is_preorder",
+    # 사이트 판매 상태 문구 원형(판매중·절판·품절 등). 목록은 판매중 행에 표시가 없어 키 생략.
+    "sale_status",
     # 크레마클럽 등록이면 여기 판형 항목 하나도 실린다(cremaclub_format — 외부 프론트 뱃지용).
     "other_formats",
     # 크레마클럽 3상태: True 등록·False 미등록·키 없음 미확인. 코너 목록은 파서가, 그 밖의 행은
@@ -309,8 +313,8 @@ def _parse_item(item, base_url: str) -> dict | None:
     observed_features = {"features": features} if features else {}
 
     # 예약판매 배지(ITEM_PREORDER_BADGE 주석 — data-statgb="01"과 정확 상관 실측). 배지를
-    # 관측했을 때만 True를 싣는다. 배지 없음은 "판매중"이 아니다(품절·절판 등 다른 statgb
-    # 상태도 배지가 없다) — False로 되채우지 않고 키를 생략한다(관측 없음 신호).
+    # 관측했을 때만 True를 싣는다. 배지 없음은 "판매중"이 아니다(품절·절판 등은 sale_status가
+    # 관측한다) — False로 되채우지 않고 키를 생략한다(관측 없음 신호).
     observed_preorder = (
         {"is_preorder": True} if item.select_one(ITEM_PREORDER_BADGE) is not None else {}
     )
@@ -321,6 +325,7 @@ def _parse_item(item, base_url: str) -> dict | None:
         **observed_tags,
         **observed_features,
         **observed_preorder,
+        **_sale_status(item, ITEM_SALE_STATUS),
         # 다른 판형(ITEM_FORMAT_LINK 주석)은 상세와 같은 레코드 스키마로 관측한다 — 줄이 비었거나
         # 없으면 빈 목록("판형 없음", 상세의 위젯 없음과 같은 뜻). 이 마크업엔 줄이 항상 올 수
         # 있으므로 키는 늘 낸다(크레마클럽 변환기는 호출하지 않아 키가 생략된다).
@@ -344,6 +349,14 @@ def _parse_item(item, base_url: str) -> dict | None:
         review_count=_parse_grouped_int(item.select_one(ITEM_REVIEW_COUNT)),
         image_url=_image_url_or_none(item),
     )
+
+
+def _sale_status(node, selector: str) -> dict:
+    """판매 상태 문구를 사이트 원형(공백 정규화)으로 관측한다. 표시가 없으면 키를 생략한다 —
+    목록은 판매중 행에 영역 자체가 없어 "없음"을 "판매중"으로 되채우면 관측을 지어내게 된다."""
+    el = node.select_one(selector)
+    status = _normalize_whitespace(el.get_text(" ", strip=True)) if el is not None else ""
+    return {"sale_status": status} if status else {}
 
 
 def _item_fields(**values) -> dict:
@@ -383,7 +396,7 @@ def parse_product(html: str, *, base_url: str) -> dict:
     반환 dict 키: goods_no, title, url, author, publisher, pub_date, list_price(int|None),
     sale_price(int|None), rating(float|None), page_count(int|None), is_ebook(bool — 판형 전역변수가
     없는 문서면 키 없음),
-    image_url(str|None),
+    image_url(str|None), sale_status(str — 판매 상태 문구 원형, 표시 없으면 키 없음),
     other_formats(list[dict]), intro, toc, pub_review, weekly_reviews(list[str]),
     info_tables(dict — 캡션→{라벨: 값}, 표가 없으면 빈 dict).
     텍스트 블록(intro/toc/pub_review)은 없으면 None, weekly_reviews는 없으면 빈 리스트.
@@ -444,6 +457,7 @@ def parse_product(html: str, *, base_url: str) -> dict:
         "page_count": _parse_page_count(soup),
         **observed_format,
         **_book_fields(soup),
+        **_sale_status(soup, PRODUCT_SALE_STATUS),
         "image_url": _image_url_or_none(soup, selector=PRODUCT_IMAGE, attr=PRODUCT_IMAGE_ATTR),
         **(
             {

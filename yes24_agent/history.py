@@ -224,6 +224,10 @@ class SourceCard(BaseModel):
     rank: int | None = Field(default=None, description="관측한 코너 내 순위")
     pub_date: str | None = Field(default=None, description="관측 출간일")
     kind: str | None = Field(default=None, description="관측 상품 종류")
+    sale_status: str | None = Field(
+        default=None,
+        description="사이트 판매 상태 문구 원형(판매중·절판·품절 등). 키 생략은 미관측",
+    )
     is_book: bool | None = Field(default=None, description="사이트 구조에서 확인한 도서 여부")
     is_ebook: bool | None = Field(default=None, description="사이트 구조에서 확인한 eBook 여부")
     checked_at: str | None = Field(default=None, description="출처를 확인한 시각(KST)")

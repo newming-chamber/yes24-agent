@@ -279,6 +279,7 @@ thinking/refs는 done.process.steps에 저장되지 않는다. 복원 시 thinki
 | author_no, kind | string / null | 저자 식별·사이트 종류 라벨(도서·잡지·Blu-ray 등). `book` 카드의 종류 표시에 쓰고, 카드 템플릿을 재판정하지 않음 |
 | is_book, is_ebook | boolean / null | 관측 속성 참고. 렌더링 선택은 card_type 사용(is_book=false여도 book 카드) |
 | cremaclub | boolean | 크레마클럽 등록(true)·미등록(false). 키 없음은 미확인 |
+| sale_status | string | 사이트 판매 상태 문구 원형(판매중·절판·품절 등). 키 없음은 미관측 |
 | sale_index, page_count, rank | number / null | 판매지수·쪽수·순위. 관측됐을 때만 제공 |
 | other_formats | 배열 / null | `{format?:string|null,url?:string|null,sale_price?:number|null}` 목록. 크레마클럽 등록이면 `format:"크레마클럽"`(url=클럽 상세, sale_price=null) 항목도 하나 |
 

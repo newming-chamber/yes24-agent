@@ -37,10 +37,15 @@ ITEM_EBOOK_LABEL = "[eBook]"
 ITEM_FORMAT_LABEL_DECORATION = "[]"
 
 # 목록·상세의 주문 JSON은 같은 사이트 상품 유형(resource_key)을 싣는다. 관측한 도서 유형:
-# 국내 01, 외서 02, 만화 07, 전자책/오디오북 13, 직수입양서 35, 직수입일서 36.
+# 국내 01, 외서 02, 만화 07, 잡지 08, 전집 11, 전자책/오디오북 13, 직수입양서 35, 직수입일서 36.
+# 잡지·전집은 2026-10-07 사용자 결정으로 도서에 포함(인쇄 읽을거리 — 실프론트가 is_book=false면
+# 종이책 배지를 생략하므로, 빠져 있으면 잡지·전집 카드의 Paper 배지가 사라진다). 실측: 보그·씨네21
+# 08, 그림책 전집 11. 같은 날 코드별 표본 확인으로 기타부교재 23(국내도서>영어문고 소책자)·문고판
+# 24(국내도서>에세이)·도서관련 44(표본 4/4가 월간 채널예스 — Yes24 인쇄 잡지)도 도서로 넣었다.
+# 중고 31(중고 DVD·음반 혼재)·음반 03·Blu-ray 28은 도서가 아니다.
 # category는 클래스도 국내도서 아래에 있어 도서 신호로 쓸 수 없다.
 GOODS_ORDER_OPTIONS = "input[name='ORD_GOODS_OPT']"
-BOOK_RESOURCE_KEYS = frozenset({"01", "02", "07", "13", "35", "36"})
+BOOK_RESOURCE_KEYS = frozenset({"01", "02", "07", "08", "11", "13", "23", "24", "35", "36", "44"})
 
 # 표지 이미지. lazy-load라 실제 커버 URL은 `src`(Noimg 플레이스홀더)가 아니라 `data-original`
 # 속성에 든다(실측: 24개 상품 전부 data-original에 image 서브도메인의 goods 커버 경로, src는
@@ -103,9 +108,17 @@ ITEM_TAG_DECORATION = "#"
 # 그래도 판정은 배지로 한다 — statgb 값 어휘("01"·"02"·"03"…)의 의미 맵을 코드에 두면
 # 사이트 소유 어휘의 정적 맵(하드코딩 등급)이 된다. `.iconC`는 분철·이벤트·할인·기획전 등
 # 다른 배지도 쓰는 범용 어휘라 반드시 reserv 클래스와 함께 잡는다. 배지 없음은 "판매중"
-# 관측이 아니다 — statgb=03/04/05 행(다른 상태, 배지 없음)이 실재하므로, 그 구분은
-# _item_fields의 키 생략("관측 없음")이 표현한다(태그와 같은 규약).
+# 관측이 아니다 — statgb=03/04/05 행(다른 상태, 배지 없음)이 실재하고, 그 상태는
+# ITEM_SALE_STATUS가 관측한다.
 ITEM_PREORDER_BADGE = "span.iconC.reserv"
+
+# 판매 상태(목록판). 품절·절판 등 판매중이 아닌 행에만 `div.info_row.info_soldOut`이 SSR되고,
+# 상태 단어는 그 안의 `span.shortV`에 있다. 같은 div에 재입고 알림 안내문(`span.fullV` —
+# "상품 판매가 시작되면 알려드립니다…")이 함께 오는 행이 있어 div 텍스트가 아니라 shortV만
+# 읽는다(실측 2026-10-07: 5개 질의 88행 — statgb 02 + 영역 없음 65, 03 + 품절 20,
+# 04 + 일시품절 2, 01 예약 1. author_scope fixture엔 모집종료·행사종료도 있다). 어휘는 사이트
+# 소유라 열거하지 않고 원형 통과한다. 판매중 행엔 영역이 없다 — 키 생략(관측 없음).
+ITEM_SALE_STATUS = "div.info_row.info_soldOut span.shortV"
 
 # 판형 부가 피처("양장"·"3권"·"EPUB"·"스페셜 오더 / 반품 불가 / 베트남판" 등 — 구매 조언
 # 접지용). 제목 옆 `span.gd_feature` 안에 피처마다 `span.feature`로 SSR된다. `.feature`도
@@ -150,6 +163,10 @@ PRODUCT_AUTHOR = ".gd_auth"
 PRODUCT_PUBLISHER = ".gd_pub"
 PRODUCT_PUB_DATE = ".gd_date"
 PRODUCT_RATING = ".gd_lnkRate em.yes_b"
+# 판매 상태(상세판). 구매 영역 `p.gd_saleState`에 모든 상품이 상태 문구를 싣는다("판매중"·
+# "절판", 복합이면 "판매중 | 한정판매" — em 구분자 포함 공백 정규화 원형. 실측 2026-10-07:
+# 105162427 절판·105362526 판매중·148213145 판매중 | 한정판매).
+PRODUCT_SALE_STATUS = "p.gd_saleState"
 
 # 표지 이미지. 목록(ITEM_IMAGE)과 달리 상세는 lazy-load가 아니라 `src`에 실제 커버 URL이
 # 든다(실측: 종이책·eBook·클래스·굿즈 fixture 4종 모두 img.gImg 1개, src=image 서브도메인의
