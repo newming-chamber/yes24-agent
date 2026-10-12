@@ -166,9 +166,12 @@ def _url_problem(url: str, settings: Settings) -> str | None:
     """메모 링크·묶음 관련 페이지 검사 — 카드 링크로 고객에게 가는 주소라 Yes24 주소만 받는다."""
     if not url:
         return None
-    host = urlsplit(url).hostname or ""
-    if len(url) > _SOURCE_URL_MAX or not is_allowed_host(
-        host, allowed_domain(settings.yes24_base_url)
+    parts = urlsplit(url)
+    if (
+        len(url) > _SOURCE_URL_MAX
+        or parts.scheme not in ("https", "http")  # javascript://www.yes24.com/… 는 호스트만 보면 통과한다
+        or parts.username is not None
+        or not is_allowed_host(parts.hostname or "", allowed_domain(settings.yes24_base_url))
     ):
         return "Yes24 주소여야 합니다"
     if "#" in url:
