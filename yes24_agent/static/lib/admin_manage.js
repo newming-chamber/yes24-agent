@@ -1,4 +1,4 @@
-// 관리 화면 — 행 편집 패널(초기 질문), 본인 비밀번호 변경.
+// 관리 화면 — 행 편집 패널(초기 질문·지식 데이터), 본인 비밀번호 변경.
 // 역할별로 컨트롤을 숨기는 것은 편의이고 판정은 서버다(숨긴 API를 직접 부르면 403).
 // DB 값은 textContent·value로만 넣는다(마크업 삽입 금지). 인라인 style은 CSP가 막으므로 클래스만 쓴다.
 
@@ -33,7 +33,7 @@ const jsonBody = (method, body) => ({ method, headers: { 'Content-Type': 'applic
 /** 편집 요청 한 벌 — 초기 질문 PATCH의 {changes, expected} 본문. */
 const editBody = (changes, expected) => jsonBody('PATCH', { changes, expected });
 
-export function initManage({ api, el, table, valueText, state, openDialog, showRecord, reload, onCreated, slotLabel, generateStatus, errorText, chanceText, slotProbability: slotChance, todayPreview, pins }) {
+export function initManage({ api, el, table, valueText, state, openDialog, showRecord, reload, onCreated, slotLabel, generateStatus, errorText, chanceText, slotProbability: slotChance, todayPreview, pins, confirmDialog, showToast, closePanel, openCollection }) {
   const $ = (id) => document.getElementById(id);
   // 역할 순서는 서버 정본(/me의 roles, 낮은 권한 → 높은 권한)을 쓴다.
   const can = (role) => state.roles.indexOf(state.role) >= state.roles.indexOf(role);
@@ -294,6 +294,263 @@ export function initManage({ api, el, table, valueText, state, openDialog, showR
     tools.append(add, generate);
   }
 
+  // ── 지식 데이터(Yes24가 전해 준 추천사·작가의 말·캠페인 일정 — 코드 이름은 memo) ──────
+  // 켜기/끄기 단위는 묶음이다. 모든 쓰기는 {.., expected_revision}(묶음 revision)이고, 응답에 실린 묶음으로
+  // 화면의 토큰을 갱신한다. 엑셀/CSV는 메모를 한꺼번에 만드는 보조 입력(서버가 파싱·검증의 정본, 미리보기는 저장 안 함).
+  const collectionPath = (id) => `/admin/memo-collections/${id}`;
+  const fileB64 = (file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(',')[1] ?? '');
+    reader.onerror = () => reject(new Error('파일을 읽지 못했습니다.'));
+    reader.readAsDataURL(file);
+  });
+  const labeled = (text, node) => { const label = el('label', null, text); label.append(node); return label; };
+  /** 409 — 다른 관리자가 먼저 바꿨다. 행을 최신 값으로 갱신하고 다시 하라고 안내한다. */
+  const conflictText = (error, row) => {
+    if (error.status !== 409 || !error.body?.current) return '';
+    Object.assign(row, error.body.current);
+    showRecord(row);
+    return `${error.message} 최신 값으로 갱신했습니다. 확인 후 다시 시도하세요.`;
+  };
+  // 설명은 에이전트가 이 묶음을 언제 쓸지 읽는 신호다 — 빈 꼴 틀만 준다(완성 예문은 내용까지 복사된다).
+  const DESCRIPTION_SKELETON = '언제 쓰는 자료: … / 누가 만들었나: … / 자료 한 건 = … / 주의(기간·대상): …';
+  const COLLECTION_META = [
+    { key: 'title', label: '이름', kind: 'text' },
+    { key: 'description', label: '설명(언제 쓰는 자료인지 — 에이전트가 읽습니다)', kind: 'textarea' },
+    { key: 'source_url', label: '관련 Yes24 페이지(선택)', kind: 'text' },
+    { key: 'period_start', label: '기간 시작', kind: 'date' },
+    { key: 'period_end', label: '기간 끝', kind: 'date', help: '기간은 에이전트가 읽는 정보입니다 — 끝나도 자동으로 꺼지지 않으니, 답변에서 빼려면 끄세요.' },
+  ];
+  const MEMO_FIELDS = [
+    { key: 'content', label: '내용', kind: 'textarea' },
+    { key: 'about', label: '누가(말한 사람·대상 인물, 선택)', kind: 'text' },
+    { key: 'link', label: '링크(Yes24 주소 하나, 선택)', kind: 'text', help: '답변의 카드가 이 페이지로 갑니다. 비우면 묶음 관련 페이지 → 첫 상품 → Yes24 홈 순입니다.' },
+    { key: 'goods_nos', label: '관련 상품번호(쉼표로 여러 개, 선택)', kind: 'text', help: '상품번호가 있으면 에이전트가 그 상품을 바로 열어 상품 카드를 함께 답니다.' },
+  ];
+  /** 목록 칸의 내용 — 줄바꿈을 ' · '로 펴서 CSS가 두 줄로 자른다(가져온 메모는 "열이름: 값" 머리말이 같아 앞 글자만으론 고를 수 없다). */
+  const snippet = (memo) => { const text = memo.content.replace(/\s*\n\s*/g, ' · '); return Object.assign(el('span', 'memo-snippet', text), { title: memo.content }); };
+  // 링크는 목록에서 뺀다(편집 폼에 있다).
+  const MEMO_COLUMNS = [
+    { key: 'content', label: '내용', text: snippet },
+    { key: 'about', label: '누가', text: (memo) => memo.about ?? '-' },
+    { key: 'goods_nos', label: '상품번호', text: (memo) => memo.goods_nos.join(', ') || '-' },
+  ];
+  const PREVIEW_MEMOS = 5;  // 가져오기 미리보기에 "에이전트가 받는 꼴"로 보여 줄 메모 수
+  const goodsList = (text) => text.split(/[\s,;/]+/).filter(Boolean);
+  const memoForm = (memo) => ({ ...memo, goods_nos: memo.goods_nos.join(', ') });
+  const memoBody = ({ content, about, link, goods_nos }) => ({ content, about: about || null, link: link || null, goods_nos: goodsList(goods_nos) });
+  const metaBody = (values) => ({ ...values, source_url: values.source_url || null });
+
+  function memoTools(tools) {
+    tools.replaceChildren();
+    if (!can('editor')) return;
+    const add = el('button', 'crema-button', '새 묶음');
+    add.onclick = () => openCollectionCreate();
+    tools.append(add);
+  }
+
+  async function openCollectionCreate() {
+    if (!(await openDialog('새 묶음'))) return;
+    const built = buildForm('새 묶음', COLLECTION_META, {}, '만들기');
+    built.nodes.description.placeholder = DESCRIPTION_SKELETON;
+    built.nodes.title.required = built.nodes.description.required = true;
+    built.onSubmit(async (values) => {
+      const created = await api('/admin/memo-collections', jsonBody('POST', metaBody(values)));
+      built.fill({});
+      showToast(`'${created.title}' 묶음을 만들었습니다 — 꺼진 상태입니다. 항목을 넣고 켜세요.`);
+      reload();
+      openCollection(created);
+      return '만들었습니다.';
+    });
+    actions().append(built.form);
+  }
+
+  /** 묶음 패널 — 메타 편집·켜기/끄기·삭제(owner), 메모 목록·검색, 새 메모·메모 편집·가져오기(아래 작업 칸 하나를 바꿔 쓴다). */
+  function memoCollectionPanel(row) {
+    const box = actions();
+    const sync = (collection) => { Object.assign(row, collection); showRecord(row); };
+    const work = el('div');
+    const search = Object.assign(inputOf('search'), { placeholder: '내용·누가·상품번호에서 찾기' });
+    const list = el('div');
+    async function refresh() {
+      try {
+        const data = await api(`/admin/api/memo-collections/${row.id}/memos?${new URLSearchParams({ query: search.value })}`);
+        sync(data.collection);
+        list.replaceChildren(data.memos.length ? table(MEMO_COLUMNS, data.memos, can('editor') ? openMemo : null) : el('p', 'analysis-note', search.value ? '맞는 항목이 없습니다.' : '항목이 없습니다.'));
+      } catch (error) { if (error.name !== 'AbortError') list.replaceChildren(el('p', 'analysis-note notice', errorText(error, '항목을 불러오지 못했습니다.'))); }
+    }
+    /** 쓰기 성공 — 묶음 토큰 갱신, 목록·바깥 표 다시 읽기. keep이면 작업 칸(새 메모 폼)을 남긴다. */
+    const saved = (collection, keep = false) => { sync(collection); if (!keep) work.replaceChildren(); refresh(); reload(); };
+    search.onsearch = search.onchange = refresh;
+    const area = el('section', 'memo-area');
+    area.append(el('h3', null, '항목'));
+    if (can('editor')) {
+      // 버튼·작업 칸은 목록 **위** — 목록은 수백 행이라 아래에 두면 화면 밖에서 열린다.
+      const add = el('button', 'crema-button', '새 항목'), importer = el('button', 'crema-button', '가져오기');
+      add.onclick = () => openWork(memoEditor(null));
+      importer.onclick = () => openWork(importForm(row, saved));
+      area.append(add, importer, work);
+      box.append(...collectionControls(row, sync));
+    }
+    area.append(search, list);
+    box.append(area);
+    refresh();
+
+    function openWork(node) { work.replaceChildren(node); work.scrollIntoView({ block: 'nearest' }); }
+    function openMemo(memo) { openWork(memoEditor(memo)); }
+    function memoEditor(memo) {
+      const built = buildForm(memo ? `항목 #${memo.id} 편집` : '새 항목', MEMO_FIELDS, memo ? memoForm(memo) : {}, memo ? '저장' : '추가');
+      built.nodes.content.required = true;
+      built.onSubmit(async (values) => {
+        const payload = memoBody(values);
+        if (!memo) {
+          // 폼은 비워서 남긴다 — 메모를 여러 건 이어서 넣는 흐름.
+          saved((await api(`${collectionPath(row.id)}/memos`, jsonBody('POST', { memo: payload, expected_revision: row.revision }))).collection, true);
+          built.fill({});
+          showToast('항목을 추가했습니다.');
+          return '추가했습니다 — 이어서 입력할 수 있습니다.';
+        }
+        const before = memoBody(memoForm(memo));
+        const changes = Object.fromEntries(Object.entries(payload).filter(([key, value]) => JSON.stringify(value) !== JSON.stringify(before[key])));
+        if (!Object.keys(changes).length) return '바뀐 값이 없습니다.';
+        saved((await api(`${collectionPath(row.id)}/memos/${memo.id}`, jsonBody('PATCH', { changes, expected_revision: row.revision }))).collection);
+        showToast('항목을 저장했습니다.');
+        return '저장했습니다.';
+      });
+      built.onConflict((error) => conflictText(error, row));
+      if (memo) {
+        const remove = el('button', 'crema-button danger', '항목 삭제');
+        remove.type = 'button';
+        remove.onclick = async () => {
+          if (!(await confirmDialog({ title: '항목 삭제', message: `항목 #${memo.id}을 지웁니다. 되돌릴 수 없습니다.`, confirmLabel: '삭제', danger: true }))) return;
+          try { saved((await api(`${collectionPath(row.id)}/memos/${memo.id}`, jsonBody('DELETE', { expected_revision: row.revision }))).collection); showToast('항목을 지웠습니다.'); }
+          catch (error) { if (error.name !== 'AbortError') showToast(conflictText(error, row) || errorText(error, '지우지 못했습니다.')); }
+        };
+        built.form.append(remove);
+      }
+      return built.form;
+    }
+  }
+
+  /** 묶음 메타 폼·켜기/끄기·삭제(owner) — editor 이상. */
+  function collectionControls(row, sync) {
+    // 켜기/끄기와 항상 참고(켜진 묶음의 항목 전문을 매 턴 지시문에 싣는다)는 같은 PATCH 한 칸이다.
+    const flagButton = (key, [on, off], [onToast, offToast]) => {
+      const button = el('button', 'crema-button', row[key] ? off : on);
+      button.onclick = async () => {
+        try {
+          sync(await api(collectionPath(row.id), jsonBody('PATCH', { changes: { [key]: !row[key] }, expected_revision: row.revision })));
+          button.textContent = row[key] ? off : on;
+          showToast(row[key] ? onToast : offToast);
+          reload();
+        } catch (error) { if (error.name !== 'AbortError') showToast(conflictText(error, row) || errorText(error, '바꾸지 못했습니다.')); }
+      };
+      return button;
+    };
+    const toggle = flagButton('active', ['답변에 켜기', '답변에서 끄기'], ['답변에 켰습니다.', '답변에서 껐습니다.']);
+    const always = flagButton('always_include', ['항상 참고로', '항상 참고 해제'], ['항상 참고로 바꿨습니다 — 짧고 놓치면 안 되는 묶음에만 쓰세요(매 답변에 실립니다).', '필요할 때만 찾아보도록 바꿨습니다.']);
+    const controls = [toggle, always];
+    if (can('owner')) {
+      const remove = el('button', 'crema-button danger', '묶음 삭제');
+      remove.onclick = async () => {
+        if (!(await confirmDialog({ title: '묶음 삭제', message: `"${row.title}"과 항목 ${row.memo_count}건을 지웁니다. 되돌릴 수 없습니다 — 답변에서만 빼려면 '끄기'를 쓰세요.`, confirmLabel: '삭제', danger: true }))) return;
+        try { await api(collectionPath(row.id), jsonBody('DELETE', { expected_revision: row.revision })); showToast('삭제했습니다.'); closePanel(); reload(); }
+        catch (error) { if (error.name !== 'AbortError') showToast(conflictText(error, row) || errorText(error, '삭제하지 못했습니다.')); }
+      };
+      controls.push(remove);
+    }
+    const edit = buildForm('묶음 편집', COLLECTION_META, row, '저장');
+    edit.nodes.description.placeholder = DESCRIPTION_SKELETON;
+    edit.onSubmit(async (values) => {
+      const next = metaBody(values);
+      const changes = Object.fromEntries(Object.entries(next).filter(([key, value]) => value !== (row[key] ?? null)));
+      if (!Object.keys(changes).length) return '바뀐 값이 없습니다.';
+      sync(await api(collectionPath(row.id), jsonBody('PATCH', { changes, expected_revision: row.revision })));
+      edit.fill(row);
+      reload();
+      return '저장했습니다.';
+    });
+    edit.onConflict((error) => { const text = conflictText(error, row); if (text) edit.fill(row); return text; });
+    return [...controls, edit.form];
+  }
+
+  /** 가져오기 — 파일 → (시트) → 미리보기 1단계(열·원시 샘플)로 매핑 고르기 → 미리보기 2단계(에이전트가 받는 꼴) → 방식·노출 확인 → 가져오기.
+   *  내용 열은 전부 해제로 시작한다(가격 같은 열이 기본으로 실리지 않게). 저장은 서버가 파일을 다시 읽는다. */
+  function importForm(row, done) {
+    const built = buildForm('가져오기(엑셀·CSV)', [
+      { key: 'mode', label: '방식', kind: 'select', options: [['append', '이 묶음에 추가'], ['replace', '묶음 통째 교체']] },
+      { key: 'consent', label: '내용이 고객 답변과 출처에 그대로 보일 수 있습니다', kind: 'checkbox' },
+    ], { mode: 'append' }, '가져오기');
+    const file = Object.assign(inputOf('file'), { accept: '.xlsx,.csv', required: true });
+    const sheet = selectOf([]), about = selectOf([]), goods = selectOf([]), link = selectOf([]);
+    const sheetLabel = labeled('시트', sheet);
+    sheetLabel.hidden = true;
+    const contentBox = el('fieldset', 'choice-list'), result = el('div');
+    built.form.querySelector('h3').after(labeled('파일(xlsx 또는 CSV UTF-8)', file), sheetLabel, contentBox, labeled('누가 열', about), labeled('상품번호 열', goods), labeled('링크 열', link), result);
+    let content = '', last = null;
+    const checked = () => [...contentBox.querySelectorAll('input:checked')].map((node) => node.value);
+    const mapping = () => ({ content_columns: checked(), about_column: about.value || null, goods_column: goods.value || null, link_column: link.value || null });
+    const body = () => ({ file_name: file.files[0]?.name ?? '', content_b64: content, sheet: sheet.value || null });
+    const choices = (select, columns) => select.replaceChildren(new Option('없음', ''), ...columns.map((c) => new Option(c, c)));
+    const issues = (data) => [...data.notes.map((note) => el('p', 'analysis-note', note)), ...data.errors.map((issue) => el('p', 'analysis-note notice', issue.message))];
+    async function columnsStep() {
+      const data = await api('/admin/memos/import-preview', jsonBody('POST', body()));
+      if (!sheet.options.length && data.sheets.length > 1) {
+        sheet.replaceChildren(...data.sheets.map((name) => new Option(name, name)));
+        sheet.value = data.sheet;
+        sheetLabel.hidden = false;
+      }
+      contentBox.replaceChildren(el('legend', null, '내용 열(여러 열이면 "열이름: 값" 줄로 이어 붙입니다 — 가격·재고 열은 넣지 마세요)'), ...data.columns.map((value) => {
+        const label = el('label', 'check', value), input = Object.assign(inputOf('checkbox'), { value });
+        input.onchange = guarded(memosStep);
+        label.prepend(input);
+        return label;
+      }));
+      choices(about, data.columns);
+      choices(goods, data.columns);
+      choices(link, data.columns);
+      const sample = data.sample_rows.slice(0, PREVIEW_MEMOS).map((values) => Object.fromEntries(data.columns.map((c, i) => [c, values[i]])));
+      result.replaceChildren(...issues(data), table(data.columns.map((c) => ({ key: c, label: c })), sample));
+      last = null;
+      built.status.textContent = data.errors.length ? '파일을 읽지 못했습니다 — 안내를 확인하세요.' : '내용 열을 고르세요.';
+    }
+    async function memosStep() {
+      if (!checked().length) { last = null; built.status.textContent = '내용 열을 고르세요.'; return; }
+      last = await api('/admin/memos/import-preview', jsonBody('POST', { ...body(), mapping: mapping() }));
+      const shown = last.memos.slice(0, PREVIEW_MEMOS).map((memo) => ({ content: memo.content, about: memo.about ?? '-', goods: memo.goods_nos.join(', ') || '-' }));
+      const used = new Set(Object.values(mapping()).flat());
+      const unused = last.columns.filter((column) => !used.has(column));
+      result.replaceChildren(
+        el('p', 'analysis-note', `항목 ${last.memos.length}건 · 건너뛴 행 ${last.skipped_rows}개 · 통째 교체면 지금 ${row.memo_count}건 → 새 ${last.memos.length}건`),
+        el('p', 'analysis-note', `쓰지 않는 열: ${unused.join(', ') || '없음'}`),
+        ...issues(last),
+        el('p', 'analysis-note', `에이전트가 받는 꼴(앞 ${shown.length}개)`),
+        table([{ key: 'content', label: '내용' }, { key: 'about', label: '누가' }, { key: 'goods', label: '상품번호' }], shown));
+      built.status.textContent = last.errors.length ? '고칠 것이 있습니다 — 매핑에서 열을 빼거나 파일을 고쳐 주세요.' : '';
+    }
+    function guarded(step) {
+      return async () => {
+        if (!content) return;
+        try { await step(); } catch (error) { if (error.name !== 'AbortError') built.status.textContent = errorText(error, '미리보기를 만들지 못했습니다.'); }
+      };
+    }
+    file.onchange = async () => { content = file.files[0] ? await fileB64(file.files[0]) : ''; sheet.replaceChildren(); sheetLabel.hidden = true; guarded(columnsStep)(); };
+    sheet.onchange = guarded(columnsStep);
+    about.onchange = goods.onchange = link.onchange = guarded(memosStep);
+    built.onSubmit(async ({ consent, mode }) => {
+      if (!consent) throw new Error('노출 확인에 체크해 주세요.');
+      if (!last || last.errors.length) throw new Error('내용 열을 고르고 미리보기의 오류를 먼저 고쳐 주세요.');
+      if (mode === 'replace' && row.active && !(await confirmDialog({ title: '켜진 묶음 통째 교체', message: `지금 ${row.memo_count}개 → 새 ${last.memos.length}개. 답변에 사용 중인 묶음이라 저장 즉시 반영되고, 되돌리기는 없습니다. 원본 파일을 보관해 두세요.`, confirmLabel: '교체' }))) return '교체를 취소했습니다.';
+      const saved = await api(`${collectionPath(row.id)}/import`, jsonBody('POST', { ...body(), mapping: mapping(), mode, expected_revision: row.revision, consent: true }));
+      built.fill({ mode: 'append' });
+      showToast(`가져왔습니다 — 추가 ${saved.inserted}개${saved.deleted ? ` · 삭제 ${saved.deleted}개` : ''}.`);
+      done(saved.collection);
+      return '가져왔습니다.';
+    });
+    built.onConflict((error) => conflictText(error, row));
+    return built.form;
+  }
+
   // ── 본인 비밀번호 ──────────────────────────────────────────────────────
   /** 새 비밀번호는 확인 칸과 같아야 하고 최소 길이(서버 설정 /me password_min_length)를 안내·사전 검사한다 — 판정은 서버. */
   async function openPasswordChange() {
@@ -328,5 +585,5 @@ export function initManage({ api, el, table, valueText, state, openDialog, showR
     actions().append(built.form);
   }
 
-  return { starterPanel, starterTools, openStarterCreate, openPasswordChange, pinNotice, pinBlockers };
+  return { starterPanel, starterTools, openStarterCreate, openPasswordChange, pinNotice, pinBlockers, memoTools, memoCollectionPanel };
 }

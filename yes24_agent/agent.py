@@ -13,6 +13,7 @@ from google.genai import types
 from yes24_agent.config import ensure_openai_api_key_env, get_settings
 from yes24_agent.rbti.persona import axis_label, build_persona_block
 from yes24_agent.sources import LEDGER_MAX_INVOCATIONS, time_kst, today_kst
+from yes24_agent.tools.memos import MEMO_CATALOG_FALLBACK, catalog_prompt
 from yes24_agent.toolsets import (
     TOOLSET_EXPERTISE,
     TOOLSETS,
@@ -55,11 +56,11 @@ def _format_policy_seeds() -> str:
 
 # ── 프롬프트 fragment 조립 ────────────────────────────────────────────────────
 # 프롬프트 본문은 (본문, 태그) fragment의 순서 결합이다. 태그는 "" | "yes24" |
-# "web" | "yes24+web" — 활성 toolset 집합(ResolvedApp.active)이 태그 집합을 포함할 때만
+# "web" | "yes24+web" | "knowledge" — 활성 toolset 집합(ResolvedApp.active)이 태그 집합을 포함할 때만
 # 그 fragment가 조립에 들어간다(조립 = 부분집합 술어 하나 + 문자열 결합). 경계는 기계 절단
 # 산물이라 구분 개행의 소유가 fragment마다 다르다 — 이음새 무결(삼중 개행 0·비활성 도구명 0)은
-# 보편 보장이 아니라 테스트된 프로필(test_toolsets _PROFILES: yes24_web·web_only —
-# 도구명 언급·섹션 순서 가드가 두 구성 모두에 돈다)에서 보장된다. 프로필 밖 구성
+# 보편 보장이 아니라 테스트된 프로필(test_toolsets _PROFILES: yes24_web·web_only·
+# yes24_web_knowledge — 도구명 언급·섹션 순서 가드가 세 구성 모두에 돈다)에서 보장된다. 프로필 밖 구성
 # (예: yes24 단독)은 조립은 되지만 이 보장 밖이다.
 # 텍스트는 tests/fixtures/prompt_yes24_web_baseline.txt에서 기계 절단한 것이다(재타이핑 금지)
 # — 풀 구성 조립은 그 픽스처와 바이트 동일해야 하며 골든 테스트(test_toolsets)가 강제한다.
@@ -225,6 +226,8 @@ Yes24 상품·정책과 오늘자·상대 시점 사실은 당신이 알 수 없
   `yes24_fetch`).
 """, "yes24"),
     ("""\
+- `yes24_notice`: 사이트에서는 볼 수 없는 Yes24의 안내(작가·선정위원 추천, 행사, 정책 예외, 응대 방법 등)를 찾습니다. 경과 서술과 답변에서 이 안내를 가리킬 때는 'Yes24 안내'라고만 합니다. {memo_catalog}""", "knowledge"),
+    ("""\
 - `web_search`: """, "web"),
     # "Yes24 밖의"는 yes24 활성일 때만 의미가 있는 대비 표현이라 분리한다(yes24 없는 구성의
     # 브랜드 잔존 해소). 풀 구성 결합 바이트는 골든이 보증.
@@ -321,10 +324,11 @@ _DYNAMIC_TAIL_TEMPLATE = """
 오늘은 {today}이고 지금은 {now}(KST)입니다. 상대 시점과 최신성은 이 날짜·시각을 기준으로 판단합니다."""  # noqa: E501 — 프롬프트 바이트 계약(줄바꿈 삽입 금지)
 
 
-def build_system_prompt(app, persona_directive: str = "") -> str:
+def build_system_prompt(app, persona_directive: str = "", memo_catalog: str = MEMO_CATALOG_FALLBACK) -> str:
     """정적 본문에 (채팅 전용) 페르소나 지시를 채우고, 말미에 현재 날짜·시각(KST)을 붙여 조립한다.
 
     persona_directive가 ""(기본)이면 해당 자리에 빈 문자열이 들어가 rbti 없는 경로와 바이트 동일.
+    memo_catalog는 knowledge 구성에서만 조립에 들어가는 활성 묶음 목록(tools.memos.catalog_prompt)이다.
     그 경로에서는 날짜·시각 말미를 뺀 앞부분 전체가 매 인보케이션 바이트 동일한 캐시 프리픽스다.
     """
     # RBTI 소개 단락은 2026-07-29 삭제 — RBTI/매트릭스는 개발자용 검증 뷰이지 사용자에게
@@ -338,6 +342,7 @@ def build_system_prompt(app, persona_directive: str = "") -> str:
     core = template.format(
         policy_seeds=_format_policy_seeds(),
         persona_directive=persona_directive,
+        memo_catalog=memo_catalog,
     )
     tail = _DYNAMIC_TAIL_TEMPLATE.format(today=today_kst(), now=time_kst())
     return f"{core}{tail}"
@@ -347,7 +352,8 @@ def build_system_prompt(app, persona_directive: str = "") -> str:
 # 상수도 하나만 둔다(2026-08-19 감사 — 같은 근거의 리터럴 2벌 통합).
 @lru_cache(maxsize=LEDGER_MAX_INVOCATIONS)
 def _invocation_instruction(
-    invocation_id: str, code: str, persona_key: str, active: frozenset[str]
+    invocation_id: str, code: str, persona_key: str, active: frozenset[str],
+    memo_catalog: str = MEMO_CATALOG_FALLBACK,
 ) -> str:
     """한 인보케이션(사용자 발화 1건)이 처음 조립한 instruction을 그 턴 내내 재사용한다.
 
@@ -361,7 +367,9 @@ def _invocation_instruction(
     남는다. LRU가 오래된 항목을 퇴출하므로 장수 프로세스에서 무한 증식하지 않는다.
     """
     directive = persona_tool_directive(code) if code else ""
-    base = build_system_prompt(resolve_app_for(persona_key, active), persona_directive=directive)
+    base = build_system_prompt(
+        resolve_app_for(persona_key, active), persona_directive=directive, memo_catalog=memo_catalog
+    )
     block = build_persona_block(code) if code else ""
     return f"{base}\n\n{block}" if block else base
 
@@ -386,11 +394,19 @@ def _make_instruction_provider(app):
     (build_persona_block, 후보 구성·읽기 권유·강조 관점). 코드가 없거나 무효면 둘 다 ""이라
         base와 바이트 동일(회귀 0). ctx.state는 세션 state의 읽기전용 뷰(MappingProxyType)다.
         """
-        return _invocation_instruction(
-            ctx.invocation_id, ctx.state.get("rbti") or "", app.persona_key, app.active
-        )
+        key = (ctx.invocation_id, ctx.state.get("rbti") or "", app.persona_key, app.active)
+        if "knowledge" not in app.active:
+            return _invocation_instruction(*key)
+        return _with_memo_catalog(key)
 
     return _instruction_provider
+
+
+async def _with_memo_catalog(key: tuple) -> str:
+    """knowledge 구성 — 활성 묶음 목록(이름 + 설명 첫 문장)을 지시문에 싣는다. ADK는 awaitable instruction을
+    기다린다. 2026-10-08 A/B(design/REPORT-memo-2026-10-08.md 후속): 목록 없음 2/18 · 이름만 10/18 ·
+    이름+첫 문장 14/18 정답 메모 인용, 일반 질문 과호출 0/8 — 모델은 어떤 자료가 있는지 몰라서 안 불렀다."""
+    return _invocation_instruction(*key, await catalog_prompt())
 
 
 # (모듈 레벨 _instruction_provider는 2026-08-19 삭제 — 소비자가 테스트뿐인 픽스처였다.

@@ -679,6 +679,13 @@
   #record-close { padding: 2px 8px; border: 0; background: none; font-size: 22px; line-height: 1; color: var(--text-meta); }
   #record-actions, #record-view { padding: 0 20px; }
   #record-actions > button { margin-top: 20px; }
+  /* 메모 패널 — 내용 칸은 두 줄까지 접고(전문은 툴팁·편집 폼), 넓은 표(가져오기 미리보기)·열 목록은 패널 안에서만 가로로 넘친다. */
+  .memo-area td[data-key="content"] { white-space: normal; max-width: none; min-width: 12em; }
+  .memo-snippet { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
+  .memo-area .manage-form { grid-template-columns: minmax(0, 1fr); }  /* 격자 칸이 넓은 표·긴 열 이름 폭으로 늘지 않게 */
+  .memo-area .table-wrap { overflow-x: auto; }
+  .memo-area :is(fieldset, select) { min-width: 0; max-width: 100%; }
+  .memo-area legend { white-space: normal; }
   /* 기록 상세 — 라벨 · 값 표. 값은 줄바꿈해 전부 보인다(목록 표처럼 말줄임하지 않는다). */
   #record-view { margin: 20px 0; }
   /* 기록 표 — 라벨 40% · 값 60%, 둘 다 줄바꿈(긴 라벨이 값 칸을 조각내지 않게). */

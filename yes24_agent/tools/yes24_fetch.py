@@ -12,12 +12,14 @@ error_type="empty"로 정직하게 반환한다.
 import asyncio
 import logging
 from typing import NamedTuple
+from urllib.parse import urldefrag
 
 from bs4 import BeautifulSoup
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
 from yes24_agent.sources import DETAIL_FIDELITY, cite_marker, now_checked_at, register_source
+from yes24_agent.tools.memos import attach_notes, turn_entries
 from yes24_agent.tools._text import (
     window_around_find,
 )
@@ -111,6 +113,10 @@ async def yes24_fetch(
     # title은 runner의 진행 상태 라벨용으로만 쓴다. 반환 dict의 title은 항상 페이지
     # 파싱 결과를 우선하며, LLM이 준 이 값으로 덮어쓰지 않는다.
     del title
+    # 조각(#…)은 서버 문서를 가르지 않는다 — 기본 구성에도 적용되는 정규화다(요청·등록 모두 조각
+    # 없는 url, 2026-10-08 결정). 메모 출처 url(상품#notice-id)을 그대로 넘겨도 상품 상세가 상품 url로
+    # 등록되고, 같은 url의 메모 출처가 상세로 덮이지 않는다.
+    url = urldefrag(url).url
 
     settings = get_settings()
     client = get_client(settings)
@@ -133,7 +139,10 @@ async def yes24_fetch(
     page = await asyncio.to_thread(parse_page, html, url, settings, find)
     if observes_cremaclub():
         await observe_page_cremaclub([page], settings)
-    return register_page(page, tool_context)
+    entries = await turn_entries()
+    result = register_page(page, tool_context)
+    attach_notes([result], entries, tool_context)
+    return result
 
 
 async def observe_page_cremaclub(pages: list[dict], settings) -> None:

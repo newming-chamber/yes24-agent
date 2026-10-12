@@ -913,7 +913,7 @@ async def fetch_starter_popular(
 
 
 # 감사 기록 대상 종류(admin_management.sql target_type) — 화면 필터 값이 곧 이 값이다.
-AUDIT_TARGETS = ("login", "admin", "user", "starter", "session")
+AUDIT_TARGETS = ("login", "admin", "user", "starter", "session", "memo_collection")
 # 대상 이름 — 계정은 계정명, 회원은 회원번호로 바꿔 싣고(행 id는 사람이 못 읽는다) 나머지는
 # target_id 그대로.
 # 로그인 기록의 target_id는 사용자가 입력한 계정명 원문이다 — 실제 계정일 때만 이름을 싣고(없으면

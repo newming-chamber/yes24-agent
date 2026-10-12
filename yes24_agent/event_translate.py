@@ -64,6 +64,9 @@ def _status_for_call(call, *, split_progress: bool = False) -> tuple[str, str] |
             return "browsing", _browse_label(first) or first
         labels = (_browse_label(s) for s in sections)
         return "browsing", " · ".join(label for label in labels if label)
+    if name == "yes24_notice":
+        # 묶음 이름은 고객 화면에 싣지 않는다(답변도 자료의 이름을 꺼내지 않는다) — 찾는 낱말만.
+        return "reading", str(args.get("query") or "")
     # web_fetch는 제목을 받지 않으므로 동작만 표시한다.
     return ("reading", "") if name == "web_fetch" else None
 

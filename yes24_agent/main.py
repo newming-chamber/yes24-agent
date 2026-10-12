@@ -50,6 +50,7 @@ from yes24_agent.config import Settings, ensure_google_api_key_env, get_settings
 from yes24_agent.history import register_history
 from yes24_agent.logctx import ContextFilter, bound, new_request_id
 from yes24_agent.matrix.matrix_runner import run_matrix_stream
+from yes24_agent.memos_admin import register_memo_admin
 from yes24_agent.overview import (
     ARM_YES24,
     OVERVIEW_ARMS,
@@ -1090,6 +1091,10 @@ def create_app() -> FastAPI:
     # 초기 질문 회전 풀(GET /chat/starters·/admin/starters/*). starter_model이 빈 값이면 미등록
     # (404 — overview_model 관례). 라우트·풀·생성의 소유자는 starters.py다.
     register_starters(app, settings)
+
+    # Yes24 제공 메모 어드민(/admin/api/memo-collections·/admin/memo-collections/*). admin_enabled일
+    # 때만 등록되고, 도구·CLI와 같은 가져오기·저장 함수를 쓴다(memos.py).
+    register_memo_admin(app, settings)
 
     # 독서 성향 16유형·축 정의(GET /rbti/types). 화면이 `rbti`에 실을 값을 고르게 하는
     # 재료이고, matrix_enabled와 무관하다 — 매트릭스는 개발자용 검증 뷰이지만 이 목록은

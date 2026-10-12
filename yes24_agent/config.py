@@ -870,7 +870,7 @@ class Settings(BaseSettings):
     starter_per_slot: int = 7
     # 한 번에 서빙하는 칩 수의 기본값(GET /chat/starters의 n 기본). NN/g 2024/2025: 3~5개.
     starter_count: int = 4
-    # 첫 화면 고정(starters.pinned = PIN_GLOBAL)을 한 벌에 넣는 상한. None = starter_count − 1
+    # 첫 화면 고정(starters.always = PIN_GLOBAL)을 한 벌에 넣는 상한. None = starter_count − 1
     # (최소 한 칸은 무작위로 돈다). 등록·수정은 이 수를 넘기면 422, 서빙은 초과분을 id순으로
     # 잘라 보통 후보로 돌린다.
     starter_global_pin_max: int | None = None
@@ -1022,6 +1022,34 @@ class Settings(BaseSettings):
     admin_image_origins: tuple[str, ...] = ("https://image.yes24.com",)
     # 통계 탭 조회 기간 상한(일). 빈 날도 0행으로 채워 돌려주므로 기간 길이가 곧 응답 행 수다.
     admin_stats_max_days: int = 366
+
+    # Yes24 제공 메모(memos.py). 메모 한 건 = 누가 무엇을 말했는가(추천사·작가의 말·캠페인
+    # 일정)이고, 켜기/끄기 단위는 묶음이다. 수백~수천 건 규모라 순위 인덱스 없이 부분 일치로 찾는다.
+    # 메모 내용 저장 상한(추천사 한 편의 여유).
+    memo_max_chars: int = Field(default=2000, gt=0)
+    # 묶음 설명 상한 — 첫 문장은 지시문 목록으로 매 턴 모델에게 간다(전문은 어드민·CLI용).
+    memo_description_max_chars: int = Field(default=1000, gt=0)
+    # 조회 도구 결과 한 번의 메모 내용 글자 합 상한.
+    memo_result_max_chars: int = Field(default=6000, gt=0)
+    # '항상 참고' 묶음 항목 전문을 지시문에 싣는 글자 합 상한 — 매 라운드 재전송 비용이다.
+    memo_always_max_chars: int = Field(default=2000, gt=0)
+    # Yes24 검색·상세 결과 행 하나에 붙이는 관련 항목(notes) 상한.
+    memo_notes_per_result: int = Field(default=3, gt=0)
+    # 가져오기 파일 바이트 상한(어드민 base64 본문 상한이 여기서 파생된다).
+    memo_import_max_bytes: int = Field(default=5_000_000, gt=0)
+    # 가져오기 데이터 행 상한.
+    memo_import_max_rows: int = Field(default=2000, gt=0)
+    # 가져오기 읽기 열 상한 — 담는 시트 칸이 (행 상한+1)×이 값에 묶인다.
+    memo_import_max_columns: int = Field(default=50, gt=0)
+    # xlsx 압축 해제 크기 합 상한. openpyxl은 공유 문자열(sharedStrings)·스타일을 시트 스트리밍과
+    # 별개로 통째 올리므로, 파일 바이트 상한 안에서도 고압축 파일이 메모리를 끌어가지 않게 묶는다.
+    memo_import_max_unzipped_bytes: int = Field(default=50_000_000, gt=0)
+    # 조회 도구가 메모 저장소를 기다리는 상한(초). 넘으면 unavailable로 진행한다 — 메모 장애가
+    # 턴 지연으로 번지지 않게. 정상 조회는 한 자릿수 ms(수천 건 LIKE)라 1초는 접속 수립까지 덮는
+    # 여유다.
+    memo_lookup_timeout_s: float = Field(default=1.0, gt=0)
+    # 저장소 엔진 풀 크기(session_db_url 공유, 쓰임은 도구 조회·어드민 클릭뿐).
+    memo_pool_size: int = Field(default=2, gt=0)
 
     # 서버
     host: str = "0.0.0.0"

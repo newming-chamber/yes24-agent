@@ -3,7 +3,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>크레마 AI 관리자</title>
-<link rel="stylesheet" href="/static/lib/admin.css?v=51" />
+<link rel="stylesheet" href="/static/lib/admin.css?v=52" />
 <!-- 로고(crema 마스코트)가 파비콘을 겸한다 — 자기 출처 정적 파일이라 /favicon.ico 401 콘솔 오류도 없다. -->
 <link rel="icon" href="/static/lib/admin-logo.svg" type="image/svg+xml" />
 
@@ -32,6 +32,7 @@
       <button id="tab-sessions" aria-pressed="false"><svg viewBox="-3 -3 20 20" aria-hidden="true"><path d="M9.25 14C8.625 14 8.09375 13.7812 7.65625 13.3438C7.21875 12.9062 7 12.375 7 11.75C7 11.125 7.21875 10.5938 7.65625 10.1562C8.09375 9.71875 8.625 9.5 9.25 9.5C9.875 9.5 10.4062 9.71875 10.8438 10.1562C11.2812 10.5938 11.5 11.125 11.5 11.75C11.5 12.375 11.2812 12.9062 10.8438 13.3438C10.4062 13.7812 9.875 14 9.25 14ZM10.7546 8.5C9.57097 8.5 8.56597 8.08833 7.73958 7.265C6.91319 6.44167 6.5 5.43819 6.5 4.25458C6.5 3.07097 6.91167 2.06597 7.735 1.23958C8.55833 0.413194 9.56181 0 10.7454 0C11.929 0 12.934 0.411667 13.7604 1.235C14.5868 2.05833 15 3.06181 15 4.24542C15 5.42903 14.5883 6.43403 13.765 7.26042C12.9417 8.08681 11.9382 8.5 10.7546 8.5ZM3.02354 12C2.19215 12 1.48035 11.7083 0.888125 11.125C0.296042 10.5417 0 9.83333 0 9C0 8.16667 0.291667 7.45833 0.875 6.875C1.45833 6.29167 2.16667 6 3 6C3.83333 6 4.54167 6.29167 5.125 6.875C5.70833 7.45833 6 8.16667 6 9C6 9.83333 5.71181 10.5417 5.13542 11.125C4.55903 11.7083 3.85507 12 3.02354 12Z" /></svg>대화</button>
       <button id="tab-users" aria-pressed="false"><svg viewBox="-3 -3 20 20" aria-hidden="true"><path d="M7 7a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zm0 1.5c-2.3 0-7 1.2-7 3.5V14h14v-2c0-2.3-4.7-3.5-7-3.5z" /></svg>회원</button>
       <button id="tab-starters" aria-pressed="false"><svg viewBox="-3 -3 20 20" aria-hidden="true"><path d="M0 6.61765V5.29412H1.27273V6.61765H0ZM6.25758 15C6.0101 15 5.76557 14.9479 5.52399 14.8438C5.28241 14.7396 5.07323 14.5956 4.89646 14.4118L1.34343 10.7169L2.01515 10.0184C2.14478 9.88358 2.28914 9.79473 2.44823 9.75184C2.60732 9.70895 2.76936 9.71201 2.93434 9.76103L4.45455 10.1654V4.19118C4.45455 4.00368 4.51518 3.84651 4.63644 3.71967C4.7577 3.59283 4.90796 3.52941 5.0872 3.52941C5.26644 3.52941 5.41793 3.59283 5.54167 3.71967C5.6654 3.84651 5.72727 4.00368 5.72727 4.19118V8.82353H6.57576V6.84301C6.57576 6.65601 6.63639 6.49816 6.75765 6.36949C6.87891 6.24081 7.02917 6.17647 7.20841 6.17647C7.38765 6.17647 7.53914 6.23989 7.66288 6.36673C7.78662 6.49357 7.84849 6.65074 7.84849 6.83824V8.82353H8.69697V7.72059C8.69697 7.53309 8.7576 7.37592 8.87886 7.24908C9.00013 7.12224 9.15038 7.05882 9.32962 7.05882C9.50886 7.05882 9.66035 7.12224 9.78409 7.24908C9.90783 7.37592 9.9697 7.53309 9.9697 7.72059V8.82353H10.8182V8.60294C10.8182 8.41544 10.8788 8.25827 11.0001 8.13143C11.1213 8.0046 11.2716 7.94118 11.4508 7.94118C11.6301 7.94118 11.7816 8.0046 11.9053 8.13143C12.029 8.25827 12.0909 8.41544 12.0909 8.60294V12.1324C12.0909 12.9289 11.8228 13.606 11.2866 14.1636C10.7504 14.7212 10.0993 15 9.33333 15H6.25758ZM0 3.97059V2.64706H1.27273V3.97059H0ZM2.54545 6.61765V5.29412H3.81818V6.61765H2.54545ZM10.1818 6.61765V5.29412H11.4545V6.61765H10.1818ZM12.7273 6.61765V5.29412H14V6.61765H12.7273ZM0 1.32353V0H1.27273V1.32353H0ZM2.54545 1.32353V0H3.81818V1.32353H2.54545ZM5.09091 1.32353V0H6.36364V1.32353H5.09091ZM7.63636 1.32353V0H8.90909V1.32353H7.63636ZM10.1818 1.32353V0H11.4545V1.32353H10.1818ZM12.7273 3.97059V2.64706H14V3.97059H12.7273ZM12.7273 1.32353V0H14V1.32353H12.7273Z" /></svg>초기 질문</button>
+      <button id="tab-memos" aria-pressed="false"><svg viewBox="-3 -3 20 20" aria-hidden="true"><path d="M2 1h10v12H2zM4 4h6V3H4zm0 3h6V6H4zm0 3h4V9H4z" /></svg>지식 데이터</button>
     </nav>
     <!-- owner 전용 메뉴는 구분선 아래 따로(crema Sidebar.tsx superuser 메뉴 자리). -->
     <nav class="toolbar" id="toolbar-owner" aria-label="관리자 메뉴" hidden>
@@ -131,13 +132,20 @@
         <div class="bleed" id="popular" aria-live="polite"></div>
       </div>
     </section>
+    <!-- 지식 데이터(코드 이름 memo): Yes24가 전해 준 "누가 무엇을 말했는가"(추천사·작가의 말·캠페인 일정)를 묶음 단위로 켜고 끈다. 묶음 행을 누르면 옆 패널에서 묶음 편집·항목 목록/검색·새 항목·가져오기. -->
+    <section class="workspace-pane" id="memos-pane" hidden>
+      <div class="workspace-head"><h2>지식 데이터</h2></div>
+      <p class="crema-note"><span id="memos-usage"></span> 켜진 묶음의 항목만 답변에 쓰입니다. 켜기·끄기·수정은 새로 찾는 답변부터 반영되고(이미 그 항목을 본 대화는 이어서 인용할 수 있습니다), 되돌리기는 없습니다. 시각은 <span class="tz"></span> 기준입니다.</p>
+      <div class="crema-table-head"><span id="memos-info"></span><span class="table-tools" id="memos-tools"></span></div>
+      <div class="bleed" id="memos" aria-live="polite"></div>
+    </section>
     <!-- 감사 로그(관리자 전용): 누가 언제 무엇을 바꿨는지 — 작업 종류·계정 필터, 행을 누르면 옆 패널에 바뀐 필드 전체. -->
     <section class="workspace-pane" id="audit-pane" hidden>
       <div class="workspace-head"><h2>감사 로그</h2></div>
       <form class="crema-filters" id="audit-filters">
         <span class="crema-segment period-presets" id="audit-range" role="group" aria-label="기간 선택" data-all="전체 기간"></span>
         <span class="crema-custom" hidden><input id="audit-since" type="date" aria-label="시작일" data-segment="audit-range" /> ~ <input id="audit-until" type="date" aria-label="종료일" data-segment="audit-range" /><button class="crema-button" type="submit">조회</button></span>
-        <span class="crema-segment" id="audit-target" role="group" aria-label="작업 종류"><button type="button" data-value="" aria-pressed="true">변경 작업</button><button type="button" data-value="all" aria-pressed="false">로그인 포함 전체</button><button type="button" data-value="login" aria-pressed="false">로그인</button><button type="button" data-value="admin" aria-pressed="false">계정 관리</button><button type="button" data-value="user" aria-pressed="false">회원</button><button type="button" data-value="starter" aria-pressed="false">초기 질문</button></span><input type="hidden" id="audit-kind" data-segment="audit-target" />
+        <span class="crema-segment" id="audit-target" role="group" aria-label="작업 종류"><button type="button" data-value="" aria-pressed="true">변경 작업</button><button type="button" data-value="all" aria-pressed="false">로그인 포함 전체</button><button type="button" data-value="login" aria-pressed="false">로그인</button><button type="button" data-value="admin" aria-pressed="false">계정 관리</button><button type="button" data-value="user" aria-pressed="false">회원</button><button type="button" data-value="starter" aria-pressed="false">초기 질문</button><button type="button" data-value="memo_collection" aria-pressed="false">지식 데이터</button></span><input type="hidden" id="audit-kind" data-segment="audit-target" />
         <label class="select"><select id="audit-actor" aria-label="계정"><option value="">모든 계정</option></select></label>
       </form>
       <p class="crema-note">시각은 <span class="tz"></span> 기준입니다. 비밀번호·키 같은 민감값은 기록되지 않습니다.</p>
@@ -189,5 +197,5 @@
 <!-- CSV 다운로드 아이콘(crema-ai-admin Statistics.tsx DownloadIcon 경로). -->
 <template id="download-icon"><svg class="crema-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="M9 11.625L5.625 8.25L6.6375 7.2L8.25 8.8125V3H9.75V8.8125L11.3625 7.2L12.375 8.25L9 11.625ZM4.5 15C4.0875 15 3.73438 14.8531 3.44063 14.5594C3.14688 14.2656 3 13.9125 3 13.5V11.25H4.5V13.5H13.5V11.25H15V13.5C15 13.9125 14.8531 14.2656 14.5594 14.5594C14.2656 14.8531 13.9125 15 13.5 15H4.5Z" /></svg></template>
 
-<script type="module" src="/static/lib/admin.js?v=69"></script>
+<script type="module" src="/static/lib/admin.js?v=71"></script>
 </html>

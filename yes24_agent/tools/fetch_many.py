@@ -19,11 +19,13 @@ error 표식으로 섞어 반환한다 — 빈 성공으로 위장하지 않는�
 
 import asyncio
 import logging
+from urllib.parse import urldefrag
 
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
 from yes24_agent.sources import now_checked_at
+from yes24_agent.tools.memos import attach_notes, turn_entries
 from yes24_agent.tools.yes24_fetch import open_page, register_page
 from yes24_agent.tools.yes24_search import get_client, observes_cremaclub
 from yes24_agent.yes24.client import Yes24FetchError
@@ -90,7 +92,9 @@ async def fetch_pages(items: list[dict], tool_context, observe_formats: bool = F
 
     for item in requested:
         candidate = item.get("url") if isinstance(item, dict) else None
-        url = candidate.strip() if isinstance(candidate, str) and candidate.strip() else None
+        # 조각은 문서를 가르지 않는다(yes24_fetch 진입과 같은 정규화 — 겹침 판정도 조각 없는 url).
+        text = candidate.strip() if isinstance(candidate, str) else ""
+        url = urldefrag(text).url or None
         if url and url in seen_urls:
             duplicate_count += 1
             continue
@@ -114,6 +118,7 @@ async def fetch_pages(items: list[dict], tool_context, observe_formats: bool = F
         return_exceptions=True,
     )
     gathered_iter = iter(parsed)
+    entries = await turn_entries()  # 등록 루프 앞에서 await를 끝낸다
 
     results: list[dict] = []
     for url in plan:
@@ -140,6 +145,7 @@ async def fetch_pages(items: list[dict], tool_context, observe_formats: bool = F
             # 순차 호출: register_source가 await 없이 하나씩 실행돼 id 원자·단조 —
             # settle_sources 정합(병렬 도구 유실 방지) 불변.
             results.append(register_page(outcome, tool_context))
+    attach_notes(results, entries, tool_context)
 
     checked_at = now_checked_at()
     ok = sum(1 for r in results if r.get("status") != "error")

@@ -21,6 +21,8 @@ dependencies = [
     # MySQL async 드라이버. google-adk[db]의 extra에는 없어 배포용 SESSION_DB_URL
     # (mysql+aiomysql://…)을 쓰려면 별도 추가가 필요하다 — 로컬 sqlite 기본은 무영향.
     "aiomysql>=0.2",
+    "openpyxl>=3.1.5",
+    "defusedxml>=0.7.1",
 ]
 
 [dependency-groups]

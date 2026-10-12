@@ -15,7 +15,9 @@ from functools import lru_cache
 from types import SimpleNamespace
 
 from yes24_agent.config import get_settings
+from yes24_agent.memos import MEMO_SOURCE_TYPE, close_memo_service
 from yes24_agent.tools.fetch_many import fetch_many
+from yes24_agent.tools.memos import start_knowledge_turn, yes24_notice
 from yes24_agent.tools.web_fetch import web_fetch
 from yes24_agent.tools.web_search import (
     aclose_shared_client as aclose_web_search_client,
@@ -52,9 +54,12 @@ class Persona:
 
 # 선언 순서 = 도구 등록 순서 정본(종전 AGENT_TOOLS 리터럴과 동일: yes24 4종 → web 2종).
 # enabled_toolsets는 켜고 끄기만 하고 순서는 여기가 소유한다.
+# knowledge(Yes24 지식 데이터 조회 도구)는 기본 enabled_toolsets에 없다 — 실험 팔(ENABLED_TOOLSETS)과
+# 세션 도구 토글로만 켜고, 기본 편입은 측정 후 사용자 승인으로 정한다.
 TOOLSETS: dict[str, tuple] = {
     "yes24": (yes24_search, yes24_fetch, fetch_many, yes24_browse),
     "web": (web_search, web_fetch),
+    "knowledge": (yes24_notice,),
 }
 
 
@@ -88,6 +93,8 @@ TOOLSET_SOURCE_TYPES: dict[str, dict[str, tuple[str, ...]]] = {
         "browse": (*GROUNDING_FIELDS, "rank"),
     },
     "web": {"web": ()},
+    # 메모는 공개 메타 필드가 0개다 — 공개 DTO 모양이 기존 notice와 같다.
+    "knowledge": {MEMO_SOURCE_TYPE: ()},
 }
 
 # 공개 계약 v2(2026-09-08): 위 레지스트리에 선언된 출처 타입은 **관측 깊이**(목록·상세·코너)라
@@ -96,8 +103,11 @@ TOOLSET_SOURCE_TYPES: dict[str, dict[str, tuple[str, ...]]] = {
 # 접는다(접는 곳은 event_translate.project_public_source 한 군데, 내부 타입·레지스트리·도구
 # 응답은 그대로다 — 모델 접지와 병합 판정은 내부 어휘를 쓴다). 여기 없는 toolset(web)과
 # 레지스트리 밖 타입(`notice` — 공개 메타 필드가 없어 위 선언에 항목이 없다)은 내부 이름
-# 그대로 공개된다. 결과 공개 어휘: product | notice | web.
-TOOLSET_PUBLIC_SOURCE_TYPE: dict[str, str] = {"yes24": "product"}
+# 그대로 공개된다. knowledge(Yes24 지식 데이터)는 notice로 접혀 document 카드가 된다 — 공개
+# 어휘·외부 프론트 계약을 늘리지 않는다. toolset을 걷어낼 때도 이 줄과 TOOLSET_SOURCE_TYPES의
+# knowledge 줄은 남긴다(세션 레지스트리의 knowledge가 book 카드로 그려지지 않게).
+# 결과 공개 어휘: product | notice | web.
+TOOLSET_PUBLIC_SOURCE_TYPE: dict[str, str] = {"yes24": "product", "knowledge": "notice"}
 
 # 턴 시작 선제 실행 훅. ACLOSE_HOOKS와 같은 병행 레지스트리 관례이며, **활성 toolset의 것만**
 # 실행한다(끈 toolset은 선제 실행도 없다). 러너가 도구 모듈을 직수입하지 않게 하는 것이 목적:
@@ -105,6 +115,7 @@ TOOLSET_PUBLIC_SOURCE_TYPE: dict[str, str] = {"yes24": "product"}
 # 시그니처는 (message, active) 공통이다.
 PREFETCH_HOOKS: dict[str, tuple] = {
     "web": (start_web_prefetch,),
+    "knowledge": (start_knowledge_turn,),
 }
 
 # lifespan 종료 훅. 활성 여부와 무관하게 전부 호출한다 — 미생성 클라이언트는 no-op
@@ -113,6 +124,7 @@ PREFETCH_HOOKS: dict[str, tuple] = {
 ACLOSE_HOOKS: dict[str, tuple] = {
     "yes24": (aclose_yes24_client,),
     "web": (aclose_web_search_client,),
+    "knowledge": (close_memo_service,),
 }
 
 PERSONAS: dict[str, Persona] = {

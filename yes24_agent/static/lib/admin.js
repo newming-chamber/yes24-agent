@@ -1,4 +1,4 @@
-import { initManage, roleLabel } from "/static/lib/admin_manage.js?v=33";
+import { initManage, roleLabel } from "/static/lib/admin_manage.js?v=35";
 import { initCharts } from "/static/lib/admin_charts.js?v=9";
 import { renderBody } from "/static/lib/md.js";
 import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceDomain, sourceTitle, CARD_LABELS } from "/static/lib/sources.js";
@@ -87,7 +87,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     if (res.status === 403 && state.role && await accountChanged()) throw new DOMException('', 'AbortError');
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
-      const detail = Array.isArray(body.detail) ? body.detail.map((item) => item.msg).join(' · ') : body.detail;
+      const detail = Array.isArray(body.detail) ? body.detail.map((item) => item.msg ?? item.message).join(' · ') : body.detail;
       throw Object.assign(new Error(detail || `요청 실패 (${res.status})`), { status: res.status, body, response: res });
     }
     return responseType === 'response' ? res : res.status === 204 ? null : res.json();
@@ -1535,7 +1535,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   // ── 감사 로그(관리자 전용): 서버가 준 행(target_type·action·before/after JSON)을 사람이 읽는 줄로 옮긴다.
   // 라벨 표는 이 한 곳이다 — 모르는 값은 원문 그대로 보인다(새 작업이 생겨도 빈칸이 되지 않게).
   const CLI_LABEL = '서버 관리 도구(CLI)';
-  const AUDIT_TARGETS = { '': '전체', login: '로그인', admin: '계정', user: '회원', starter: '초기 질문', session: '대화' };
+  const AUDIT_TARGETS = { '': '전체', login: '로그인', admin: '계정', user: '회원', starter: '초기 질문', session: '대화', memo_collection: '지식 데이터' };
   // 작업명은 동사만 — 무엇에 대한 작업인지는 바로 옆 '대상' 칸("초기 질문 #151 · …", "계정 owner")이 말한다.
   const AUDIT_ACTIONS = {
     'login:ok': '로그인', 'login:failed': '로그인 실패', 'login:logout': '로그아웃',
@@ -1543,10 +1543,18 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     'user:update': '변경',
     'starter:create': '직접 등록', 'starter:update': '수정', 'starter:deactivate': '노출 끄기', 'starter:generate': '자동 생성',
     'session:purge': '영구 삭제',
+    'memo_collection:create': '묶음 만들기', 'memo_collection:update': '묶음 편집', 'memo_collection:activate': '답변에 켜기',
+    'memo_collection:deactivate': '답변에서 끄기', 'memo_collection:delete': '묶음 삭제', 'memo_collection:memo_create': '항목 추가',
+    'memo_collection:memo_update': '항목 수정', 'memo_collection:memo_delete': '항목 삭제',
+    'memo_collection:import_append': '가져오기(추가)', 'memo_collection:import_replace': '가져오기(교체)',
   };
   const AUDIT_FIELDS = {
     username: '계정명', role: '역할', is_active: '활성', note: '메모', text: '문장', pinned: '고정', active: '노출 설정', valid_from: '노출 시작일', valid_until: '노출 종료일',
     slot: '분야', status: '결과', inserted: '추가 수', force: '다시 생성', user_id: '회원번호', turns: '질의 수', deleted_at: '삭제 요청 시각', app_name: '앱',
+    // 메모(memo_collection) — 'active'는 위 공용 라벨(노출 설정·켜짐/꺼짐)을 같이 쓴다.
+    title: '묶음 이름', description: '설명', source_url: '관련 페이지', period_start: '기간 시작', period_end: '기간 끝', memo_count: '항목 수', always_include: '항상 참고',
+    memo_id: '항목 번호', content: '내용', about: '누가', link: '링크', goods_nos: '상품번호',
+    file_name: '파일', file_sha256: '파일 해시', sheet: '시트', mapping: '매핑', deleted: '삭제 수',
   };
   const auditValue = (field, value) => (value == null ? '-' : field === 'role' ? roleLabel(value) : field === 'slot' ? slotLabel(value) : field === 'status' ? GENERATE_STATUS[value] ?? value : field === 'active' ? (value ? '켜짐' : '꺼짐') : field === 'pinned' ? PINS[value === true ? 'slot' : value === false ? '' : value]?.label ?? String(value) : typeof value === 'boolean' ? (value ? '예' : '아니오') : typeof value === 'object' ? JSON.stringify(value) : String(value));
   /** 바뀐 필드 — [라벨, 이전, 이후]. 'by'(CLI 표시)는 계정 칸이 말하므로 뺀다. */
@@ -1600,6 +1608,36 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       addMissingOptions($('audit-actor'), [...data.actors, ...(data.cli_actor ? [data.cli_actor] : [])], (value) => (value === data.cli_actor ? CLI_LABEL : value));
       state.starterSlots = data.slots ?? state.starterSlots;
     });
+  }
+
+  // ── 메모(Yes24가 전해 준 추천사·작가의 말·캠페인 일정) — 묶음 목록은 한 번에 다 받는 짧은 목록, 정렬은 표 안에서.
+  // 이 서버가 메모 조회 도구를 켰는가(서버 응답 usage) — 꺼진 서버에선 켠 묶음도 답변에 쓰이지 않는다.
+  let memoUsage = { tool: false };
+  const memoUsageText = ({ tool }) => `이 서버: 조회 도구 ${tool ? '켜짐' : '꺼짐 — 지금은 켠 묶음도 답변에 쓰이지 않습니다'}.`;
+  const MEMO_COLLECTION_COLUMNS = [
+    { key: 'title', label: '묶음' },
+    { key: 'description', label: '설명' },
+    { key: 'memo_count', label: '항목 수' },
+    { key: 'period', label: '기간', text: (row) => (row.period_start || row.period_end ? `${row.period_start ?? ''} ~ ${row.period_end ?? ''}` : '-') },
+    { key: 'active', label: '상태', format: (v) => flag(v, memoUsage.tool ? '답변에 사용 중' : '켜짐(이 서버에선 미사용)', '꺼짐') },
+    { key: 'always_include', label: '항상 참고', format: (v) => flag(v, '예', '아니오') },
+    { key: 'updated_at', label: '마지막 반영', text: (row) => `${row.updated_at} · ${row.updated_by}` },
+  ];
+  // 패널 요약 — 설명·관련 페이지는 아래 편집 폼 하나에만 둔다(두 번 보이면 메모 목록이 밀린다).
+  const MEMO_COLLECTION_DETAIL = MEMO_COLLECTION_COLUMNS.filter((column) => !['title', 'description'].includes(column.key));
+  function loadMemos() {
+    writeHash();
+    manage.memoTools($('memos-tools'));
+    return request('memos', '/admin/api/memo-collections', (data) => {
+      memoUsage = data.usage;
+      $('memos-usage').textContent = memoUsageText(memoUsage);
+      $('memos-info').textContent = `묶음 ${num(data.collections.length)}개`;
+      $('memos').replaceChildren(data.collections.length ? table(MEMO_COLLECTION_COLUMNS, data.collections, openMemoCollection, { key: 'updated_at', dir: 'desc' }) : placeholder('만든 묶음이 없습니다.'));
+    });
+  }
+  async function openMemoCollection(row) {
+    if (!(await openDialog(row.title, row, MEMO_COLLECTION_DETAIL))) return;
+    manage.memoCollectionPanel(row);
   }
 
   async function openUser(row) {
@@ -1950,7 +1988,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   }
 
 
-  const manage = initManage({ api, el, table, valueText, state, openDialog, showRecord, reload: () => { state.preview = null; loaders[state.tab](); }, onCreated: starterCreated, slotLabel, generateStatus: GENERATE_STATUS, errorText, chanceText, slotProbability, todayPreview, pins: PINS });
+  const manage = initManage({ api, el, table, valueText, state, openDialog, showRecord, reload: () => { state.preview = null; loaders[state.tab](); }, onCreated: starterCreated, slotLabel, generateStatus: GENERATE_STATUS, errorText, chanceText, slotProbability, todayPreview, pins: PINS, confirmDialog, showToast, closePanel, openCollection: openMemoCollection });
   /** 직접 등록 성공 — 패널을 닫고 알림, 다시 읽은 화면에서 새 질문(캘린더 막대)을 잠깐 강조한다. */
   function starterCreated(created) {
     closePanel();
@@ -2029,7 +2067,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     $(input).addEventListener('search', () => { if (!$(input).value) $(form).requestSubmit(); });
   }
 
-  const loaders = { dashboard: loadDashboard, statistics: loadStatistics, sessions: loadSessions, users: loadUsers, starters: loadStarters, audit: loadAudit };
+  const loaders = { dashboard: loadDashboard, statistics: loadStatistics, sessions: loadSessions, users: loadUsers, starters: loadStarters, memos: loadMemos, audit: loadAudit };
   // 감사 로그 필터 — 작업 종류 세그먼트·계정 선택, 바꾸면 첫 페이지부터 다시 읽는다.
   $('audit-filters').onsubmit = (event) => { event.preventDefault(); applyQuery('audit'); loadAudit(); };
   $('audit-actor').onchange = () => $('audit-filters').requestSubmit();

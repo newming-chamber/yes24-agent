@@ -363,9 +363,10 @@ def _public_source_types() -> tuple[str, ...]:
     """공개 출처 어휘(`done.sources[].type`) — toolsets 레지스트리에서 파생한다.
 
     접히는 toolset은 공개 이름 하나(yes24→product), 안 접히는 toolset은 선언 타입 그대로(web).
-    `notice`만 손으로 더한다: 공개 메타 필드가 없어 레지스트리에 선언이 없고(toolsets 주석·
-    event_translate passthrough 규칙), 유일한 정의가 yes24_fetch 내부 리터럴이라 끌어올 상수가
-    없다. 그 밖의 값은 여기 열거하지 않는다 — 새 toolset은 선언과 함께 자동으로 따라온다.
+    `notice`만 손으로 더한다: notice는 두 곳에서 나온다 — yes24_fetch 내부 리터럴(공개 메타
+    필드가 없어 레지스트리에 선언이 없다, event_translate passthrough 규칙)과 internal 접힘
+    (TOOLSET_PUBLIC_SOURCE_TYPE). internal이 꺼진 구성에서도 yes24_fetch 쪽이 있으므로 손 추가는
+    남긴다. 그 밖의 값은 여기 열거하지 않는다 — 새 toolset은 선언과 함께 자동으로 따라온다.
     """
     names: list[str] = []
     for toolset, types in TOOLSET_SOURCE_TYPES.items():

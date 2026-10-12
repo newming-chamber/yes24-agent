@@ -34,6 +34,7 @@ from google.adk.tools import ToolContext
 
 from yes24_agent.config import Settings, get_settings
 from yes24_agent.sources import cite_marker, now_checked_at, register_source
+from yes24_agent.tools.memos import attach_notes, turn_entries
 from yes24_agent.tool_progress import ToolProgressGroup, parsed_progress
 from yes24_agent.tools._planning import (
     angle_error_summary,
@@ -267,6 +268,7 @@ async def yes24_search(
         각도 중 하나라도 검색에 성공하면 status="ok"와 results 목록(모든 각도의 결과를
         상품 기준으로 병합·중복제거, 각 항목에 인용용 source_id와 어느 각도에서 나왔는지
         queries 포함), 각 각도의 성공/실패/결과 수를 담은 searches 요약, 검색 시각 checked_at,
+        행에 notes가 있으면 그 책·저자에 대한 Yes24 안내(사람의 말·행사·안내 — 각 note의 cite_as로 인용),
         result_count를 담은 dict. 어느 각도에서도 상품을 찾지 못하면 results가 빈 목록이고
         result_count=0이다. 섹션을 한정했는데 0건인
         각도는 통합 검색으로 한 번 더 자동 재검색되며, 그 항목은 searches에 expanded_from으로
@@ -391,6 +393,7 @@ async def yes24_search(
         await observe_cremaclub([row["fields"] for row in merged.values()], settings)
 
     # 2) 등록(순차): 병합된 행마다 한 번만 등록한다 — source_id 유일·단조.
+    entries = await turn_entries()  # knowledge 구성이 아니면 [] (await는 등록 루프 앞에서 끝난다)
     checked_at = now_checked_at()
     results: list[dict] = []
     for row in merged.values():
@@ -416,6 +419,8 @@ async def yes24_search(
                 **fields,
             }
         )
+
+    attach_notes(results, entries, tool_context)
 
     ok_count = sum(1 for s in searches if s["status"] == "ok")
     if ok_count == 0:
