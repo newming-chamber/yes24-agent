@@ -82,6 +82,9 @@ _METADATA = MetaData()
 _TITLE_MAX = 100
 _SHORT_MAX = 100  # 누가
 _SOURCE_URL_MAX = 500
+# 호스트는 도메인 문자만 — 파이썬은 "evil.com\\.yes24.com"을 yes24 하위 도메인으로 읽지만 브라우저는
+# 역슬래시를 슬래시로 바꿔 evil.com으로 간다(%2f·탭도 같은 갈래).
+_HOST_RE = re.compile(r"[a-z0-9.-]+")
 _GOODS_MAX = 1000
 memo_collections = Table(
     "memo_collections",
@@ -169,9 +172,11 @@ def _url_problem(url: str, settings: Settings) -> str | None:
     parts = urlsplit(url)
     if (
         len(url) > _SOURCE_URL_MAX
+        or any(char.isspace() or ord(char) < 32 for char in url)  # urlsplit은 탭·개행을 조용히 지운다
         or parts.scheme not in ("https", "http")  # javascript://www.yes24.com/… 는 호스트만 보면 통과한다
         or parts.username is not None
-        or not is_allowed_host(parts.hostname or "", allowed_domain(settings.yes24_base_url))
+        or not _HOST_RE.fullmatch(parts.hostname or "")
+        or not is_allowed_host(parts.hostname, allowed_domain(settings.yes24_base_url))
     ):
         return "Yes24 주소여야 합니다"
     if "#" in url:
