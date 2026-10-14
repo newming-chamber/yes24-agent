@@ -61,7 +61,7 @@ _INVOCATION_LEDGER: dict[str, dict] = {}  # {inv: {"watermark": int, "url_ids": 
 # 경로) 락으로 원자성을 보장한다. 구간이 짧아 경합 비용은 무시할 수준이다.
 _LEDGER_LOCK = threading.Lock()
 # 장부 보관 상한(동시 진행 인보케이션 수의 여유 상한). 조정 대상 설정값이 아니라 자료구조
-# 상한이라 코드 상수로 두며, 같은 근거를 쓰는 agent._invocation_instruction의 lru_cache가
+# 상한이라 코드 상수로 두며, 같은 근거를 쓰는 agent._invocation_clock_note의 lru_cache가
 # 이 상수를 import한다(리터럴 2벌 금지). 초과 시 가장 오래 전에 시작된 인보케이션부터
 # 버린다(dict는 삽입 순서를 보존한다).
 LEDGER_MAX_INVOCATIONS = 64

@@ -1,7 +1,7 @@
 """루트 에이전트 정의 — 범용 AI 어시스턴트(+ Yes24 책·상품 실시간 검색 강점).
 
-instruction·도구·페르소나를 조립해 단일 루트(pro) LlmAgent를 만든다. instruction은 호출
-시점 날짜를 반영하는 콜러블이며, 단일 순차 도구 루프는 runner가 돌린다.
+instruction·도구·페르소나를 조립해 단일 루트(pro) LlmAgent를 만든다. instruction은 정적이고
+날짜·시각은 모델 콜백이 요청 끝에 메모로 붙이며, 단일 순차 도구 루프는 runner가 돌린다.
 """
 
 from functools import lru_cache
@@ -308,24 +308,26 @@ Yes24 정책 탐색 입구:
 )
 
 
-# 날짜·시각은 계속 바뀌므로 본문 중간이 아니라 **말미**에 둔다 — 앞의 본문이 바이트 동일한
-# 프리픽스로 유지돼 Gemini implicit caching이 히트한다(TTFT·비용 절감). rbti 없는 경로(대다수
-# 트래픽)에서는 프롬프트 전체가 이 한 줄 말미만 빼고 캐시 가능한 프리픽스가 된다.
-# 시각까지 넣으면 말미가 분마다 달라져 이 프리픽스 뒤(대화 히스토리)는 턴 간 재사용이 끊긴다
-# — 정확도 대 캐시 할인의 교환이며, 초 단위가 아닌 분 단위 절사가 그 완화다(sources.time_kst).
+# 날짜·시각은 시스템 프롬프트에 넣지 않는다 — 요청 직전 마지막 메시지 끝에 메모로 붙인다
+# (_append_clock_note). Gemini implicit caching은 앞에서부터 바이트가 같은 프리픽스만 재사용하는데,
+# 시스템 프롬프트는 대화 히스토리보다 앞이라 여기 분 단위 시각이 있으면 턴마다 히스토리 전체가
+# 캐시 밖으로 밀린다(2026-10-13 실측: 같은 히스토리 2만 3천 토큰 재요청 시 말미 시각 0% vs 메모
+# 91% 캐시, 운영 3.6-flash 적중률 46%). 아래 안내 문장은 정적이라 프리픽스를 깨지 않는다.
 #
 # persona_directive는 여기 넣지 않는다: 말미로 옮겼을 때 페르소나가 증거 계약보다 뒤(최신 위치)로
 # 밀려 RBTI 경로에서 무인용 추천(도구 없이 파라메트릭 지식으로 책 추천)이 관측됐다
 # (2026-07-20 A/B: 말미 2건/7런 vs 원위치 0건/6런). 캐시 이득보다 인용 계약이 우선이라 원위치 유지.
-_DYNAMIC_TAIL_TEMPLATE = """
-오늘은 {today}이고 지금은 {now}(KST)입니다. 상대 시점과 최신성은 이 날짜·시각을 기준으로 판단합니다."""  # noqa: E501 — 프롬프트 바이트 계약(줄바꿈 삽입 금지)
+_CLOCK_GUIDE = """
+현재 날짜·시각(KST)은 대화 마지막 메시지 끝의 [현재 시각] 메모로 주어집니다. 상대 시점과 최신성은 그 날짜·시각을 기준으로 판단합니다."""  # noqa: E501 — 프롬프트 바이트 계약(줄바꿈 삽입 금지)
+
+_CLOCK_NOTE_TEMPLATE = "\n\n[현재 시각] 오늘은 {today}이고 지금은 {now}(KST)입니다."
 
 
 def build_system_prompt(app, persona_directive: str = "") -> str:
-    """정적 본문에 (채팅 전용) 페르소나 지시를 채우고, 말미에 현재 날짜·시각(KST)을 붙여 조립한다.
+    """정적 본문에 (채팅 전용) 페르소나 지시를 채우고, 말미에 시각 메모 안내를 붙여 조립한다.
 
     persona_directive가 ""(기본)이면 해당 자리에 빈 문자열이 들어가 rbti 없는 경로와 바이트 동일.
-    그 경로에서는 날짜·시각 말미를 뺀 앞부분 전체가 매 인보케이션 바이트 동일한 캐시 프리픽스다.
+    날짜·시각은 여기 없으므로 결과 전체가 매 인보케이션 바이트 동일한 캐시 프리픽스다.
     """
     # RBTI 소개 단락은 2026-07-29 삭제 — RBTI/매트릭스는 개발자용 검증 뷰이지 사용자에게
     # 소개·영업할 앱 기능이 아니다(사용자 확인: "내가 보기 위한 뷰"). 페르소나 선택 시의
@@ -339,31 +341,46 @@ def build_system_prompt(app, persona_directive: str = "") -> str:
         policy_seeds=_format_policy_seeds(),
         persona_directive=persona_directive,
     )
-    tail = _DYNAMIC_TAIL_TEMPLATE.format(today=today_kst(), now=time_kst())
-    return f"{core}{tail}"
+    return f"{core}{_CLOCK_GUIDE}"
+
+
+# 프롬프트가 정적이 됐으므로 instruction은 (페르소나 코드, 구성) 조합별로 한 번만 조립한다.
+@lru_cache(maxsize=LEDGER_MAX_INVOCATIONS)
+def _instruction_for(code: str, persona_key: str, active: frozenset[str]) -> str:
+    """페르소나 코드·구성 조합의 instruction(정적). 무효 코드는 base와 바이트 동일."""
+    directive = persona_tool_directive(code) if code else ""
+    base = build_system_prompt(resolve_app_for(persona_key, active), persona_directive=directive)
+    block = build_persona_block(code) if code else ""
+    return f"{base}\n\n{block}" if block else base
 
 
 # 캐시 상한 = 동시 진행 인보케이션 수의 여유 상한. 근거가 sources의 발급 장부와 같으므로
 # 상수도 하나만 둔다(2026-08-19 감사 — 같은 근거의 리터럴 2벌 통합).
 @lru_cache(maxsize=LEDGER_MAX_INVOCATIONS)
-def _invocation_instruction(
-    invocation_id: str, code: str, persona_key: str, active: frozenset[str]
-) -> str:
-    """한 인보케이션(사용자 발화 1건)이 처음 조립한 instruction을 그 턴 내내 재사용한다.
+def _invocation_clock_note(invocation_id: str) -> str:
+    """한 인보케이션(사용자 발화 1건)이 처음 본 날짜·시각 메모를 그 턴 내내 재사용한다.
 
-    ADK는 instruction 콜러블을 인보케이션이 아니라 **LLM 요청마다** 평가한다. 그래서 도구
-    루프가 분 경계를 넘으면 라운드 1이 본 시각과 라운드 3이 본 시각이 달라진다 — 같은 발화를
-    처리하는 중에 기준 시각이 흔들리면 마감 경계(당일배송 등) 판단이 턴 중간에 뒤집힐 수 있다.
-    시각의 자연스러운 유효 범위는 인보케이션이며, 이 캐시가 그 범위를 코드로 고정한다.
-    (부수 효과로 프롬프트 프리픽스가 턴 내내 바이트 동일해져 implicit caching 재사용도 산다.)
-
-    상한 64는 동시에 진행 중인 인보케이션 수의 여유 상한이다 — 매트릭스 16셀이 동시에 돌아도
-    남는다. LRU가 오래된 항목을 퇴출하므로 장수 프로세스에서 무한 증식하지 않는다.
+    ADK는 모델 콜백을 LLM 요청마다 부른다. 고정이 없으면 도구 루프가 분 경계를 넘을 때 라운드마다
+    기준 시각이 달라져 마감 경계(당일배송 등) 판단이 턴 중간에 뒤집힐 수 있다.
     """
-    directive = persona_tool_directive(code) if code else ""
-    base = build_system_prompt(resolve_app_for(persona_key, active), persona_directive=directive)
-    block = build_persona_block(code) if code else ""
-    return f"{base}\n\n{block}" if block else base
+    return _CLOCK_NOTE_TEMPLATE.format(today=today_kst(), now=time_kst())
+
+
+def _append_clock_note(callback_context, llm_request):
+    """요청 직전 마지막 메시지 끝에 날짜·시각 메모를 붙인다(세션에는 저장하지 않는다).
+
+    맨 끝에 두므로 시스템 프롬프트와 이전 히스토리는 턴이 바뀌어도 바이트 동일해 캐시가 이어진다.
+    마지막 Content는 세션 이벤트와 객체를 공유할 수 있어 제자리 수정하지 않고 사본으로 바꾼다.
+    도구 호출 모드 등 요청의 다른 설정은 건드리지 않는다. None을 돌려 모델 호출을 그대로 진행한다.
+    """
+    note = types.Part(text=_invocation_clock_note(callback_context.invocation_id))
+    contents = llm_request.contents
+    if contents and contents[-1].role == "user":
+        last = contents[-1]
+        contents[-1] = types.Content(role="user", parts=[*(last.parts or []), note])
+    else:
+        contents.append(types.Content(role="user", parts=[note]))
+    return None
 
 
 def _make_instruction_provider(app):
@@ -378,17 +395,14 @@ def _make_instruction_provider(app):
         """ADK가 LLM 요청마다 호출하는 동적 instruction — core·서술·독자 페르소나 조립.
 
     LlmAgent.instruction은 str뿐 아니라 (ReadonlyContext) -> str 콜러블을 받으며,
-    호출 시점에 평가된다. 날짜·시각을 여기서 계산해 경계를 넘겨도 서버 재시작 없이
-    "오늘"·"지금"이 정확히 유지되도록 한다(턴 내부 고정은 _invocation_instruction).
+    호출 시점에 평가된다. 날짜·시각은 여기 넣지 않는다(_append_clock_note가 요청 끝에 붙인다).
 
     세션 state에 RBTI 코드가 있으면(플러밍이 저장) **두 지점**에 페르소나를 얹는다: 상단
     도구-반영 지시(persona_tool_directive, 검색·선택에 실제 적용)와 끝의 상세 블록
     (build_persona_block, 후보 구성·읽기 권유·강조 관점). 코드가 없거나 무효면 둘 다 ""이라
         base와 바이트 동일(회귀 0). ctx.state는 세션 state의 읽기전용 뷰(MappingProxyType)다.
         """
-        return _invocation_instruction(
-            ctx.invocation_id, ctx.state.get("rbti") or "", app.persona_key, app.active
-        )
+        return _instruction_for(ctx.state.get("rbti") or "", app.persona_key, app.active)
 
     return _instruction_provider
 
@@ -426,6 +440,7 @@ def create_agent(model_name: str | None = None, app=None) -> LlmAgent:
         name=AGENT_NAME,
         description="범용 질문에 답하고 Yes24 상품·정책과 웹 사실을 근거로 종합하는 어시스턴트.",
         instruction=_make_instruction_provider(app),
+        before_model_callback=_append_clock_note,
         tools=list(app.tools),
         generate_content_config=types.GenerateContentConfig(
             thinking_config=types.ThinkingConfig(
