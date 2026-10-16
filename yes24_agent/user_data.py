@@ -35,7 +35,7 @@ mysql이 아니면(로컬 sqlite) 스택이 자연 비활성이다(구조 분기
 (전부 unread·자동 제목) 목록·복원이 그대로 동작한다.
 
 DDL은 `scripts/chat_turn.sql`·`scripts/turn_feedback.sql`·`scripts/turn_click.sql`·
-`scripts/session_ui.sql`(기존 DB는 `scripts/session_ui_deleted_at.sql`)
+`scripts/giftcard_issue.sql`·`scripts/session_ui.sql`(기존 DB는 `scripts/session_ui_deleted_at.sql`)
 (usage_log 관례).
 """
 
@@ -52,6 +52,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from yes24_agent.admin_auth import AUDIT_INSERT, audit_params
+from yes24_agent.admin_data import GIFTCARD_RECEIVED
 from yes24_agent.config import get_settings
 from yes24_agent.db import MysqlBackedService
 from yes24_agent.session_service import mysql_pool_kwargs
@@ -69,7 +70,7 @@ class SessionUi:
 
 
 class UserDataService(MysqlBackedService):
-    """chat_turn·turn_feedback·turn_click·session_ui 서비스(프로세스 싱글턴, 풀 1개).
+    """chat_turn·turn_feedback·turn_click·session_ui·giftcard_issue 서비스(프로세스 싱글턴, 풀 1개).
 
     풀 보유·활성 판정·질의·마감은 db.MysqlBackedService가 소유한다 — 여기 남는 것은 SQL뿐이다.
     풀 팩토리를 주입할 수 있어 테스트는 실 DB 없이 전 경로를 돈다(AuthService·UsageLogger 패턴).
@@ -102,9 +103,10 @@ class UserDataService(MysqlBackedService):
             "SELECT u.user_no, a.key_hash, t.id, t.app_name, t.user_id, t.session_id, "
             "t.turn_id, t.started_at, t.completed_at, t.user_text, t.text, t.status, "
             "t.sources, t.process, t.meta, t.error, t.rbti_applied, t.history_saved, "
-            "f.app_name, c.app_name, s.app_name, s.deleted_at, l.app_name, d.target_type "
+            "f.app_name, c.app_name, s.app_name, s.deleted_at, l.app_name, d.target_type, "
+            "g.user_id, g.event_key, g.result_code "
             "FROM users u, auth_keys a, chat_turn t, turn_feedback f, turn_click c, "
-            "session_ui s, usage_log l, admin_audit d WHERE 1 = 0",
+            "session_ui s, usage_log l, admin_audit d, giftcard_issue g WHERE 1 = 0",
             (),
             fetch_all=True,
         )
@@ -425,6 +427,28 @@ class UserDataService(MysqlBackedService):
                 source_type,
                 label,
             ),
+        )
+
+    # ── giftcard_issue ─────────────────────────────────────────────────────
+
+    async def giftcard_issued(self, *, user_id: str, event_key: str) -> bool:
+        """이 이벤트로 Yes24가 "받았다"고 답한 기록(SUCCESS·ALREADY_APPLIED)이 있는가."""
+        return bool(
+            await self._run(
+                "SELECT 1 FROM giftcard_issue WHERE user_id = %s AND event_key = %s "
+                f"AND {GIFTCARD_RECEIVED} LIMIT 1",
+                (user_id, event_key),
+                fetch_all=True,
+            )
+        )
+
+    async def record_giftcard_result(
+        self, *, user_id: str, event_key: str, result_code: str
+    ) -> None:
+        """발급 시도 1건 기록 — 행 추가만 한다(시각은 DB가 찍는다)."""
+        await self._run(
+            "INSERT INTO giftcard_issue (user_id, event_key, result_code) VALUES (%s, %s, %s)",
+            (user_id, event_key, result_code),
         )
 
     # ── session_ui ─────────────────────────────────────────────────────────

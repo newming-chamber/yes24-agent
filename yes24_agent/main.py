@@ -47,6 +47,7 @@ from yes24_agent.auth import (
     token_matches,
 )
 from yes24_agent.config import Settings, ensure_google_api_key_env, get_settings
+from yes24_agent.giftcard import register_giftcard
 from yes24_agent.history import register_history
 from yes24_agent.logctx import ContextFilter, bound, new_request_id
 from yes24_agent.matrix.matrix_runner import run_matrix_stream
@@ -1086,6 +1087,8 @@ def create_app() -> FastAPI:
 
     # Yes24 백엔드 조회(POST /partner/chat-activity). partner_api_key가 비면 미등록(404).
     register_partner(app, settings)
+    # 크레마AI 상품권 이벤트(POST /event/giftcard/*). giftcard_event_key가 비면 미등록(404).
+    register_giftcard(app, settings)
 
     # 초기 질문 회전 풀(GET /chat/starters·/admin/starters/*). starter_model이 빈 값이면 미등록
     # (404 — overview_model 관례). 라우트·풀·생성의 소유자는 starters.py다.

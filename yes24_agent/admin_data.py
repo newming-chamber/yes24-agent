@@ -507,6 +507,7 @@ async def fetch_stats(
         [settings.admin_preview_max_chars, *params, settings.admin_page_size],
     )
     comments = [jsonable(row) for row in await cur.fetchall()]
+    giftcard = await _giftcard_stats(cur, settings, period, excluded)
 
     since, until = period
     days = [until - timedelta(days=i) for i in range((until - since).days + 1)]
@@ -534,4 +535,120 @@ async def fetch_stats(
         "weekday": weekday,
         "rbti": rbti,
         "feedback": {"daily": feedback_daily, "comments": comments},
+        "giftcard": giftcard,
     }
+
+
+# ── 상품권 이벤트 기록(giftcard_issue) ──────────────────────────────────────
+# 클라이언트가 전달한 발급 결과를 모은 운영 참고 이력이다(giftcard.py) — Yes24 실제 발급 수와 다를
+# 수 있고 잔여 수량의 근거가 아니다. 조회는 설정의 현재 이벤트 키 하나로 한정하고, 키가 비면(이벤트
+# 종료 스위치) 조회하지 않는다.
+
+# "받은 회원" 판정 식 — Yes24가 "이 회원은 받았다"고 답한 코드(giftcard.py 독스트링). 대상자 확인
+# (user_data.giftcard_issued)과 어드민 집계가 이 식 하나를 쓴다. 이 모듈에 두는 이유는 import 방향 —
+# user_data가 admin 계층(admin_auth → admin_data)을 이미 읽는다.
+GIFTCARD_RECEIVED = "result_code IN ('SUCCESS', 'ALREADY_APPLIED')"
+
+
+def _giftcard_event(settings: Settings) -> dict[str, Any] | None:
+    key = settings.giftcard_event_key
+    if not key:
+        return None
+    return {"key": key, "start": settings.giftcard_event_start, "end": settings.giftcard_event_end}
+
+
+async def _giftcard_stats(
+    cur, settings: Settings, period: tuple[date, date], excluded: tuple[str, ...]
+) -> dict[str, Any] | None:
+    """통계 '상품권' 묶음 — 기간(어드민 시간대) 안의 시도를 결과 코드별·일별·시간대별(기간 합계)로,
+    회원은 고유 수로. 세 묶음은 (날짜, 시, 코드) 한 문장에서 나눠 센다.
+
+    received = 그 코드가 "받은" 판정(GIFTCARD_RECEIVED)인가 — 묶음 열(result_code)의 식이라 행마다
+    같다. 받은 회원은 일별 값을 더하지 않고 기간 전체에서 다시 센다(여러 번 시도한 회원은 한 번).
+    """
+    event = _giftcard_event(settings)
+    if event is None:
+        return None
+    hours = settings.admin_utc_offset_hours
+    where, params = period_filter("created_at", period, hours, excluded)
+    scope, params = sql_where(["event_key = %s", *where]), [event["key"], *params]
+    await cur.execute(
+        f"SELECT {local_day('created_at', hours)} AS day, "
+        f"HOUR{local_time('created_at', hours)} AS hour, result_code, "
+        f"{GIFTCARD_RECEIVED} AS received, COUNT(*) AS attempts "
+        f"FROM giftcard_issue{scope} GROUP BY day, hour, result_code",
+        params,
+    )
+    rows = await cur.fetchall()
+    await cur.execute(
+        "SELECT COUNT(*) AS attempts, COUNT(DISTINCT user_id) AS users, "
+        f"COUNT(DISTINCT CASE WHEN {GIFTCARD_RECEIVED} THEN user_id END) AS received_users "
+        f"FROM giftcard_issue{scope}",
+        params,
+    )
+    summary = jsonable(await cur.fetchone())
+
+    def attempts(group, received: bool = False) -> int:
+        return sum(int(row["attempts"]) for row in group if row["received"] or not received)
+
+    codes = [
+        {"result_code": code, "attempts": attempts(group), "received": bool(group[0]["received"])}
+        for (code,), group in _grouped(rows, "result_code").items()
+    ]
+    return {
+        "event": event,
+        "summary": summary,
+        "codes": sorted(codes, key=lambda row: (-row["attempts"], row["result_code"])),
+        "daily": [
+            {"day": day, "attempts": attempts(group), "received": attempts(group, received=True)}
+            for (day,), group in sorted(_grouped(rows, "day").items())
+        ],
+        "hourly": [
+            {"hour": hour, "attempts": attempts(group), "received": attempts(group, received=True)}
+            for (hour,), group in sorted(_grouped(rows, "hour").items())
+        ],
+    }
+
+
+async def fetch_user_giftcard(cur, settings: Settings, user_no: str) -> dict[str, Any]:
+    """회원 옆 패널 — 그 회원의 현재 이벤트 시도 기록(최신순, 한 화면 분량). 한 행 더 읽어
+    truncated(더 있음)를 알린다. idx_giftcard_issue_owner (user_id, event_key) 등치로 찾는다."""
+    event = _giftcard_event(settings)
+    if event is None:
+        return {"event": None, "items": [], "truncated": False}
+    size = settings.admin_page_size
+    await cur.execute(
+        "SELECT created_at, result_code FROM giftcard_issue WHERE user_id = %s AND event_key = %s "
+        "ORDER BY created_at DESC, id DESC LIMIT %s",
+        [user_no, event["key"], size + 1],
+    )
+    rows = await cur.fetchall()
+    return {"event": event, "items": [jsonable(row) for row in rows[:size]],
+            "truncated": len(rows) > size}
+
+
+async def with_user_giftcard(cur, settings: Settings, page: dict[str, Any]) -> dict[str, Any]:
+    """회원 목록 한 페이지에 상품권 상태(giftcard)를 붙인다 — 목록 쿼리는 그대로 두고 그 페이지
+    회원번호만 한 번 더 조회한다(페이지당 1문장, 인덱스 (user_id, event_key)).
+
+    giftcard = {received: 받은 판정 기록이 있는가, last_result: 시각순 마지막 결과 코드}, 기록이
+    없으면 None. 이벤트가 꺼져 있으면 조회도 필드도 없다(giftcard_event None)."""
+    event = _giftcard_event(settings)
+    if event is None or not page["items"]:
+        return {**page, "giftcard_event": event}
+    ids = sorted({str(row["user_no"]) for row in page["items"]})
+    await cur.execute(
+        f"SELECT user_id, result_code, {GIFTCARD_RECEIVED} AS received FROM giftcard_issue "
+        f"WHERE event_key = %s AND user_id IN ({', '.join(['%s'] * len(ids))}) "
+        "ORDER BY created_at, id",
+        [event["key"], *ids],
+    )
+    status: dict[str, dict[str, Any]] = {}
+    for row in await cur.fetchall():
+        before = status.get(row["user_id"], {"received": False})
+        status[row["user_id"]] = {
+            "received": before["received"] or bool(row["received"]),
+            "last_result": row["result_code"],
+        }
+    items = [{**row, "giftcard": status.get(str(row["user_no"]))} for row in page["items"]]
+    return {**page, "items": items, "giftcard_event": event}

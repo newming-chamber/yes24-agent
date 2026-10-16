@@ -777,6 +777,13 @@ class Settings(BaseSettings):
     # 미등록(404)**이 배포 기본이다(overview_model 관례의 구조적 off 스위치). 호출자가 회원 쿠키가
     # 없는 Yes24 백엔드라 x-api-key(회원 식별)와 다른 헤더 `x-partner-key`로 받는다.
     partner_api_key: str = Field(default="", repr=False)
+    # 크레마AI 상품권 이벤트(`/event/giftcard/*`). 키는 Yes24 발급 API의 eventNm과 같은 값으로,
+    # 결과 기록의 이벤트 구분값이자 **비우면 라우트 미등록(404)**인 종료 스위치다. 기간은 대상자
+    # 판정의 질문 구간(KST 날짜, 양 끝 포함). 시작은 메일 첨부의 10/14가 아니라 10/16(2026-10-16
+    # 사용자 결정 — 기간 전 질문만 있는 회원은 이벤트 중 새로 질문해야 대상).
+    giftcard_event_key: str = Field(default="2026_CremaAI_Event", max_length=64)  # DDL 폭
+    giftcard_event_start: date = date(2026, 10, 16)
+    giftcard_event_end: date = date(2026, 11, 1)
     # 인증 DB 커넥션 풀 상한. 세션 DB 풀(SQLAlchemy)과 별도로 잡히는 aiomysql 풀이라,
     # 요청당 짧은 조회 몇 건이 전부인 용도에 맞춰 작게 둔다.
     auth_pool_max: int = 5

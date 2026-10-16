@@ -972,11 +972,15 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       onData(data);
       // 서버 정렬 — 열을 누르면 첫 페이지부터 그 순서로 다시 읽는다(검색 조건은 그대로).
       const sorting = { ...sort, onSort: (sortKey, dir) => { state.sort[key] = { key: sortKey, dir }; state[key + 'Page'] = 0; loaders[key](); } };
-      $(key).replaceChildren(data.items.length ? table(columns, data.items.map(prepare), onRow, sorting) : emptyList(key, '조건에 맞는 기록이 없습니다.'));
+      const shown = typeof columns === 'function' ? columns(data) : columns;  // 응답에 따라 열이 달라지는 목록(회원 상품권)
+      $(key).replaceChildren(data.items.length ? table(shown, data.items.map(prepare), onRow, sorting) : emptyList(key, '조건에 맞는 기록이 없습니다.'));
       cremaPager($(key + '-pager'), data.total, data.page_size, page, (to) => { state[key + 'Page'] = to; loaders[key](); });
     });
   }
-  const loadUsers = () => loadList('users', `/admin/api/users?${new URLSearchParams({ ...state.applied.users, ...scope() })}`, USER_COLUMNS, openUser, undefined, (data) => {
+  // 상품권 열 — 이벤트가 켜져 있을 때만(서버 giftcard_event). 받음이 우선, 아니면 마지막 결과 코드 원문. 정렬·필터·CSV 없음.
+  const GIFTCARD_COLUMN = { key: 'giftcard', label: '이벤트 참여', format: (g) => (!g ? '-' : g.received ? '✓' : giftcardLabel(g.last_result)) };
+  const userColumns = (data) => (data.giftcard_event ? [...USER_COLUMNS, GIFTCARD_COLUMN] : USER_COLUMNS);
+  const loadUsers = () => loadList('users', `/admin/api/users?${new URLSearchParams({ ...state.applied.users, ...scope() })}`, userColumns, openUser, undefined, (data) => {
     addMissingOptions($('users-rbti'), data.rbti_types, rbtiLabel);
     // 대화 상세의 '회원 보기'로 왔으면 그 회원 패널을 연다(회원번호 정확 일치 검색의 결과 행).
     const wanted = state.pendingMember, hit = data.items.find((row) => String(row.user_no) === wanted);
@@ -1608,6 +1612,17 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     const sessions = el('button', null, '이 회원의 대화 보기');
     sessions.onclick = () => openSessions({ q: row.user_no });
     $('record-actions').append(sessions);
+    // 상품권 이벤트 시도 기록(조회 전용) — 이벤트가 꺼져 있거나 기록이 없으면 비워 둔다. 자리를 먼저 붙여 두면
+    // 그 사이 패널이 다른 행으로 바뀌어도(본문 교체로 자리가 떨어져 나감) 엉뚱한 패널에 붙지 않는다.
+    const box = el('div');
+    $('record-view').append(box);
+    api(`/admin/api/users/${encodeURIComponent(row.user_no)}/giftcard`).then((gift) => {
+      if (!gift.event || !gift.items.length) return;
+      const head = el('div', 'section-head');
+      head.append(el('h3', null, '이벤트 참여 기록'), el('span', null, giftcardEvent(gift.event)));
+      box.append(head, table([{ key: 'created_at', label: '시각', format: when }, { key: 'result_code', label: '결과', format: giftcardResult }], gift.items),
+        ...(gift.truncated ? [el('p', 'crema-note', `최근 ${num(gift.items.length)}건만 표시합니다.`)] : []), el('p', 'crema-note', GIFTCARD_NOTE));
+    }, (error) => console.error(error));
   }
 
   async function openStarter(row) {
@@ -1881,12 +1896,55 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     return [cards, daily, bars, head, tools, wrap];
   }
 
+  /** 상품권 이벤트 기록 고지 — 통계 묶음·회원 패널 공용(서버 giftcard.py와 같은 뜻). */
+  const GIFTCARD_NOTE = '앱이 전달한 발급 결과를 모은 운영 참고 기록입니다. Yes24 실제 발급 수와 다를 수 있고 잔여 수량의 근거가 아닙니다.';
+  /** 발급 결과 코드 → 한글 사유(Yes24 상품권 발급 API 가이드 v1.3 §9). 회원 목록·옆 패널·통계 표 공용 — 사전에 없는 코드는 원문. */
+  const GIFTCARD_RESULTS = { SUCCESS: '발급 성공', ALREADY_APPLIED: '이미 응모', NOT_VERIFIED: '본인인증 필요', NOT_LOGGED_IN: '비로그인', FAIL: '발급 실패', DUPLICATE: '발행번호 중복', EXCEED: '발급 횟수 초과', EXPIRE: '기간 만료' };
+  const giftcardLabel = (code) => GIFTCARD_RESULTS[code] ?? code;
+  /** 라벨 + 원문 코드 작게(운영자가 Yes24와 이야기할 때 원문이 필요하다) — 시각 칸의 보조 글자 서식(.stamp small). */
+  const giftcardResult = (code) => {
+    if (!GIFTCARD_RESULTS[code]) return code;
+    const cell = el('span', 'stamp', GIFTCARD_RESULTS[code]);
+    cell.append(el('small', null, code));
+    return cell;
+  };
+  const giftcardEvent = (event) => `${event.key} · 이벤트 기간 ${event.start} ~ ${event.end}`;
+  /** 상품권 묶음 — 시도·회원 수, 일별 시도(받음 · 그 외), 결과 코드별 건수. 받음 = 서버 판정(codes[].received).
+   *  일별 11열 표·엑셀(고객 양식)에는 넣지 않는다. 이벤트가 꺼져 있으면(설정 키 없음) 안내만. */
+  function giftcardBlocks(data, range) {
+    const gift = data.giftcard;
+    if (!gift) return [el('div', 'placeholder', '진행 중인 이벤트가 없습니다.')];
+    const note = el('p', 'crema-note', `${giftcardEvent(gift.event)} — ${GIFTCARD_NOTE}`);
+    const cards = el('div', 'crema-cards'), line = el('div', 'crema-row');
+    line.append(cardBox('발급 시도', num(gift.summary.attempts), '건', range), cardBox('시도 회원', num(gift.summary.users), '명', range),
+      cardBox('받은 회원', num(gift.summary.received_users), '명', range, 'SUCCESS·ALREADY_APPLIED 기록이 있는 회원'));
+    cards.append(line);
+    // 일별·시간대별(기간 합계, 대시보드 '시간대별 질의'와 같은 0~23시 축) — 둘 다 받음 · 그 외, 기록 없는 칸은 0.
+    const split = (rows, key, categories) => {
+      const by = new Map(rows.map((row) => [row[key], row]));
+      return [['받음', 'tone-blue', (row) => row.received], ['그 외', 'tone-grey', (row) => row.attempts - row.received]]
+        .map(([label, className, pick]) => ({ label, className, values: categories.map((c) => (by.has(c) ? pick(by.get(c)) : 0)) }));
+    };
+    const days = data.daily.map((row) => row.day).reverse(), hours = [...Array(24).keys()];
+    const bars = charts.stackedBars({ title: '일별 발급 시도', categories: days, unit: 'count', format: num, series: split(gift.daily, 'day', days) });
+    const hourly = charts.stackedBars({
+      title: '시간대별 발급 시도', categories: hours, unit: 'count', format: num, tick: (hour) => `${hour}시`, axisTitle: '시각',
+      series: split(gift.hourly, 'hour', hours),
+    });
+    for (const chart of [bars, hourly]) chart.classList.add('crema-bars');
+    if (!gift.codes.length) return [note, cards, bars, hourly];
+    const wrap = el('div', 'bleed');
+    wrap.append(table([{ key: 'result_code', label: '결과', format: giftcardResult }, { key: 'received', label: '받음 판정', format: (v) => flag(v, '받음') }, { key: 'attempts', label: '건수', format: num }], gift.codes));
+    return [note, cards, bars, hourly, wrap];
+  }
+
   function renderStatistics() {
     const data = state.statistics, view = STAT_VIEWS[state.statisticsView];
     if (!data) return;
     const range = `${data.period.since} ~ ${data.period.until}`;
     if (state.statisticsView === 'rbti') { $('statistics').replaceChildren(...rbtiBlocks(data, range)); return; }
     if (state.statisticsView === 'feedback') { $('statistics').replaceChildren(...feedbackBlocks(data, range)); return; }
+    if (state.statisticsView === 'giftcard') { $('statistics').replaceChildren(...giftcardBlocks(data, range)); return; }
     const cards = el('div', 'crema-cards');
     for (const row of view.cards) { const line = el('div', 'crema-row'); line.append(...row.map((key) => cremaCard(key, data.summary, range))); cards.append(line); }
     const oldestFirst = [...data.daily].reverse();

@@ -46,6 +46,7 @@ from yes24_agent.admin_data import (
     fetch_analytics,
     fetch_cost,
     fetch_stats,
+    fetch_user_giftcard,
     jsonable,
     local_day,
     nickname_by_user_pk_sql,
@@ -54,6 +55,7 @@ from yes24_agent.admin_data import (
     refusal_breakdown,
     sql_where,
     with_nickname,
+    with_user_giftcard,
 )
 from yes24_agent.config import Settings
 from yes24_agent.session_service import mysql_pool_kwargs
@@ -1096,8 +1098,8 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
         nickname: Literal["", "any"] = "",
         excluded: tuple[str, ...] = scope,
     ) -> Any:
-        return await _query(
-            lambda cur: fetch_users(
+        async def users_page(cur):
+            listed = await fetch_users(
                 cur,
                 settings,
                 query=q.strip(),
@@ -1108,7 +1110,14 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
                 nickname=nickname,
                 excluded=excluded,
             )
-        )
+            return await with_user_giftcard(cur, settings, listed)
+
+        return await _query(users_page)
+
+    @router.get("/api/users/{user_no}/giftcard", dependencies=[Depends(require_admin)])
+    async def admin_user_giftcard(user_no: str) -> Any:
+        """회원 옆 패널의 상품권 이벤트 시도 기록(조회 전용 — 운영 참고 이력)."""
+        return await _query(fetch_user_giftcard, settings, user_no)
 
     @router.get("/api/starters", dependencies=[Depends(require_admin)])
     async def admin_starters(
