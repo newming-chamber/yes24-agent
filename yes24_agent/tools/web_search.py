@@ -146,6 +146,39 @@ def _grounding_client(timeout_ms: int) -> genai.Client:
     return genai.Client(http_options=genai_types.HttpOptions(timeout=timeout_ms))
 
 
+# 그라운딩 쿼터 소진 표시(프로세스 전역, monotonic 시각): 이 시각 전까지 그라운딩을 건너뛴다.
+# 2026-10-19 상용 장애 — 검색 그라운딩 한도가 소진되면 매 호출이 429라, 호출마다 429를 맞고
+# 전환하면 왕복만 낭비한다. 쿨다운(config web_grounding_quota_cooldown_s)이 지나면 시각
+# 비교만으로 풀린다. 표시·건너뛰기 지점은 _grounding_raw_results 하나다(프리페치·정상 경로 공통).
+# None이 아닌 동안이 "전환 중"이다 — 시각이 지나도 그라운딩이 성공할 때까지 남겨, 재시도
+# 프로브의 재429를 새 전환(운영 Slack 알림 = ERROR)과 구분한다.
+_grounding_quota_cooldown_until: float | None = None
+
+
+class _GroundingQuotaExhausted(RuntimeError):
+    """소진 표시 중이라 그라운딩을 호출하지 않았다(종단 실패와 같은 경로로 처리된다)."""
+
+
+def _grounding_quota_exhausted() -> bool:
+    """그라운딩 쿼터 소진 표시가 살아 있는지(쿨다운 중인지) 판정한다."""
+    until = _grounding_quota_cooldown_until
+    return until is not None and time.monotonic() < until
+
+
+def _mark_grounding_quota_exhausted(settings: Settings) -> None:
+    """쿨다운 동안 소진 표시를 건다(살아 있으면 무동작). 정상→전환은 ERROR, 재시도 프로브의
+    재429는 WARNING이다."""
+    global _grounding_quota_cooldown_until
+    if _grounding_quota_exhausted():
+        return
+    log = logger.error if _grounding_quota_cooldown_until is None else logger.warning
+    _grounding_quota_cooldown_until = time.monotonic() + settings.web_grounding_quota_cooldown_s
+    log(
+        f"web_search grounding quota exhausted → switched to perplexity "
+        f"(retry every {settings.web_grounding_quota_cooldown_s:.0f}s)"
+    )
+
+
 # ── 웹 선제 실행(prefetch) ─────────────────────────────────────────────────────
 # TTFT 실측(2026-07-28): 시변 질의의 첫 본문 토큰 11.8s = 사고1(도구 결정) 3.8 → 도구 2.8 →
 # 사고2 5.2의 직렬 합. 도구 실행에는 모델 판단이 필요 없으므로, 턴 시작 시 경량 모델이
@@ -380,7 +413,12 @@ async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
     ① 벤더 5xx·타임아웃(ServerError — 504가 재시도에서 정상, 라이브 실측) ② **빈 근거**
     — 그라운딩 종합은 확률적이라 같은 질의가 다음 시도에서 출처를 붙인다(영화 질의 실측:
     E2E 1회 empty → 직호출 3/3 성공). 4xx(ClientError)는 반복해도 같으므로 즉시 실패.
+    그중 429(쿼터 소진)는 소진 표시를 남기고(예외는 그대로 올린다), 표시 중에는 서브콜 없이
+    즉시 실패한다 — 호출부는 다른 종단 실패와 똑같이 처리한다(퍼플렉시티 전환은 web_search).
     """
+    global _grounding_quota_cooldown_until
+    if _grounding_quota_exhausted():
+        raise _GroundingQuotaExhausted("grounding quota cooldown")
     last_error: Exception | None = None
     raw_results: list[dict] = []
     for _ in range(settings.web_grounding_max_attempts):
@@ -405,11 +443,19 @@ async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
                 break
         except genai_errors.ServerError as exc:
             last_error = exc
+        except genai_errors.ClientError as exc:
+            if exc.code == 429:
+                _mark_grounding_quota_exhausted(settings)
+            last_error = exc
+            break
         except Exception as exc:  # noqa: BLE001 — 비일시 오류: 재시도 없이 종단 실패로 올린다
             last_error = exc
             break
     if last_error is not None:
         raise last_error
+    if _grounding_quota_cooldown_until is not None:  # 서브콜 성공 = 전환 해제
+        _grounding_quota_cooldown_until = None
+        logger.info("web_search grounding recovered → back from perplexity")
     if raw_results:
         # 최종 URL·제목 보강(병렬·실패 무해, 요청 1회로 둘 다). 프리페치 파이프라인 안에서도
         # 실행되므로 대부분의 지연이 모델 사고 시간에 숨는다.
@@ -727,17 +773,47 @@ async def web_search(
 
     # 백엔드 라우팅(config web_search_backend): 그라운딩이 기본. 도메인 필터는 그라운딩에
     # 구조적 필터가 없어 원시(퍼플렉시티) 경로로 처리한다 — 능력 기반 라우팅(콘텐츠 분기 아님).
+    # 그라운딩이 실패하면(쿼터 소진 표시 중의 즉시 실패 포함 — _grounding_raw_results) 그 호출만
+    # 퍼플렉시티로 다시 처리한다(2026-10-19 상용 429 장애). 퍼플렉시티 키가 없으면 전환할 곳이
+    # 없으므로 그라운딩 결과(오류 포함)를 그대로 돌려준다 — 키 유무가 곧 전환 가용성이다.
+    outcome: dict | None = None
     if settings.web_search_backend == "grounding" and not domain_filters:
         outcome = await _grounded_search(planned, tool_context, settings)
-        if dropped_queries and outcome.get("status") == "ok":
-            # 상한 초과 각도를 조용히 버리지 않는다(fail-loud) — 퍼플렉시티 경로와 동일 규약.
-            outcome["dropped_count"] = len(dropped_queries)
-            outcome["dropped_queries"] = dropped_queries
-            outcome["message"] = dropped_queries_message(
-                settings.web_search_max_queries, len(dropped_queries)
+        if outcome["status"] != "ok" and settings.perplexity_api_key:
+            logger.info(
+                f"web_search backend=grounding fallback=perplexity "
+                f"reason={outcome['error_type']}"
             )
-        return outcome
+            outcome = None
+    if outcome is None:
+        outcome = await _perplexity_search(
+            planned, domain_filters, tool_context, settings, dropped=len(dropped_queries)
+        )
 
+    if dropped_queries and outcome["status"] == "ok":
+        # 상한 초과 각도를 조용히 버리지 않는다(fail-loud) — 두 경로 공통 규약(가법 필드:
+        # 드롭이 없으면 반환 형태에 이 키가 없다).
+        outcome["dropped_count"] = len(dropped_queries)
+        outcome["dropped_queries"] = dropped_queries
+        outcome["message"] = dropped_queries_message(
+            settings.web_search_max_queries, len(dropped_queries)
+        )
+    return outcome
+
+
+async def _perplexity_search(
+    planned: list[str],
+    domain_filters: list[str],
+    tool_context: ToolContext,
+    settings: Settings,
+    *,
+    dropped: int,
+) -> dict:
+    """퍼플렉시티 /search 원시 경로 — 각도별 병렬 검색 후 출처를 순차 등록해 도구 결과를 조립한다.
+
+    도메인 필터 지정·`web_search_backend="perplexity"`·그라운딩 실패 전환이 모두 이 함수를
+    부른다(경로 하나). dropped는 로그용 카운트이고, dropped_* 필드는 호출부가 붙인다.
+    """
     searched = await asyncio.gather(
         *(search_raw(q, settings, domain_filters) for q in planned)
     )
@@ -817,7 +893,7 @@ async def web_search(
 
     logger.info(
         f"web_search queries={len(planned)} angles_ok={ok_count} results={len(results)} "
-        f"dropped={len(dropped_queries)}"
+        f"dropped={dropped}"
     )
     response = {
         "status": "ok",
@@ -827,11 +903,4 @@ async def web_search(
         "checked_at": checked_at,
         "result_count": len(results),
     }
-    if dropped_queries:
-        # 가법 필드: 드롭이 없으면 반환 형태는 단일/다중 각도 모두 이 키가 없다.
-        response["dropped_count"] = len(dropped_queries)
-        response["dropped_queries"] = dropped_queries
-        response["message"] = dropped_queries_message(
-            settings.web_search_max_queries, len(dropped_queries)
-        )
     return response
