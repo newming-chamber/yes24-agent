@@ -44,7 +44,7 @@ from pydantic_core import PydanticCustomError
 
 from yes24_agent.admin_data import BOOL_DECODERS, jsonable
 from yes24_agent.config import Settings, get_settings
-from yes24_agent.db import MysqlBackedService
+from yes24_agent.db import MysqlBackedService, run_within
 from yes24_agent.rbti.persona import get_archetype_name, matrix_codes
 from yes24_agent.session_service import mysql_pool_kwargs
 
@@ -366,18 +366,26 @@ class AdminService(MysqlBackedService):
 
     @asynccontextmanager
     async def _connection(self) -> AsyncIterator[Any]:
-        """풀 커넥션 1개. 드라이버 실패는 503으로, HTTPException은 그대로 올린다."""
+        """풀 커넥션 1개. 드라이버 실패는 503으로, HTTPException은 그대로 올린다.
+
+        직접 `async with`로 쓰는 곳은 `transaction`뿐이다(라우트 본문이 호출자 태스크에서 돌아야
+        해 취소 차폐 밖 — 어드민 라우트는 스트리밍이 아니라 클라이언트 이탈로 취소되지 않는다).
+        나머지는 `_with_connection`으로 본문까지 분리 태스크에서 완주한다.
+        """
         if self._db is None:
             raise HTTPException(status_code=503, detail=self._unavailable_detail)
         try:
-            pool = await self._db.get()
-            async with pool.acquire() as conn:
+            async with self._db.connection() as conn:
                 yield conn
         except HTTPException:
             raise
         except (aiomysql.Error, OSError, asyncio.TimeoutError) as exc:
             logger.error(f"{self._failure_detail} ({type(exc).__name__}): {exc}")
             raise HTTPException(status_code=503, detail=self._failure_detail) from exc
+
+    async def _with_connection(self, body):
+        """body(conn)을 `_connection` 안에서 분리 태스크로 완주시킨다(db.run_within)."""
+        return await run_within(self._connection(), body)
 
     async def scrypt(self, fn, *args):
         """scrypt(해시·검증)를 스레드에서 돌리되 프로세스 동시 수를 config 상한으로 묶는다.
@@ -411,23 +419,34 @@ class AdminService(MysqlBackedService):
         """
         settings = get_settings()
         window = settings.admin_login_window_s
-        async with self._connection() as conn, conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(
-                "SELECT id, username, password_hash, role, is_active, password_changed_at "
-                "FROM admin_users WHERE username = %s",
-                (username,),
-            )
-            account = await cur.fetchone()
-            await cur.execute(AUDIT_INSERT, audit_params(None, "login", username, "failed", ip=ip))
-            reservation = cur.lastrowid
-            await cur.execute(
-                _FAILURE_COUNT,
-                (username, window, account["password_changed_at"] if account else None, username),
-            )
-            if (await cur.fetchone())["failures"] > settings.admin_login_max_failures:
-                await cur.execute(_RESERVATION_DELETE, (reservation,))
-                logger.warning(f"admin 로그인 잠김: username={username!r} ip={ip}")
-                return LoginResult("locked", retry_after_s=window), None, None
+
+        async def reserve(conn):
+            """(계정 행, 예약 id) — 잠겼으면 예약을 지우고 (계정, None)."""
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT id, username, password_hash, role, is_active, password_changed_at "
+                    "FROM admin_users WHERE username = %s",
+                    (username,),
+                )
+                account = await cur.fetchone()
+                await cur.execute(
+                    AUDIT_INSERT, audit_params(None, "login", username, "failed", ip=ip)
+                )
+                reservation = cur.lastrowid
+                await cur.execute(
+                    _FAILURE_COUNT,
+                    (username, window, account["password_changed_at"] if account else None,
+                     username),
+                )
+                if (await cur.fetchone())["failures"] > settings.admin_login_max_failures:
+                    await cur.execute(_RESERVATION_DELETE, (reservation,))
+                    return account, None
+                return account, reservation
+
+        account, reservation = await self._with_connection(reserve)
+        if reservation is None:
+            logger.warning(f"admin 로그인 잠김: username={username!r} ip={ip}")
+            return LoginResult("locked", retry_after_s=window), None, None
         stored = account["password_hash"] if account else self._dummy_hash
         matched = await self.scrypt(verify_password, password, stored)
         if matched and account and account["is_active"]:
@@ -448,30 +467,35 @@ class AdminService(MysqlBackedService):
         if account is None:
             return result
         token = secrets.token_urlsafe(_TOKEN_BYTES)
-        async with self._connection() as conn, conn.cursor(aiomysql.DictCursor) as cur:
-            await conn.begin()
-            try:
-                await cur.execute(_RESERVATION_DELETE, (reservation,))
-                await cur.execute(
-                    "INSERT INTO admin_sessions (admin_user_id, token_hash, expires_at, ip) "
-                    "VALUES (%s, %s, NOW(3) + INTERVAL %s SECOND, %s)",
-                    (
-                        account["id"],
-                        sha256(token.encode()).digest(),
-                        get_settings().admin_session_ttl_s,
-                        _recorded_ip(ip),
-                    ),
-                )
-                actor = AdminActor(
-                    cur.lastrowid, account["id"], account["username"], account["role"]
-                )
-                await cur.execute(
-                    AUDIT_INSERT, audit_params(actor, "login", actor.username, "ok", ip=ip)
-                )
-                await conn.commit()
-            except BaseException:
-                await conn.rollback()
-                raise
+
+        async def open_session(conn) -> AdminActor:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await conn.begin()
+                try:
+                    await cur.execute(_RESERVATION_DELETE, (reservation,))
+                    await cur.execute(
+                        "INSERT INTO admin_sessions (admin_user_id, token_hash, expires_at, ip) "
+                        "VALUES (%s, %s, NOW(3) + INTERVAL %s SECOND, %s)",
+                        (
+                            account["id"],
+                            sha256(token.encode()).digest(),
+                            get_settings().admin_session_ttl_s,
+                            _recorded_ip(ip),
+                        ),
+                    )
+                    actor = AdminActor(
+                        cur.lastrowid, account["id"], account["username"], account["role"]
+                    )
+                    await cur.execute(
+                        AUDIT_INSERT, audit_params(actor, "login", actor.username, "ok", ip=ip)
+                    )
+                    await conn.commit()
+                    return actor
+                except BaseException:
+                    await conn.rollback()
+                    raise
+
+        actor = await self._with_connection(open_session)
         return LoginResult("ok", token=token, actor=actor)
 
     async def authenticate(self, token: str) -> AdminActor | None:

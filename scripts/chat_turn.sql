@@ -19,6 +19,11 @@ CREATE TABLE IF NOT EXISTS chat_turn (
     meta JSON NULL,
     error JSON NULL,
     rbti_applied VARCHAR(4) NULL,
+    -- 실제로 답한 모델(done.model)·폴백으로 답했을 때 원래 메인 모델(아니면 NULL). 기존 DB는 model_routing.sql.
+    model VARCHAR(128) NULL,
+    fallback_from VARCHAR(128) NULL,
+    -- 그 턴이 답한 프롬프트 버전(prompt_version.id, NULL = 코드 기본). 기존 DB는 prompt_versions.sql.
+    prompt_version_id BIGINT NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uq_chat_turn_scope (app_name, user_id, session_id, turn_id),
     KEY idx_chat_turn_session_time (app_name, user_id, session_id, started_at, id),

@@ -23,8 +23,8 @@ ADK는 LLM 원시 이벤트를, chat_turn은 사용자에게 공개한 확정본
 `history.owned_session` 한 곳이, 쓰기는 `_run_owned`의 부모 잠금 술어가 막는다. 기본은 무기한
 보존이고, 보존 일수(`session_delete_retention_days`)를 양수로 두면 그 뒤 파기 루프가 부모
 `sessions` 행을 지우고 FK CASCADE가
-events·chat_turn·turn_feedback·session_ui를 함께 지운다. turn_click·usage_log는 FK가 없어
-남는다(분석 로그, 2026-09-08 결정).
+events·chat_turn(→turn_round)·turn_feedback·session_ui를 함께 지운다. turn_click·usage_log는
+FK가 없어 남는다(분석 로그, 2026-09-08 결정).
 
 접속 정보는 인증·사용량과 같은 단일 출처 — `config.session_db_url`을 파싱한다. 세션 DB가
 mysql이 아니면(로컬 sqlite) 스택이 자연 비활성이다(구조 분기).
@@ -34,9 +34,9 @@ mysql이 아니면(로컬 sqlite) 스택이 자연 비활성이다(구조 분기
 단 **읽기는 비활성 구성에서 빈 값으로 내려간다**: 저장소가 없으면 상태도 없는 것이 사실이라
 (전부 unread·자동 제목) 목록·복원이 그대로 동작한다.
 
-DDL은 `scripts/chat_turn.sql`·`scripts/turn_feedback.sql`·`scripts/turn_click.sql`·
-`scripts/giftcard_issue.sql`·`scripts/session_ui.sql`(기존 DB는 `scripts/session_ui_deleted_at.sql`)
-(usage_log 관례).
+DDL은 `scripts/chat_turn.sql`·`scripts/turn_round.sql`·`scripts/turn_feedback.sql`·
+`scripts/turn_click.sql`·`scripts/giftcard_issue.sql`·`scripts/session_ui.sql`
+(기존 DB는 `scripts/session_ui_deleted_at.sql`)(usage_log 관례).
 """
 
 from __future__ import annotations
@@ -44,7 +44,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -54,10 +53,50 @@ from fastapi import HTTPException
 from yes24_agent.admin_auth import AUDIT_INSERT, audit_params
 from yes24_agent.admin_data import GIFTCARD_RECEIVED
 from yes24_agent.config import get_settings
-from yes24_agent.db import MysqlBackedService
+from yes24_agent.db import MysqlBackedService, rollback_unless_closed
 from yes24_agent.session_service import mysql_pool_kwargs
 
 logger = logging.getLogger(__name__)
+
+
+# 대화 파기 삭제 집합 — (자식 테이블, 참조 테이블) FK가 전부 ON DELETE CASCADE여야 한다.
+_CASCADE_FKS = (
+    ("events", "sessions"),
+    ("chat_turn", "sessions"),
+    ("turn_feedback", "sessions"),
+    ("session_ui", "sessions"),
+    ("turn_round", "chat_turn"),
+)
+# TurnProcess.rounds 행 키(event_translate.TurnProcess.round_usage) — 열 이름은 "round"만
+# round_index(MySQL 함수명)다. seq(유일 키)는 목록 순번이다.
+_ROUND_KEYS = (
+    "attempt", "round", "model", "started_ms", "ended_ms", "prompt_tokens", "response_tokens",
+    "thinking_tokens", "cached_tokens", "tool_calls", "error_status",
+)
+_ROUND_COLUMNS = ("app_name", "user_id", "session_id", "turn_id", "seq", "attempt", "round_index",
+                  *_ROUND_KEYS[2:])
+
+
+def _round_inserts(scope: tuple[str, str, str, str], rounds: list[dict]) -> list[tuple[str, tuple]]:
+    """턴의 라운드 행 전부를 INSERT 한 문장으로(행이 없으면 문장 없음). 최초 기록이 이긴다."""
+    if not rounds:
+        return []
+    row_sql = f"({', '.join(['%s'] * len(_ROUND_COLUMNS))})"
+    params = tuple(
+        value
+        for seq, row in enumerate(rounds)
+        for value in (
+            *scope,
+            seq,
+            *(json.dumps(row[k], ensure_ascii=False) if k == "tool_calls" else row[k]
+              for k in _ROUND_KEYS),
+        )
+    )
+    return [(
+        f"INSERT INTO turn_round ({', '.join(_ROUND_COLUMNS)}) VALUES "
+        f"{', '.join([row_sql] * len(rounds))} ON DUPLICATE KEY UPDATE id = id",
+        params,
+    )]
 
 
 @dataclass(frozen=True)
@@ -103,38 +142,54 @@ class UserDataService(MysqlBackedService):
             "SELECT u.user_no, a.key_hash, t.id, t.app_name, t.user_id, t.session_id, "
             "t.turn_id, t.started_at, t.completed_at, t.user_text, t.text, t.status, "
             "t.sources, t.process, t.meta, t.error, t.rbti_applied, t.history_saved, "
-            "f.app_name, c.app_name, s.app_name, s.deleted_at, l.app_name, d.target_type, "
-            "g.user_id, g.event_key, g.result_code "
+            "t.model, t.fallback_from, t.prompt_version_id, t.input_source, "
+            "f.app_name, c.app_name, "
+            "s.app_name, s.deleted_at, "
+            "l.app_name, d.target_type, g.user_id, g.event_key, g.result_code, "
+            # 운영 뷰 chat_turns(operational_views.sql)도 모델 열을 싣는 판이어야 한다 — 어드민
+            # 세션 상세가 이 뷰에서 모델을 읽는다(재적용 누락이 상세 503으로 숨지 않게 기동 실패).
+            "v.model, v.fallback_from, v.prompt_version_id, l.service_tier, l.reasoning_effort, "
+            "m.service_tiers, m.reasoning_efforts, m.prompt_versions, p.slots, p.base_hash, "
+            "p.activated_at, p.retired_at, r.seq, r.attempt, r.round_index, r.started_ms, "
+            "r.thinking_tokens, r.tool_calls, r.error_status "
             "FROM users u, auth_keys a, chat_turn t, turn_feedback f, turn_click c, "
-            "session_ui s, usage_log l, admin_audit d, giftcard_issue g WHERE 1 = 0",
+            "session_ui s, usage_log l, admin_audit d, giftcard_issue g, chat_turns v, "
+            "model_settings m, prompt_version p, turn_round r WHERE 1 = 0",
             (),
             fetch_all=True,
         )
-        # 파기의 삭제 집합은 sessions를 참조하는 FK의 CASCADE 하나다. CASCADE가 아니면 파기가
-        # 부모만 지우거나(FK 없음 — 본문이 고아로 남는데 대장은 "파기됨") 막힌다(RESTRICT).
-        # 판정은 FK 이름이 아니라 참조 테이블과 DELETE_RULE로 한다.
-        rules = dict(
-            await self._run(
-                "SELECT table_name, delete_rule FROM information_schema.referential_constraints "
-                "WHERE constraint_schema = DATABASE() AND referenced_table_name = 'sessions'",
+        # 파기의 삭제 집합은 sessions를 참조하는 FK의 CASCADE 하나다(turn_round는 chat_turn을
+        # 거친 2단). CASCADE가 아니면 파기가 부모만 지우거나(FK 없음 — 본문이 고아로 남는데
+        # 대장은 "파기됨") 막힌다(RESTRICT). 판정은 FK 이름이 아니라 (테이블, 참조 테이블)과
+        # DELETE_RULE로 한다.
+        rules = {
+            (table, referenced): rule
+            for table, referenced, rule in await self._run(
+                "SELECT table_name, referenced_table_name, delete_rule "
+                "FROM information_schema.referential_constraints "
+                "WHERE constraint_schema = DATABASE() "
+                "AND referenced_table_name IN ('sessions', 'chat_turn')",
                 (),
                 fetch_all=True,
             )
-        )
+        }
         missing = [
-            table
-            for table in ("events", "chat_turn", "turn_feedback", "session_ui")
-            if rules.get(table) != "CASCADE"
+            f"{table}→{referenced}"
+            for table, referenced in _CASCADE_FKS
+            if rules.get((table, referenced)) != "CASCADE"
         ]
         if missing:
             raise RuntimeError(
-                f"sessions FK가 ON DELETE CASCADE가 아닙니다({', '.join(missing)}) — 대화 파기가 "
-                "본문을 남깁니다. migrate_database.py의 session_integrity 단계를 먼저 적용하세요."
+                f"FK가 ON DELETE CASCADE가 아닙니다({', '.join(missing)}) — 대화 파기가 본문을 "
+                "남깁니다. migrate_database.py의 session_integrity 단계·scripts/turn_round.sql을 "
+                "먼저 적용하세요."
             )
 
-    @asynccontextmanager
-    async def _transaction(self):
-        """READ COMMITTED 트랜잭션의 커서. 본문이 예외면 되돌리고, DB 오류는 503으로 올린다.
+    async def _in_transaction(self, body):
+        """READ COMMITTED 트랜잭션 안에서 body(cur)를 돌린다. 본문이 예외면 되돌리고, DB 오류는
+        503으로 올린다. 접속 획득부터 commit/rollback·반납까지 분리 태스크 하나로 완주한다
+        (`_guarded` → LazyAiomysqlPool.run) — 본문이 컨텍스트 매니저로 호출자 태스크에서 돌면
+        클라이언트 이탈의 취소가 문장 중간·rollback 도중에 떨어진다.
 
         RC인 이유(격리 MySQL 실측 두 건): 기본 REPEATABLE READ의 잠금 읽기는 **없는 행 자리에
         갭 잠금**을 건다. ① 소유 쓰기의 부모 잠금(`LEFT JOIN session_ui … FOR UPDATE`)은
@@ -144,25 +199,34 @@ class UserDataService(MysqlBackedService):
         대기(1205)에 걸었다. RC는 갭 잠금 없이 실제 행만 잠근다. `SET TRANSACTION`은 SESSION
         없이 **다음 트랜잭션 하나에만** 걸려 풀로 돌아간 접속의 격리 수준을 오염시키지 않는다.
         """
+
+        async def transaction(conn):
+            async with conn.cursor() as cur:
+                await cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            await conn.begin()
+            try:
+                async with conn.cursor() as cur:
+                    result = await body(cur)
+                await conn.commit()
+                return result
+            except BaseException:
+                await rollback_unless_closed(conn)
+                raise
+
+        return await self._guarded(transaction)
+
+    async def _guarded(self, body):
+        """골격(MysqlBackedService)과 같은 판정이되 로그만 다르다 — 이 테이블들의 문장엔 키 값이
+        들어가므로 드라이버 메시지 본문을 남기지 않는다(`_run`·`_run_all`도 이 로그를 탄다)."""
         if self._db is None:
             raise HTTPException(status_code=503, detail=self._unavailable_detail)
         try:
-            pool = await self._db.get()
-            async with pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-                await conn.begin()
-                try:
-                    async with conn.cursor() as cur:
-                        yield cur
-                    await conn.commit()
-                except BaseException:
-                    await conn.rollback()
-                    raise
+            return await self._db.run(body)
         except HTTPException:
             raise
         except Exception as exc:
-            logger.error(f"대화 데이터 트랜잭션 실패: {type(exc).__name__}")
+            # 드라이버 오류 코드(첫 인자)만 싣는다 — 메시지 본문엔 키 값이 들어갈 수 있다.
+            logger.error(f"대화 데이터 트랜잭션 실패: {type(exc).__name__}{exc.args[:1]}")
             raise HTTPException(status_code=503, detail=self._failure_detail) from exc
 
     async def _run_owned(
@@ -178,7 +242,8 @@ class UserDataService(MysqlBackedService):
         우회한 어떤 쓰기(늦게 도착한 턴 확정본·다른 서버에서 진행 중이던 턴 포함)도 삭제된
         대화에 닿지 않는다. 두 행을 모두 잠그므로 같은 부모를 잡는 삭제 표식과 직렬화된다.
         """
-        async with self._transaction() as cur:
+
+        async def owned_write(cur):
             await cur.execute(
                 "SELECT s.id FROM sessions s LEFT JOIN session_ui u "
                 "ON u.app_name = s.app_name AND u.user_id = s.user_id AND u.session_id = s.id "
@@ -196,6 +261,8 @@ class UserDataService(MysqlBackedService):
                 result = await cur.fetchall() if cur.description else cur.rowcount
             return result
 
+        return await self._in_transaction(owned_write)
+
     async def _write_owned(self, sql: str, params: tuple) -> None:
         """소유권 열(app_name,user_id,session_id)을 먼저 받는 단일 쓰기 문장."""
         app_name, user_id, session_id, *_ = params
@@ -208,7 +275,8 @@ class UserDataService(MysqlBackedService):
             return []
         rows = await self._run(
             "SELECT turn_id, user_text, started_at, completed_at, status, text, "
-            "sources, process, meta, error, rbti_applied, history_saved FROM chat_turn "
+            "sources, process, meta, error, rbti_applied, history_saved, input_source "
+            "FROM chat_turn "
             "WHERE app_name = %s AND user_id = %s AND session_id = %s "
             "ORDER BY started_at, completed_at, id",
             (app_name, user_id, session_id),
@@ -260,6 +328,7 @@ class UserDataService(MysqlBackedService):
             "user_text": row[1],
             "started_at": row[2].replace(tzinfo=timezone.utc).timestamp(),
             "completed_at": row[3].replace(tzinfo=timezone.utc).timestamp(),
+            "input_source": row[12],
             "snapshot": {
                 "session_id": session_id,
                 "turn_id": row[0],
@@ -287,8 +356,20 @@ class UserDataService(MysqlBackedService):
         completed_at: float,
         payload: dict,
         verify_completed_at: bool = False,
+        model: str | None = None,
+        fallback_from: str | None = None,
+        prompt_version_id: int | None = None,
+        rounds: list[dict] | None = None,
+        input_source: str | None = None,
     ) -> bool:
-        """최초 확정본만 저장한다. 재전송은 값이 같을 때만 성공으로 인정한다."""
+        """최초 확정본만 저장한다. 재전송은 값이 같을 때만 성공으로 인정한다.
+
+        model = 실제로 답한 모델(done.model), fallback_from = 폴백으로 답했을 때 원래 메인 모델,
+        prompt_version_id = 답한 프롬프트 버전(None = 코드 기본), rounds = TurnProcess.rounds(LLM
+        콜별 토큰·지연·시도 — turn_round 행, 같은 트랜잭션),
+        input_source = 질문 유입 경로(요청 필드). 전부 운영 기록이라 재전송 동일성 대조에
+        넣지 않고, 확정본처럼 최초 기록이 이긴다(유일 키 충돌은 무시 — 백필은 모델·라운드를 모른다).
+        """
         if type(payload["history_saved"]) is not bool:
             raise ValueError("history_saved는 boolean이어야 합니다.")
         if payload["cited_ids"] != [source["id"] for source in payload["sources"]]:
@@ -305,8 +386,9 @@ class UserDataService(MysqlBackedService):
                     "INSERT INTO chat_turn (app_name, user_id, session_id, turn_id, "
                     "user_text, started_at, completed_at, status, text, "
                     "sources, process, meta, error, "
-                    "rbti_applied, history_saved) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "rbti_applied, history_saved, prompt_version_id, model, fallback_from, "
+                    "input_source) "
+                    f"VALUES ({', '.join(['%s'] * 19)}) "
                     "ON DUPLICATE KEY UPDATE id = id",
                     (
                         app_name,
@@ -321,8 +403,13 @@ class UserDataService(MysqlBackedService):
                         *encoded,
                         payload["rbti_applied"],
                         payload["history_saved"],
+                        prompt_version_id,
+                        model,
+                        fallback_from,
+                        input_source,
                     ),
                 ),
+                *_round_inserts((app_name, user_id, session_id, turn_id), rounds or []),
                 (
                     "SELECT turn_id, user_text, started_at, completed_at, status, text, "
                     "sources, process, meta, error, rbti_applied, history_saved FROM chat_turn "
@@ -547,7 +634,8 @@ class UserDataService(MysqlBackedService):
         session_ui). 대장에는 내용이 아니라 "언제 삭제 요청 → 언제 파기, 턴 몇 개"만 남는다.
         트랜잭션이 RC라 막히는 것은 지금 파기 중인 그 대화뿐이다(`_transaction`).
         """
-        async with self._transaction() as cur:
+
+        async def purge(cur):
             await cur.execute(
                 "SELECT app_name, user_id, session_id, deleted_at FROM session_ui "
                 "WHERE deleted_at < NOW(3) - INTERVAL %s DAY "
@@ -586,6 +674,8 @@ class UserDataService(MysqlBackedService):
                 )
                 purged += 1
             return purged
+
+        return await self._in_transaction(purge)
 
     def start_purge_loop(self) -> None:
         """파기 루프를 띄운다(lifespan). 저장소가 없거나 보존 일수가 0(무기한 보존)이면 태스크를

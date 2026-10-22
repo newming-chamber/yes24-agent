@@ -794,3 +794,14 @@
   .day-prob.zero { max-width: 180px; font-size: var(--crema-fs-axis); color: var(--text-meta); text-align: right; }
   .manage-form .field-help { margin-top: -4px; font-size: var(--crema-fs-axis); color: var(--text-meta); line-height: 1.5; }
   .manage-form .field-warn:not(:empty) { margin-top: -4px; padding: 6px 10px; border-radius: var(--crema-radius-control); background: var(--warn-bg); color: var(--warn-text); font-size: var(--crema-fs-axis); }
+  /* 프롬프트 버전(admin_prompts.js) — 목록|편집 · 잠긴 영역(읽기 전용 회색)과 슬롯 · 이전 대비 diff. 색은 기존 토큰만. */
+  #prompts > * + * { margin-top: 16px; }
+  .prompt-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 20px; align-items: start; }
+  .prompt-actions .table-tools { flex-wrap: wrap; }
+  .prompt-preview { display: grid; gap: 8px; }
+  .prompt-locked, .prompt-slot { margin: 0; padding: 10px 12px; max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border-radius: var(--crema-radius-control); font-size: var(--crema-fs-axis); line-height: 1.5; }
+  .prompt-locked { background: var(--crema-grey-100); color: var(--text-meta); user-select: text; }
+  .prompt-slot { background: var(--panel); border: 1px solid var(--border); }
+  .prompt-preview textarea, .manage-form textarea[name=reason] { min-height: 120px; font-size: var(--crema-fs-axis); line-height: 1.5; }
+  .prompt-diff { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 1023px) { .prompt-grid, .prompt-diff { grid-template-columns: 1fr; } }

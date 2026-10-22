@@ -3,7 +3,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>크레마 AI 관리자</title>
-<link rel="stylesheet" href="/static/lib/admin.css?v=51" />
+<link rel="stylesheet" href="/static/lib/admin.css?v=53" />
 <!-- 로고(crema 마스코트)가 파비콘을 겸한다 — 자기 출처 정적 파일이라 /favicon.ico 401 콘솔 오류도 없다. -->
 <link rel="icon" href="/static/lib/admin-logo.svg" type="image/svg+xml" />
 
@@ -36,6 +36,8 @@
     <!-- owner 전용 메뉴는 구분선 아래 따로(crema Sidebar.tsx superuser 메뉴 자리). -->
     <nav class="toolbar" id="toolbar-owner" aria-label="관리자 메뉴" hidden>
       <button id="tab-audit" aria-pressed="false"><svg viewBox="-3 -3 20 20" aria-hidden="true"><path d="M1.5 0h8L14 4.5V14H1.5zM3 5h5.5V3.5H3zm0 3h8V6.5H3zm0 3h8V9.5H3z" /></svg>감사 로그</button>
+      <button id="tab-models" aria-pressed="false"><svg viewBox="-3 -3 20 20" aria-hidden="true"><path d="M7 0l6 3.5v7L7 14l-6-3.5v-7zm0 2.3L3 4.6v4.8l4 2.3 4-2.3V4.6z" /></svg>모델</button>
+      <button id="tab-prompts" aria-pressed="false"><svg viewBox="-3 -3 20 20" aria-hidden="true"><path d="M1.5 0h8L14 4.5V14H1.5zM3 5h5.5V3.5H3zm0 3h8V6.5H3zm0 3h8V9.5H3z" /></svg>프롬프트</button>
     </nav>
     <details class="profile">
       <summary><span class="badge" aria-hidden="true"><svg viewBox="0 0 13.2875 20.0002"><path d="M0.227335 19.7215C1.47239 20.0333 2.7685 20.0839 4.03408 19.8702C6.77616 19.4399 10.0739 17.3851 11.1915 12.6341L13.2834 4.17171C13.2887 4.14974 13.2889 4.12686 13.2841 4.10479C13.2792 4.08272 13.2694 4.06203 13.2554 4.0443C13.2414 4.02656 13.2236 4.01225 13.2032 4.00242C13.1829 3.9926 13.1606 3.98753 13.138 3.98759H9.96478C9.96478 3.98759 8.94718 7.91388 8.75932 8.63407C8.09536 11.1812 6.70494 12.6049 4.76844 12.6174C3.47717 12.6258 2.98982 11.6332 3.3972 9.78497L4.75803 4.16878C4.76307 4.14731 4.76318 4.12498 4.75834 4.10346C4.75349 4.08194 4.74383 4.0618 4.73008 4.04455C4.71632 4.02731 4.69883 4.0134 4.67893 4.0039C4.65902 3.99439 4.63722 3.98953 4.61516 3.98967H1.54942C1.54942 3.98967 0.802572 7.05373 0.31647 8.90233C-0.583256 12.3246 0.429347 15.0009 3.4326 15.2066C5.05044 15.3174 6.45752 14.5302 7.52553 13.5022L7.57842 13.5076C6.96153 15.5815 5.91976 16.732 3.87122 17.1215C2.94456 17.2674 1.99543 17.1264 1.15121 16.7174C1.13457 16.7083 1.11606 16.7031 1.09711 16.7023C1.07816 16.7014 1.05926 16.7048 1.04184 16.7123C1.02442 16.7198 1.00894 16.7312 0.996563 16.7456C0.984191 16.76 0.975263 16.777 0.97044 16.7953L0.229 19.724" fill="#6b7684" /><path d="M5.66809 3.37063C6.53408 3.37063 6.87021 2.71499 7.09056 1.68531C7.30466 0.683119 7.2572 0 6.38913 0C5.52106 0 5.18115 0.683119 4.96663 1.68531C4.74669 2.71458 4.8021 3.37063 5.66809 3.37063Z" fill="#0080FF" /><path d="M8.98492 3.37063C9.85091 3.37063 10.187 2.71499 10.4074 1.68531C10.6219 0.683119 10.574 0 9.70593 0C8.83786 0 8.49798 0.683119 8.28346 1.68531C8.06352 2.71458 8.11685 3.37063 8.98492 3.37063Z" fill="#0080FF" /></svg></span><span class="account" id="account"></span></summary>
@@ -137,13 +139,23 @@
       <form class="crema-filters" id="audit-filters">
         <span class="crema-segment period-presets" id="audit-range" role="group" aria-label="기간 선택" data-all="전체 기간"></span>
         <span class="crema-custom" hidden><input id="audit-since" type="date" aria-label="시작일" data-segment="audit-range" /> ~ <input id="audit-until" type="date" aria-label="종료일" data-segment="audit-range" /><button class="crema-button" type="submit">조회</button></span>
-        <span class="crema-segment" id="audit-target" role="group" aria-label="작업 종류"><button type="button" data-value="" aria-pressed="true">변경 작업</button><button type="button" data-value="all" aria-pressed="false">로그인 포함 전체</button><button type="button" data-value="login" aria-pressed="false">로그인</button><button type="button" data-value="admin" aria-pressed="false">계정 관리</button><button type="button" data-value="user" aria-pressed="false">회원</button><button type="button" data-value="starter" aria-pressed="false">초기 질문</button></span><input type="hidden" id="audit-kind" data-segment="audit-target" />
+        <span class="crema-segment" id="audit-target" role="group" aria-label="작업 종류"><button type="button" data-value="" aria-pressed="true">변경 작업</button><button type="button" data-value="all" aria-pressed="false">로그인 포함 전체</button><button type="button" data-value="login" aria-pressed="false">로그인</button><button type="button" data-value="admin" aria-pressed="false">계정 관리</button><button type="button" data-value="user" aria-pressed="false">회원</button><button type="button" data-value="starter" aria-pressed="false">초기 질문</button><button type="button" data-value="model" aria-pressed="false">모델 설정</button><button type="button" data-value="prompt" aria-pressed="false">프롬프트</button></span><input type="hidden" id="audit-kind" data-segment="audit-target" />
         <label class="select"><select id="audit-actor" aria-label="계정"><option value="">모든 계정</option></select></label>
       </form>
       <p class="crema-note">시각은 <span class="tz"></span> 기준입니다. 비밀번호·키 같은 민감값은 기록되지 않습니다.</p>
       <div class="crema-table-head"><span id="audit-info"></span><span class="table-tools"><button class="crema-download" id="audit-csv" type="button">CSV 다운로드</button></span></div>
       <div class="bleed" id="audit" aria-live="polite"></div>
       <nav class="crema-pager" id="audit-pager" aria-label="페이지"></nav>
+    </section>
+    <!-- 모델(관리자 전용): 답변 기본·폴백 모델 런타임 설정, 이 서버의 폴백 상태, 모델별 질의·폴백·비용, 최근 변경. -->
+    <section class="workspace-pane" id="models-pane" hidden>
+      <div class="workspace-head"><h2>모델</h2></div>
+      <div class="bleed pad" id="models" aria-live="polite"></div>
+    </section>
+    <!-- 프롬프트(관리자 전용): 모델별 프롬프트 버전(슬롯 문구) 생성·승격·롤백·폐기(admin_prompts.js). 판정은 로컬 qa/testbed가 한다. -->
+    <section class="workspace-pane" id="prompts-pane" hidden>
+      <div class="workspace-head"><h2>프롬프트</h2></div>
+      <div class="bleed pad" id="prompts" aria-live="polite"></div>
     </section>
     <!-- 대화: crema-ai-admin QueryAnalysis.tsx(목록)·QueryDetail.tsx(상세). 넓은 화면은 T자(위 조회 바 전체 폭, 아래 목록|상세 상시 분할), 좁은 화면은 목록→상세 한 칸. -->
     <section class="workspace-pane" id="sessions-pane" hidden>
@@ -189,5 +201,5 @@
 <!-- CSV 다운로드 아이콘(crema-ai-admin Statistics.tsx DownloadIcon 경로). -->
 <template id="download-icon"><svg class="crema-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="M9 11.625L5.625 8.25L6.6375 7.2L8.25 8.8125V3H9.75V8.8125L11.3625 7.2L12.375 8.25L9 11.625ZM4.5 15C4.0875 15 3.73438 14.8531 3.44063 14.5594C3.14688 14.2656 3 13.9125 3 13.5V11.25H4.5V13.5H13.5V11.25H15V13.5C15 13.9125 14.8531 14.2656 14.5594 14.5594C14.2656 14.8531 13.9125 15 13.5 15H4.5Z" /></svg></template>
 
-<script type="module" src="/static/lib/admin.js?v=74"></script>
+<script type="module" src="/static/lib/admin.js?v=82"></script>
 </html>

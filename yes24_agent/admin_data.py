@@ -15,9 +15,20 @@ from yes24_agent.admin_cost import (
     attach_costs,
     cost_notes,
     per_turn,
+    price_for,
     total,
 )
 from yes24_agent.config import Settings
+from yes24_agent.model_routing import (
+    AUDIT_TARGET as MODEL_AUDIT_TARGET,
+)
+from yes24_agent.model_routing import (
+    SETTINGS_COLUMNS,
+    SETTINGS_ROW_ID,
+    cooldowns,
+    effective_choice,
+    tiered_models,
+)
 
 # admin 접속(읽기 전용 조회·AdminService 풀) 공통 디코더 — BOOLEAN 열을 bool로 싣는다.
 # 열 이름이 아니라 결과 열 타입(TINY)으로 판정하므로 뷰·조인을 거쳐도 같다. 파생값(SUM(a=1)
@@ -341,9 +352,9 @@ async def fetch_cost(
             cur,
             # background = 사용자에 귀속되지 않은 행(초기 질문 생성 등 대화 밖 작업) — 열 값으로.
             f"SELECT DATE(created_at) AS day, {local_day('created_at', hours)} AS local_day, "
-            f"model, component, user_id IS NULL AS background, {_USAGE_SUMS} "
+            f"model, service_tier, component, user_id IS NULL AS background, {_USAGE_SUMS} "
             f"FROM usage_log{sql_where(usage_where)} "
-            "GROUP BY day, local_day, model, component, background",
+            "GROUP BY day, local_day, model, service_tier, component, background",
             usage_params,
         ),
         settings.llm_prices,
@@ -353,9 +364,10 @@ async def fetch_cost(
     user_usage = attach_costs(
         await _fetch(
             cur,
-            f"SELECT user_id, DATE(created_at) AS day, model, component, {_USAGE_SUMS} "
+            f"SELECT user_id, DATE(created_at) AS day, model, service_tier, component, "
+            f"{_USAGE_SUMS} "
             f"FROM usage_log{sql_where([*user_where, 'user_id IS NOT NULL'])} "
-            "GROUP BY user_id, day, model, component",
+            "GROUP BY user_id, day, model, service_tier, component",
             user_params,
         ),
         settings.llm_prices,
@@ -418,6 +430,154 @@ async def fetch_cost(
         "daily": daily,
         "users": users,
         "notes": cost_notes(total(now)),
+    }
+
+
+async def fetch_model_panel(cur, settings: Settings) -> dict[str, Any]:
+    """모델 설정 패널(owner 전용 라우트) — 유효 모델·출처, 모델별 턴·폴백·비용, 최근 변경 이력.
+
+    유효 모델은 서빙과 같은 판정(model_routing.effective_choice)을 DB 원본 행에 다시 적용한 값이다
+    — 다른 인스턴스의 캐시는 model_settings_ttl_s 안에 이 값으로 수렴한다. 쿨다운은 이 응답을 만든
+    프로세스의 상태뿐이다(서버·컨테이너마다 따로 있다). 창(admin_model_window_hours)은 지금부터
+    거꾸로 센 시간이라 달력일 집계(통계 탭)와 다르다. 턴 수·폴백 수는 chat_turn.model 기준이고
+    열 도입 전 턴은 model이 NULL인 한 행으로 모인다. 비용은 그 모델이 답한 main 행(usage_log)만이다.
+    """
+    windows = list(settings.admin_model_window_hours)
+    spans = range(len(windows))
+    rows = await _fetch(
+        cur,
+        f"SELECT {', '.join(SETTINGS_COLUMNS)}, updated_at FROM model_settings WHERE id = %s",
+        [SETTINGS_ROW_ID],
+    )
+    stored = rows[0] if rows else None
+    choice = effective_choice(
+        settings, {key: stored[key] for key in SETTINGS_COLUMNS} if stored else None
+    )
+
+    in_window = "started_at >= NOW(6) - INTERVAL %s HOUR"
+    turns = {
+        row["model"]: row
+        for row in await _fetch(
+            cur,
+            "SELECT model, "
+            + ", ".join(
+                f"SUM({in_window}) AS turns_{i}, "
+                f"SUM(fallback_from IS NOT NULL AND {in_window}) AS fallbacks_{i}"
+                for i in spans
+            )
+            + f" FROM chat_turn WHERE {in_window} GROUP BY model",
+            [*(hours for hours in windows for _ in range(2)), max(windows)],
+        )
+    }
+    flags = ", ".join(f"created_at >= NOW(3) - INTERVAL %s HOUR AS w{i}" for i in spans)
+    usage = attach_costs(
+        await _fetch(
+            cur,
+            f"SELECT DATE(created_at) AS day, model, service_tier, {flags}, {_USAGE_SUMS} "
+            "FROM usage_log WHERE component = %s AND created_at >= NOW(3) - INTERVAL %s HOUR "
+            f"GROUP BY day, model, service_tier, {', '.join(f'w{i}' for i in spans)}",
+            [*windows, MAIN_COMPONENT, max(windows)],
+        ),
+        settings.llm_prices,
+    )
+    models = [
+        {
+            "model": model,
+            "turns": [int((turns.get(model) or {}).get(f"turns_{i}") or 0) for i in spans],
+            "fallbacks": [int((turns.get(model) or {}).get(f"fallbacks_{i}") or 0) for i in spans],
+            "cost_usd": [
+                total(r for r in usage if r["model"] == model and r[f"w{i}"])["cost_usd"]
+                for i in spans
+            ],
+            # 처리 등급별 분해(""= 표준) — 등급이 섞인 모델(fast 전환 전후)의 비용 근거.
+            "cost_by_tier": [
+                {
+                    "service_tier": tier,
+                    "cost_usd": [
+                        total(
+                            r for r in usage
+                            if r["model"] == model and (r["service_tier"] or "") == tier
+                            and r[f"w{i}"]
+                        )["cost_usd"]
+                        for i in spans
+                    ],
+                }
+                for tier in sorted(
+                    {r["service_tier"] or "" for r in usage if r["model"] == model}
+                )
+            ],
+        }
+        for model in {*turns, *(row["model"] for row in usage)}
+    ]
+    today = datetime.now(timezone.utc).date()
+    labels = {model: label for label, model in settings.selectable_models.items()}
+    in_use = {choice.default, choice.fallback} - {""}
+    prices = []
+    for price in settings.llm_prices:
+        in_effect = price_for(
+            settings.llm_prices, price.model, today, price.service_tier
+        ) is price
+        prices.append({
+            **jsonable(price.model_dump()),
+            "label": labels.get(price.model),
+            "in_effect": in_effect,
+            # 지금 기본·폴백으로 쓰는 모델의 그 등급 행 중 오늘 유효한 것(화면 강조).
+            "current": in_effect and price.model in in_use
+            and price.service_tier == choice.service_tiers.get(price.model, ""),
+        })
+    coverage = total(usage)  # 비용 각주 재료
+    history = await _fetch(
+        cur,
+        "SELECT created_at, actor_name, action, `before`, `after` FROM admin_audit "
+        "WHERE target_type = %s ORDER BY created_at DESC, id DESC LIMIT %s",
+        [MODEL_AUDIT_TARGET, settings.admin_model_history_rows],
+    )
+    return {
+        "default": {"model": choice.default, "source": choice.default_source},
+        "fallback": {"model": choice.fallback, "source": choice.fallback_source},
+        "config": {"default_model": settings.model_name, "fallback_model": settings.fallback_model},
+        "stored": jsonable(stored) if stored else None,
+        "selectable": settings.selectable_models,
+        # 처리 등급(LiteLLM 모델만 — ID 형태로 판정, model_routing.tiered_models).
+        "service_tiers": [
+            {
+                "model": model,
+                "label": labels.get(model),
+                "tier": choice.service_tiers.get(model, ""),
+                "config_tier": settings.litellm_service_tiers.get(model, ""),
+                "source": "runtime" if model in choice.runtime_tiers else "config",
+            }
+            for model in tiered_models(settings)
+        ],
+        "tier_options": list(settings.litellm_service_tier_options),
+        "tier_notes": settings.litellm_service_tier_notes,
+        # 사고 강도(같은 기계·같은 모델 목록). 맵에 없는 모델은 전역 litellm_reasoning_effort.
+        "reasoning_efforts": [
+            {
+                "model": model,
+                "label": labels.get(model),
+                "effort": choice.reasoning_efforts.get(model, settings.litellm_reasoning_effort),
+                "config_effort": settings.litellm_reasoning_efforts.get(
+                    model, settings.litellm_reasoning_effort
+                ),
+                "source": "runtime" if model in choice.runtime_efforts else "config",
+            }
+            for model in tiered_models(settings)
+        ],
+        "effort_options": list(settings.litellm_reasoning_effort_options),
+        # 비용 계산의 근거 단가(정본 config llm_prices — 화면은 숫자를 들지 않는다).
+        "prices": prices,
+        "cooldown_s": settings.model_fallback_cooldown_s,
+        "settings_ttl_s": settings.model_settings_ttl_s,
+        "cooldowns": cooldowns(),
+        "window_hours": windows,
+        # 턴 수(7일) 많은 순, 기록 없는 모델(NULL)은 뒤로.
+        "models": sorted(
+            models, key=lambda m: (m["model"] is None, -m["turns"][-1], m["model"] or "")
+        ),
+        "history": [jsonable(row, ("before", "after")) for row in history],
+        # 비용 각주(예상치·빠진 기록·등급 추정) — 판정·문장은 admin_cost.cost_notes 한 곳이다.
+        "cost_notes": cost_notes(coverage, background=False),
     }
 
 
@@ -652,3 +812,91 @@ async def with_user_giftcard(cur, settings: Settings, page: dict[str, Any]) -> d
         }
     items = [{**row, "giftcard": status.get(str(row["user_no"]))} for row in page["items"]]
     return {**page, "items": items, "giftcard_event": event}
+
+
+# 추적 화면의 도구 스텝 칩 — 공개 process.steps에서 칩에 필요한 키만(출처 목록은 세션 상세 몫).
+_TRACE_STEP_KEYS = ("stage", "detail", "state", "result_count")
+
+
+async def fetch_turn_trace(
+    cur, settings: Settings, session_id: str, turn_id: str, user_id: str | None = None
+) -> dict[str, Any] | None:
+    """턴 추적(owner 전용 라우트) — 콜별 라운드(turn_round)·시도 전환·usage_log 행과 비용.
+
+    라운드 행은 TurnProcess.rounds 그대로다(시도별·콜별, 같은 라운드에 콜이 여럿일 수 있다).
+    도구 스텝(chat_turn.process.steps)은 **마지막 시도**의 것뿐이라(재시도는 누적기를 새로 연다)
+    마지막 시도의 각 라운드 마지막 콜에 붙인다. turn_round 도입 전 턴은 rounds가 빈 목록이다.
+    비용은 그 턴의 usage_log 행(main·서브콜)에 admin_cost 단가를 붙인 합이다.
+    """
+    where, params = ["session_id = %s", "turn_id = %s"], [session_id, turn_id]
+    if user_id is not None:
+        where.append("user_id = %s")
+        params.append(user_id)
+    turns = await _fetch(
+        cur,
+        "SELECT app_name, user_id, process, model, fallback_from, prompt_version_id "
+        f"FROM chat_turn{sql_where(where)} LIMIT 2",
+        params,
+    )
+    if not turns:
+        return None
+    if len(turns) > 1:
+        raise HTTPException(status_code=409, detail="사용자 식별자를 함께 지정해 주세요.")
+    turn = jsonable(turns[0], ("process",))
+    scope = [turn["app_name"], turn["user_id"], session_id, turn_id]
+    scoped = "WHERE app_name = %s AND user_id = %s AND session_id = %s AND turn_id = %s"
+    rounds = [
+        jsonable(row, ("tool_calls",))
+        for row in await _fetch(
+            cur,
+            "SELECT attempt, round_index AS round, model, started_ms, ended_ms, prompt_tokens, "
+            "response_tokens, thinking_tokens, cached_tokens, tool_calls, error_status "
+            f"FROM turn_round {scoped} ORDER BY seq",
+            scope,
+        )
+    ]
+    last_call: dict[int, dict[str, Any]] = {}
+    final_attempt = max((row["attempt"] for row in rounds), default=0)
+    for row in rounds:
+        row["steps"] = []
+        if row["attempt"] == final_attempt:
+            last_call[row["round"]] = row
+    for step in (turn["process"] or {}).get("steps", []):
+        if step.get("round") in last_call:
+            last_call[step["round"]]["steps"].append(
+                {key: step[key] for key in _TRACE_STEP_KEYS if key in step}
+            )
+    attempts: dict[int, dict[str, Any]] = {}
+    for row in rounds:  # 시도의 모델·상태코드 = 그 시도 마지막 행의 값
+        attempts[row["attempt"]] = {
+            "attempt": row["attempt"], "model": row["model"], "error_status": row["error_status"],
+        }
+    # 행마다 단가(UTC 날짜 `day`는 date 그대로 — 응답 정형은 단가를 붙인 뒤).
+    usage = [
+        jsonable(row)
+        for row in attach_costs(
+            await _fetch(
+                cur,
+                "SELECT DATE(created_at) AS day, component, model, service_tier, "
+                "reasoning_effort, prompt_tokens, response_tokens, thinking_tokens, cached_tokens, "
+                f"latency_ms, llm_calls, {_USAGE_SUMS} FROM usage_log {scoped} "
+                "GROUP BY id ORDER BY id",
+                scope,
+            ),
+            settings.llm_prices,
+        )
+    ]
+    main = next((row for row in usage if row["component"] == MAIN_COMPONENT), {})
+    return {
+        "turn_id": turn_id,
+        "model": turn["model"],
+        "fallback_from": turn["fallback_from"],
+        "prompt_version": turn["prompt_version_id"],
+        "service_tier": main.get("service_tier"),
+        "reasoning_effort": main.get("reasoning_effort"),
+        "elapsed_ms": (turn["process"] or {}).get("elapsed_ms"),
+        "rounds": rounds,
+        "attempts": list(attempts.values()),
+        "usage": usage,
+        "cost_usd": total(usage)["cost_usd"],
+    }

@@ -24,7 +24,6 @@
 각 각도의 상태를 searches로 노출한다 — 빈 성공으로 위장하지 않는다.
 """
 
-import asyncio
 import contextlib
 import contextvars
 import logging
@@ -33,6 +32,7 @@ from typing import NamedTuple
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import Settings, get_settings
+from yes24_agent.cpu_pool import run_cpu
 from yes24_agent.sources import cite_marker, now_checked_at, register_source
 from yes24_agent.tool_progress import ToolProgressGroup, parsed_progress
 from yes24_agent.tools._planning import (
@@ -212,9 +212,10 @@ async def _search_one(
         }
 
     try:
-        # 파싱은 순수 계산(1.1MB HTML에 ~100ms)이라 워커 스레드로 내린다 — 이벤트 루프가 그동안
-        # SSE 전송·다른 각도의 네트워크·오버뷰 판정 Task를 계속 돌린다(H17 오프로드).
-        parsed = await asyncio.to_thread(
+        # 파싱은 순수 계산(1.1MB HTML에 ~100ms)이라 프로세스 풀로 내린다 — 이벤트 루프가 그동안
+        # SSE 전송·다른 각도의 네트워크·오버뷰 판정 Task를 계속 돌리고, GIL에 묶이지 않아 다른
+        # 코어를 쓴다(H17 오프로드 → 2026-10-17 cpu_pool).
+        parsed = await run_cpu(
             parse_search, html, base_url=settings.yes24_base_url, limit=budget.result_limit
         )
     except ParseError as exc:

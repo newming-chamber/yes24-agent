@@ -446,9 +446,18 @@ class TurnProcess:
     스텝은 도구 status(호출·결과)만이다 — thinking·refs는 과정의 재료가 아니다(RBTI는 status가
     아니라 전용 `rbti` 이벤트라 애초에 여길 지나지 않는다).
     스텝 dict는 `{round,stage,detail,step_id,state}`이고 결과는 result_count/sources도 갖는다.
+
+    `rounds`는 LLM 콜별 토큰·지연 기록(`round_usage`)이다 — **비공개**(운영자 추적 전용)라
+    `payload()`(공개 done.process)에 싣지 않는다. 재시도로 새 시도를 열 때는 `next_attempt`가 이전
+    시도의 행을 이월한다(행의 `attempt`가 시도 번호, 실패한 시도의 마지막 행에 `error_status`).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, attempt: int = 0, started_ms: int = 0) -> None:
+        self.rounds: list[dict] = []
+        self._attempt = attempt
+        # 지금 라운드의 첫 모델 이벤트 시각(시도 시작 기준 아님)
+        self._round_open_ms: int | None = None
+        self._attempt_started_ms = started_ms
         self.steps: list[dict] = []
         self.source_ids: set[int] = set()
         self._tool_pending = False  # 도구 응답을 처리했고 아직 다음 모델 이벤트가 안 왔다
@@ -462,12 +471,66 @@ class TurnProcess:
         """현재 LLM 라운드 인덱스(0부터) — delta·status 프레임의 `round`."""
         return len(self._raw_starts) - 1
 
-    def model_event(self, raw_len: int) -> None:
-        """모델 이벤트 도착 — 도구 응답 뒤 첫 이벤트면 새 라운드(raw_len = 그 시점 원시 길이)."""
+    def model_event(self, raw_len: int, at_ms: int | None = None) -> None:
+        """모델 이벤트 도착 — 도구 응답 뒤 첫 이벤트면 새 라운드(raw_len = 그 시점 원시 길이).
+
+        at_ms(턴 시작 기준 경과)는 라이브만 준다 — 라운드의 첫 모델 이벤트 시각이 그 라운드
+        `rounds` 행의 started_ms다. 히스토리 복원은 시각이 없어 넘기지 않는다.
+        """
         if self._tool_pending:
             self._tool_pending = False
             self._raw_starts.append(raw_len)
             self._content_phase = None
+            self._round_open_ms = None
+        if self._round_open_ms is None:
+            self._round_open_ms = at_ms
+
+    def round_usage(self, usage, *, at_ms: int, model: str, tool_calls: list[str]) -> None:
+        """LLM 콜 1회의 usage(non-partial 모델 이벤트의 usage_metadata)를 지금 라운드 행으로."""
+        started = self._round_open_ms
+        self.rounds.append({
+            "attempt": self._attempt,
+            "round": self.round,
+            "model": model,
+            "started_ms": started if started is not None else at_ms,
+            "ended_ms": at_ms,
+            "prompt_tokens": getattr(usage, "prompt_token_count", None),
+            "response_tokens": getattr(usage, "candidates_token_count", None),
+            "thinking_tokens": getattr(usage, "thoughts_token_count", None),
+            "cached_tokens": getattr(usage, "cached_content_token_count", None),
+            "tool_calls": tool_calls,
+            "error_status": None,
+        })
+        # 같은 라운드에 콜이 또 오면(도구 없이 이어지는 콜) 그 콜은 이 시각부터 잰다.
+        self._round_open_ms = at_ms
+
+    def next_attempt(self, *, error_status: int | None, at_ms: int, model: str) -> "TurnProcess":
+        """재시도용 새 누적기 — 이 시도의 `rounds`를 이월하고 실패 상태코드를 남긴다.
+
+        실패한 시도에 usage가 하나도 없으면(첫 콜이 곧장 429 등) 토큰 없는 행 1개로 시도를 남긴다 —
+        "어떤 모델이 어떤 상태코드로 얼마 만에 실패했나"가 추적의 재료다.
+        """
+        rounds = [dict(row) for row in self.rounds]
+        mine = [row for row in rounds if row["attempt"] == self._attempt]
+        if mine:
+            mine[-1]["error_status"] = error_status
+        else:
+            rounds.append({
+                "attempt": self._attempt,
+                "round": self.round,
+                "model": model,
+                "started_ms": self._attempt_started_ms,
+                "ended_ms": at_ms,
+                "prompt_tokens": None,
+                "response_tokens": None,
+                "thinking_tokens": None,
+                "cached_tokens": None,
+                "tool_calls": [],
+                "error_status": error_status,
+            })
+        nxt = TurnProcess(attempt=self._attempt + 1, started_ms=at_ms)
+        nxt.rounds = rounds
+        return nxt
 
     def content_event(self, phase: str) -> dict | None:
         """실제 본문이 있는 라운드의 역할 전환만 한 번씩 알린다."""

@@ -97,6 +97,14 @@ _RETRY_RUN_WHERE = (
     "OR (status = 'failed' AND started_at < CURRENT_TIMESTAMP - INTERVAL %s SECOND) "
     "OR (status <> 'running' AND %s)"
 )
+
+
+def _retry_params(settings: Settings, force: bool) -> tuple:
+    """`_RETRY_RUN_WHERE`의 자리값 — 선점과 사전 확인이 같은 판정을 쓰게 한 곳에서 만든다."""
+    return (int(settings.starter_timeout_s * _STALE_RUN_FACTOR),
+            settings.starter_refresh_interval_s, force)
+
+
 # 슬롯 키의 `종류:대상` 구분자. 라벨 파생과 관리자 필터가 같은 규약을 본다.
 TARGET_SEP = ":"
 # 대상이 여럿인 종류의 키 접두(대상 이름이 뒤에 붙는다).
@@ -1438,6 +1446,11 @@ class StarterService(MysqlBackedService):
         # 활성될 수 있다(이전 auto가 0건이면 비활성 UPDATE가 서로를 못 막는다). 프로세스
         # 하나에서 생성이 겹치는 것만이라도 여기서 막는다.
         self._generation_lock = asyncio.Lock()
+        # (날짜, 그날 목록의 슬롯 키) — 마지막 build_slots가 본 것. 목록은 사이트에서 오므로
+        # (코너·분야 페이지 fetch + 전체 파싱) 서빙마다 다시 만들면 CPU가 든다(2026-10-17 운영
+        # py-spy: parse_corner_links 7.0%·parse_category_links 6.0%). 키만 기억해 두고, 그 키가
+        # 전부 정착했는지를 starter_runs에 먼저 묻는다(`_settled`).
+        self._slot_keys: tuple[dt.date, tuple[str, ...]] | None = None
 
     @classmethod
     def get_instance(cls) -> StarterService:
@@ -1508,9 +1521,31 @@ class StarterService(MysqlBackedService):
 
     async def _generate_guarded(self, today: dt.date) -> None:
         try:
+            if await self._settled(today):
+                return
             await self.run_generation(None, today)
         except Exception as exc:  # noqa: BLE001 — 백그라운드: 서빙에 얹히지 않는다(로그만)
             logger.warning(f"starters 자동 생성 실패(무시): {type(exc).__name__}: {exc}")
+
+    async def _settled(self, today: dt.date) -> bool:
+        """오늘 목록의 슬롯이 전부 재실행 대상이 아닌가 — 목록을 다시 만들기 전에 묻는다.
+
+        판정은 선점(`_claim_run`)과 같은 술어(`_RETRY_RUN_WHERE`, force 없음)라 결과가 같다:
+        여기서 참이면 run_generation이 돌아도 모든 슬롯이 skipped였다. 실패 후 대기 경과·
+        stale running·행 없는 슬롯이 하나라도 있거나 오늘 목록을 아직 모르면(프로세스 첫
+        호출·날짜 변경) 거짓 — 기존처럼 목록을 다시 받고 선점부터 한다. 확인은 읽기뿐이라
+        여러 프로세스의 선점 의미(INSERT IGNORE·조건부 UPDATE)는 그대로다.
+        """
+        if self._slot_keys is None or self._slot_keys[0] != today or not self._slot_keys[1]:
+            return False
+        keys = self._slot_keys[1]
+        placeholders = ", ".join(["%s"] * len(keys))
+        rows = await self._run(
+            f"SELECT slot FROM starter_runs WHERE slot IN ({placeholders}) AND run_date = %s "
+            f"AND NOT ({_RETRY_RUN_WHERE})",
+            (*keys, today, *_retry_params(get_settings(), False)), fetch_all=True,
+        )
+        return {row[0] for row in rows or ()} >= set(keys)
 
     # ── 생성·저장 ─────────────────────────────────────────────────────────
 
@@ -1530,8 +1565,7 @@ class StarterService(MysqlBackedService):
             "UPDATE starter_runs SET status = 'running', detail = %s, "
             "started_at = CURRENT_TIMESTAMP WHERE slot = %s AND run_date = %s "
             f"AND ({_RETRY_RUN_WHERE})",
-            (token, slot, today, int(settings.starter_timeout_s * _STALE_RUN_FACTOR),
-             settings.starter_refresh_interval_s, force),
+            (token, slot, today, *_retry_params(settings, force)),
         )
         return (token, force) if rowcount else None
 
@@ -1558,6 +1592,7 @@ class StarterService(MysqlBackedService):
             specs = {
                 spec.key: spec for spec in await build_slots(settings, get_client(settings), today)
             }
+            self._slot_keys = (today, tuple(specs))
             # 칩 라벨은 첫 선점 뒤에 한 번만 정한다. 목록을 만들 때 지으면 오늘 생성이 끝난 뒤의
             # 서빙마다 모델 콜이 나간다(2026-09-28 운영: 하루 5,644콜, LLM 비용의 62%).
             labels: dict | None = None
@@ -1745,51 +1780,45 @@ class StarterService(MysqlBackedService):
         self, slot: str, today: dt.date, token: str, retained: list[dict], items: list[dict],
         status: str, detail: str, label: str = "",
     ) -> bool:
-        if self._db is None:
-            raise HTTPException(status_code=503, detail=self._unavailable_detail)
-        try:
-            pool = await self._db.get()
-            async with pool.acquire() as conn:
-                await conn.begin()
-                try:
-                    async with conn.cursor() as cur:
+        async def save(conn) -> bool:
+            await conn.begin()
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT detail FROM starter_runs WHERE slot = %s AND run_date = %s "
+                        "AND status = 'running' FOR UPDATE", (slot, today),
+                    )
+                    row = await cur.fetchone()
+                    if row is None or row[0] != token:
+                        await conn.rollback()
+                        return False
+                    await cur.execute(
+                        "UPDATE starters SET active = 0 "
+                        "WHERE slot = %s AND source = 'auto' AND active = 1", (slot,),
+                    )
+                    for item in retained:
                         await cur.execute(
-                            "SELECT detail FROM starter_runs WHERE slot = %s AND run_date = %s "
-                            "AND status = 'running' FOR UPDATE", (slot, today),
+                            "UPDATE starters SET active = 1, source_url = %s WHERE id = %s",
+                            (item["source_url"], item["id"]),
                         )
-                        row = await cur.fetchone()
-                        if row is None or row[0] != token:
-                            await conn.rollback()
-                            return False
+                    for item in items:
                         await cur.execute(
-                            "UPDATE starters SET active = 0 "
-                            "WHERE slot = %s AND source = 'auto' AND active = 1", (slot,),
+                            "INSERT INTO starters (slot, label, text, source, goods_no, "
+                            "source_url, run_date) VALUES (%s, %s, %s, 'auto', %s, %s, %s)",
+                            (slot, label or None, item["text"], item["goods_no"],
+                             item["source_url"], today),
                         )
-                        for item in retained:
-                            await cur.execute(
-                                "UPDATE starters SET active = 1, source_url = %s WHERE id = %s",
-                                (item["source_url"], item["id"]),
-                            )
-                        for item in items:
-                            await cur.execute(
-                                "INSERT INTO starters (slot, label, text, source, goods_no, "
-                                "source_url, run_date) VALUES (%s, %s, %s, 'auto', %s, %s, %s)",
-                                (slot, label or None, item["text"], item["goods_no"],
-                                 item["source_url"], today),
-                            )
-                        await cur.execute(*self._finish_run_statement(
-                            slot, today, token, status, detail
-                        ))
-                    await conn.commit()
-                except BaseException:
-                    await conn.rollback()
-                    raise
-            return True
-        except HTTPException:
-            raise
-        except Exception as exc:  # noqa: BLE001 — 저장 실패를 성공 응답으로 숨기지 않는다
-            logger.error("starters 풀 저장 실패: %s", exc)
-            raise HTTPException(status_code=503, detail=self._failure_detail) from exc
+                    await cur.execute(*self._finish_run_statement(
+                        slot, today, token, status, detail
+                    ))
+                await conn.commit()
+                return True
+            except BaseException:
+                await conn.rollback()
+                raise
+
+        # 구성 부재·드라이버 실패의 503 판정은 골격(`_guarded`)의 것 — 문구만 이 서비스 것이다.
+        return await self._guarded(save)
 
     @staticmethod
     def _finish_run_statement(

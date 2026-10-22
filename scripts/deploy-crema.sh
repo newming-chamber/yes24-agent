@@ -18,6 +18,12 @@ CADDYFILE="/root/Caddyfile"
 DOMAIN="${DOMAIN:-yes24-agent.dev.griplabs.io}"
 PORT_A=8011
 PORT_B=8012
+# shellcheck source=scripts/deploy-guard.sh
+. "$(cd "$(dirname "$0")" && pwd)/deploy-guard.sh"
+
+echo "[0/5] 배포 가드 — 옮길 이미지의 커밋 라벨 · 지금 떠 있는 QA 컨테이너 파일 대조"
+deploy_guard_image "$IMAGE:latest" ssh "$BUILD_HOST"
+deploy_guard_removed "$(deploy_guard_image_files "$IMAGE:latest" ssh "$BUILD_HOST")" "$IMAGE-$PORT_A $IMAGE-$PORT_B" ssh "$SSH_HOST"
 
 echo "[1/5] 활성 포트 확인"
 ACTIVE=$(ssh "$SSH_HOST" "sudo awk '/${DOMAIN} \{/,/\}/' $CADDYFILE | grep -oE 'localhost:[0-9]+' | cut -d: -f2")

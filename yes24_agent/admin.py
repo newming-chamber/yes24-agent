@@ -3,10 +3,11 @@
 모듈 경계: 누가(계정·세션·역할·감사 트랜잭션)는 `admin_auth`가, 무엇을 본다/바꾼다는 이
 모듈이 소유한다. 역방향 import는 없다. 권한은 라우트마다 최소 역할 하나다 — 조회는
 `require_admin`(viewer), 비용·감사 기록은 `require_owner`(docs/admin-management-design-20260914.md
-§4). 쓰기 라우트(계정·초기 질문)는 `admin_auth`·`starters`가 소유한다.
+§4). 쓰기 라우트(계정·초기 질문)는 `admin_auth`·`starters`가 소유하고, 여기 있는 쓰기는 owner
+전용 모델 설정(PATCH /admin/models — AdminService 트랜잭션) 하나다.
 
-내부 정보(조사 과정·오류 내부·토큰·비용)는 화면이 아니라 **응답에서** 뺀다 — 개발자 도구로
-보이면 화면에서 숨긴 의미가 없다. 비용만 owner 전용 라우트 하나로 나간다.
+내부 정보(조사 과정·오류 내부·토큰·비용·답변 모델)는 화면이 아니라 **응답에서** 뺀다 — 개발자
+도구로 보이면 화면에서 숨긴 의미가 없다. 비용·모델은 owner 응답에만 실린다.
 
 조회: 대화의 정본은 턴 테이블 `chat_turn`(2026-09-09 정규화)이고 뷰 `chat_turns`로 읽는다.
 세션 상세의 턴별 피드백·클릭은 그 세션 턴에 한정한 서브쿼리로 붙인다 — 토큰까지 결합한 운영 뷰
@@ -32,8 +33,14 @@ from typing import Any, Literal
 import aiomysql
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+from pydantic_core import PydanticCustomError
 
 from yes24_agent.admin_auth import (
+    AdminActor,
+    AdminService,
+    EditBody,
+    EditChanges,
     require_admin,
     require_owner,
 )
@@ -45,7 +52,9 @@ from yes24_agent.admin_data import (
     excluded_condition,
     fetch_analytics,
     fetch_cost,
+    fetch_model_panel,
     fetch_stats,
+    fetch_turn_trace,
     fetch_user_giftcard,
     jsonable,
     local_day,
@@ -57,7 +66,18 @@ from yes24_agent.admin_data import (
     with_nickname,
     with_user_giftcard,
 )
-from yes24_agent.config import Settings
+from yes24_agent.admin_prompts import check_prompt_bindings, register_admin_prompts
+from yes24_agent.config import Settings, get_settings
+from yes24_agent.model_routing import AUDIT_TARGET as MODEL_AUDIT_TARGET
+from yes24_agent.model_routing import (
+    PER_MODEL_COLUMNS,
+    SETTINGS_COLUMNS,
+    SETTINGS_ROW_ID,
+    encode_model_map,
+    invalidate_cache,
+    storable_setting,
+)
+from yes24_agent.prompt_versions import AUDIT_TARGET as PROMPT_AUDIT_TARGET
 from yes24_agent.session_service import mysql_pool_kwargs
 from yes24_agent.starters import (
     _CHIP_LABEL_MAX_CHARS,
@@ -124,6 +144,29 @@ def readonly_connect_kwargs(session_db_url: str) -> dict[str, Any] | None:
     return kwargs
 
 
+def snapshot_query(connect, connect_kwargs: dict[str, Any]):
+    """요청 단위 조회기 — `query(fetch, *args)`는 한 요청의 모든 SELECT를 동일한 읽기 전용
+    스냅샷에서 실행한다(admin·admin_prompts 라우트 공통 골격). DB 실패는 503이다."""
+
+    async def query(fetch, *args):
+        try:
+            conn = await connect(**connect_kwargs)
+            try:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+                    return await fetch(cur, *args)
+            finally:
+                try:
+                    await conn.rollback()
+                finally:
+                    conn.close()
+        except _DB_ERRORS as exc:
+            logger.warning(f"admin DB 조회 실패: {type(exc).__name__}")
+            raise HTTPException(status_code=503, detail="데이터를 불러올 수 없습니다.") from None
+
+    return query
+
+
 # ── 조회 ───────────────────────────────────────────────────────────────────
 
 _SESSION_TURNS = "t.app_name = s.app_name AND t.user_id = s.user_id AND t.session_id = s.id"
@@ -165,12 +208,14 @@ FEEDBACK_RATINGS = {"up": "likes", "down": "dislikes"}
 
 # 세션 상세 턴 JSON 열(DDL scripts/chat_turn.sql) — 구조로 싣는다.
 _TURN_JSON_COLUMNS = ("sources",)
+# 턴의 답변 모델 열 — owner 응답에만 싣는다(모델명은 운영 내부 정보, 비용 패널과 같은 선).
+_TURN_MODEL_COLUMNS = ("model", "fallback_from")
 # 턴 하나에 붙는 클릭 수 — 그 턴의 소유자 스코프 키(앱·사용자·세션·턴)로만 센다.
 _TURN_SCOPE = "x.app_name = t.app_name AND x.user_id = t.user_id AND x.session_id = t.session_id "
 _TURN_SCOPE += "AND x.turn_id = t.turn_id"
 _DETAIL_TURNS_SQL = (
     "SELECT t.turn_id, t.asked_at, t.completed_at, t.user_message, t.assistant_message, "
-    "t.status, t.sources, t.rbti_applied, t.elapsed_ms, "
+    "t.status, t.sources, t.rbti_applied, t.elapsed_ms, t.model, t.fallback_from, t.input_source, "
     # 피드백은 턴당 최신 1행(uq_turn_feedback_user_turn)이라 JOIN해도 턴이 늘지 않는다.
     "f.rating AS rating, f.comment AS feedback_comment, "
     f"(SELECT COUNT(*) FROM turn_click x WHERE {_TURN_SCOPE}) AS clicks "
@@ -307,8 +352,11 @@ async def fetch_session_detail(
     cur: aiomysql.DictCursor,
     session_id: str,
     user_id: str | None = None,
+    with_model: bool = False,
 ) -> dict[str, Any] | None:
     """세션 상세: 턴 타임라인(질문·답변·상태·출처·피드백·클릭) + 간단 지표.
+
+    with_model(owner)이면 턴마다 답변 모델·폴백 전 모델을 싣고, 아니면 그 키 자체를 뺀다.
 
     앱은 값이 하나라 조회·응답에서 뺐다. 세션 식별 키(app_name, user_id, id)는 조인 계약이라 SQL이
     내부에서 그대로 쓴다.
@@ -334,6 +382,10 @@ async def fetch_session_detail(
 
     await cur.execute(_DETAIL_TURNS_SQL, (app_name, session["user_id"], session_id))
     turns = [jsonable(turn, _TURN_JSON_COLUMNS) for turn in await cur.fetchall()]
+    if not with_model:
+        for turn in turns:
+            for column in _TURN_MODEL_COLUMNS:
+                turn.pop(column, None)
 
     elapsed = [turn["elapsed_ms"] for turn in turns if turn["elapsed_ms"] is not None]
     return {
@@ -915,7 +967,9 @@ async def fetch_starter_popular(
 
 
 # 감사 기록 대상 종류(admin_management.sql target_type) — 화면 필터 값이 곧 이 값이다.
-AUDIT_TARGETS = ("login", "admin", "user", "starter", "session")
+AUDIT_TARGETS = (
+    "login", "admin", "user", "starter", "session", MODEL_AUDIT_TARGET, PROMPT_AUDIT_TARGET,
+)
 # 대상 이름 — 계정은 계정명, 회원은 회원번호로 바꿔 싣고(행 id는 사람이 못 읽는다) 나머지는
 # target_id 그대로.
 # 로그인 기록의 target_id는 사용자가 입력한 계정명 원문이다 — 실제 계정일 때만 이름을 싣고(없으면
@@ -991,6 +1045,62 @@ async def fetch_audit(
     return page_data
 
 
+# ── 모델 설정 쓰기 본문 ─────────────────────────────────────────────────────
+
+
+class ModelSettingsChanges(EditChanges):
+    """null이 정상 입력이다("config 따름") — 그래서 모든 필드가 `T | None`(EditChanges 규칙).
+
+    service_tiers·reasoning_efforts는 {LiteLLM 모델: 값} 전체 맵이다 — 맵에 없는 모델은 config를
+    따른다. prompt_versions는 {모델 | "*": 버전 id} 전체 맵(승격·롤백 — DB 판정은 라우트가 더한다).
+    """
+
+    default_model: str | None = None
+    fallback_model: str | None = None
+    service_tiers: dict[str, str] | None = None
+    reasoning_efforts: dict[str, str] | None = None
+    prompt_versions: dict[str, int] | None = None
+
+    @field_validator(
+        "default_model", "fallback_model", "service_tiers", "reasoning_efforts", "prompt_versions"
+    )
+    @classmethod
+    def _storable(cls, value, info: ValidationInfo):
+        """판정은 서빙의 재검증과 한 함수다(model_routing.storable_setting)."""
+        if value is None or storable_setting(get_settings(), info.field_name, value):
+            return value
+        raise PydanticCustomError(
+            "unknown_model", "선택할 수 없는 모델·값입니다: {value}", {"value": str(value)}
+        )
+
+
+class _ModelSettingsExpected(BaseModel):
+    """편집 프로토콜의 expected — 화면이 본 model_settings 행 값(검증 없이 대조만)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    default_model: str | None = None
+    fallback_model: str | None = None
+    # 모델별 맵 열은 저장 행 그대로(정본 직렬화 문자열 — encode_model_map).
+    service_tiers: str | None = None
+    reasoning_efforts: str | None = None
+    prompt_versions: str | None = None
+
+
+class ModelSettingsEdit(EditBody):
+    changes: ModelSettingsChanges
+    expected: _ModelSettingsExpected | None = None
+    # 프롬프트 버전 첫 승격의 owner 사유 메모 — 게이트 재료이자 감사 after에 남는다(admin_prompts).
+    reason: str | None = Field(default=None, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def _blank_is_missing(cls, value: str | None) -> str | None:
+        """공백뿐인 사유는 사유가 아니다 — 게이트(check_prompt_bindings)가 보는 값과 감사에 남는
+        값을 하나로."""
+        return (value or "").strip() or None
+
+
 # ── 라우터 ─────────────────────────────────────────────────────────────────
 
 
@@ -1014,22 +1124,7 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
             response.headers.update(headers)
         return response
 
-    async def _query(fetch, *args):
-        """한 요청의 모든 SELECT를 동일한 읽기 전용 스냅샷에서 실행한다."""
-        try:
-            conn = await connect(**connect_kwargs)
-            try:
-                async with conn.cursor(aiomysql.DictCursor) as cur:
-                    await cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
-                    return await fetch(cur, *args)
-            finally:
-                try:
-                    await conn.rollback()
-                finally:
-                    conn.close()
-        except _DB_ERRORS as exc:
-            logger.warning(f"admin DB 조회 실패: {type(exc).__name__}")
-            raise HTTPException(status_code=503, detail="데이터를 불러올 수 없습니다.") from None
+    _query = snapshot_query(connect, connect_kwargs)
 
     # page 상한 — 거대값이 OFFSET 전체 스캔(503·DB 장애 로그)이 아니라 422로 떨어진다.
     page_query = Query(default=0, ge=0, le=settings.admin_max_page)
@@ -1078,15 +1173,29 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
             )
         )
 
-    @router.get("/api/sessions/{session_id}", dependencies=[Depends(require_admin)])
+    @router.get("/api/sessions/{session_id}")
     async def admin_session_detail(
         session_id: str,
         user_id: str | None = None,
+        actor: AdminActor = Depends(require_admin),
     ) -> Any:
-        detail = await _query(fetch_session_detail, session_id, user_id)
+        detail = await _query(
+            fetch_session_detail, session_id, user_id, actor.at_least("owner")
+        )
         if detail is None:
             return JSONResponse({"detail": "세션을 찾을 수 없습니다."}, status_code=404)
         return detail
+
+    @router.get(
+        "/api/sessions/{session_id}/turns/{turn_id}/trace",
+        dependencies=[Depends(require_owner)],
+    )
+    async def admin_turn_trace(session_id: str, turn_id: str, user_id: str | None = None) -> Any:
+        """턴 추적(owner 전용) — 라운드별 토큰·지연·도구, 폴백·재시도 시도, usage 행·비용."""
+        trace = await _query(fetch_turn_trace, settings, session_id, turn_id, user_id)
+        if trace is None:
+            return JSONResponse({"detail": "턴을 찾을 수 없습니다."}, status_code=404)
+        return trace
 
     @router.get("/api/users", dependencies=[Depends(require_admin)])
     async def admin_users(
@@ -1224,6 +1333,44 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
         """비용 패널(owner 전용). 대시보드 응답에는 비용 필드가 없다."""
         return await _query(fetch_cost, settings, period, excluded)
 
+    @router.get("/api/models", dependencies=[Depends(require_owner)])
+    async def admin_models() -> Any:
+        """모델 설정 패널(owner 전용) — 유효 모델·출처·쿨다운(이 인스턴스)·모델별 지표·변경 이력."""
+        return await _query(fetch_model_panel, settings)
+
+    @app.patch("/admin/models", include_in_schema=False)
+    async def admin_update_models(
+        body: ModelSettingsEdit, request: Request, actor: AdminActor = Depends(require_owner)
+    ) -> dict[str, Any]:
+        """런타임 기본·폴백 모델·모델별 처리 등급·사고 강도·프롬프트 버전 변경(owner 전용, 변경·감사
+        한 트랜잭션). 프롬프트 버전 바인딩은 같은 트랜잭션에서 승격 게이트(첫 승격 = 사유 메모
+        필수)를 지난다(admin_prompts) — 응답의 warnings는 거부가 아닌 경고(base_hash 불일치)다.
+
+        이 인스턴스는 곧바로, 다른 서버·컨테이너는 model_settings_ttl_s 안에 따라온다.
+        """
+        changes = body.changes.model_dump(exclude_unset=True)
+        for column in PER_MODEL_COLUMNS:  # 행에는 정본 직렬화로 둔다(같은 맵 = 같은 문자열)
+            if column in changes:
+                changes[column] = encode_model_map(changes[column] or {})
+        expected = body.expected.model_dump(exclude_unset=True) if body.expected else None
+        async with AdminService.get_instance().transaction(actor, request) as tx:
+            before, after = await tx.edit_row(
+                "model_settings", SETTINGS_ROW_ID, SETTINGS_COLUMNS, changes, expected
+            )
+            promotion = (
+                await check_prompt_bindings(tx.cur, after["prompt_versions"], body.reason)
+                if "prompt_versions" in after
+                else {}
+            )
+            if after:
+                await tx.audit(
+                    MODEL_AUDIT_TARGET, SETTINGS_ROW_ID, "update", before,
+                    {**after, **promotion.get("audit", {})},
+                )
+        invalidate_cache()
+        warnings = {k: v for k, v in promotion.items() if k == "warnings"}
+        return {"updated": sorted(after), **warnings}
+
     @router.get("/api/stats", dependencies=[Depends(require_admin)])
     async def admin_stats(since: date, until: date, excluded: tuple[str, ...] = scope) -> Any:
         """통계 탭(KST 일별 보고). 빈 날도 채우므로 기간이 필수이고 길이에 상한이 있다."""
@@ -1235,4 +1382,5 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
             )
         return await _query(fetch_stats, settings, (since, until), excluded)
 
+    register_admin_prompts(app, settings, _query)
     app.include_router(router)

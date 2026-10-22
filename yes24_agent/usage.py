@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class UsageScope:
+    """요청 1건의 usage 귀속 문맥 — turn_id·session_id가 채워진 뒤(finish 이후) 행마다 기록한다."""
+
     user_id: str
     endpoint: str
     session_id: str | None = None
@@ -127,6 +129,8 @@ class UsageLogger:
         llm_calls: int | None = None,
         tool_calls: int | None = None,
         cited_sources: int | None = None,
+        service_tier: str | None = None,
+        reasoning_effort: str | None = None,
         created_at: datetime | None = None,
     ) -> None:
         """사용량 1행 기록을 예약한다(fire-and-forget) — 어떤 실패도 밖으로 던지지 않는다.
@@ -161,6 +165,10 @@ class UsageLogger:
                 llm_calls,
                 tool_calls,
                 cited_sources,
+                # LiteLLM 처리 등급 — 비용 단가 조회의 축(admin_cost.price_for). NULL = 표준.
+                service_tier,
+                # 실제로 실은 사고 강도(LiteLLM만) — 사고 토큰·지연을 강도별로 가르는 축.
+                reasoning_effort,
                 created_at or datetime.now(timezone.utc).replace(tzinfo=None),
             )
             # 본류(스트리밍·서브콜)와 분리된 task로 쓴다 — DB 왕복이 턴 지연에 얹히지 않는다.
@@ -172,19 +180,21 @@ class UsageLogger:
 
     async def _insert(self, row: tuple) -> None:
         """usage_log INSERT 1건. 풀 생성 실패·테이블 부재·연결 끊김 전부 warning 후 무시."""
+
+        async def insert(conn):
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO usage_log (app_name, session_id, user_id, endpoint, "
+                    "component, model, prompt_tokens, response_tokens, total_tokens, "
+                    "thinking_tokens, cached_tokens, latency_ms, turn_id, outcome, "
+                    "llm_calls, tool_calls, cited_sources, service_tier, reasoning_effort, "
+                    "created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                    "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    row,
+                )
+
         try:
-            pool = await self._db.get()
-            async with pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "INSERT INTO usage_log (app_name, session_id, user_id, endpoint, "
-                        "component, model, prompt_tokens, response_tokens, total_tokens, "
-                        "thinking_tokens, cached_tokens, latency_ms, turn_id, outcome, "
-                        "llm_calls, tool_calls, cited_sources, created_at) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                        "%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                        row,
-                    )
+            await self._db.run(insert)
         except Exception as exc:  # noqa: BLE001 — 부가 채널: 기록 실패가 턴을 막으면 안 된다
             logger.warning(f"usage_log INSERT 실패(무시): {exc}")
 
@@ -223,14 +233,19 @@ def record_usage(
     llm_calls: int | None = None,
     tool_calls: int | None = None,
     cited_sources: int | None = None,
+    service_tier: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> None:
     """모듈 진입점 — 호출부(runner·서브콜들)는 이 함수 하나만 안다(최소 결합).
 
     서브콜에는 세션 문맥이 없을 수 있어 session_id·user_id·endpoint·latency_ms 전부
     선택이다(테이블도 NULL 허용).
     """
-    if usage is None or not UsageLogger.get_instance().enabled:
+    if usage is None:
         return
+    if not UsageLogger.get_instance().enabled:
+        return
+    scope = _usage_scope.get()
     fields = dict(
         model=model,
         session_id=session_id,
@@ -242,9 +257,10 @@ def record_usage(
         llm_calls=llm_calls,
         tool_calls=tool_calls,
         cited_sources=cited_sources,
+        service_tier=service_tier,
+        reasoning_effort=reasoning_effort,
         created_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
-    scope = _usage_scope.get()
     if scope is not None:
         scope.record(component, usage, fields)
     else:

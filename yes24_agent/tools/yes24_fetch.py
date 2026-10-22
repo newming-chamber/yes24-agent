@@ -9,7 +9,6 @@
 error_type="empty"로 정직하게 반환한다.
 """
 
-import asyncio
 import logging
 from typing import NamedTuple
 
@@ -17,6 +16,7 @@ from bs4 import BeautifulSoup
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import get_settings
+from yes24_agent.cpu_pool import run_cpu, settings_view
 from yes24_agent.sources import DETAIL_FIDELITY, cite_marker, now_checked_at, register_source
 from yes24_agent.tools._text import (
     window_around_find,
@@ -125,12 +125,13 @@ async def yes24_fetch(
             "message": f"Yes24 페이지 조회에 실패했습니다: {exc}",
         }
 
-    # **두 단계로 가른 이유(H17 오프로드)**: 파싱(상세 400KB에 ~70ms)은 순수 계산이라 워커
-    # 스레드로 내리고, 등록은 **이벤트 루프에서 await 없이** 실행해 source_id의 원자·단조를
-    # 지킨다. 종전엔 이 근거가 둘을 한 번에 도는 동기 편의 함수(build_result_from_html)의
-    # 독스트링에 살았는데, 오늘 fetch·fetch_many가 둘 다 두 단계를 직접 부르게 되면서 그
-    # 함수의 호출자가 하나도 남지 않아 삭제했다(2026-08-31 적대 감사) — 근거는 여기로 옮긴다.
-    page = await asyncio.to_thread(parse_page, html, url, settings, find)
+    # **두 단계로 가른 이유(H17 오프로드)**: 파싱(상세 400KB에 ~70ms)은 순수 계산이라 프로세스
+    # 풀로 내리고(parse_off_loop), 등록은 **이벤트 루프에서 await 없이** 실행해 source_id의
+    # 원자·단조를 지킨다. 종전엔 이 근거가 둘을 한 번에 도는 동기 편의 함수
+    # (build_result_from_html)의 독스트링에 살았는데, 오늘 fetch·fetch_many가 둘 다 두 단계를
+    # 직접 부르게 되면서 그 함수의 호출자가 하나도 남지 않아 삭제했다(2026-08-31 적대 감사) —
+    # 근거는 여기로 옮긴다.
+    page = await parse_off_loop(html, url, settings, find)
     if observes_cremaclub():
         await observe_page_cremaclub([page], settings)
     return register_page(page, tool_context)
@@ -147,21 +148,42 @@ async def observe_page_cremaclub(pages: list[dict], settings) -> None:
     )
 
 
-async def open_page(
-    url: str, client, settings, parse_lock: asyncio.Lock, *, observe_formats: bool
-) -> dict:
+async def open_page(url: str, client, settings, *, observe_formats: bool) -> dict:
     """url 하나를 열어 parse_page 중간 레코드를 만든다(등록 없음 — 호출부의 순차 루프 몫).
 
     "조회 → 파싱 → (옵션) 크레마클럽 관측"의 한 체인이라 여러 url을 gather하면 한 권의 클럽
-    조회가 다른 권의 주 요청·파싱을 기다리지 않는다. 파싱(순수 계산, 1건 ~100ms)은 호출부가 준
-    잠금으로 한 번에 하나씩 스레드에 내린다 — 동시에 돌리면 GIL 경합으로 벽시계가 는다
-    (실측 2026-08-27: 5건 순차 614ms vs 5스레드 924ms).
+    조회가 다른 권의 주 요청·파싱을 기다리지 않는다. 파싱은 프로세스 풀이라 여러 권이 동시에
+    풀에 들어가도 GIL 경합이 없다 — 종전의 파싱 직렬화 잠금(2026-08-27 실측: 5스레드 동시가
+    순차보다 느렸다)은 스레드 파싱의 근거였으므로 삭제했다(풀이 깨진 스레드 폴백 때만 그 경합이
+    되살아나며, 그때는 느려질 뿐 결과는 같다).
     """
     html = await client.get_text(url)
-    async with parse_lock:
-        page = await asyncio.to_thread(parse_page, html, url, settings)
+    page = await parse_off_loop(html, url, settings)
     if observe_formats:
         await observe_page_cremaclub([page], settings)
+    return page
+
+
+# parse_page가 읽는 설정 필드 — 프로세스 풀로는 이 원시값 묶음만 보낸다(cpu_pool.settings_view).
+_PAGE_SETTINGS = (
+    "yes24_base_url",
+    "fetch_links_limit",
+    "yes24_disallowed_paths",
+    "fetch_max_chars",
+    "fetch_find_lead_chars",
+    "fetch_min_meaningful_chars",
+)
+
+
+async def parse_off_loop(html: str, url: str, settings, find: str | None = None) -> dict:
+    """parse_page를 프로세스 풀에서 돌린다(yes24_fetch·fetch_many 공용 — 열람 경로 하나).
+
+    실패 레코드의 로그는 여기서 남긴다 — 파싱은 다른 프로세스에서 돌아 그 안의 logger 호출은
+    부모의 로그 핸들러에 닿지 않는다(cpu_pool 계약).
+    """
+    page = await run_cpu(parse_page, html, url, settings_view(settings, *_PAGE_SETTINGS), find)
+    if page.get("status") == "error":
+        logger.info(f"yes24_fetch url={url!r} status=error error_type={page['error_type']}")
     return page
 
 
@@ -171,9 +193,15 @@ def parse_page(html: str, url: str, settings, find: str | None = None) -> dict:
     find는 범용 어포던스로, 상세(book_detail)·공지(notice) 양쪽에 적용된다 — 상세에서는
     키워드를 포함한 블록을 예산 우선순위 앞으로 당기고, 공지에서는 키워드 주변 창을 잘라준다.
     반환은 `{"type": "book_detail"|"notice", ...}` 중간 레코드 또는 status="error" dict다.
+
+    전체 트리는 **한 번만** 세운다(parse-once — 종전엔 링크 추출·상세 판별·상세/범용 파서가
+    같은 HTML을 세 번 세웠고, 상용 CPU의 1/3이 이 함수였다). 순서가 계약이다: 읽기만 하는
+    링크 추출·상세 판별이 먼저, soup을 변형하는(decompose) 상세/범용 파서가 마지막이다.
+    settings는 아래 필드만 읽는다 — 프로세스 풀로 넘길 땐 그 원시값 묶음만 보낸다(_PAGE_SETTINGS).
     """
+    soup = BeautifulSoup(html, "lxml")
     links = extract_links(
-        html,
+        soup,
         base_url=settings.yes24_base_url,
         limit=settings.fetch_links_limit,
         page_url=url,
@@ -184,9 +212,10 @@ def parse_page(html: str, url: str, settings, find: str | None = None) -> dict:
     # 주소가 아니라 문서가 상세를 판별한다(parsers.is_product_detail) — Yes24는 같은 상세
     # 마크업을 여러 경로로 서빙하고(대소문자 다른 /Product/Goods/, 크레마클럽 /BookClub/Detail/),
     # 경로 목록을 유지하는 방식은 새 경로가 생길 때마다 조용히 틀린다.
-    if is_product_detail(html):
+    if is_product_detail(soup):
         return _parse_product_page(
             html,
+            soup,
             url,
             settings.yes24_base_url,
             settings.fetch_max_chars,
@@ -195,7 +224,7 @@ def parse_page(html: str, url: str, settings, find: str | None = None) -> dict:
             find=find,
         )
     return _parse_generic_page(
-        html,
+        soup,
         url,
         settings.fetch_max_chars,
         settings.fetch_min_meaningful_chars,
@@ -215,8 +244,57 @@ def register_page(page: dict, tool_context: ToolContext) -> dict:
     return _REGISTRARS[page["type"]](page, tool_context)
 
 
+def detail_content(
+    intro: str | None, toc: str | None, pub_review: str | None, weekly_reviews: list[str]
+) -> str | None:
+    """상세 설명 블록의 연접 — 출처 레지스트리·응답 snippet의 근거 본문 한 식.
+
+    설명 블록이 하나도 없는 상품(굿즈·문구 등)은 페이지에 설명 본문 자체가 없다. 이때 빈
+    문자열을 근거(snippet)로 등록하면 모델에 남는 신호가 "열어봤다"뿐이라, 열어보고도 못 본
+    내용을 파라메트릭으로 채운다(실측 2026-08-03: 책갈피·독서대 답변의 '특징'이 전부 창작,
+    출처 snippet 길이 0). 없음을 값으로 위장하지 않고 None으로 두어 호출처 message로 명시한다.
+    모델 요청 투영(project_detail_for_model)이 같은 식으로 snippet을 되짚으므로 여기만 바꾼다.
+    """
+    blocks = (intro, toc, pub_review, *weekly_reviews)
+    return "\n\n".join(block for block in blocks if block) or None
+
+
+def project_detail_for_model(response):
+    """book_detail 응답의 모델 요청 사본에서 snippet을 뺀다 — 세션 원문은 그대로다.
+
+    snippet은 intro·toc·pub_review·weekly_reviews 연접(detail_content)과 바이트 동일해 모델에겐
+    중복이다. 연접과 다르거나(절단·가공) 꼴이 어긋나면 손대지 않는다(fail-safe) — 응답 객체를
+    그대로(is) 돌려주면 호출자가 무변경으로 안다.
+    """
+    if not isinstance(response, dict):
+        return response
+    if response.get("type") != "book_detail" or response.get("status") != "ok":
+        return response
+    snippet, reviews = response.get("snippet"), response.get("weekly_reviews")
+    if not isinstance(snippet, str) or not snippet or not isinstance(reviews, list):
+        return response
+    blocks = (response.get("intro"), response.get("toc"), response.get("pub_review"), *reviews)
+    if any(block is not None and not isinstance(block, str) for block in blocks):
+        return response
+    if snippet != detail_content(*blocks[:3], list(blocks[3:])):
+        return response
+    return {key: value for key, value in response.items() if key != "snippet"}
+
+
+def project_fetch_many_for_model(response):
+    """fetch_many 응답의 results 안 상세마다 project_detail_for_model — 오류 항목은 그대로다."""
+    if not isinstance(response, dict) or not isinstance(response.get("results"), list):
+        return response
+    results = response["results"]
+    projected = [project_detail_for_model(detail) for detail in results]
+    if all(before is after for before, after in zip(results, projected)):
+        return response
+    return {**response, "results": projected}
+
+
 def _parse_product_page(
     html: str,
+    soup: BeautifulSoup,
     url: str,
     base_url: str,
     max_chars: int,
@@ -233,9 +311,8 @@ def _parse_product_page(
     재호출로 읽히게 한다.
     """
     try:
-        product = parse_product(html, base_url=base_url)
+        product = parse_product(html, base_url=base_url, soup=soup)
     except ParseError as exc:
-        logger.info(f"yes24_fetch url={url!r} status=error error_type=parse")
         return {
             "status": "error",
             "error_type": "parse",
@@ -252,13 +329,7 @@ def _parse_product_page(
         lead_chars=lead_chars,
     )
 
-    # 설명 블록이 하나도 없는 상품(굿즈·문구 등)은 페이지에 설명 본문 자체가 없다. 이때 빈
-    # 문자열을 근거(snippet)로 등록하면 모델에 남는 신호가 "열어봤다"뿐이라, 열어보고도 못 본
-    # 내용을 파라메트릭으로 채운다(실측 2026-08-03: 책갈피·독서대 답변의 '특징'이 전부 창작,
-    # 출처 snippet 길이 0). 없음을 값으로 위장하지 않고 None으로 두어 아래 message로 명시한다.
-    content = (
-        "\n\n".join(block for block in (intro, toc, pub_review, *weekly_reviews) if block) or None
-    )
+    content = detail_content(intro, toc, pub_review, weekly_reviews)
     return {
         "type": "book_detail",
         "url": url,
@@ -320,11 +391,12 @@ def _register_product(page: dict, tool_context: ToolContext) -> dict:
         # 넘긴 것과 같은 상수이며, 코어는 이 숫자의 크기만 비교한다(T1: 도구가 선언).
         "fidelity": DETAIL_FIDELITY,
         **fields,
-        # snippet은 블록들의 연접이라 모델에겐 중복이지만, **공개 출처 DTO의 근거 본문**이다.
-        # done.sources는 세션 레지스트리가 아니라 이 도구 응답에서 만들어지므로
-        # (_sources_from_response), 여기서 빼면 출처 카드·인용 검증·QA 판정이 근거를 잃는다 —
-        # 2026-07-21 정본 하네스에서 evidence_faithfulness가 4 → 0~2로 급락해 실측됐다.
-        # 페이로드 절감은 evidence_segments·GNB 링크 제거만으로 충분하다.
+        # snippet은 블록들의 연접(detail_content)이라 모델에겐 중복이지만, **세션 관찰본**이다 —
+        # ADK 병렬 function call은 state의 출처 레지스트리를 last-wins로 덮어 유실시킬 수 있고
+        # (settle_sources), 그때 레코드를 되세우는 근거가 이 응답의 snippet이다(2026-09-18 감사:
+        # 레지스트리 유실 시 snippet 제거하면 공개 DTO 상이 299/299). 그래서 응답에는 남기고,
+        # 모델 요청 사본에서만 투영기(project_detail_for_model, toolsets.MODEL_INPUT_PROJECTORS)가
+        # 제거한다 — 세션 이벤트·출처 카드·인용 검증·병렬 유실 복구는 원문을 본다.
         "snippet": content,
         "intro": page["intro"],
         "toc": page["toc"],
@@ -359,7 +431,7 @@ def _register_product(page: dict, tool_context: ToolContext) -> dict:
 
 
 def _parse_generic_page(
-    html: str,
+    soup: BeautifulSoup,
     url: str,
     max_chars: int,
     min_meaningful_chars: int,
@@ -373,9 +445,9 @@ def _parse_generic_page(
     "짧은 페이지였음"으로 위장하지 않는다(빈 성공 위장 금지와 같은 정신 — 실측:
     FAQ 결제정보 페이지 13.7K자에서 무이자 규정이 6K 상한 밖에 있어 답이 유실됐다).
     find 키워드가 주어지면 그 첫 등장 위치 조금 앞에서부터 창을 잘라, 에이전트가
-    잘린 뒷부분의 특정 정보를 추가 fetch 한 번으로 읽을 수 있게 한다.
+    잘린 뒷부분의 특정 정보를 추가 fetch 한 번으로 읽을 수 있게 한다. **soup을 변형한다**
+    (비본문 태그·사이트 크롬 decompose) — parse_page가 링크 추출 뒤에 부른다.
     """
-    soup = BeautifulSoup(html, "lxml")
     for tag in [*soup(_NOISE_TAGS), *soup.select(PAGE_CHROME)]:
         tag.decompose()
 
@@ -389,7 +461,6 @@ def _parse_generic_page(
     )
 
     if len(text) < min_meaningful_chars:
-        logger.info(f"yes24_fetch url={url!r} status=error error_type=empty chars={len(text)}")
         return {
             "status": "error",
             "error_type": "empty",
@@ -405,10 +476,6 @@ def _parse_generic_page(
             faq_entries, max_chars, find
         )
         if not selected_entries:
-            logger.info(
-                f"yes24_fetch url={url!r} status=error error_type=content_too_large "
-                f"total={total_chars}"
-            )
             return {
                 "status": "error",
                 "error_type": "content_too_large",

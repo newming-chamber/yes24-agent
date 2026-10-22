@@ -1,7 +1,9 @@
 """어드민 분석의 비용 추정 — usage_log 집계 행에 단가를 붙이고 합산하는 순수 함수(DB 없음).
 
 핵심 정의(화면 각주의 근거 — 상세는 docs/admin-operations.md §7, docs는 저장소 밖):
-- 금액 = 사용량(토큰) × 표준 단가(settings.llm_prices, 행의 UTC 날짜에 유효한 구간). 예상치다.
+- 금액 = 사용량(토큰) × 단가(settings.llm_prices, 행의 UTC 날짜·처리 등급에 유효한 구간). 예상치다.
+  처리 등급(usage_log.service_tier — LiteLLM fast 등) 행이 없으면 표준 행으로 추정하고 각주가
+  밝힌다.
 - 대화 / 대화 외 = usage_log.user_id가 있는 행 / 없는 행(user_id IS NULL — 초기 질문 자동
   생성처럼 사용자 귀속이 없는 작업). 구성요소 이름 목록으로 가르지 않는다.
 - 금액을 모르는 기록(단가 미등록 모델·토큰 미측정 행)은 0으로 치지 않고 합계에서 뺀다 — 그런
@@ -28,10 +30,21 @@ from yes24_agent.config import ModelPrice
 TOKEN_KINDS = ("input_uncached", "input_cached", "output_billed")
 
 
-def price_for(prices: Iterable[ModelPrice], model: str | None, day: date) -> ModelPrice | None:
-    """그 날짜에 유효한 단가 — 모델명 정확 일치 중 effective_from <= day인 가장 늦은 구간."""
-    applicable = [p for p in prices if p.model == model and p.effective_from <= day]
-    return max(applicable, key=lambda p: p.effective_from, default=None)
+def price_for(
+    prices: Iterable[ModelPrice], model: str | None, day: date, service_tier: str | None = None
+) -> ModelPrice | None:
+    """그 날짜·등급에 유효한 단가 — (모델명, 등급) 정확 일치 중 effective_from <= day인 가장 늦은
+    구간. 등급 행이 없으면 표준("") 행이다(돌려준 행의 service_tier로 추정 여부를 안다)."""
+    prices = list(prices)
+
+    def latest(tier: str) -> ModelPrice | None:
+        applicable = [
+            p for p in prices
+            if p.model == model and p.service_tier == tier and p.effective_from <= day
+        ]
+        return max(applicable, key=lambda p: p.effective_from, default=None)
+
+    return latest(service_tier or "") or (latest("") if service_tier else None)
 
 
 def cost_of(tokens: Mapping[str, Any], price: ModelPrice) -> float:
@@ -43,11 +56,17 @@ def cost_of(tokens: Mapping[str, Any], price: ModelPrice) -> float:
 
 
 def attach_costs(rows: Iterable[Mapping[str, Any]], prices: list[ModelPrice]) -> list[dict]:
-    """집계 행마다 그 행의 날짜(`day`)·모델 단가로 `cost_usd`(단가 없으면 None)를 붙인다."""
+    """집계 행마다 그 행의 날짜(`day`)·모델·등급(`service_tier`, 없으면 표준) 단가로
+    `cost_usd`(단가 없으면 None)를 붙인다. 등급 단가가 없어 표준가로 셈한 행은 tier_estimated."""
     attached = []
     for row in rows:
-        price = price_for(prices, row["model"], row["day"])
-        attached.append({**row, "cost_usd": cost_of(row, price) if price else None})
+        tier = row.get("service_tier") or ""
+        price = price_for(prices, row["model"], row["day"], tier)
+        attached.append({
+            **row,
+            "cost_usd": cost_of(row, price) if price else None,
+            "tier_estimated": price is not None and price.service_tier != tier,
+        })
     return attached
 
 
@@ -66,6 +85,7 @@ def total(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         "unpriced_tokens": 0,
         "unmeasured_rows": 0,
         "cache_unknown_rows": 0,
+        "tier_estimated_rows": 0,
         **dict.fromkeys(TOKEN_KINDS, 0),
         "cost_usd": 0.0,
     }
@@ -84,6 +104,7 @@ def total(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         priced_any = True
         out["priced_rows"] += measured
         out["cache_unknown_rows"] += int(row["cache_unknown_rows"])
+        out["tier_estimated_rows"] += measured if row.get("tier_estimated") else 0
         out["cost_usd"] += row["cost_usd"]
     if out["rows"] and not priced_any:
         out["cost_usd"] = None
@@ -97,14 +118,28 @@ def per_turn(cost_usd: float | None, turns: int) -> float | None:
 # 비용 각주 — 사용자에게 보이는 문장이라 config가 아니라 여기 둔다. 산식·제외·과대/과소 요인의
 # 상세는 운영 문서(docs/admin-operations.md '비용 계산 방법')에 있고, 화면은 예상치라는 사실과
 # '대화 외'의 뜻만 말한다(개발 용어 없이). 모델명은 싣지 않는다(2026-09-28 사용자 결정).
-_ESTIMATE = "모델 사용량에 표준 단가를 곱한 예상치(USD)예요. 실제 청구액과 다를 수 있어요."
+# 할증 문구는 벤더 비의존으로 둔다 — 긴 컨텍스트 할증 경계가 벤더·모델마다 다르다(2.5-pro 200K,
+# Luna 272K — config llm_prices 주석).
+_ESTIMATE = (
+    "모델 사용량에 그 모델·처리 등급 단가를 곱한 예상치(USD)예요. 긴 컨텍스트 구간 할증과 "
+    "캐시 쓰기 단가는 반영하지 않아 실제 청구액과 다를 수 있어요."
+)
 _BACKGROUND = (
     "‘대화 외’는 초기 질문 자동 생성·AI 오버뷰처럼 특정 사용자의 대화가 아닌 작업의 비용이에요."
 )
 _PARTIAL = "일부 기록은 금액을 알 수 없어 합계에서 빠졌어요."
+_TIER_ESTIMATE = "처리 등급 단가가 등록되지 않은 기록은 표준 단가로 추정했어요."
 
 
-def cost_notes(coverage: Mapping[str, int]) -> list[str]:
-    """화면 각주 — 예상치 안내 · '대화 외' 정의 · (있을 때만) 금액을 모르는 기록이 빠졌다는 말."""
+def cost_notes(coverage: Mapping[str, int], *, background: bool = True) -> list[str]:
+    """화면 각주 — 예상치 안내 · '대화 외' 정의 · (있을 때만) 금액을 모르는 기록이 빠졌다는 말과
+    등급 단가 미등록 → 표준가 추정. 판정은 여기 한 곳이고 화면은 받은 문장을 그대로 싣는다.
+
+    background=False는 '대화 외'가 없는 집계(모델 패널 — 답변 main 행만)용이다."""
     partial = coverage["unpriced_rows"] or coverage["unmeasured_rows"]
-    return [_ESTIMATE, _BACKGROUND, *([_PARTIAL] if partial else [])]
+    return [
+        _ESTIMATE,
+        *([_BACKGROUND] if background else []),
+        *([_PARTIAL] if partial else []),
+        *([_TIER_ESTIMATE] if coverage.get("tier_estimated_rows") else []),
+    ]

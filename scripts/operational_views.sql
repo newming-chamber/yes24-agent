@@ -2,7 +2,7 @@
 CREATE OR REPLACE SQL SECURITY INVOKER VIEW chat_turns AS
 SELECT app_name,user_id,session_id,turn_id,started_at AS asked_at,
        completed_at,user_text AS user_message,text AS assistant_message,status,error,
-       sources,process,meta,rbti_applied,
+       sources,process,meta,rbti_applied,model,fallback_from,prompt_version_id,input_source,
        JSON_EXTRACT(sources,'$[*].id') AS cited_ids,
        JSON_VALUE(process,'$.elapsed_ms' RETURNING UNSIGNED) AS elapsed_ms,
        history_saved

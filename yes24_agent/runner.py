@@ -21,12 +21,18 @@ from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.events import Event, EventActions
 from google.adk.runners import Runner
 from google.adk.sessions import BaseSessionService
+from google.adk.sessions.base_session_service import GetSessionConfig
 from google.genai import types
-from google.genai.errors import APIError
 
 from yes24_agent.adk_stream import iter_adk_events
+from yes24_agent.adk_utc import (
+    begin_append_scope,
+    finish_append_scope,
+    settle_pending_appends,
+)
 from yes24_agent.agent import get_agent
 from yes24_agent.config import get_settings
+from yes24_agent.db import detached_count
 from yes24_agent.enrichment import (
     RECOMMENDATION_REASONS_STATE_KEY,
     SESSION_TITLE_STATE_KEY,
@@ -41,6 +47,14 @@ from yes24_agent.event_translate import (
 )
 from yes24_agent.history_compaction import schedule_history_compaction
 from yes24_agent.logctx import update as log_update
+from yes24_agent.model_routing import (
+    TurnModels,
+    mark_turn_ok,
+    plan_turn_models,
+    raise_recorded_model_error,
+    retry_model,
+    vendor_error_status,
+)
 from yes24_agent.postprocess import (
     StreamRenumberer,
     build_done_payload,
@@ -81,12 +95,6 @@ from yes24_agent.usage import begin_usage_scope, finish_usage_scope, record_usag
 from yes24_agent.user_data import UserDataService
 
 logger = logging.getLogger(__name__)
-
-# Gemini 과부하/일시장애로 판정하는 HTTP 상태코드(반응형 폴백 트리거). 429=RESOURCE_EXHAUSTED
-# (레이트리밋·쿼터), 503=UNAVAILABLE(과부하), 500/502/504=일시 서버 오류, 529=Overloaded.
-# 400(bad request)·403·404 등 영구 오류는 제외 ─ 재시도해도 소용없어 정직 안내로 보낸다.
-_OVERLOAD_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 529})
-
 
 # 예고 홀드 기계(_markdown_block_is_open·_fence_is_open·_held_continues_open_block·held 버퍼)는
 # 2026-07-29 Claude Code식 내레이션 전환으로 통째로 삭제했다 — 도구 직전 예고를 본문에서 빼
@@ -276,11 +284,6 @@ _EMPTY_RESPONSE_FALLBACK = (
 )
 
 
-def _is_overloaded_error(exc: BaseException) -> bool:
-    """Gemini API 과부하/일시장애(반응형 재시도 대상)인지 판정한다."""
-    return isinstance(exc, APIError) and getattr(exc, "code", None) in _OVERLOAD_STATUS_CODES
-
-
 # 평상·예외·타임아웃이 공통으로 거치는 최종 인용 조립기는 postprocess.finalize_answer다 —
 # 히스토리 복원(history.py)도 같은 조립기를 써야 해서 조립 소유권을 postprocess로 옮겼다.
 
@@ -416,7 +419,7 @@ async def _closeout_error_frames(
     known_sources: dict[int, dict],
     final_text: str,
     sources: list[dict],
-    active_model: str,
+    models: TurnModels,
     service: BaseSessionService,
     session_id: str,
     user_id: str,
@@ -424,6 +427,7 @@ async def _closeout_error_frames(
     user_text: str,
     started_at: float,
     rbti_applied: str | None,
+    input_source: str | None,
     process: TurnProcess,
     elapsed_ms: int,
 ) -> AsyncIterator[str]:
@@ -462,7 +466,7 @@ async def _closeout_error_frames(
         )
         error_done["text"] = citation.text
         finalize = str
-    error_done["model"] = active_model
+    error_done["model"] = models.active
     error_done["turn_id"] = turn_id
     error_done["rbti_applied"] = rbti_applied
     error_done.update(
@@ -485,10 +489,33 @@ async def _closeout_error_frames(
         yield frame
     error_done["history_saved"] = await persist_turn_snapshot(
         service, session_id, user_id, turn_id, error_done,
-        user_text=user_text, started_at=started_at,
+        user_text=user_text, started_at=started_at, input_source=input_source,
+        **_trace_columns(models, process),
     )
     completion.update(saved=error_done["history_saved"], sent=True)
     yield sse_done(error_done)
+
+
+def _trace_columns(models: TurnModels, process) -> dict:
+    """턴 스냅샷의 owner 추적 값(chat_turn 열 model·fallback_from·prompt_version_id, turn_round 행)
+    — 세 마감 경로(정상·오류·중단)가 같은 값을 싣는 한 지점."""
+    return {
+        "model": models.active or None,
+        "fallback_from": models.fallback_from,
+        "prompt_version": models.prompt_version,
+        "rounds": [dict(row) for row in process.rounds],
+    }
+
+
+def _agent_for(models: TurnModels, app):
+    """이 턴의 지금 모델로 에이전트를 고른다 — 첫 시도·재시도가 같은 구성 축을 싣는 한 지점."""
+    return get_agent(
+        models.active,
+        app,
+        models.service_tier,
+        models.reasoning_effort,
+        prompt_version=models.prompt_version,
+    )
 
 
 async def run_agent_stream(
@@ -502,6 +529,7 @@ async def run_agent_stream(
     enrich: bool = True,
     endpoint: str = "chat",
     use_rbti: bool = False,
+    input_source: str | None = None,
 ) -> AsyncIterator[str]:
     """사용자 메시지 1건을 처리하며 SSE 프레임 문자열을 순서대로 yield한다.
 
@@ -558,16 +586,26 @@ async def run_agent_stream(
     lock = _get_session_lock(session_id) if session_id else None
     lock_acquired = False
     usage_scope, usage_token = begin_usage_scope(session_user_id, endpoint)
+    pending_appends, append_token = begin_append_scope()
     try:
         for prefetch in app.prefetch_hooks:
             prefetch(message, app.active)
+        # 세션 락 대기는 준비 상한 **밖**이다 — 같은 세션의 앞 턴이 스트리밍 중이면 기다렸다
+        # 실행하는 게 정상 동작이다(상한 안에 두면 두 번째 메시지가 20초 뒤 setup_timeout으로
+        # 실패한다). 락 보유자는 준비 상한 + 스트림 sse_timeout 가드로 유한해 무한 대기가 아니다.
         if lock is not None:
             await lock.acquire()
             lock_acquired = True
-        # 세션 서비스 생성(디렉토리 실패 등)과 세션 조회/생성 실패는 스트림을 시작조차
-        # 못 하는 상황 — error+done으로 알리고 종료한다. DB 락(OperationalError)·디렉토리
-        # 오류(OSError) 등 어떤 예외가 나도 "done 정확히 1회" 불변식을 지킨다.
-        try:
+
+        async def prepare():
+            """턴 준비 구간 — 첫 모델 이벤트 전에 DB·설정을 만지는 모든 await를 한 코루틴에 모은다.
+
+            아래 wait_for가 이 전체에 turn_setup_timeout_s 상한을 건다(2026-10-21 QA: 모든 턴이
+            create_session 앞에서 예외·로그 없이 무기한 정지 — sse_timeout_s는 스트림 루프
+            안에서만 재어 이 구간을 못 본다). 타임아웃의 취소는 이 코루틴에만 떨어지고, 안에서
+            띄운 DB 연산은 db.run_detached가 분리 태스크로 완주시킨다(풀 접속 보호).
+            """
+            nonlocal session_id
             service = session_service if session_service is not None else _get_session_service()
             # 사용자가 삭제한 대화는 없는 id와 같은 계약(새 대화)이되 **새 id**로 연다 — 행이
             # 보존 기간 동안 남아 있어 같은 id로는 그 숨긴 대화에 턴이 쌓인다. 락을 잡은 뒤에
@@ -588,19 +626,33 @@ async def run_agent_stream(
                     session,
                     Event(author="system", actions=EventActions(state_delta={"rbti": code})),
                 )
-            # 이 세션에 제목이 아직 없는가 — meta 파이프라인의 제목 생성 여부(구조 판정).
-            # 턴 시작에 잡아 두어, 이번 턴이 직접 영속한 제목을 같은 턴이 다시 만들지 않는다.
-            want_title = enrich and not session.state.get(SESSION_TITLE_STATE_KEY)
-            # 추천 이유 이월 저장소(`{url: reason}`) — 세션 락이 같은 세션의 턴을 순차화하므로
-            # 턴 시작 스냅샷으로 충분하다(이번 턴 외엔 아무도 쓰지 않는다).
-            remembered_reasons = dict(session.state.get(RECOMMENDATION_REASONS_STATE_KEY) or {})
-            # 직전 턴은 후속 질문의 맥락 재료다(2026-09-04 눈가림 배터리 — 직전 턴 있는 턴에서
-            # 세트 구체성 57%→86%). 이번 턴의 user 이벤트가 붙기 전인 지금 잡아야 "직전"이다.
-            # 부가 채널 재료가 세션 준비를 죽이면 안 된다 — 이력 객체가 없으면 그냥 없는 것.
-            prior_turn = _prior_turn(getattr(session, "events", None) or []) if enrich else None
+            # 이 턴의 모델 계획(model_routing): 명시 선택 > 런타임 설정 > config, 메인이 429
+            # 쿨다운 중이면 곧장 폴백. 프롬프트·도구·thinking 구성은 모델과 무관하게 동일하고,
+            # done.model·chat_turn.model이 실제로 답한 모델을 싣는다. 설정 행·프롬프트 버전
+            # 읽기가 DB라 준비 구간에 속한다(실패는 안에서 config 폴백 — 여기까지 안 올라온다).
+            return service, session, code, await plan_turn_models(model)
+
+        # 세션 서비스 생성(디렉토리 실패 등)과 세션 조회/생성 실패는 스트림을 시작조차
+        # 못 하는 상황 — error+done으로 알리고 종료한다. DB 락(OperationalError)·디렉토리
+        # 오류(OSError) 등 어떤 예외가 나도 "done 정확히 1회" 불변식을 지킨다.
+        failure: tuple[str, str] | None = None
+        try:
+            service, session, code, models = await asyncio.wait_for(
+                prepare(), timeout=settings.turn_setup_timeout_s
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                f"턴 준비 {settings.turn_setup_timeout_s}초 초과 — 세션/설정 경로 정지 의심"
+                f"(session_id={session_id}, 진행 중 분리 DB 연산={detached_count()})"
+            )
+            failure = ("setup_timeout", "대화를 준비하지 못했어요. 잠시 후 다시 시도해 주세요.")
         except Exception as exc:  # noqa: BLE001 — 스트림 시작 전 방어선(done 1회 불변식 보장)
             logger.exception(f"세션 준비 실패: {exc}")
-            error_text = "대화 세션을 준비하지 못했어요. 잠시 후 다시 시도해 주세요."
+            failure = (
+                "session_unavailable", "대화 세션을 준비하지 못했어요. 잠시 후 다시 시도해 주세요."
+            )
+        if failure is not None:
+            error_code, error_text = failure
             yield sse_error(error_text)
             _, error_done = finalize_answer(
                 error_text,
@@ -612,7 +664,7 @@ async def run_agent_stream(
             error_done["rbti_applied"] = None  # 페르소나가 적용될 턴 자체가 없었다
             error_done.update(
                 status="failed",
-                error={"code": "session_unavailable", "message": error_text},
+                error={"code": error_code, "message": error_text},
                 meta={"recommendations": [], "follow_ups": []},
                 history_saved=False,
             )
@@ -631,7 +683,6 @@ async def run_agent_stream(
         # except·finally가 참조하는 이름만 여기서 미리 묶어 미바인딩을 막는다.
         prior_sources: list[dict] = []
         known_sources: dict[int, dict] = {}
-        active_model = ""
         event_stream = timed_event_stream = None
 
         # 스트림에서 관찰한 출처를 **원시 도구 응답 그대로** 누적한다. 병렬 도구 실행 시
@@ -653,7 +704,7 @@ async def run_agent_stream(
         # 더한다 — LLM 콜 1회당 non-partial 모델 이벤트가 정확히 1개이고 그 usage는 콜
         # 단독분이라(Gemini·LiteLLM 양 경로 공통), 이 합이 콜마다 프롬프트를 다시 세는
         # 실제 과금 기준과 일치한다. partial 청크의 usage는 그 콜의 누적 스냅샷이라
-        # 합산하면 대폭 중복 계상된다(ADK 2.3.0 실측). 과부하 재시도에서도 리셋하지
+        # 합산하면 대폭 중복 계상된다(ADK 2.3.0 실측). 폴백 재시도에서도 리셋하지
         # 않는다 — 버려진 첫 시도의 콜도 실제 과금된 호출이다(관찰만, 본류 무간섭).
         usage_calls = 0
         usage_prompt = usage_response = usage_total = 0
@@ -663,6 +714,33 @@ async def run_agent_stream(
         # 마지막 LLM 콜의 프롬프트 토큰 — 이력 압축 발동 판정 재료(history_compaction). 합계가
         # 아니라 마지막 콜인 이유: 다음 턴이 재전송할 이력의 크기를 대표하는 값이 그것이다.
         last_prompt_tokens = 0
+        usage_event_ids: set[str] = set()
+
+        def collect_usage(event: Event) -> None:
+            nonlocal usage_calls, usage_prompt, usage_response, usage_total
+            nonlocal usage_thoughts, usage_cached, last_prompt_tokens
+            model_event = not event.get_function_responses()
+            if model_event:
+                process.model_event(sum(map(len, raw_body)), at_ms=_elapsed_ms())
+            usage = event.usage_metadata
+            if event.partial or usage is None:
+                return
+            usage_event_ids.add(event.id)
+            usage_calls += 1
+            usage_prompt += usage.prompt_token_count or 0
+            usage_response += usage.candidates_token_count or 0
+            usage_total += usage.total_token_count or 0
+            usage_thoughts += usage.thoughts_token_count or 0
+            usage_cached += usage.cached_content_token_count or 0
+            last_prompt_tokens = usage.prompt_token_count or 0
+            if model_event:
+                process.round_usage(
+                    usage,
+                    at_ms=_elapsed_ms(),
+                    model=models.active,
+                    tool_calls=[call.name for call in event.get_function_calls()],
+                )
+
         # 모델이 쓴 **원시** 본문 조각(세션 누적 id 그대로). 인용 검증의 입력이다.
         raw_body: list[str] = []
         # 화면에 흘린 **표시 번호** 본문 조각. 마감의 4b 대조(_emit_final_body)가 이 값 위에
@@ -689,10 +767,10 @@ async def run_agent_stream(
 
         final_text = ""
         emitted_output = False
-        retried_overload = False
+        retried = False
         # 이 턴의 공개 id(done.turn_id) = ADK가 부여한 invocation_id. events 테이블의 1급
         # 컬럼과 같은 값이라 피드백(turn_feedback)·admin 턴 집계가 한 열쇠를 쓴다. Runner에
-        # **주입하지 않고 읽는다** — 주입은 ADK의 재개(resume) 분기를 켠다. 과부하 재시도는
+        # **주입하지 않고 읽는다** — 주입은 ADK의 재개(resume) 분기를 켠다. 폴백 재시도는
         # 새 invocation을 받으므로 매 이벤트 갱신이 자연스럽게 최종 시도의 id를 남긴다.
         try:
             # 이전 턴들이 남긴 출처 레지스트리(멀티턴 영속). 마감 화해가 실패할 때의
@@ -704,17 +782,20 @@ async def run_agent_stream(
             known_sources = {
                 source["id"]: source for source in prior_sources if source.get("id") is not None
             }
+            # 이 세션에 제목이 아직 없는가 — meta 파이프라인의 제목 생성 여부(구조 판정).
+            # 턴 시작에 잡아 두어, 이번 턴이 직접 영속한 제목을 같은 턴이 다시 만들지 않는다.
+            want_title = enrich and not session.state.get(SESSION_TITLE_STATE_KEY)
+            # 추천 이유 이월 저장소(`{url: reason}`) — 세션 락이 같은 세션의 턴을 순차화하므로
+            # 턴 시작 스냅샷으로 충분하다(이번 턴 외엔 아무도 쓰지 않는다).
+            remembered_reasons = dict(session.state.get(RECOMMENDATION_REASONS_STATE_KEY) or {})
+            # 직전 턴은 후속 질문의 맥락 재료다(2026-09-04 눈가림 배터리 — 직전 턴 있는 턴에서
+            # 세트 구체성 57%→86%). 이번 턴의 user 이벤트가 붙기 전인 지금 잡아야 "직전"이다.
+            prior_turn = _prior_turn(getattr(session, "events", None) or []) if enrich else None
             run_config = RunConfig(
                 streaming_mode=StreamingMode.SSE,
                 max_llm_calls=settings.max_llm_calls,
             )
-            # 사용자가 UI에서 고른 모델의 에이전트(무효·미지정이면 config 기본 모델). 자동 라우팅이
-            # 아니라 명시 선택이라 단일 루프 원칙은 유지된다 — 프롬프트·도구·thinking 구성은
-            # 모델과 무관하게 동일하고, done.model이 실제 사용 모델을 싣는다.
-            agent = get_agent(model, app)
-            # LiteLLM 경로에선 agent.model이 BaseLlm 객체라 str()이 pydantic repr을
-            # 뱉는다 — 모델ID 문자열(.model 속성)을 우선한다.
-            active_model = getattr(agent.model, "model", None) or str(agent.model)
+            agent = _agent_for(models, app)
 
             runner = Runner(
                 agent=agent,
@@ -726,7 +807,7 @@ async def run_agent_stream(
             if use_rbti:
                 # 턴 속성 신호(피그마 10) — 첫 모델 이벤트 전 1회. 문장은 프론트 몫이고 서버는
                 # 코드와 축 라벨(데이터)만 싣는다. emitted_output은 올리지 않는다(본문이
-                # 아니라 과부하 재시도 가능성을 보존한다 — thinking과 같은 규율).
+                # 아니라 폴백 재시도 가능성을 보존한다 — thinking과 같은 규율).
                 yield sse_rbti(code, axis_label(code))
 
             # 이벤트 간격에 sse_timeout_s 상한을 건다. ADK 스트림은 하나의 고정 task가 소비해
@@ -737,7 +818,12 @@ async def run_agent_stream(
                 new_message=new_message,
                 run_config=run_config,
             )
-            timed_event_stream = iter_adk_events(event_stream, timeout_s=settings.sse_timeout_s)
+            # 모델 호출 원본 예외 목록(model_routing.record_model_error가 채운다). ADK는 예외를 오류
+            # 이벤트로 바꿔 흘리므로, 그 이벤트를 받으면 여기 담긴 원본을 다시 올려 판정한다.
+            model_errors: list[BaseException] = []
+            timed_event_stream = iter_adk_events(
+                event_stream, timeout_s=settings.sse_timeout_s, model_errors=model_errors
+            )
 
             while True:
                 while True:
@@ -772,22 +858,33 @@ async def run_agent_stream(
                             event_task = None
                         else:
                             event = await timed_event_stream.__anext__()
+                        # turn_id는 원본 예외를 다시 올리기 **전에** 잡는다 — 첫 모델 호출이 실패한
+                        # 턴은 오류 이벤트가 유일한 이벤트라, 놓치면 실패 마감이 영속되지 않는다.
+                        if not isinstance(event, ToolProgress) and event.invocation_id:
+                            turn_id = event.invocation_id
+                        raise_recorded_model_error(event, model_errors)
                     except StopAsyncIteration:
                         break
-                    except APIError as exc:
-                        if (
-                            settings.error_fallback
-                            and not retried_overload
-                            and not emitted_output
-                            and _is_overloaded_error(exc)
-                        ):
-                            logger.warning(
-                                f"Gemini 과부하/일시장애(code={getattr(exc, 'code', '?')}) "
-                                f"감지 → 같은 메시지로 재시도(session_id={resolved_session_id})."
-                            )
+                    except Exception as exc:  # noqa: BLE001 — 판정은 retry_model 한 곳, 나머지는 재전파
+                        # 다시 돌 수 있는 창은 진행·본문 프레임이 하나도 안 나간 때뿐이다 — 본문은
+                        # reset으로 무를 수 있어도 도구 스텝(step_id·round)은 무를 이벤트가 없어,
+                        # 새 시도의 스텝이 같은 id·round로 겹친다(SSE 계약). 사고 라벨·rbti는
+                        # 미리보기 채널이라 창을 닫지 않는다.
+                        next_model = retry_model(
+                            models, exc, retryable=not retried and not emitted_output
+                        )
+                        if next_model is not None:
                             await timed_event_stream.aclose()
                             await event_stream.aclose()
-                            retried_overload = True
+                            retried = True
+                            # 버려지는 시도의 라운드 기록을 이월한다(비공개 추적 — TurnProcess).
+                            process = process.next_attempt(
+                                error_status=vendor_error_status(exc),
+                                at_ms=_elapsed_ms(),
+                                model=models.active,
+                            )
+                            models.switch(next_model)
+                            agent = _agent_for(models, app)
                             # 재시도 스트림에도 프리페치를 다시 연다 — 첫 시도가 이미
                             # 소비했어도 캐시가 완료 task를 돌려주므로 추가 비용이 없다.
                             for prefetch in app.prefetch_hooks:
@@ -797,7 +894,6 @@ async def run_agent_stream(
                             preview_sources = {}
                             renumberer = StreamRenumberer()
                             tool_ran_since_text = False
-                            process = TurnProcess()
                             thought_buf = []
                             for task in thought_tasks:
                                 task.cancel()
@@ -814,8 +910,11 @@ async def run_agent_stream(
                                 new_message=new_message,
                                 run_config=run_config,
                             )
+                            model_errors.clear()
                             timed_event_stream = iter_adk_events(
-                                event_stream, timeout_s=settings.sse_timeout_s
+                                event_stream,
+                                timeout_s=settings.sse_timeout_s,
+                                model_errors=model_errors,
                             )
                             continue
                         raise
@@ -827,31 +926,15 @@ async def run_agent_stream(
                             yield _step_frame(step)
                         continue
 
-                    if event.invocation_id:
-                        turn_id = event.invocation_id
-
                     # 토큰 사용량 누적 — 분기 앞 단일 지점이라 함수콜·최종 텍스트·미래
                     # 분기를 전부 덮는다(합산 규칙은 위 usage_calls 선언 주석 참조).
-                    if not event.partial and event.usage_metadata is not None:
-                        usage_calls += 1
-                        usage_prompt += event.usage_metadata.prompt_token_count or 0
-                        usage_response += event.usage_metadata.candidates_token_count or 0
-                        usage_total += event.usage_metadata.total_token_count or 0
-                        usage_thoughts += event.usage_metadata.thoughts_token_count or 0
-                        usage_cached += (
-                            event.usage_metadata.cached_content_token_count or 0
-                        )
-                        last_prompt_tokens = event.usage_metadata.prompt_token_count or 0
+                    collect_usage(event)
 
                     if not event.partial and event.error_code:
                         final_text = _event_text(event) or final_text
                         raise RuntimeError(f"ADK model error: {event.error_code}")
 
                     responses = event.get_function_responses()
-                    if not responses:
-                        # 도구 응답이 아닌 모든 이벤트가 모델 이벤트다 — 도구 응답 뒤 첫 것이
-                        # 새 라운드를 연다(round +1, 그 시점 원시 길이가 답의 원시 시작).
-                        process.model_event(sum(map(len, raw_body)))
 
                     if not event.partial and event.get_function_calls():
                         # 도구 직전 예고·경과 서술은 이미 본문 delta로 흘렀다(내레이션 전환).
@@ -919,7 +1002,7 @@ async def run_agent_stream(
                     if event.partial:
                         # 사고 요약은 본문보다 먼저 도착한다(벤더 사고 구간) — 닫힌 문단마다
                         # 진행 타임라인으로 흘려 첫 응답 침묵을 채운다. emitted_output은
-                        # 올리지 않는다: 미리보기 채널이라 과부하 재시도 가능성을 보존한다
+                        # 올리지 않는다: 미리보기 채널이라 폴백 재시도 가능성을 보존한다
                         # (재시도하면 새 스트림의 사고가 이어 붙는 것이 자연스럽다).
                         thought_chunk = _event_thought_text(event)
                         if thought_chunk:
@@ -1001,7 +1084,7 @@ async def run_agent_stream(
                         f"(session_id={resolved_session_id})."
                     )
 
-                done_payload["model"] = active_model
+                done_payload["model"] = models.active
                 done_payload["turn_id"] = turn_id
                 # 이 턴에 적용된 RBTI 코드(미적용이면 null) — 프론트 배지("RBTI 데이터가
                 # 활용됨")의 근거다. bool이 아니라 코드인 이유: 배지는 truthiness로 충분하고,
@@ -1019,6 +1102,7 @@ async def run_agent_stream(
 
                 final_done = done_payload
                 outcome = "ok"
+                mark_turn_ok(models)
                 if _ensure_substantive_text(final_done):
                     outcome = "empty"
                     yield sse_error(final_done["text"])
@@ -1114,12 +1198,14 @@ async def run_agent_stream(
                     f"tools={tool_call_count} sources={len(final_done.get('sources', []))} "
                     f"cited={len(final_done.get('cited_ids', []))} "
                     f"chars={len(final_done.get('text', ''))} "
-                    f"rbti={final_done.get('rbti_applied') or '-'} model={active_model or '-'}"
+                    f"rbti={final_done.get('rbti_applied') or '-'} model={models.active or '-'}"
                 )
                 final_done["process"]["elapsed_ms"] = _elapsed_ms()
                 final_done["history_saved"] = await persist_turn_snapshot(
                     service, resolved_session_id, session_user_id, turn_id, final_done,
                     user_text=message, started_at=request_started_at,
+                    input_source=input_source,
+                    **_trace_columns(models, process),
                 )
                 completion.update(saved=final_done["history_saved"], sent=True)
                 # 이력 압축 예약(임계값 미만이면 no-op). done **앞**에서 예약하는 이유: done 뒤의
@@ -1153,7 +1239,7 @@ async def run_agent_stream(
                 sources=await _settle_turn_sources(
                     service, resolved_session_id, observed_sources, prior_sources, session_user_id
                 ),
-                active_model=active_model,
+                models=models,
                 service=service,
                 session_id=resolved_session_id,
                 user_id=session_user_id,
@@ -1161,6 +1247,7 @@ async def run_agent_stream(
                 user_text=message,
                 started_at=request_started_at,
                 rbti_applied=code,
+                input_source=input_source,
                 process=process,
                 elapsed_ms=_elapsed_ms(),
             )
@@ -1187,7 +1274,7 @@ async def run_agent_stream(
                 sources=await _settle_turn_sources(
                     service, resolved_session_id, observed_sources, prior_sources, session_user_id
                 ),
-                active_model=active_model,
+                models=models,
                 service=service,
                 session_id=resolved_session_id,
                 user_id=session_user_id,
@@ -1195,6 +1282,7 @@ async def run_agent_stream(
                 user_text=message,
                 started_at=request_started_at,
                 rbti_applied=code,
+                input_source=input_source,
                 process=process,
                 elapsed_ms=_elapsed_ms(),
             )
@@ -1217,6 +1305,32 @@ async def run_agent_stream(
                             logger.warning(f"스트림 자원 정리 실패: {exc}")
                 if not completion["saved"] and not completion["sent"] and turn_id:
                     outcome = "aborted"
+                    # ADK는 non-partial 이벤트를 세션에 append한 뒤 yield하므로, 중단이 append
+                    # 창·펌프 큐 체류 창에 걸리면 그 LLM 콜의 usage가 위 루프에 안 들어온다.
+                    # 진행 중인 append를 기다린 뒤 이번 턴(request_started_at 이후) 이벤트만
+                    # 다시 읽어 빠진 콜을 보탠다. 회수 행의 ended_ms(도구 응답 직후 첫 이벤트면
+                    # started_ms도)는 콜 시각이 아니라 회수 시각이다. 첫 콜의 append 창은 회수
+                    # 대상 밖 — turn_id는 첫 이벤트 yield에서야 채워지므로 위 `and turn_id`에서
+                    # 걸러진다.
+                    try:
+                        await settle_pending_appends(pending_appends)
+                        saved_session = await service.get_session(
+                            app_name=settings.app_name,
+                            user_id=session_user_id,
+                            session_id=resolved_session_id,
+                            config=GetSessionConfig(after_timestamp=request_started_at),
+                        )
+                        if saved_session is not None:
+                            for saved_event in saved_session.events:
+                                if (
+                                    saved_event.invocation_id == turn_id
+                                    and saved_event.id not in usage_event_ids
+                                    and not saved_event.partial
+                                    and saved_event.usage_metadata is not None
+                                ):
+                                    collect_usage(saved_event)
+                    except Exception as exc:
+                        logger.warning(f"중단된 턴 사용량 재조회 실패: {exc}")
                     try:
                         sources = settle_sources(prior_sources, observed_sources)
                         _, interrupted = finalize_answer(
@@ -1244,6 +1358,8 @@ async def run_agent_stream(
                         await persist_turn_snapshot(
                             service, resolved_session_id, session_user_id, turn_id, interrupted,
                             user_text=message, started_at=request_started_at,
+                            input_source=input_source,
+                            **_trace_columns(models, process),
                         )
                     except Exception as exc:  # noqa: BLE001 — 중단은 완료 프레임을 약속하지 않는다
                         logger.warning(f"중단된 턴 스냅샷 영속 실패: {exc}")
@@ -1261,7 +1377,12 @@ async def run_agent_stream(
                     thoughts_token_count=usage_thoughts,
                     cached_content_token_count=usage_cached,
                 ),
-                model=active_model or None,
+                model=models.active or None,
+                # 요청한 처리 등급(LiteLLM만, 표준은 NULL). 응답이 돌려준 실제 등급은 litellm
+                # responses 브리지가 버려(response.completed의 service_tier 미전달) 얻을 수 없다.
+                service_tier=models.service_tier or None,
+                # 실제로 실은 사고 강도(LiteLLM만, Gemini·미전달은 NULL) — 사고 토큰·지연 분석 축.
+                reasoning_effort=models.reasoning_effort or None,
                 session_id=resolved_session_id,
                 user_id=session_user_id,
                 endpoint=endpoint,
@@ -1273,6 +1394,7 @@ async def run_agent_stream(
                 cited_sources=len(final_done.get("cited_ids", [])) if final_done else None,
             )
     finally:
+        finish_append_scope(pending_appends, append_token)
         finish_usage_scope(usage_scope, usage_token, turn_id)
         if lock is not None and lock_acquired:
             lock.release()

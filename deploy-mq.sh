@@ -53,6 +53,11 @@ TAG="$(date +%Y%m%d-%H%M%S)"        # 롤백용 날짜 태그
 REMOTE_BUILD="~/yes24-build"
 REMOTE_DATA="~/yes24-agent-data"
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=scripts/deploy-guard.sh
+. "$LOCAL_DIR/scripts/deploy-guard.sh"
+
+echo "[0/6] 배포 가드 — 빌드 트리 미커밋 확인 · 이미지 라벨"
+deploy_guard_tree "$LOCAL_DIR"
 
 echo "[1/6] 소스 패키징 (시크릿 제외)"
 SRC_TGZ="$(mktemp -t yes24-src.XXXX.tgz)"
@@ -76,7 +81,7 @@ ssh "$SSH_HOST" bash -lc "'
   rm -rf $REMOTE_BUILD && mkdir -p $REMOTE_BUILD
   tar xzf /tmp/yes24-src.tgz -C $REMOTE_BUILD
   cd $REMOTE_BUILD
-  docker build -t $IMAGE:latest -t $IMAGE:$TAG .
+  docker build $GUARD_LABEL_FLAGS -t $IMAGE:latest -t $IMAGE:$TAG .
 '"
 # .env는 빌드 후에 올린다 (COPY 대상 아님 + .dockerignore 제외라 이미지 유출 없음).
 # 로컬 .env와 배포 전용 주입값을 **한 스트림으로 stdin 전송**한다:

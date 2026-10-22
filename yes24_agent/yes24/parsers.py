@@ -158,6 +158,18 @@ class ParseError(Exception):
     """검색 결과 HTML 파싱 실패. 메시지에 원인(어떤 셀렉터가 안 맞았는지)을 포함한다."""
 
 
+# 한 페이지에 파서 여럿이 붙는 경로(상세 열람·코너 목록)는 전체 트리를 **한 번만** 세워 넘긴다
+# (parse-once, 2026-10-17 상용 CPU 포화 — py-spy상 CPU의 55.6%가 BeautifulSoup 생성자였고
+# 상세 한 장을 링크·판별·상세 파서가 세 번 세웠다). 그래서 공개 파서는 html 문자열과 이미
+# 세운 soup을 둘 다 받는다. soup을 공유하는 호출자는 **변형하는 파서(decompose)를 마지막에**
+# 부른다 — 변형 후 다른 파서가 읽으면 결과가 바뀐다(호출부 주석에 순서 근거).
+Doc = str | BeautifulSoup
+
+
+def _as_soup(doc: Doc) -> BeautifulSoup:
+    return doc if isinstance(doc, BeautifulSoup) else BeautifulSoup(doc, "lxml")
+
+
 def parse_search(html: str, *, base_url: str, limit: int = 10) -> list[dict]:
     """Yes24 검색 결과 HTML을 파싱해 상품 목록을 반환한다.
 
@@ -178,7 +190,7 @@ def parse_search(html: str, *, base_url: str, limit: int = 10) -> list[dict]:
 
 
 def _parse_list(
-    html: str,
+    doc: Doc,
     *,
     limit: int,
     container_selector: str,
@@ -200,13 +212,18 @@ def _parse_list(
     렌더하면서 아이템만 0개인 응답은 관측된 적 없으므로, **컨테이너는 있는데 아이템이
     0개면 아이템 셀렉터가 썩은 것**으로 보고 ParseError. 컨테이너와 아이템이 있는데도
     전부 변환 실패하면 역시 ParseError(부분적 구조 변경 감지 — 빈 성공 위장 금지).
-    """
-    soup = _container_soup(html, container_selector)
 
-    if soup.select_one(container_selector) is None:
-        # 부분 트리에 컨테이너가 없다 — 무결과·구조 파손 판정은 전체 트리로만 내린다
-        # (부분 파싱은 최적화일 뿐 판정 근거가 아니다: 무결과 페이지는 수 KB라 비용 없음).
-        soup = BeautifulSoup(html, "lxml")
+    이미 세운 전체 트리(soup)를 받으면 부분 파싱 없이 그 트리로 판정한다(같은 셀렉터 —
+    부분 파싱이 전체 트리와 같은 결과를 낸다는 것은 test_parsers의 대조 테스트가 지킨다).
+    """
+    if isinstance(doc, BeautifulSoup):
+        soup = doc
+    else:
+        soup = _container_soup(doc, container_selector)
+        if soup.select_one(container_selector) is None:
+            # 부분 트리에 컨테이너가 없다 — 무결과·구조 파손 판정은 전체 트리로만 내린다
+            # (부분 파싱은 최적화일 뿐 판정 근거가 아니다: 무결과 페이지는 수 KB라 비용 없음).
+            soup = BeautifulSoup(doc, "lxml")
 
     if soup.select_one(container_selector) is None:
         if soup.select_one(NO_RESULTS_MARKER) is not None:
@@ -377,7 +394,7 @@ def _item_fields(**values) -> dict:
     return {name: values[name] for name in _ITEM_FIELDS if name in values}
 
 
-def is_product_detail(html: str) -> bool:
+def is_product_detail(doc: Doc) -> bool:
     """이 HTML이 상품 상세 페이지인가 — **주소가 아니라 문서가 판별한다**.
 
     Yes24는 같은 상세 마크업을 여러 경로로 서빙한다. 크레마클럽 상세
@@ -387,14 +404,19 @@ def is_product_detail(html: str) -> bool:
 
     판별은 상세에만 렌더되는 제목 영역(PRODUCT_TITLE)의 존재로 한다. 2026-09-17 실측
     82개 문서(상세 57 / 비상세 25 — fixture + 라이브 저장본)에서 오분류 0.
-    SoupStrainer로 제목 영역만 만들어 문서당 ~7ms이며, 이 판별이 붙는 곳은 네트워크
-    왕복(페이지당 수백 ms) 뒤라 비용이 묻힌다 — 그래서 더 싼 사전 판별을 겹쳐 두지 않는다.
+    html 문자열이면 SoupStrainer로 제목 영역만 만든다(판별만 필요한 크레마클럽 판정용). 다만
+    lxml 토크나이저는 문서 전체를 훑으므로 전체 트리가 이미 있는 호출자(상세 열람)는 그 soup을
+    넘긴다 — 같은 문서를 두 번 토크나이즈하지 않는다(parse-once). 판정식은 하나다.
     """
-    area = BeautifulSoup(html, "lxml", parse_only=SoupStrainer(class_=PRODUCT_TITLE_AREA_CLASS))
+    area = (
+        doc
+        if isinstance(doc, BeautifulSoup)
+        else BeautifulSoup(doc, "lxml", parse_only=SoupStrainer(class_=PRODUCT_TITLE_AREA_CLASS))
+    )
     return area.find(class_=PRODUCT_TITLE_AREA_CLASS) is not None
 
 
-def parse_product(html: str, *, base_url: str) -> dict:
+def parse_product(html: str, *, base_url: str, soup: BeautifulSoup | None = None) -> dict:
     """Yes24 상품 상세 페이지 HTML을 파싱해 상세 정보를 반환한다.
 
     반환 dict 키: goods_no, title, url, author, publisher, pub_date, list_price(int|None),
@@ -420,8 +442,11 @@ def parse_product(html: str, *, base_url: str) -> dict:
 
     제목(CSS)도 없고 goods_no(JS 변수)도 없으면 상품 상세 페이지가 아니거나 구조가
     변경된 것으로 보고 ParseError를 발생시킨다.
+
+    html은 JS 전역변수 정규식이 읽고, 트리는 이미 세운 soup이 있으면 그것을 쓴다(parse-once).
+    **soup을 변형한다**(저자 펼침 UI decompose) — 공유 호출자는 이 파서를 마지막에 부른다.
     """
-    soup = BeautifulSoup(html, "lxml")
+    soup = _as_soup(html) if soup is None else soup
 
     title = _text_or_none(soup.select_one(PRODUCT_TITLE))
     goods_no_match = re.search(PRODUCT_GOODS_NO_JS_RE, html)
@@ -619,7 +644,7 @@ def _parse_page_count(soup: BeautifulSoup) -> int | None:
     return None
 
 
-def parse_browse_list(html: str, *, base_url: str, section: str, limit: int = 24) -> list[dict]:
+def parse_browse_list(doc: Doc, *, base_url: str, section: str, limit: int = 24) -> list[dict]:
     """Yes24 섹션 목록(베스트셀러/신간/크레마클럽 인기) HTML을 파싱한다.
 
     반환 dict 키: rank(int|None) + parse_search와 **동일한 상품 필드 집합**(_ITEM_FIELDS —
@@ -639,6 +664,8 @@ def parse_browse_list(html: str, *, base_url: str, section: str, limit: int = 24
     오류만 잡는다). 무결과·구조 파손 판정은 _parse_list(parse_search와 같은 골격)가 한다 —
     컨테이너 없음+무결과 신호만 0건 성공이고, 컨테이너 없음·아이템 0개·전부 변환 실패는
     ParseError.
+
+    **soup을 변형한다**(행 저자 펼침 UI decompose) — 공유 호출자는 이 파서를 마지막에 부른다.
     """
     try:
         spec = BROWSE_SEED_URLS[section]
@@ -648,7 +675,7 @@ def parse_browse_list(html: str, *, base_url: str, section: str, limit: int = 24
 
     # 마크업 종류 → 아이템 변환기. 표에 없는 markup은 KeyError로 즉시 터진다(조용한 오분기 금지).
     return _parse_list(
-        html,
+        doc,
         limit=limit,
         container_selector=spec["list_container"],
         item_selector=spec["item"],
@@ -774,7 +801,7 @@ def _parse_rank(item, rank_selector: str, has_rank: bool) -> int | None:
 
 
 def extract_links(
-    html: str,
+    doc: Doc,
     *,
     base_url: str,
     disallowed_paths: tuple[str, ...],
@@ -815,17 +842,23 @@ def extract_links(
 
     이 함수는 순수 함수다(설정값을 직접 참조하지 않고 호출자가 주입한다) — 도메인·robots
     허용 정책의 최종 판단은 client가 하고, 여기서는 그 규칙으로 후보를 줄이고 현재 페이지
-    맥락의 신호를 앞세워 신호 대 잡음비를 높인다.
+    맥락의 신호를 앞세워 신호 대 잡음비를 높인다. soup을 **변형하지 않는다** — 같은 soup을
+    상세·범용 파서가 이어서 읽는다(parse-once).
     """
-    soup = BeautifulSoup(html, "lxml")
+    soup = _as_soup(doc)
 
     # 다른 판형 위젯은 parse_product가 판형·가격·url 레코드(other_formats)로 이미 싣는다.
     # 여기서 또 내보내면 같은 값이 두 경로로 나가고, 링크 쪽은 임자 없는 라벨 문자열
     # ("eBook 12,000원 이동")이라 오귀속의 발판이 된다. 도달 경로가 사라지는 것은 아니다 —
     # 같은 url이 other_formats[].url에 그대로 있어 거기서 이어서 열람할 수 있다.
     # 판정은 컨테이너 구조이지 라벨 문구가 아니며, 상세가 아닌 페이지에선 무동작이다.
-    for widget in soup.select(PRODUCT_FORMAT_CONTAINER):
-        widget.decompose()
+    # 위젯을 걷어내지(decompose) 않고 그 안의 앵커를 건너뛴다 — 걷어내면 뒤이어 같은 soup을
+    # 읽는 parse_product가 판형 위젯(other_formats)을 잃는다.
+    in_widget = {
+        id(anchor)
+        for widget in soup.select(PRODUCT_FORMAT_CONTAINER)
+        for anchor in widget.find_all("a", href=True)
+    }
 
     # 도메인 허용 판정은 client와 같은 헬퍼 하나를 공유한다(hostname 기준 suffix 일치).
     internal_domain = allowed_domain(base_url)
@@ -835,6 +868,8 @@ def extract_links(
     pages: list[dict] = []
 
     for anchor in soup.find_all("a", href=True):
+        if id(anchor) in in_widget:
+            continue
         href = anchor["href"].strip()
         if not href or href.startswith("#") or href.lower().startswith("javascript:"):
             continue
@@ -1315,7 +1350,7 @@ def parse_corner_links(html: str, *, base_url: str, section: str) -> list[dict]:
     return list(corners.values())
 
 
-def parse_category_links(html: str, *, limit: int) -> list[dict]:
+def parse_category_links(doc: Doc, *, limit: int) -> list[dict]:
     """목록 페이지 내비의 카테고리 링크(이름·번호)를 추출한다.
 
     카테고리 번호를 코드에 열거하는 대신 **페이지 자신의 내비를 단일 소스**로 쓴다 —
@@ -1324,7 +1359,7 @@ def parse_category_links(html: str, *, limit: int) -> list[dict]:
     정적 맵은 사이트 개편 시 조용히 썩는다). 이름 없는 링크는 건너뛰고, 같은 번호는
     첫 등장만 남기며(문서 순서 보존), limit에서 멈춘다.
     """
-    return _category_links(BeautifulSoup(html, "lxml"), limit=limit)
+    return _category_links(_as_soup(doc), limit=limit)
 
 
 # 코너 레코드(urls.BROWSE_SEED_URLS)에서 페이지 레벨 **원문 문구**로 뽑는 선택 키. 레코드에
@@ -1333,19 +1368,18 @@ def parse_category_links(html: str, *, limit: int) -> list[dict]:
 _PAGE_TEXT_FIELDS = ("period", "period_note")
 
 
-def parse_browse_page_meta(html: str, *, section: str, limit: int) -> dict:
+def parse_browse_page_meta(doc: Doc, *, section: str, limit: int) -> dict:
     """코너 페이지의 목록 밖 관측 — 분야 내비와 페이지가 명시한 집계 기간 문구.
 
-    목록 파서(parse_browse_list)는 컨테이너 서브트리만 세우므로(_container_soup) 페이지 레벨
-    요소를 볼 수 없다. 분야 내비(parse_category_links)가 이미 전체 트리를 한 번 세우므로 그
-    한 번에 기간 문구 추출을 합친다 — 전체 트리 2회 세우기 금지(H17).
+    페이지 레벨 요소라 전체 트리가 필요하다. 코너 열람(yes24_browse)은 그 전체 트리 한 벌을
+    목록 파서와 나눠 쓴다(parse-once) — 이 함수는 읽기만 하므로 목록 파서보다 먼저 부른다.
 
     반환: {"categories": [...]} + 레코드가 선언한 _PAGE_TEXT_FIELDS 중 페이지에 있는 것만.
     셀렉터가 여러 요소에 걸치면(월간 코너의 연·월 라벨) 원문을 공백으로 이어 한 값으로 낸다.
     회귀(2026-09-15 배터리): 페이로드에 집계 기간이 없어 모델이 주간 순위를 월간처럼 썼다.
     """
     spec = BROWSE_SEED_URLS[section]
-    soup = BeautifulSoup(html, "lxml")
+    soup = _as_soup(doc)
     meta: dict = {"categories": _category_links(soup, limit=limit)}
     for field in _PAGE_TEXT_FIELDS:
         selector = spec.get(field)

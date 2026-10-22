@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from secrets import compare_digest
-from typing import Annotated
+from typing import Annotated, Literal
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -37,6 +37,7 @@ from yes24_agent.admin_auth import (
     register_admin_auth,
     require_admin,
 )
+from yes24_agent.alerts import install_slack_alerts
 from yes24_agent.auth import (
     AuthenticatedUser,
     AuthService,
@@ -47,10 +48,12 @@ from yes24_agent.auth import (
     token_matches,
 )
 from yes24_agent.config import Settings, ensure_google_api_key_env, get_settings
+from yes24_agent.cpu_pool import shutdown_cpu_pool
 from yes24_agent.giftcard import register_giftcard
 from yes24_agent.history import register_history
 from yes24_agent.logctx import ContextFilter, bound, new_request_id
 from yes24_agent.matrix.matrix_runner import run_matrix_stream
+from yes24_agent.model_routing import close_model_settings_store, current_models
 from yes24_agent.overview import (
     ARM_YES24,
     OVERVIEW_ARMS,
@@ -59,6 +62,7 @@ from yes24_agent.overview import (
     warm_search,
 )
 from yes24_agent.partner import register_partner, require_partner
+from yes24_agent.prompt_versions import close_prompt_version_store
 from yes24_agent.rbti.persona import is_valid_code
 from yes24_agent.rbti.profile import fetch_user_rbti
 from yes24_agent.rbti.routes import register_rbti
@@ -115,22 +119,20 @@ _ACCESS_EXEMPT_PATHS = frozenset(
     {
         "/health", "/login", "/logout", "/docs", "/redoc", "/openapi.json",
         "/admin", "/admin/", "/admin/api/login", "/admin/api/logout",
-        "/static/lib/admin.css", "/static/lib/admin.js", "/static/lib/admin_manage.js",
-        "/static/lib/admin_charts.js",
-        # 어드민 대화 상세가 채팅과 같은 본문 렌더(md.js)·출처 유틸(sources.js)을 쓴다 —
-        # 데이터가 아니라 라이브러리 코드라 월 밖에 둬도 드러나는 것이 없다
-        # (데이터는 /admin/api 뒤).
-        "/static/lib/md.js",
-        "/static/lib/sources.js",
-        # 로그인 화면이 세션 전에 쓰는 로고(파비콘 겸)·자체 호스팅 폰트(Pretendard, OFL)
-        # — 데이터 없음.
-        "/static/lib/admin-logo.svg",
-        "/static/lib/fonts/Pretendard-Regular.subset.woff2",
-        "/static/lib/fonts/Pretendard-Medium.subset.woff2",
-        "/static/lib/fonts/Pretendard-SemiBold.subset.woff2",
-        "/static/lib/fonts/Pretendard-Bold.subset.woff2",
     }
 )
+# 정적 라이브러리 디렉터리(_STATIC_LIB_DIR)는 통째로 월 밖이다 — 어드민 로그인 화면이 세션 전에
+# 읽는 스크립트·스타일·로고·폰트(Pretendard, OFL)가 여기 있고, 어느 파일도 데이터가 아니다(데이터는
+# /admin/api·/chat 뒤). 파일 단위 손목록이었을 때 새 모듈이 빠져 어드민의 ES 모듈
+# import가 401로 깨지고 화면 전체가 빈 채로 떴다(2026-10-20 QA) — 목록 대신 마운트 경로로 연다.
+_ACCESS_EXEMPT_PREFIX = "/static/lib/"
+
+
+def _static_lib_path(path: str) -> bool:
+    """월 밖 정적 라이브러리 경로인가 — 점 세그먼트는 거부한다. 지금은 접두가 맞는 요청이 전부
+    StaticFiles 마운트로 가서 디렉터리 밖이 404지만(2026-10-20 QA 실측), 그 가정을 라우팅에만
+    맡기지 않는다."""
+    return path.startswith(_ACCESS_EXEMPT_PREFIX) and ".." not in path.split("/")
 
 
 def _delegating_routes(app: FastAPI, judge) -> list:
@@ -327,11 +329,18 @@ _SSE_RESPONSES: dict = {
 # 파생한 것과 같은 이유 — 손목록은 갱신을 잊는 순간 조용히 어긋난다).
 ADMIN_ONLY_MARK = "x-admin-only"
 
+# 질문 유입 경로의 정본 — DB(chat_turn.input_source)는 검사하지 않고 이 Literal이 422로
+# 거른다. 값을 더하면 프론트·분석 쿼리가 같이 바뀌므로 여기 한 곳만 고친다.
+InputSource = Literal[
+    "user_written", "home_suggestion", "followup_suggestion", "external_link", "retry"
+]
+
 
 class ChatRequest(BaseModel):
     """`/chat/stream` 요청 본문 — 설명은 **OpenAPI로 나간다**(주석은 /docs에 안 보인다).
 
-    프론트가 채우는 필드는 `message`·`session_id`·`use_rbti`·`rbti` 넷이다. RBTI **코드**의
+    프론트가 채우는 필드는 `message`·`session_id`·`use_rbti`·`rbti`·`input_source`
+    다섯이다. RBTI **코드**의
     기본 정본은 서버다 — 사람에게 붙는 값이라 외부 RBTI API로 조회한다(rbti/profile.py).
     화면에 유형 선택기가 있는 프론트는 그 선택을 `rbti`로 실어 **이번 턴만** 덮어쓸 수 있고,
     **이번 턴에 쓸지 말지**(`use_rbti`)는 언제나 화면이 정한다. 2026-09-14 공개: 그전까지
@@ -388,6 +397,19 @@ class ChatRequest(BaseModel):
         " 아니면 **422**이고, 그 거절은 `use_rbti`와 무관하다 — 조용히 미적용되지 않는다."
         " 빈 문자열은 '안 실음'과 같다.",
         examples=["CADI"],
+    )
+    input_source: InputSource | None = Field(
+        default=None,
+        description="질문의 유입 경로. 답변에는 영향이 없고 대화 기록(chat_turn)에만 남는다."
+        " 값별 의미: `user_written`=사용자가 입력창에 직접 작성해 전송,"
+        " `home_suggestion`=홈 화면 제안 질문 칩을 눌러 전송,"
+        " `followup_suggestion`=채팅 답변 하단의 후속 제안 질문을 눌러 전송,"
+        " `external_link`=이벤트 페이지 등 바깥 링크가 URL에 질문을 실어 바로 연 경우,"
+        " `retry`=실패한 턴을 다시 시도해 재전송."
+        " 문장이 **어디서 만들어졌는가**를 적는다 — 홈에서 직접 쓴 질문이 URL로 채팅 화면에"
+        " 넘어와 전송돼도 `user_written`이다. 목록 밖의 값은 422다. 안 보내면 NULL로 남는다"
+        " (구 클라이언트와 같다).",
+        examples=["home_suggestion"],
     )
     model: str | None = Field(
         default=None,
@@ -504,6 +526,7 @@ def _configure_logging() -> None:
         )
         file_handler.setFormatter(logging.Formatter(log_format))
         logging.getLogger().addHandler(file_handler)
+    install_slack_alerts(settings)  # 웹훅 URL이 있을 때만 ERROR 알림 핸들러를 단다
     # 필터는 **핸들러마다** 달아야 한다(로거에 달면 상위 로거로 전파된 레코드를 놓친다).
     for handler in logging.getLogger().handlers:
         handler.addFilter(ContextFilter())
@@ -546,9 +569,14 @@ async def lifespan(app: FastAPI):
     await close_starter_service()
     # 관리자 세션·감사 풀(만들어진 적 없으면 no-op).
     await close_admin_service()
+    # 런타임 모델 설정 읽기 풀(만들어진 적 없으면 no-op).
+    await close_model_settings_store()
+    await close_prompt_version_store()
     # 토큰 사용량 기록 풀도 나란히 정리한다 — 진행 중인 fire-and-forget INSERT를
     # 배수한 뒤 닫는다(만들어진 적 없으면 no-op).
     await close_usage_logger()
+    # HTML 파싱 프로세스 풀(cpu_pool — 만들어진 적 없으면 no-op). 워커 프로세스를 남기지 않는다.
+    shutdown_cpu_pool()
 
 
 def _register_frontend(app: FastAPI, settings: Settings) -> None:
@@ -629,7 +657,7 @@ def _register_frontend(app: FastAPI, settings: Settings) -> None:
             # 파트너 키(Yes24 백엔드)도 같은 위임이다 — 판정은 require_partner가 한다.
             if _key_route_matches(route_cache["admin"] + route_cache["partner"], request):
                 return await call_next(request)
-            if path in _ACCESS_EXEMPT_PATHS or any(
+            if path in _ACCESS_EXEMPT_PATHS or _static_lib_path(path) or any(
                 token_valid(cookie, pw) for pw in wall_passwords
             ):
                 return await call_next(request)
@@ -893,8 +921,10 @@ def create_app() -> FastAPI:
         """
         if not settings_unlocked(request):
             raise HTTPException(status_code=403, detail="설정 접근 권한이 없습니다.")
-        settings = get_settings()
-        return {"models": settings.selectable_models, "default": settings.model_name}
+        # default는 지금 유효한 기본(런타임 모델 설정 > config) — 선택기가 생략할 값과 서버가
+        # 실제로 쓸 값이 같아야 "기본" 표시가 거짓이 되지 않는다.
+        default = (await current_models()).default
+        return {"models": get_settings().selectable_models, "default": default}
 
     @app.get("/toolsets", include_in_schema=False)
     async def toolsets(request: Request) -> dict:
@@ -972,6 +1002,7 @@ def create_app() -> FastAPI:
             # persona status(턴 시작 신호)의 게이트 — 코드 유무와 별개로 "요청했는가"다
             # (요청했지만 코드가 없는 회원도 그 사실을 화면이 그린다, 피그마 10-C).
             use_rbti=request.use_rbti,
+            input_source=request.input_source,
         )
         return StreamingResponse(
             stream if unlocked else _hide_model_frames(stream),
@@ -1130,7 +1161,11 @@ def create_app() -> FastAPI:
     return app
 
 
-app = create_app()
+# cpu_pool의 spawn 워커는 부모의 __main__(`python -m yes24_agent.main`)을 __mp_main__으로 다시
+# import한다 — 여기서 앱을 또 만들면 워커마다 로그 파일 핸들러(같은 파일 회전 경합)·Slack 전송
+# 스레드·앱 객체가 생긴다. 워커는 파서 함수만 쓰므로 앱을 만들지 않는다.
+if __name__ != "__mp_main__":
+    app = create_app()
 
 
 if __name__ == "__main__":

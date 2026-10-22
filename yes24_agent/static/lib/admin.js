@@ -1,5 +1,6 @@
 import { initManage, roleLabel } from "/static/lib/admin_manage.js?v=33";
 import { initCharts } from "/static/lib/admin_charts.js?v=9";
+import { initPrompts } from "/static/lib/admin_prompts.js?v=1";
 import { renderBody } from "/static/lib/md.js";
 import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceDomain, sourceTitle, CARD_LABELS } from "/static/lib/sources.js";
 
@@ -25,6 +26,12 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   const statusLabel = (status) => ({ failed: '실패', interrupted: '중단', unknown: '종료 상태 미확인' })[status] || status;
   /** 피드백 평가 라벨(DDL ck_turn_feedback_rating: up/down) — 목록 배지·필터·상세·통계 공용. */
   const FEEDBACK_LABELS = { up: '좋아요', down: '싫어요' };
+  // 질문 유입 경로(chat_turn.input_source) — 값 정본은 main.py InputSource, 여기는 표시 이름만.
+  // 모르는 값은 원문 그대로 보인다(목록 밖 값이 생겨도 숨기지 않는다).
+  const INPUT_SOURCE_LABELS = {
+    user_written: '직접 입력', home_suggestion: '홈 제안', followup_suggestion: '후속 제안',
+    external_link: '외부 링크', retry: '재시도',
+  };
   /** 용어 통일표(한 곳) — 화면 라벨·CSV 머리가 이 말을 쓴다. 통계 일별 11열 엑셀 머리만 고객 양식이라 STAT_COLUMNS.excel. */
   const TERMS = { turns: '질의 수', users: '활성 사용자', clicks: '링크 클릭 수', sessions: '세션' };
   /** 답변거절 세부(서버 refused = {상태: 수}) — '실패 n · 중단 n'. 상태 목록은 서버 REFUSED가 정본이다. */
@@ -423,8 +430,47 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   // 인용 출처 묶음 — 출처의 구조 분류(sources.js sourceCardType: card_type·type)로 나눈다. Yes24 상품은 표지 카드, 나머지는 한 줄.
   const SOURCE_GROUPS = [['book', '상품', sourceCard, 'source-cards'], ['link', '웹', sourceLine, 'source-lines'], ['document', 'Yes24 안내', sourceLine, 'source-lines']];
 
-  /** 질의내역 한 칸 — 머리(질문·시각·지표)를 누르면 그 자리에 답변(md.js 렌더 + 인용 마커)과 출처 카드가 펼쳐진다. */
-  function turnBlock(t, i) {
+  /** 턴 추적(owner) — 펼칠 때 한 번 불러온다. 메타 줄(모델·등급·강도·프롬프트 버전·총비용), 시도 전환 배지, 라운드 표
+   *  (콜마다 시작·지연 막대·토큰·도구 스텝 칩). 라운드 기록 도입 전 턴은 표 대신 그 사실을 적는다. */
+  function traceView(session, t) {
+    const box = el('details', 'sources');
+    box.append(el('summary', 'fold', '추적 보기'));
+    box.addEventListener('toggle', async () => {
+      if (!box.open || box.dataset.loaded) return;
+      box.dataset.loaded = '1';
+      const params = new URLSearchParams(session.user_id ? { user_id: session.user_id } : {});
+      const path = `/admin/api/sessions/${encodeURIComponent(session.id)}/turns/${encodeURIComponent(t.turn_id)}/trace?${params}`;
+      let d;
+      try { d = await api(path); } catch (error) { delete box.dataset.loaded; box.append(el('p', 'empty', errorText(error))); return; }
+      const meta = [`모델 ${d.model ?? '미기록'}${d.fallback_from ? ` (폴백 · 원래 ${d.fallback_from})` : ''}`, `등급 ${tierLabel(d.service_tier)}`,
+        `강도 ${effortLabel(d.reasoning_effort)}`, `프롬프트 ${d.prompt_version == null ? '코드 기본' : `#${d.prompt_version}`}`, `비용 ${usd(d.cost_usd)}`];
+      box.append(el('p', null, meta.join(' · ')));
+      if (d.attempts.length > 1) box.append(el('p', null, d.attempts.map((a) => `시도 ${a.attempt + 1} ${a.model}${a.error_status ? ` → ${a.error_status}` : ''}`).join(' ⟶ ')));
+      if (!d.rounds.length) { box.append(el('p', 'empty', '라운드 기록이 없는 턴입니다(기록 도입 전).')); return; }
+      const end = Math.max(...d.rounds.map((r) => r.ended_ms), 1);
+      const bar = (r) => {
+        const cell = el('span'), fill = el('span');
+        // 턴 전체(0~마지막 콜 끝) 위의 이 콜 구간 — CSP가 style 속성을 막아 CSSOM으로 칠한다.
+        Object.assign(fill.style, { display: 'inline-block', height: '0.6em', background: 'var(--accent)', marginLeft: `${(r.started_ms / end) * 100}%`, width: `${Math.max(((r.ended_ms - r.started_ms) / end) * 100, 0.5)}%` });
+        Object.assign(cell.style, { display: 'block', minWidth: '8em' });
+        cell.append(fill, el('br'), seconds((r.ended_ms - r.started_ms) / 1000));
+        return cell;
+      };
+      const steps = (r) => [...r.tool_calls, ...r.steps.map((s) => [s.stage, s.detail, s.result_count == null ? '' : `${num(s.result_count)}건`].filter(Boolean).join(' '))].join(' · ') || '-';
+      box.append(table([
+        { key: 'attempt', label: '시도', format: (v) => String(v + 1) }, { key: 'round', label: '라운드', format: (v) => String(v + 1) },
+        { key: 'started_ms', label: '시작', format: (v) => seconds(v / 1000) }, { key: 'span', label: '지연', text: bar },
+        ...[['thinking_tokens', '사고'], ['response_tokens', '출력'], ['prompt_tokens', '입력'], ['cached_tokens', '캐시'], ['error_status', '오류']]
+          .map(([key, label]) => ({ key, label, format: (v) => (v == null ? '-' : num(v)) })),
+        { key: 'tools', label: '도구', text: steps },
+      ], d.rounds));
+    });
+    return box;
+  }
+
+  /** 질의내역 한 칸 — 머리(질문·시각·지표)를 누르면 그 자리에 답변(md.js 렌더 + 인용 마커)과 출처 카드가 펼쳐진다.
+   *  session(세션 상세에서만)이 있고 턴에 model 키가 있으면(서버가 owner 응답에만 싣는다) 추적 보기를 붙인다. */
+  function turnBlock(t, i, session) {
     const block = el('details', 'turn bleed');
     block.dataset.turnId = t.turn_id;
     const meta = el('small');
@@ -432,8 +478,11 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     // 배지(상태·평가·RBTI)는 목록 카드와 같은 클래스, 시각은 목록과 같은 형식(YYYY-MM-DD HH:mm).
     if (t.rating) meta.append(el('em', `feedback-${t.rating}`, FEEDBACK_LABELS[t.rating]), ' ');
     if (t.rbti_applied) meta.append(el('em', 'rbti', t.rbti_applied), ' ');
+    // 답변 모델은 관리자 응답에만 실린다(서버가 다른 역할에서는 키를 뺀다).
+    const model = t.model ? `모델 ${t.model}${t.fallback_from ? ` (폴백 · 원래 ${t.fallback_from})` : ''}` : '';
     meta.append([stamp(t.asked_at), t.elapsed_ms == null ? '' : `응답 ${seconds(t.elapsed_ms / 1000)}`,
-      t.clicks ? `클릭 ${num(t.clicks)}` : ''].filter(Boolean).join(' · '));
+      t.input_source ? `유입 ${INPUT_SOURCE_LABELS[t.input_source] ?? t.input_source}` : '',
+      t.clicks ? `클릭 ${num(t.clicks)}` : '', model].filter(Boolean).join(' · '));
     const head = el('summary', 'turn-head fold');
     head.append(el('em', null, `#${i + 1}`), el('b', null, t.user_message), meta);
     const tools = el('div', 'turn-tools');
@@ -476,6 +525,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       sources.append(el('summary', 'fold', ['인용 출처', ...counts].join(' · ')), ...groups);
       body.append(sources);
     }
+    if (session && 'model' in t) body.append(traceView(session, t));
     block.append(head, body);
     return block;
   }
@@ -546,7 +596,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       basics.open = infoOpen;
       basics.append(summary, info);
       if (!turns.length) { $('detail').replaceChildren(bar, basics, el('div', 'placeholder', '이 대화에는 기록된 턴이 없습니다.')); return; }
-      const blocks = turns.map(turnBlock);
+      const blocks = turns.map((t, i) => turnBlock(t, i, d.session));
       // 피드백 필터(좋아요·싫어요)로 연 대화는 그 평가가 달린 첫 턴을 펼쳐 강조한다(대개 #1이 아니다).
       const rated = state.applied.sessions?.rating, target = rated && turns.findIndex((t) => t.rating === rated);
       if (preservePosition) for (const b of blocks) b.open = openTurns.has(b.dataset.turnId);
@@ -1539,7 +1589,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   // ── 감사 로그(관리자 전용): 서버가 준 행(target_type·action·before/after JSON)을 사람이 읽는 줄로 옮긴다.
   // 라벨 표는 이 한 곳이다 — 모르는 값은 원문 그대로 보인다(새 작업이 생겨도 빈칸이 되지 않게).
   const CLI_LABEL = '서버 관리 도구(CLI)';
-  const AUDIT_TARGETS = { '': '전체', login: '로그인', admin: '계정', user: '회원', starter: '초기 질문', session: '대화' };
+  const AUDIT_TARGETS = { '': '전체', login: '로그인', admin: '계정', user: '회원', starter: '초기 질문', session: '대화', model: '모델 설정', prompt: '프롬프트' };
   // 작업명은 동사만 — 무엇에 대한 작업인지는 바로 옆 '대상' 칸("초기 질문 #151 · …", "계정 owner")이 말한다.
   const AUDIT_ACTIONS = {
     'login:ok': '로그인', 'login:failed': '로그인 실패', 'login:logout': '로그아웃',
@@ -1547,12 +1597,24 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     'user:update': '변경',
     'starter:create': '직접 등록', 'starter:update': '수정', 'starter:deactivate': '노출 끄기', 'starter:generate': '자동 생성',
     'session:purge': '영구 삭제',
+    'model:update': '변경',
   };
   const AUDIT_FIELDS = {
     username: '계정명', role: '역할', is_active: '활성', note: '메모', text: '문장', pinned: '고정', active: '노출 설정', valid_from: '노출 시작일', valid_until: '노출 종료일',
     slot: '분야', status: '결과', inserted: '추가 수', force: '다시 생성', user_id: '회원번호', turns: '질의 수', deleted_at: '삭제 요청 시각', app_name: '앱',
+    default_model: '기본 모델', fallback_model: '폴백 모델', service_tiers: '처리 등급', reasoning_efforts: '사고 강도',
   };
-  const auditValue = (field, value) => (value == null ? '-' : field === 'role' ? roleLabel(value) : field === 'slot' ? slotLabel(value) : field === 'status' ? GENERATE_STATUS[value] ?? value : field === 'active' ? (value ? '켜짐' : '꺼짐') : field === 'pinned' ? PINS[value === true ? 'slot' : value === false ? '' : value]?.label ?? String(value) : typeof value === 'boolean' ? (value ? '예' : '아니오') : typeof value === 'object' ? JSON.stringify(value) : String(value));
+  // 모델 설정 값: null = 설정 파일 기본값 따름, '' = 폴백 끔(서버 model_settings 규칙).
+  const MODEL_FIELDS = new Set(['default_model', 'fallback_model', 'service_tiers', 'reasoning_efforts']);
+  /** 처리 등급 표기 — ''는 표준(서버 litellm_service_tier_options의 빈 값). */
+  const tierLabel = (tier) => tier || '표준';
+  /** 저장된 등급 맵(정본 직렬화 문자열) → '모델 등급 · …'. 깨진 값은 원문 그대로. */
+  /** 사고 강도 표기 — ''는 미전달(벤더 기본). */
+  const effortLabel = (effort) => effort || '벤더 기본(미전달)';
+  /** 저장된 모델별 맵(정본 직렬화 문자열) → '모델 값 · …'. 깨진 값은 원문 그대로. */
+  const mapText = (raw, label) => { try { return Object.entries(JSON.parse(raw)).map(([model, value]) => `${model} ${label(value)}`).join(' · '); } catch { return raw; } };
+  const MAP_LABELS = { service_tiers: tierLabel, reasoning_efforts: effortLabel };
+  const auditValue = (field, value) => (MODEL_FIELDS.has(field) && (value == null || value === '') ? (value == null ? '설정 파일 기본값' : '끔') : MAP_LABELS[field] ? mapText(value, MAP_LABELS[field]) : value == null ? '-' : field === 'role' ? roleLabel(value) : field === 'slot' ? slotLabel(value) : field === 'status' ? GENERATE_STATUS[value] ?? value : field === 'active' ? (value ? '켜짐' : '꺼짐') : field === 'pinned' ? PINS[value === true ? 'slot' : value === false ? '' : value]?.label ?? String(value) : typeof value === 'boolean' ? (value ? '예' : '아니오') : typeof value === 'object' ? JSON.stringify(value) : String(value));
   /** 바뀐 필드 — [라벨, 이전, 이후]. 'by'(CLI 표시)는 계정 칸이 말하므로 뺀다. */
   const auditChanges = (row) => [...new Set([...Object.keys(row.before ?? {}), ...Object.keys(row.after ?? {})])].filter((field) => field !== 'by')
     .map((field) => [AUDIT_FIELDS[field] ?? field, row.before && field in row.before ? auditValue(field, row.before[field]) : null, row.after && field in row.after ? auditValue(field, row.after[field]) : null]);
@@ -1560,6 +1622,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
    *  싣지 않는다 — 아이디 칸에 친 비밀번호가 보이지 않게). 세션은 id 앞 8자, 초기 질문은 #id. */
   function auditTarget(row) {
     const name = row.target_name;
+    if (row.target_type === 'model') return AUDIT_TARGETS.model;  // 설정 행은 하나뿐이다(id 1)
     if (name == null) return row.target_type === 'login' ? '알 수 없는 계정' : `${AUDIT_TARGETS[row.target_type] ?? row.target_type} -`;
     const noun = row.target_type === 'login' ? AUDIT_TARGETS.admin : AUDIT_TARGETS[row.target_type] ?? row.target_type;
     // 초기 질문 대상은 행 id(#n) 또는 분야 키(지금 생성 — 분야 이름으로).
@@ -1603,6 +1666,137 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     return loadList('audit', `/admin/api/audit?${new URLSearchParams(state.applied.audit)}`, AUDIT_COLUMNS, openAudit, auditRow, (data) => {
       addMissingOptions($('audit-actor'), [...data.actors, ...(data.cli_actor ? [data.cli_actor] : [])], (value) => (value === data.cli_actor ? CLI_LABEL : value));
       state.starterSlots = data.slots ?? state.starterSlots;
+    });
+  }
+
+  // ── 모델(관리자 전용) — 런타임 기본·폴백 모델, 이 서버의 폴백 상태, 모델별 사용, 최근 변경. 판정·검증은 서버다.
+  // 저장 값: null = 설정 파일 기본값 따름, ''(폴백만) = 끔, 그 밖 = 선택 가능 모델 id(/admin/api/models selectable).
+  const CONFIG_CHOICE = '__config__';
+  const MODEL_SOURCES = { config: '설정 파일', runtime: '관리자 설정' };
+  const windowLabel = (hours) => (hours % 24 || hours === 24 ? `${hours}시간` : `${hours / 24}일`);
+  function loadModels() {
+    writeHash();
+    return request('models', '/admin/api/models', (data) => {
+      const names = Object.fromEntries(Object.entries(data.selectable).map(([label, id]) => [id, label]));
+      const modelName = (id) => (id == null ? '기록 없음(모델 기록 이전 턴)' : id === '' ? '끔' : names[id] ? `${names[id]} (${id})` : id);
+      // 단가는 서버 단가표(config llm_prices)가 정본이다 — 화면은 숫자를 들지 않고 응답에서 찾는다.
+      const priceOf = (model, tier) => data.prices.find((row) => row.model === model && row.service_tier === tier && row.in_effect);
+      const priceText = (row) => (row ? `입력 ${usd(row.input_usd_per_mtok)} · 출력 ${usd(row.output_usd_per_mtok)} /1M 토큰` : '단가 미등록');
+      // 설정 폼 — 바뀐 칸만 보낸다(expected = 화면이 본 저장 행, 다른 관리자가 먼저 바꿨으면 409).
+      const stored = data.stored ?? { default_model: null, fallback_model: null, service_tiers: null, reasoning_efforts: null };
+      const form = el('form', 'manage-form');
+      const select = (field, label, configured, offAllowed) => {
+        const box = el('select');
+        box.append(new Option(`설정 파일 기본값 — ${modelName(configured)}`, CONFIG_CHOICE));
+        if (offAllowed) box.append(new Option('끔', ''));
+        for (const [name, id] of Object.entries(data.selectable)) box.append(new Option(`${name} (${id})`, id));
+        // 저장값이 지금 목록에 없으면(배포가 모델을 뺐다 — 서빙은 이미 무시 중) 'config 따름'으로 보이고
+        // 알린다. 그대로 두면 빈 칸이 선택돼 저장 시 ''가 날아가 사유 없는 422가 난다.
+        const known = stored[field] == null || [...box.options].some((option) => option.value === stored[field]);
+        box.value = known ? stored[field] ?? CONFIG_CHOICE : CONFIG_CHOICE;
+        box.name = field;
+        const wrap = el('label', null, label);
+        wrap.append(box);
+        if (!known) wrap.append(el('small', 'error', `저장된 값 ${stored[field]}은(는) 지금 선택할 수 없는 모델이라 무시되고 있습니다 — 저장하면 설정 파일 기본값으로 바뀝니다.`));
+        return wrap;
+      };
+      // 모델별 맵(처리 등급·사고 강도) — LiteLLM(OpenAI) 경로 모델마다(서버가 ID 형태로 고른 목록). 같은 모델
+      // ID는 기본이든 폴백이든 같은 값. 두 맵은 같은 기계(서버 PER_MODEL_COLUMNS)라 화면도 한 편집기를 쓴다.
+      const MAPS = [
+        { column: 'service_tiers', title: '처리 등급', entries: data.service_tiers, options: data.tier_options, value: 'tier', configValue: 'config_tier', label: tierLabel,
+          hint: (model, tier) => `${priceText(priceOf(model, tier))}${data.tier_notes[tier] ? ` · ${data.tier_notes[tier]}` : ''}` },
+        { column: 'reasoning_efforts', title: '사고 강도', entries: data.reasoning_efforts, options: data.effort_options, value: 'effort', configValue: 'config_effort', label: effortLabel, hint: () => '' },
+      ];
+      const storedMaps = Object.fromEntries(MAPS.map(({ column }) => { try { return [column, stored[column] ? JSON.parse(stored[column]) : {}]; } catch { return [column, {}]; } }));
+      const mapSelect = (spec, entry) => {
+        const box = el('select');
+        box.append(new Option(`설정 파일 기본값 — ${spec.label(entry[spec.configValue])}`, CONFIG_CHOICE));
+        for (const option of spec.options) { const hint = spec.hint(entry.model, option); box.append(new Option(`${spec.label(option)}${hint ? ` — ${hint}` : ''}`, option)); }
+        const saved = storedMaps[spec.column];
+        box.value = entry.model in saved && spec.options.includes(saved[entry.model]) ? saved[entry.model] : CONFIG_CHOICE;
+        box.dataset.model = entry.model;
+        const wrap = el('label', null, `${spec.title} · ${modelName(entry.model)}`);
+        wrap.append(box);
+        return wrap;
+      };
+      const mapBoxes = MAPS.map((spec) => spec.entries.map((entry) => mapSelect(spec, entry)));
+      const save = el('button', 'primary', '저장');
+      save.type = 'submit';
+      form.append(
+        select('default_model', '기본 모델', data.config.default_model, false),
+        select('fallback_model', '폴백 모델(메인 모델이 첫 응답 전에 429·5xx·타임아웃으로 실패하면 이 모델로 다시 답한다)', data.config.fallback_model, true),
+        ...mapBoxes.flat(),
+        save,
+      );
+      /** 맵 비교용 정렬 표기(서버 정본 직렬화와 같은 키 순서). */
+      const sortedMap = (map) => JSON.stringify(Object.fromEntries(Object.entries(map).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))));
+      form.onsubmit = async (event) => {
+        event.preventDefault();
+        const changes = {};
+        for (const field of ['default_model', 'fallback_model']) {
+          const value = form.elements[field].value === CONFIG_CHOICE ? null : form.elements[field].value;
+          if (value !== (stored[field] ?? null)) changes[field] = value;
+        }
+        MAPS.forEach((spec, i) => {
+          const map = {};
+          for (const wrap of mapBoxes[i]) { const box = wrap.querySelector('select'); if (box.value !== CONFIG_CHOICE) map[box.dataset.model] = box.value; }
+          if (sortedMap(map) !== sortedMap(storedMaps[spec.column])) changes[spec.column] = Object.keys(map).length ? map : null;
+        });
+        if (!Object.keys(changes).length) { showToast('바뀐 설정이 없습니다.'); return; }
+        save.disabled = true;
+        const expected = Object.fromEntries(['default_model', 'fallback_model', ...MAPS.map((spec) => spec.column)].map((key) => [key, stored[key] ?? null]));
+        try {
+          await api('/admin/models', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ changes, expected }) });
+          showToast(`저장했습니다. 다른 서버는 ${num(data.settings_ttl_s)}초 안에 따라옵니다.`);
+          loadModels();
+        } catch (error) {
+          if (error.name !== 'AbortError') showError(errorText(error, '저장하지 못했습니다.'));
+          save.disabled = false;
+        }
+      };
+      const current = table([{ key: 'label', label: '항목' }, { key: 'value', label: '값' }, { key: 'source', label: '출처' }], [
+        { label: '기본 모델', value: modelName(data.default.model), source: MODEL_SOURCES[data.default.source] },
+        { label: '폴백 모델', value: modelName(data.fallback.model), source: MODEL_SOURCES[data.fallback.source] },
+        ...MAPS.flatMap((spec) => spec.entries.map((entry) => ({ label: `${spec.title} · ${names[entry.model] ?? entry.model}`, value: spec.label(entry[spec.value]), source: MODEL_SOURCES[entry.source] }))),
+      ]);
+      const settingsCard = analysisCard('답변 모델 설정', current, `대화 화면에서 모델을 직접 고른 질의는 폴백하지 않습니다. 처리 등급·사고 강도는 OpenAI 경로 모델에만 있습니다(Gemini는 사고량을 스스로 정한다). 저장하면 이 서버는 바로, 다른 서버는 ${num(data.settings_ttl_s)}초 안에 반영됩니다.`);
+      settingsCard.append(form);
+      // 쿨다운 — 이 응답을 만든 서버(컨테이너) 하나의 상태다. 남은 0초 = 다음 질의가 그 모델을 다시 시험한다.
+      const cooling = data.cooldowns.length
+        ? table([{ key: 'model', label: '건너뛰는 모델', format: modelName }, { key: 'remaining_s', label: '남은 시간', format: (s) => (s ? `${num(Math.ceil(s / 60))}분` : '다음 질의에 재시도') }], data.cooldowns)
+        : el('p', 'analysis-note', '전환 없음 — 메인 모델로 답하는 중입니다.');
+      const coolingCard = analysisCard('폴백 상태(이 서버 기준)', cooling, `모델이 429(쿼터·지출 한도)를 내면 ${num(Math.round(data.cooldown_s / 60))}분 동안 그 모델을 건너뜁니다. 서버·컨테이너마다 따로 셉니다.`);
+      const usageColumns = [{ key: 'model', label: '모델', format: modelName }];
+      data.window_hours.forEach((hours, i) => usageColumns.push(
+        { key: `turns_${i}`, label: `질의 ${windowLabel(hours)}`, format: num },
+        { key: `fallbacks_${i}`, label: `폴백 ${windowLabel(hours)}`, format: num },
+        { key: `cost_${i}`, label: `비용 ${windowLabel(hours)}`, format: usd },
+      ));
+      // 등급이 섞인 모델만 등급별 비용(가장 긴 창)을 따로 보인다.
+      const last = data.window_hours.length - 1;
+      const tierSplit = (row) => (row.cost_by_tier.some((t) => t.service_tier) ? row.cost_by_tier.map((t) => `${tierLabel(t.service_tier)} ${usd(t.cost_usd[last])}`).join(' · ') : '');
+      if (data.models.some(tierSplit)) usageColumns.push({ key: 'tiers', label: `등급별 비용 ${windowLabel(data.window_hours[last])}` });
+      const usageRows = data.models.map((row) => Object.assign({ model: row.model, tiers: tierSplit(row) || '-' }, ...data.window_hours.map((_, i) => ({ [`turns_${i}`]: row.turns[i], [`fallbacks_${i}`]: row.fallbacks[i], [`cost_${i}`]: row.cost_usd[i] }))));
+      // 비용 각주는 서버(admin_cost.cost_notes)가 판정한 문장을 그대로 싣는다.
+      const usageNote = ['폴백 = 메인 모델 대신 폴백 모델이 답한 질의. 비용 = 그 모델이 답한 질의의 비용(단가는 아래 단가표).', ...data.cost_notes].join(' ');
+      const usageCard = analysisCard('모델별 사용', usageRows.length ? table(usageColumns, usageRows, null, {}) : el('p', 'analysis-note', '기간 안의 질의가 없습니다.'), usageNote);
+      // 단가표 — 비용 계산의 근거(정본 config llm_prices). 지금 기본·폴백으로 쓰는 모델의 그 등급 행을 강조한다.
+      const role = (row) => (!row.current ? '' : [data.default.model === row.model ? '기본' : '', data.fallback.model === row.model ? '폴백' : ''].filter(Boolean).join('·'));
+      const sourceLink = (url) => { if (!isSafeUrl(url)) return url ?? '-'; const a = el('a', null, sourceDomain({ url })); a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer'; return a; };
+      const priceRows = [...data.prices].sort((a, b) => (b.current - a.current) || String(a.model).localeCompare(String(b.model)) || a.service_tier.localeCompare(b.service_tier) || a.effective_from.localeCompare(b.effective_from))
+        .map((row) => ({ ...row, use: role(row) || (row.in_effect ? '' : '예정'), model_name: modelName(row.model) }));
+      const priceTable = table([
+        { key: 'use', label: '사용 중', format: (v) => (v ? el('b', null, v) : '') },
+        { key: 'model_name', label: '모델' }, { key: 'service_tier', label: '등급', format: tierLabel },
+        { key: 'input_usd_per_mtok', label: '입력', format: usd }, { key: 'cached_input_usd_per_mtok', label: '캐시 입력', format: usd }, { key: 'output_usd_per_mtok', label: '출력', format: usd },
+        { key: 'effective_from', label: '적용 시작일', format: day }, { key: 'checked_on', label: '확인일', format: day }, { key: 'source', label: '출처', format: sourceLink },
+      ], priceRows);
+      for (const [i, row] of priceRows.entries()) if (row.current) priceTable.querySelectorAll('tbody tr')[i].setAttribute('aria-current', 'true');
+      const priceCard = analysisCard('단가표 (USD / 1M 토큰)', priceTable, '모델별 사용의 비용 계산 근거입니다(산식·한계는 그 각주). 적용 시작일이 미래인 행은 그날부터 쓰입니다.');
+      const historyCard = analysisCard('최근 변경', data.history.length ? table([
+        { key: 'created_at', label: '시각', format: when }, { key: 'actor_name', label: '계정', format: day }, { key: 'change', label: '변경 내용' },
+      ], data.history.map((row) => ({ ...row, change: auditChanges({ ...row, target_type: 'model' }).map(([label, before, after]) => `${label}: ${before ?? '-'} → ${after ?? '-'}`).join(' · ') || '-' }))) : el('p', 'analysis-note', '변경 기록이 없습니다.'));
+      $('models').replaceChildren(settingsCard, coolingCard, usageCard, priceCard, historyCard);
     });
   }
 
@@ -2087,7 +2281,9 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     $(input).addEventListener('search', () => { if (!$(input).value) $(form).requestSubmit(); });
   }
 
-  const loaders = { dashboard: loadDashboard, statistics: loadStatistics, sessions: loadSessions, users: loadUsers, starters: loadStarters, audit: loadAudit };
+  // 프롬프트 버전(관리자 전용) — 화면은 admin_prompts.js가 그리고, 여기서는 공용 렌더(표·카드·패널·대화상자)를 넘긴다.
+  const prompts = initPrompts({ $, el, api, table, analysisCard, openDialog, confirmDialog, showToast, errorText, placeholder });
+  const loaders = { dashboard: loadDashboard, statistics: loadStatistics, sessions: loadSessions, users: loadUsers, starters: loadStarters, audit: loadAudit, models: loadModels, prompts: prompts.load };
   // 감사 로그 필터 — 작업 종류 세그먼트·계정 선택, 바꾸면 첫 페이지부터 다시 읽는다.
   $('audit-filters').onsubmit = (event) => { event.preventDefault(); applyQuery('audit'); loadAudit(); };
   $('audit-actor').onchange = () => $('audit-filters').requestSubmit();
@@ -2111,7 +2307,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
 
   // 화면별 최소 역할 — 메뉴를 숨기는 것만으로는 주소(#audit)로 직접 들어오는 길이 남는다. 판정은 서버(403)가
   // 하지만, 열 수 없는 화면을 그리고 오류를 띄우는 대신 대시보드로 돌려보낸다.
-  const TAB_ROLES = { audit: 'owner' };
+  const TAB_ROLES = { audit: 'owner', models: 'owner', prompts: 'owner' };
   async function switchTab(tab) {
     // 패널은 연 화면의 행을 보여 준다 — 화면을 떠나면 닫는다(저장 안 한 변경이 있을 때만 묻고 기다린다).
     if (panelDirty() && !(await confirmLeave())) return;

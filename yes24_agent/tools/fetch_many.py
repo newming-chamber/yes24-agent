@@ -105,12 +105,8 @@ async def fetch_pages(items: list[dict], tool_context, observe_formats: bool = F
 
     # url마다 "주 요청 → 파싱 → (도구면) 크레마클럽 조회"를 한 체인(open_page)으로 gather한다.
     # return_exceptions=True로 개별 실패를 값으로 받는다(등록은 아래 순차 루프 — 레이스 0).
-    parse_lock = asyncio.Lock()
     parsed = await asyncio.gather(
-        *(
-            open_page(url, client, settings, parse_lock, observe_formats=observe_formats)
-            for url in valid_urls
-        ),
+        *(open_page(url, client, settings, observe_formats=observe_formats) for url in valid_urls),
         return_exceptions=True,
     )
     gathered_iter = iter(parsed)

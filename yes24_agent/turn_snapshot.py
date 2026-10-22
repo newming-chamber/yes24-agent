@@ -35,8 +35,18 @@ async def persist_turn_snapshot(
     *,
     user_text: str | None = None,
     started_at: float | None = None,
+    model: str | None = None,
+    fallback_from: str | None = None,
+    prompt_version: int | None = None,
+    rounds: list[dict] | None = None,
+    input_source: str | None = None,
 ) -> bool:
-    """세션 락 안에서 호출한다. 동일한 확정본 재시도는 추가 이벤트를 만들지 않는다."""
+    """세션 락 안에서 호출한다. 동일한 확정본 재시도는 추가 이벤트를 만들지 않는다.
+
+    model·fallback_from(답한 모델·폴백 전 메인 모델)·prompt_version(답한 프롬프트 버전 id)은
+    chat_turn 열에, rounds(TurnProcess.rounds — LLM 콜별 토큰·지연·시도)는 turn_round 행에만 쓴다.
+    전부 공개 스냅샷 필드가 아니라(owner 추적 전용) SQLite 이벤트 스냅샷에는 싣지 않는다.
+    """
     if not turn_id:
         return False
     try:
@@ -44,17 +54,26 @@ async def persist_turn_snapshot(
         snapshot.update(session_id=session_id, turn_id=turn_id, history_saved=True)
         data = UserDataService.get_instance()
         table_storage = data.enabled and isinstance(service, DatabaseSessionService)
-        if table_storage and user_text is not None and started_at is not None:
+
+        async def save(text: str, started: float) -> bool:
             return await data.save_turn(
                 app_name=get_settings().app_name,
                 user_id=user_id,
                 session_id=session_id,
                 turn_id=turn_id,
-                user_text=user_text,
-                started_at=started_at,
+                user_text=text,
+                started_at=started,
                 completed_at=datetime.now(timezone.utc).timestamp(),
                 payload=snapshot,
+                model=model,
+                fallback_from=fallback_from,
+                prompt_version_id=prompt_version,
+                rounds=rounds,
+                input_source=input_source,
             )
+
+        if table_storage and user_text is not None and started_at is not None:
+            return await save(user_text, started_at)
         session = await service.get_session(
             app_name=get_settings().app_name,
             user_id=user_id,
@@ -74,16 +93,7 @@ async def persist_turn_snapshot(
                 for part in (event.content.parts if event.content else []) or []
                 if part.text and not part.thought
             )
-            return await data.save_turn(
-                app_name=get_settings().app_name,
-                user_id=user_id,
-                session_id=session_id,
-                turn_id=turn_id,
-                user_text=user_text,
-                started_at=min(event.timestamp for event in events),
-                completed_at=datetime.now(timezone.utc).timestamp(),
-                payload=snapshot,
-            )
+            return await save(user_text, min(event.timestamp for event in events))
         for event in reversed(session.events):
             if event.invocation_id != turn_id:
                 continue

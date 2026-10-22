@@ -5,7 +5,6 @@ from __future__ import annotations
 import hmac
 import json
 import logging
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from hashlib import sha256
 from secrets import compare_digest
@@ -104,32 +103,38 @@ class AuthService:
         if self._db is not None:
             await self._db.close()
 
-    @asynccontextmanager
-    async def _cursor(self, *, transaction: bool = False):
-        try:
-            pool = await self._db.get()
-            async with pool.acquire() as connection:
+    async def _with_cursor(self, body, *, transaction: bool = False):
+        """body(cursor)를 풀 접속 위에서 분리 태스크로 완주시킨다(LazyAiomysqlPool.run) —
+        접속 획득·commit/rollback·반납이 본문과 한 태스크라 바깥 취소가 중간에 못 끼어든다."""
+
+        async def with_cursor(connection):
+            if transaction:
+                await connection.begin()
+            try:
+                async with connection.cursor() as cursor:
+                    result = await body(cursor)
                 if transaction:
-                    await connection.begin()
-                try:
-                    async with connection.cursor() as cursor:
-                        yield cursor
-                    if transaction:
-                        await connection.commit()
-                except BaseException:
-                    if transaction:
-                        await connection.rollback()
-                    raise
+                    await connection.commit()
+                return result
+            except BaseException:
+                if transaction:
+                    await connection.rollback()
+                raise
+
+        try:
+            return await self._db.run(with_cursor)
         except HTTPException:
             raise
         except Exception as exc:
-            logger.error("인증 DB 실패: %s", type(exc).__name__)
+            logger.error(f"인증 DB 실패: {type(exc).__name__}")
             raise HTTPException(status_code=503, detail="인증 DB 요청에 실패했습니다.") from exc
 
     async def _run(self, sql: str, params: tuple, *, fetch: bool = False):
-        async with self._cursor() as cursor:
+        async def query(cursor):
             await cursor.execute(sql, params)
             return await cursor.fetchone() if fetch else None
+
+        return await self._with_cursor(query)
 
     @staticmethod
     def _is_dev_key(api_key: str) -> bool:
@@ -185,8 +190,9 @@ class AuthService:
                 refreshed_no, login_id = _user_fields(data)
                 if refreshed_no != user_no:
                     raise _unidentified()
-                async with self._cursor(transaction=True) as cursor:
-                    rpm, rpd = await self._lock_identity(cursor, user_id, key_id)
+
+                async def refresh(cursor):
+                    limits = await self._lock_identity(cursor, user_id, key_id)
                     await cursor.execute(
                         "UPDATE users SET user_login_id = %s WHERE id = %s",
                         (login_id, user_id),
@@ -196,6 +202,9 @@ class AuthService:
                         "WHERE id = %s",
                         (json.dumps(data, ensure_ascii=False), key_id),
                     )
+                    return limits
+
+                rpm, rpd = await self._with_cursor(refresh, transaction=True)
         else:
             raise _unidentified()
         return AuthenticatedUser(api_key, user_no, login_id, rpm, rpd, user_id, key_id)
@@ -209,7 +218,8 @@ class AuthService:
             else await self._member_info(api_key)
         )
         user_no, login_id = _user_fields(data)
-        async with self._cursor(transaction=True) as cursor:
+
+        async def register(cursor):
             await cursor.execute(
                 "INSERT INTO users (user_no, user_login_id, rate_limit_rpm, rate_limit_rpd) "
                 "VALUES (%s, %s, %s, %s) ON DUPLICATE KEY UPDATE id = id",
@@ -240,11 +250,15 @@ class AuthService:
             await cursor.execute(
                 "UPDATE users SET user_login_id = %s WHERE id = %s", (login_id, user_id)
             )
+            return rpm, rpd, user_id, key_id
+
+        rpm, rpd, user_id, key_id = await self._with_cursor(register, transaction=True)
         return AuthenticatedUser(api_key, user_no, login_id, rpm, rpd, user_id, key_id)
 
     async def consume_request(self, user: AuthenticatedUser, endpoint: str) -> None:
         """사용자 행 잠금 안에서 한도 확인과 기록을 원자적으로 처리한다."""
-        async with self._cursor(transaction=True) as cursor:
+
+        async def consume(cursor):
             rpm, rpd = await self._lock_identity(cursor, user.user_id, user.auth_key_id)
             await cursor.execute(
                 "SELECT COALESCE(SUM(requested_at > NOW(3) - INTERVAL 1 MINUTE), 0), COUNT(*) "
@@ -264,6 +278,8 @@ class AuthService:
                 "INSERT INTO rate_limit_log (user_id, auth_key_id, endpoint) VALUES (%s, %s, %s)",
                 (user.user_id, user.auth_key_id, endpoint),
             )
+
+        await self._with_cursor(consume, transaction=True)
 
 
 async def close_auth_service() -> None:

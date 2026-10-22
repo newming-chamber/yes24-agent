@@ -40,6 +40,7 @@ import logging
 from bs4 import BeautifulSoup, Tag
 
 from yes24_agent.config import Settings
+from yes24_agent.cpu_pool import run_cpu
 from yes24_agent.yes24.client import Yes24Client, Yes24FetchError, Yes24TextCache
 from yes24_agent.yes24.parsers import cremaclub_format, is_product_detail
 from yes24_agent.yes24.selectors import (
@@ -169,8 +170,8 @@ async def _judge(client: Yes24Client, url: str) -> str:
     except Yes24FetchError as exc:
         logger.info(f"cremaclub url={url!r} status=unobserved reason={exc}")
         raise _Unobserved(url) from exc
-    # 상세 판별(문서당 ~7ms)은 순수 계산이라 스레드로 내린다 — 한 턴에 수십 건이 몰린다.
-    verdict = await asyncio.to_thread(_verdict, status, html)
+    # 상세 판별(문서당 ~7ms)은 순수 계산이라 프로세스 풀로 내린다 — 한 턴에 수십 건이 몰린다.
+    verdict = await run_cpu(_verdict, status, html)
     if verdict is None:
         logger.info(f"cremaclub url={url!r} status=unobserved http={status} chars={len(html)}")
         raise _Unobserved(url)

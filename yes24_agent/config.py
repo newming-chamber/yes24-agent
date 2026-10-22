@@ -21,6 +21,9 @@ class ModelPrice(BaseModel):
     것이 그 날짜에 이긴다 — 단가 변경은 행을 고치지 않고 새 행을 더한다(이력 보존)."""
 
     model: str  # usage_log.model 값과 정확 일치(접두·패턴 매칭 없음)
+    # 처리 등급(usage_log.service_tier와 정확 일치). "" = 표준. 등급 행이 없으면 표준 행으로
+    # 추정한다(admin_cost.price_for — 어드민 각주가 밝힌다).
+    service_tier: str = ""
     effective_from: date  # 이 날짜(UTC)부터 적용
     input_usd_per_mtok: float
     cached_input_usd_per_mtok: float  # 캐시 단가가 없는 벤더면 입력 단가와 같은 값(할인 없음)
@@ -33,7 +36,7 @@ _GEMINI_PRICING = "https://ai.google.dev/gemini-api/docs/pricing"
 _OPENAI_PRICING = "https://developers.openai.com/api/docs/pricing"
 # 첫 구간의 시작일 — 공식 페이지의 가격 시작일이 아니라 usage_log 기록 전부를 덮는 날짜다.
 _PRICE_EPOCH = date(2026, 1, 1)
-_PRICE_CHECKED = date(2026, 9, 14)
+_PRICE_CHECKED = date(2026, 9, 14)  # 공식 페이지 확인일(행마다 다를 수 있다 — 아래 표)
 
 
 class Settings(BaseSettings):
@@ -59,10 +62,19 @@ class Settings(BaseSettings):
         "Gemini 3.5 Flash": "gemini-3.5-flash",
         "Gemini 3.6 Flash": "gemini-3.6-flash",
         "Gemini 3.7 Flash": "gemini-3.7-flash",
+        # 2026-10-20 추가 — 3.6 대체·절감 후보 비교용. 3.8은 공식 문서 "most intelligent Flash,
+        # stable"이고 2026-12-31까지 3.6과 같은 단가. Flash-Lite 둘은 3.6의 1/2(3.5)·1/3(3.1) 단가.
+        # 채택 판정은 QA 30문항 눈가림 비교(구조·디테일·지연·비용)로.
+        "Gemini 3.8 Flash": "gemini-3.8-flash",
+        "Gemini 3.5 Flash-Lite": "gemini-3.5-flash-lite",
+        "Gemini 3.1 Flash-Lite": "gemini-3.1-flash-lite",
         # responses/ 접두는 litellm의 responses API 브리지 — chat/completions의
         # "function tools + reasoning 병용 불가" 제약이 없어 reasoning을 켠 채 도구를 쓴다.
         # 2026-08-12 도그푸딩 실측: reasoning 끈 chat 경로는 도구 회피(추천 3/3 무도구 창작).
         "GPT 5.6 Luna": "openai/responses/gpt-5.6-luna",
+        # 2026-10-19 추가(출시 09-22) — 로컬 40케이스 프로브: 지연 13.0s vs gemini 15.3s,
+        # 메인 턴 비용 ~1/7, 품질 판정은 QA에서.
+        "GPT 6 Luna": "openai/responses/gpt-6-luna",
     }
     # 활성 도구셋(toolsets.TOOLSETS 키 부분집합). 도구 등록·프롬프트 fragment 활성·프론트
     # 브랜딩이 여기서 파생된다. 순서는 레지스트리 선언 순서가 정본(이 리스트는 켜고 끄기만).
@@ -90,6 +102,54 @@ class Settings(BaseSettings):
     # 8.4/49.1/26.4s — 추천 턴 지연의 지배 변수는 effort가 아니라 조사 라운드 수,
     # medium도 49s 관측). Luna는 드롭다운 선택지라 기본(flash) 사용자 무영향.
     litellm_reasoning_effort: str = "high"
+    # 허용 사고 강도: "" = 미전달(벤더 기본 — gpt-6-luna는 medium), 나머지는 gpt-6-luna 공식
+    # 문서(2026-10-19) 지원값. Gemini의 -1 같은 적응형(auto) 값은 없다. "none"은 넣지 않았다 —
+    # reasoning을 끈 경로가 도구를 회피하고 추천을 창작했다(2026-08-12 프로브 3/3, 위 주석).
+    litellm_reasoning_effort_options: tuple[str, ...] = (
+        "", "low", "medium", "high", "xhigh", "max"
+    )
+    # 모델별 사고 강도(위 전역 값을 모델 단위로 덮는다 — 키는 LiteLLM 선택 가능 모델). owner
+    # 어드민의 런타임 설정(model_settings.reasoning_efforts)이 다시 모델 단위로 덮는다.
+    # env: LITELLM_REASONING_EFFORTS='{"openai/responses/gpt-6-luna": "xhigh"}'
+    litellm_reasoning_efforts: dict[str, str] = {}
+
+    @model_validator(mode="after")
+    def _check_model_levers(self):
+        """기동 시 끊는다 — 전역 사고 강도는 모델별 값과 같은 허용 목록을 지나야 한다
+        (none 우회 차단)."""
+        if self.litellm_reasoning_effort not in self.litellm_reasoning_effort_options:
+            raise ValueError(
+                f"litellm_reasoning_effort={self.litellm_reasoning_effort!r}는 허용 목록 밖입니다 "
+                f"({self.litellm_reasoning_effort_options})"
+            )
+        return self
+    # LiteLLM(OpenAI) 경로 모델별 처리 등급(service_tier) — 키는 selectable_models의 LiteLLM 값
+    # (ID에 "/"), 값은 litellm_service_tier_options 중 하나. 없는 모델은 ""(표준 = 미전달).
+    # owner 어드민의 런타임 설정(model_settings.service_tiers)이 모델 단위로 이 값을 덮는다.
+    # litellm은 service_tier를 모델명과 무관하게 지원 파라미터로 받는다(1.83 실측: gpt-6-luna도
+    # get_supported_openai_params에 포함 — allowed_openai_params 우회 불필요).
+    litellm_service_tiers: dict[str, str] = {}
+    # 고를 수 있는 등급. "" = 표준, "fast" = 빠른 등급(단가 2배 — llm_prices의 fast 행).
+    # flex는 넣지 않는다(2026-10-19 사용자 결정) — 지연이 크고 용량이 모자라면 거절돼 대화형에
+    # 맞지 않는다.
+    litellm_service_tier_options: tuple[str, ...] = ("", "fast")
+    # 등급 선택 옆 짧은 안내(어드민 모델 패널). 실측 근거가 있는 등급만 적는다.
+    litellm_service_tier_notes: dict[str, str] = {
+        "fast": "응답 약 2배 빠름(2026-10-19 실측 중앙값 18.0→9.8초)",
+    }
+    # 답변 모델 폴백(model_routing.py). 메인 모델이 첫 진행·본문 프레임 전에 벤더 일시 오류
+    # (429·5xx·타임아웃)로 실패하면 같은 턴을 이 모델로 한 번 다시 돈다. 빈 값 = 끔(기본) —
+    # 운영 적용은 owner가 어드민 모델 설정에서 켠다(런타임 설정이 이 값을 덮는다). 값은
+    # selectable_models의 값이어야 한다(런타임 설정은 화이트리스트 밖 값을 거부·무시한다).
+    fallback_model: str = ""
+    # 메인 모델 429(쿼터·월 지출 한도) 뒤 메인을 건너뛰고 곧장 폴백으로 갈 쿨다운(초, 프로세스
+    # 전역). web_grounding_quota_cooldown_s와 같은 근거 — 429 본문으로는 분당 한도·일 한도·
+    # 지출 한도를 구분할 수 없어 리셋 시각이 아니라 쿨다운 뒤 첫 턴이 재프로브한다
+    # (2026-10-17 지출 한도 장애는 3시간 지속).
+    model_fallback_cooldown_s: float = 3600.0
+    # 런타임 모델 설정(model_settings 행) 캐시 수명(초). 서버 여러 대가 재시작 없이 이 시간 안에
+    # 수렴한다. 저장한 인스턴스는 즉시 반영한다.
+    model_settings_ttl_s: float = 30.0
     # 사고 요약 스트리밍(Gemini include_thoughts). 벤더 사고 구간(첫 3~5초)은 본문 파트가
     # 없어 화면이 비는데, 사고 요약 파트는 그 구간에 먼저 도착한다 — runner가 이를 진행
     # 타임라인(stage=thinking)으로 흘려 첫 응답 체감 침묵을 줄인다(LLM 실생성 텍스트,
@@ -427,9 +487,13 @@ class Settings(BaseSettings):
     # 것은 프롬프트에 실리는 행의 출처뿐이라 SSE·인용·예산 계약이 팔마다 그대로 성립한다.
     overview_compare_enabled: bool = False
 
-    # 에러 구동 반응형 재시도: pro 경로가 Gemini 과부하/일시장애(429/5xx)로 첫 응답조차 내지
-    # 못하면 같은 pro로 딱 1회 조용히 재시도한다. off면 곧장 정직 안내(error+done).
-    error_fallback: bool = True
+    # 답변 모델 호출 단위 재시도(model_routing.CallRetry): 한 LLM 요청이 벤더 일시 오류(5xx·
+    # 타임아웃, 429 제외)로 응답 시작 전에 실패하면 그 요청만 같은 모델로 다시 부른다(턴 재실행
+    # 아님 — 도구 라운드 뒤 503도 산다). 재시도 횟수(0 = 끔), 첫 대기, 대기 상한(초, 지수 증가).
+    # 기본 2회·0.5→1초는 최악 +1.5초다(2026-10-19 운영 503: 3시간 ~670턴 중 2~3턴 실패).
+    model_call_retries: int = Field(default=2, ge=0)
+    model_call_retry_initial_s: float = Field(default=0.5, ge=0)
+    model_call_retry_max_s: float = Field(default=2.0, ge=0)
     max_llm_calls: int = 50  # ADK RunConfig 상한
 
     # 출처·인용
@@ -610,6 +674,15 @@ class Settings(BaseSettings):
     # 맥락 글자 수(리드 마진). 키워드 바로 앞 문장·제목이 함께 실려야 규정의 범위·조건이
     # 이해된다(예: "무이자 할부" 앞의 카드사 소제목). 창 크기 자체는 fetch_max_chars.
     fetch_find_lead_chars: int = 500
+    # Yes24 HTML 파싱(상세·코너·검색·크레마클럽 판정)을 돌리는 프로세스 풀 워커 수(cpu_pool).
+    # 근거(2026-10-17 상용 장애): t4g.medium(2 vCPU)의 단일 프로세스(workers=1 — 세션 락이
+    # 프로세스 내부라 고정)가 CPU 110~120%로 포화됐고, py-spy상 CPU의 55.6%가 BeautifulSoup
+    # 생성자였다. to_thread는 GIL에 묶여 두 번째 코어를 못 쓴다. 1인 이유(2026-10-17 감사): 상용은
+    # 서버당 컨테이너 2개 × 2 vCPU라 컨테이너당 파서 워커 1개(+메인 프로세스)면 코어를 다 쓰고,
+    # 워커당 RSS ~163MB(spawn 워커가 주 모듈 `python -m yes24_agent.main`까지 다시 import)라
+    # 2개면 박스 피크가 ~3.5/3.8GB까지 오른다.
+    # 0이면 풀을 만들지 않고 종전처럼 워커 스레드(to_thread)에서 돈다(같은 함수·같은 결과).
+    cpu_pool_workers: int = Field(default=1, ge=0)
     # fetch_many 1회 호출에서 동시에 열 상세 페이지 수 상한. 컨텍스트·지연 폭발 방지 겸,
     # 공유 Yes24Client의 동시성 Semaphore(http_concurrency=5)와 정렬해 초과 요청이 쌓이지
     # 않게 한다. 초과 items는 이 상한까지만 처리한다(하드코딩 금지 — 원칙 6).
@@ -970,6 +1043,9 @@ class Settings(BaseSettings):
     admin_preview_max_chars: int = 140
     # page 쿼리 상한 — 거대값이 OFFSET 전체 스캔(503·DB 장애 로그)이 아니라 422로 떨어진다.
     admin_max_page: int = 10000
+    # 모델 설정 패널(owner)의 최근 변경 이력 행 수와 모델별 지표 창(시간, 짧은 것부터).
+    admin_model_history_rows: int = 10
+    admin_model_window_hours: tuple[int, ...] = (24, 168)
     # 관리자 비밀번호 해시 scrypt 파라미터 — n = 2**log2_n, 메모리 128·r·n(기본 32 MiB).
     # 저장 문자열이 파라미터를 품어(scrypt$log2n$r$p$salt$dk) 값을 바꿔도 기존 해시가 검증된다.
     admin_scrypt_log2_n: int = 15
@@ -1005,18 +1081,34 @@ class Settings(BaseSettings):
     # 그라운딩 요청료(무료 한도·초과 단가)는 금액 계산에 쓰지 않아 여기에 두지 않는다.
     # env: LLM_PRICES='[{"model": ..., ...}]'
     llm_prices: list[ModelPrice] = [
-        ModelPrice(model=model, effective_from=start, input_usd_per_mtok=p_in,
-                   cached_input_usd_per_mtok=p_cache, output_usd_per_mtok=p_out,
-                   source=source, checked_on=_PRICE_CHECKED)
-        for model, start, p_in, p_cache, p_out, source in (
-            ("gemini-3.6-flash", _PRICE_EPOCH, 0.75, 0.075, 3.75, _GEMINI_PRICING),
-            ("gemini-3.6-flash", date(2027, 1, 1), 1.50, 0.15, 7.50, _GEMINI_PRICING),
-            ("gemini-3.7-flash", _PRICE_EPOCH, 0.75, 0.075, 3.75, _GEMINI_PRICING),
-            ("gemini-3.7-flash", date(2027, 1, 1), 1.50, 0.15, 7.50, _GEMINI_PRICING),
-            ("gemini-3.5-flash", _PRICE_EPOCH, 1.50, 0.15, 9.00, _GEMINI_PRICING),
-            ("gemini-3.1-flash-lite", _PRICE_EPOCH, 0.25, 0.025, 1.50, _GEMINI_PRICING),
-            ("gemini-2.5-pro", _PRICE_EPOCH, 1.25, 0.125, 10.00, _GEMINI_PRICING),
-            ("openai/responses/gpt-5.6-luna", _PRICE_EPOCH, 0.20, 0.02, 1.20, _OPENAI_PRICING),
+        ModelPrice(model=model, service_tier=tier, effective_from=start,
+                   input_usd_per_mtok=p_in, cached_input_usd_per_mtok=p_cache,
+                   output_usd_per_mtok=p_out, source=source, checked_on=checked)
+        for model, tier, start, p_in, p_cache, p_out, source, checked in (
+            ("gemini-3.6-flash", "", _PRICE_EPOCH, 0.75, 0.075, 3.75, _GEMINI_PRICING,
+             _PRICE_CHECKED),
+            ("gemini-3.6-flash", "", date(2027, 1, 1), 1.50, 0.15, 7.50, _GEMINI_PRICING,
+             _PRICE_CHECKED),
+            ("gemini-3.7-flash", "", _PRICE_EPOCH, 0.75, 0.075, 3.75, _GEMINI_PRICING,
+             _PRICE_CHECKED),
+            ("gemini-3.7-flash", "", date(2027, 1, 1), 1.50, 0.15, 7.50, _GEMINI_PRICING,
+             _PRICE_CHECKED),
+            ("gemini-3.5-flash", "", _PRICE_EPOCH, 1.50, 0.15, 9.00, _GEMINI_PRICING,
+             _PRICE_CHECKED),
+            ("gemini-3.1-flash-lite", "", _PRICE_EPOCH, 0.25, 0.025, 1.50, _GEMINI_PRICING,
+             _PRICE_CHECKED),
+            ("gemini-2.5-pro", "", _PRICE_EPOCH, 1.25, 0.125, 10.00, _GEMINI_PRICING,
+             _PRICE_CHECKED),
+            ("openai/responses/gpt-5.6-luna", "", _PRICE_EPOCH, 0.20, 0.02, 1.20,
+             _OPENAI_PRICING, _PRICE_CHECKED),
+            # fast 등급 = 표준의 정확히 2배(공식 가격 페이지, 2026-10-19 확인).
+            ("openai/responses/gpt-5.6-luna", "fast", _PRICE_EPOCH, 0.40, 0.04, 2.40,
+             _OPENAI_PRICING, date(2026, 10, 19)),
+            # 2026-09-22 출시 — 표준·fast 모두 2026-10-19 공식 페이지 확인(≤272K 표준 구간).
+            ("openai/responses/gpt-6-luna", "", _PRICE_EPOCH, 0.10, 0.01, 0.50,
+             _OPENAI_PRICING, date(2026, 10, 19)),
+            ("openai/responses/gpt-6-luna", "fast", _PRICE_EPOCH, 0.20, 0.02, 1.00,
+             _OPENAI_PRICING, date(2026, 10, 19)),
         )
     ]
     # 원화 환산(선택). 환율은 시변이라 코드 상수가 아니라 운영자가 기준일과 함께 넣는 값이다 —
@@ -1036,6 +1128,10 @@ class Settings(BaseSettings):
     admin_image_origins: tuple[str, ...] = ("https://image.yes24.com",)
     # 통계 탭 조회 기간 상한(일). 빈 날도 0행으로 채워 돌려주므로 기간 길이가 곧 응답 행 수다.
     admin_stats_max_days: int = 366
+
+    # 프롬프트 버전 슬롯 텍스트 길이 상한(docs/admin-lab-design-20261019.md §2.1 storable_overlay —
+    # 저장·서빙 공통 판정).
+    prompt_slot_max_chars: int = Field(default=4000, ge=1)
 
     # 서버
     host: str = "0.0.0.0"
@@ -1064,6 +1160,12 @@ class Settings(BaseSettings):
     status_detail_max_chars: int = 120
     # SSE 연결 상한. **초기값·근거 미기록**(e9cf930). 긴 조사 턴의 실제 소요와 대조된 적 없다.
     sse_timeout_s: float = 180.0
+    # 턴 준비 구간(세션 락 → UI 상태·세션 조회/생성 → system 이벤트 → 모델 계획·프롬프트 버전
+    # 적재) 상한. 정상 준비는 수십 ms~1s인데, 2026-10-21 QA에서 모든 턴이 첫 DB 쓰기
+    # (create_session) 앞에서 예외·로그 없이 216초 넘게 멈췄고 sse_timeout_s는 스트림 루프
+    # 안에서만 재어 이 구간을 못 봤다. 초과하면 error(code=setup_timeout)+done으로 마감한다
+    # — 원인(세션/설정 경로 정지)은 못 고치지만 무기한 매달림 대신 실패로 드러낸다.
+    turn_setup_timeout_s: float = 20.0
     app_name: str = "yes24-agent"
     # 요청 본문 상한(문자). ChatRequest.message·MatrixRequest.question에 pydantic max_length로
     # 걸어 초장문 입력을 422로 구조적으로 거절한다(키워드 탐지 아님) — 컨텍스트·토큰 폭발과
@@ -1083,6 +1185,12 @@ class Settings(BaseSettings):
     log_file_path: str = ""
     log_max_bytes: int = 10 * 1024 * 1024  # 로그 파일 회전 임계 크기(바이트)
     log_backup_count: int = 5  # 회전 보관 백업 파일 수
+    # ERROR 로그 Slack 알림(alerts.py). SSE가 200이라 ALB 지표에 안 잡히는 채팅 실패를 사람에게
+    # 바로 알린다(2026-10-17 장애). slack_webhook_url(아래 시크릿)이 비면 기능 전체 비활성.
+    slack_alert_window_s: int = 60  # 같은 에러를 요약 1건으로 묶는 창(초)
+    slack_alert_timeout_s: float = 5.0  # 웹훅 전송 타임아웃(초)
+    slack_alert_queue_size: int = 1000  # 전송 대기 큐 상한 — 넘치면 버린다(emit은 막지 않는다)
+    alert_instance: str = ""  # 알림의 인스턴스 표기 — 빈 값이면 socket.gethostname()
 
     # 시크릿 (.env에서만 로드). 시크릿 필드는 전부 repr=False — Settings repr(pytest monkeypatch의
     # AttributeError 메시지가 통째로 싣는다)에 값이 평문으로 찍혔다(2026-09-14 실측).
@@ -1090,6 +1198,7 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(default="", repr=False)  # LiteLLM 경로(openai/*) 모델용
     perplexity_api_key: str = Field(default="", repr=False)  # web_search(퍼플렉시티 /search)용
     tavily_api_key: str = Field(default="", repr=False)  # web_fetch(Tavily /extract)용
+    slack_webhook_url: str = Field(default="", repr=False)  # ERROR 알림 incoming webhook
 
 
 @lru_cache

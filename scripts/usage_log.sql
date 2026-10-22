@@ -17,6 +17,9 @@ CREATE TABLE IF NOT EXISTS usage_log (
     endpoint VARCHAR(32) NULL,      -- 'chat' | 'matrix' — run_agent_stream 호출부가 지정
     component VARCHAR(32) NOT NULL, -- 'main' | 'enrichment' | 'thought_translation' | ...
     model VARCHAR(128) NULL,
+    -- 요청한 LiteLLM 처리 등급(NULL = 표준·Gemini) — 비용 단가 축. 기존 DB는 model_routing.sql.
+    service_tier VARCHAR(16) NULL,
+    reasoning_effort VARCHAR(16) NULL, -- 실제로 실은 LiteLLM 사고 강도(NULL = Gemini·미전달)
     prompt_tokens INT NULL,         -- 요청(프롬프트) 토큰 — genai prompt_token_count
     response_tokens INT NULL,       -- 응답(후보) 토큰 — genai candidates_token_count
     total_tokens INT NULL,          -- 벤더 합계(사고 토큰 포함) — genai total_token_count

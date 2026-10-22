@@ -4,13 +4,19 @@ instruction·도구·페르소나를 조립해 단일 루트(pro) LlmAgent를 �
 날짜·시각은 모델 콜백이 요청 끝에 메모로 붙이며, 단일 순차 도구 루프는 runner가 돌린다.
 """
 
+from collections.abc import Mapping
 from functools import lru_cache
+from typing import Any
 
 from google.adk.agents import LlmAgent
 from google.adk.agents.readonly_context import ReadonlyContext
+from google.adk.models.google_llm import Gemini
 from google.genai import types
 
 from yes24_agent.config import ensure_openai_api_key_env, get_settings
+from yes24_agent.litellm_reasoning import ReasoningCarryClient
+from yes24_agent.model_input import make_projection_callback
+from yes24_agent.model_routing import record_model_error, retrying, uses_litellm
 from yes24_agent.rbti.persona import axis_label, build_persona_block
 from yes24_agent.sources import LEDGER_MAX_INVOCATIONS, time_kst, today_kst
 from yes24_agent.toolsets import (
@@ -54,7 +60,7 @@ def _format_policy_seeds() -> str:
 
 
 # ── 프롬프트 fragment 조립 ────────────────────────────────────────────────────
-# 프롬프트 본문은 (본문, 태그) fragment의 순서 결합이다. 태그는 "" | "yes24" |
+# 프롬프트 본문은 (본문, 태그, 슬롯) fragment의 순서 결합이다. 태그는 "" | "yes24" |
 # "web" | "yes24+web" — 활성 toolset 집합(ResolvedApp.active)이 태그 집합을 포함할 때만
 # 그 fragment가 조립에 들어간다(조립 = 부분집합 술어 하나 + 문자열 결합). 경계는 기계 절단
 # 산물이라 구분 개행의 소유가 fragment마다 다르다 — 이음새 무결(삼중 개행 0·비활성 도구명 0)은
@@ -63,7 +69,16 @@ def _format_policy_seeds() -> str:
 # (예: yes24 단독)은 조립은 되지만 이 보장 밖이다.
 # 텍스트는 tests/fixtures/prompt_yes24_web_baseline.txt에서 기계 절단한 것이다(재타이핑 금지)
 # — 풀 구성 조립은 그 픽스처와 바이트 동일해야 하며 골든 테스트(test_toolsets)가 강제한다.
-_Frag = tuple[str, str]  # (본문, 태그)
+#
+# 계약 경계(docs/admin-lab-design-20261019.md §2.1): 슬롯 이름이 ""인 fragment는 전부 **잠금**(계약)이고,
+# 이름이 있는 fragment만 프롬프트 버전(DB 오버레이)이 바꿀 수 있다 — 기본이 잠금이다. 어떤 것이
+# 계약인지는 문구가 아니라 이 메타데이터(코드 선언·리뷰·골든 대상)가 정한다. 슬롯 fragment는 조립에
+# 본문 대신 format 필드 {slot_<이름>}로 들어가고 build_system_prompt가 값(오버레이 또는 이 본문)을
+# 채운다 — 오버레이 텍스트는 format **값**이라 중괄호를 넣어도 템플릿이 깨지지 않는다. 슬롯은 계약
+# 앞에만 둔다(프롬프트 순서 = 우선순위 — 뒤에 둔 지시가 앞의 인용 계약을 누른다, 2026-07-20 A/B).
+# 슬롯 추가는 코드 변경(리뷰·골든 재검증)이지 운영 설정이 아니다.
+_Frag = tuple[str, str, str]  # (본문, 태그, 슬롯 이름 — "" = 잠금)
+_SLOT_FIELD = "slot_"
 
 
 def _tagset(tags: str) -> frozenset[str]:
@@ -71,8 +86,12 @@ def _tagset(tags: str) -> frozenset[str]:
 
 
 def compose(fragments: tuple[_Frag, ...], active: frozenset[str]) -> str:
-    """활성 toolset 집합이 태그를 전부 포함하는 fragment만 순서대로 결합한다."""
-    return "".join(text for text, tags in fragments if _tagset(tags) <= active)
+    """활성 toolset 집합이 태그를 전부 포함하는 fragment만 순서대로 결합한다(슬롯은 format 필드)."""
+    return "".join(
+        f"{{{_SLOT_FIELD}{slot}}}" if slot else text
+        for text, tags, slot in fragments
+        if _tagset(tags) <= active
+    )
 
 
 # 정체성 = 공통 베이스 + **켜진 toolset의 강점 절 합성**(2026-08-06 사용자 방향: 페르소나
@@ -112,11 +131,17 @@ def build_identity(active: frozenset[str], name: str) -> str:
 
 
 _BODY_FRAGMENTS: tuple[_Frag, ...] = (
+    # 슬롯 profile — 정체성 직후·공통 본문 앞의 추가 전용 자리(기본 빈 문자열). 계약보다 앞이라
+    # 충돌 시 뒤의 계약이 이긴다(프롬프트 순서 = 우선순위).
+    ("", "", "profile"),
     ("""\
 사용자의 언어로 질문에 직접 답하고,
 답을 변명·자기소개로 시작하지 마세요. 하지 않은 검색을 했다고 말하지 말고, 도구 결과를 받기
 전에 그 내용을 아는 것처럼 쓰지 마세요.
 
+""", "", ""),
+    # 슬롯 narration — 경과 서술 문단(대체 슬롯). 기본 = 아래 원문, 계약(## 근거가 필요한 경우)보다 앞.
+    ("""\
 여러 단계로 조사하는 답변에서는 조사하면서 말하세요: 도구 호출 직전에 한 문장씩, 새 문단으로 —
 첫 문장은 요청을 알아들었음을 자연스럽게 담아 시작하고("<대상>을 찾으시는군요, <어디>부터
 살펴볼게요" 꼴), 그 뒤로는 방금 나온 결과를 과거형으로 짧게 딛고 아직 안 한 다음 단계만
@@ -126,7 +151,8 @@ _BODY_FRAGMENTS: tuple[_Frag, ...] = (
 미래형으로 되풀이하지 마세요. 도구 이름·인자·결과의 필드명 같은 내부 표기는 절대 본문에 쓰지
 않습니다 — 도구 결과의 값은 사용자의 말로 옮겨 씁니다. 한 번의 도구 호출로 끝나는 단순한 답과
 도구 없는 대화에는 경과 서술을 붙이지 않고, 조사가 끝나면 경과 서술에 기대지 말고 완결된 답으로
-마무리하세요.
+마무리하세요.""", "", "narration"),
+    ("""
 정체성을 직접 물으면 위 정체성을 본론으로 답하세요. 실행 모델명·버전은 사용자가 그것을 물었을
 때만, 추측하지 말고 응답 UI의 모델 메타가 정본이라고 안내합니다 — 묻지 않았으면 꺼내지 않습니다.
 
@@ -163,11 +189,11 @@ _BODY_FRAGMENTS: tuple[_Frag, ...] = (
   검색 범위에서 일치 항목을 확인하지 못했다고 한정해 말합니다.
 
 ## 근거가 필요한 경우
-""", ""),
+""", "", ""),
     ("""\
 Yes24 상품·정책과 오늘자·상대 시점 사실은 당신이 알 수 없는 값입니다. 아무리 잘 안다고 여겨도
 자체 지식으로 답하지 말고 **반드시** 이번 턴의 도구 결과로 확인해 인용합니다.
-""", "yes24"),
+""", "yes24", ""),
     ("""\
 - Yes24 상품 사실(가격·평점·재고·판매순위·구매)은 `yes24_search`·`yes24_fetch`로 확인하고 그
   결과가 준 `cite_as` 문자열을 그대로 복사해 인용하세요. `[n]`을 붙인 값은 그 출처에서 실제로 관측된 값과
@@ -184,7 +210,7 @@ Yes24 상품·정책과 오늘자·상대 시점 사실은 당신이 알 수 없
 - Yes24 이벤트·기획전·혜택을 안내할 때는 혜택과 함께 출처 페이지에 적힌 기간과, 참여 여부나 받는
   혜택을 바꾸는 조건·유의사항(대상 제한, 지급 시점·유효기간, 수량 한정·조기 종료, 중복 불가 등)을
   전합니다. 페이지에 없는 기간·조건은 만들지 않습니다.
-""", "yes24"),
+""", "yes24", ""),
     ("""\
 - 현재·상대 시점의 사실은 오늘 기준 절대 날짜를 검색 query에 포함해 웹 결과로 확인합니다.
   `published_at`은 발행, `last_updated`는 갱신 시점이며 `checked_at`은 서비스가 가져온 시점일 뿐
@@ -198,7 +224,7 @@ Yes24 상품·정책과 오늘자·상대 시점 사실은 당신이 알 수 없
   `web_search`로 확인합니다. 반대로 시간이 지나도 변하지 않는 일반 상식·정의·기초 과학·수학처럼
   안정적인 일반 지식은 검색 없이 즉답하고, 입력만으로 처리할 번역·요약·글쓰기·계산·아이디어·
   조언과 잡담·정체성 질문도 도구 없이 답합니다.
-""", "web"),
+""", "web", ""),
     ("""\
 - 검색 결과의 제목이나 요약이 암시한다는 이유만으로 상세 내용·정책·효과를 추론하거나 서술하지
   마세요 — 실재 대상의 내용·줄거리·성격은 이번 턴에 그 상세 페이지를 읽었을 때만 서술하고,
@@ -214,7 +240,7 @@ Yes24 상품·정책과 오늘자·상대 시점 사실은 당신이 알 수 없
   넘을 이유가 되지 않으니, 탈락으로 수가 모자라면 검색어를 바꿔 후보를 넓히세요.
 
 ## 도구 선택
-""", ""),
+""", "", ""),
     ("""\
 - `yes24_search`: 특정 Yes24 책·상품을 찾거나 조건에 맞는 후보를 탐색합니다. 질문의 핵심 대상과
   속성을 검색어로 사용하고, 결과의 구조화된 필드로 대상 일치 여부와 상품 사실을 판단합니다.
@@ -223,30 +249,30 @@ Yes24 상품·정책과 오늘자·상대 시점 사실은 당신이 알 수 없
   읽습니다. 결과가 잘렸거나 답이 다른 링크에 있으면 해당 페이지의 검색·링크 정보를 사용합니다.
 - `fetch_many`: 여러 Yes24 페이지의 상세 내용이 모두 필요할 때 동시에 읽습니다(한 페이지면
   `yes24_fetch`).
-""", "yes24"),
+""", "yes24", ""),
     ("""\
-- `web_search`: """, "web"),
+- `web_search`: """, "web", ""),
     # "Yes24 밖의"는 yes24 활성일 때만 의미가 있는 대비 표현이라 분리한다(yes24 없는 구성의
     # 브랜드 잔존 해소). 풀 구성 결합 바이트는 골든이 보증.
-    ("""Yes24 밖의 """, "yes24+web"),
+    ("""Yes24 밖의 """, "yes24+web", ""),
     ("""외부 사실과 지식을 검색합니다. 답변을 출처별로 구획하면 구획
   라벨은 인용한 URL의 실제 발행 hostname과 일치시키고, 여러 출처의 종합은 별도 구획에 둡니다.
 - `web_fetch`: 검색 결과의 스니펫만으로 핵심 주장을 뒷받침할 수 없거나 출처가 충돌할 때 원문을
-  읽습니다.""", "web"),
+  읽습니다.""", "web", ""),
     ("""\
- Yes24 URL은 Yes24 도구로 읽습니다.""", "yes24+web"),
+ Yes24 URL은 Yes24 도구로 읽습니다.""", "yes24+web", ""),
     ("""\
 
 
 도구의 `status`와 결과 내용은 구분해서 처리합니다. 성공 응답에 항목이 없는 것은 일치 결과가
 없다는 관측이고, 오류 응답은 확인 자체가 실패한 것입니다. `truncated`나 부분 결과는 페이지 전체의
 부재를 뜻하지 않습니다. 오류나 부분 결과를 근거로 사실을 단정하지 말고, 남아 있는 유효한 증거로
-답할 수 있는 범위와 확인하지 못한 범위를 나눕니다.""", ""),
+답할 수 있는 범위와 확인하지 못한 범위를 나눕니다.""", "", ""),
     ("""\
 
 
 Yes24 정책 탐색 입구:
-{policy_seeds}""", "yes24"),
+{policy_seeds}""", "yes24", ""),
     ("""\
 
 
@@ -266,16 +292,16 @@ Yes24 정책 탐색 입구:
 - 실제 사건·기록·수치의 근거는 그 사실을 공식적으로 기록하거나 보도하는 성격의 출처여야
   합니다. 개인 영상·게임 시뮬레이션·팬 창작·커뮤니티 추측은 실제 사실의 근거가 아닙니다 —
   그런 출처만 확보됐다면 사실을 단정하지 말고, 그 성격을 밝히며 확인 불가로 답하세요.
-""", ""),
+""", "", ""),
     ("""\
 - 도구를 실행한 턴의 최종 답변에서 검증 가능한 사실이 있는 단락에 유효한 `[n]`이 하나도 없으면
   불완전한 답변입니다. 그 단락을 직접 지지하는 인용을 넣거나 단락을 삭제하세요. 앞 단락의 인용은
   다음 단락의 근거가 되지 않습니다.
-""", ""),
+""", "", ""),
     ("""\
 - 외부 웹의 상품 정보를 Yes24 판매 사실로 전환하지 마세요 — Yes24 판매가·구매 가능 여부·상품
   링크는 같은 대상을 Yes24에서 이번 턴에 확인한 뒤에만 답합니다.
-""", "yes24+web"),
+""", "yes24+web", ""),
     ("""\
 
 ## 최종 답변
@@ -304,8 +330,58 @@ Yes24 정책 탐색 입구:
   정밀도의 시점을 별도 문장에 명시하고 그 값을 제공한 같은 출처를 바로 인용하세요. 일반적인 발표
   주기나 다른 출처의 시점으로 대체하지 말고, 그 값이 없으면 생략하거나 추정하지 말고 요청한 시점이
   제공되지 않았다고 밝히세요.
-""", ""),
+""", "", ""),
 )
+
+
+# 슬롯 이름 → 기본 텍스트(코드 fragment 원문, 선언 순서). 오버레이가 없으면 이 값이 채워져 골든과
+# 바이트 동일하다. 슬롯 선언의 단일 출처 — 저장·서빙 검증이 모두 이 키 집합을 본다.
+PROMPT_SLOTS: dict[str, str] = {slot: text for text, _tags, slot in _BODY_FRAGMENTS if slot}
+
+
+def storable_overlay(slots: Any) -> bool:
+    """프롬프트 버전에 둘 수 있는 슬롯 맵인가 — 저장(어드민)·서빙(캐시 적재) 단일 판정.
+
+    키는 선언된 슬롯(PROMPT_SLOTS)의 부분집합, 값은 문자열, 길이는 config prompt_slot_max_chars 이하.
+    model_routing.storable_setting과 같은 모양이다.
+    """
+    limit = get_settings().prompt_slot_max_chars
+    return isinstance(slots, dict) and all(
+        name in PROMPT_SLOTS and isinstance(text, str) and len(text) <= limit
+        for name, text in slots.items()
+    )
+
+
+def slot_values(overlay: Mapping[str, str]) -> dict[str, str]:
+    """조립 템플릿의 슬롯 format 값 — 오버레이에 있는 슬롯은 그 텍스트, 없으면 코드 기본."""
+    return {
+        f"{_SLOT_FIELD}{name}": overlay.get(name, default) for name, default in PROMPT_SLOTS.items()
+    }
+
+
+# 프롬프트 버전 id → 슬롯 맵. 버전은 불변이라 프로세스 영구 캐시이고(무효화 없음), 적재는 비동기
+# DB 읽기라 여기가 아니라 prompt_versions.ensure_loaded가 한다(에이전트 조립은 동기).
+_OVERLAYS: dict[int, dict[str, str]] = {}
+
+
+def register_overlay(version_id: int, slots: Mapping[str, str]) -> None:
+    if not storable_overlay(dict(slots)):
+        raise ValueError(f"프롬프트 버전 {version_id}: 선언 밖 슬롯·길이 초과")
+    _OVERLAYS[version_id] = dict(slots)
+
+
+def has_overlay(version_id: int) -> bool:
+    return version_id in _OVERLAYS
+
+
+def _overlay_for(version_id: int | None) -> dict[str, str]:
+    """버전 id의 슬롯 맵(None = 코드 그대로). 적재 안 된 id는 조용히 코드 기본으로 떨어지지 않는다 —
+    그 버전 라벨로 코드 프롬프트가 돌면 추적(chat_turn.prompt_version_id)이 거짓이 된다."""
+    if version_id is None:
+        return {}
+    if version_id not in _OVERLAYS:
+        raise LookupError(f"프롬프트 버전 {version_id} 미적재(prompt_versions.ensure_loaded 선행)")
+    return _OVERLAYS[version_id]
 
 
 # 날짜·시각은 시스템 프롬프트에 넣지 않는다 — 요청 직전 마지막 메시지 끝에 메모로 붙인다
@@ -323,33 +399,46 @@ _CLOCK_GUIDE = """
 _CLOCK_NOTE_TEMPLATE = "\n\n[현재 시각] 오늘은 {today}이고 지금은 {now}(KST)입니다."
 
 
-def build_system_prompt(app, persona_directive: str = "") -> str:
+def build_system_prompt(
+    app, persona_directive: str = "", overlay: Mapping[str, str] | None = None
+) -> str:
     """정적 본문에 (채팅 전용) 페르소나 지시를 채우고, 말미에 시각 메모 안내를 붙여 조립한다.
 
     persona_directive가 ""(기본)이면 해당 자리에 빈 문자열이 들어가 rbti 없는 경로와 바이트 동일.
     날짜·시각은 여기 없으므로 결과 전체가 매 인보케이션 바이트 동일한 캐시 프리픽스다.
+    overlay는 프롬프트 버전의 슬롯 맵(슬롯 이름 → 텍스트) — 없는 슬롯은 코드 기본이라 None·빈 맵이면
+    바이트 동일하다. 잠긴 fragment는 오버레이가 닿을 자리가 없다(compose가 슬롯만 필드로 연다).
     """
     # RBTI 소개 단락은 2026-07-29 삭제 — RBTI/매트릭스는 개발자용 검증 뷰이지 사용자에게
     # 소개·영업할 앱 기능이 아니다(사용자 확인: "내가 보기 위한 뷰"). 페르소나 선택 시의
     # 어조 반영(persona_directive)은 유지하되, 모델이 먼저 RBTI를 입에 올리지 않는다.
-    template = build_identity(app.active, app.persona.branding.title) + compose(
-        _BODY_FRAGMENTS, app.active
+    template = (
+        build_identity(app.active, app.persona.branding.title)
+        + compose(_BODY_FRAGMENTS, app.active)
     )
     # str.format은 잉여 kwarg를 무시한다 — yes24 off 구성에서 {policy_seeds} 필드가
     # 조립에서 빠져도 같은 호출이 무분기로 성립한다.
     core = template.format(
         policy_seeds=_format_policy_seeds(),
         persona_directive=persona_directive,
+        **slot_values(overlay or {}),
     )
     return f"{core}{_CLOCK_GUIDE}"
 
 
 # 프롬프트가 정적이 됐으므로 instruction은 (페르소나 코드, 구성) 조합별로 한 번만 조립한다.
 @lru_cache(maxsize=LEDGER_MAX_INVOCATIONS)
-def _instruction_for(code: str, persona_key: str, active: frozenset[str]) -> str:
-    """페르소나 코드·구성 조합의 instruction(정적). 무효 코드는 base와 바이트 동일."""
+def _instruction_for(
+    code: str, persona_key: str, active: frozenset[str], prompt_version: int | None = None
+) -> str:
+    """페르소나 코드·구성·프롬프트 버전 조합의 instruction(정적 — 버전은 불변이라 id가 키다).
+    무효 코드는 base와 바이트 동일."""
     directive = persona_tool_directive(code) if code else ""
-    base = build_system_prompt(resolve_app_for(persona_key, active), persona_directive=directive)
+    base = build_system_prompt(
+        resolve_app_for(persona_key, active),
+        persona_directive=directive,
+        overlay=_overlay_for(prompt_version),
+    )
     block = build_persona_block(code) if code else ""
     return f"{base}\n\n{block}" if block else base
 
@@ -367,23 +456,30 @@ def _invocation_clock_note(invocation_id: str) -> str:
 
 
 def _append_clock_note(callback_context, llm_request):
-    """요청 직전 마지막 메시지 끝에 날짜·시각 메모를 붙인다(세션에는 저장하지 않는다).
+    """이번 턴 사용자 질문 끝에 날짜·시각 메모를 붙인다(세션에는 저장하지 않는다).
 
-    맨 끝에 두므로 시스템 프롬프트와 이전 히스토리는 턴이 바뀌어도 바이트 동일해 캐시가 이어진다.
-    마지막 Content는 세션 이벤트와 객체를 공유할 수 있어 제자리 수정하지 않고 사본으로 바꾼다.
-    도구 호출 모드 등 요청의 다른 설정은 건드리지 않는다. None을 돌려 모델 호출을 그대로 진행한다.
+    시스템 프롬프트에 두지 않는 이유: 분 단위 시각이 프리픽스를 매 분 바꿔 암묵 캐시가 깨진다
+    (cacc8e0). 요청 맨 끝이 아니라 **질문 메시지**에 붙이는 이유: 시각은 턴 안에서 고정이라 질문
+    메시지가 라운드마다 바이트 동일하고, 그 뒤에 쌓이는 도구 라운드가 앞 라운드 요청의 확장이 된다.
+    종전처럼 매 라운드 도구 결과 뒤에 붙이면 (a) 프리픽스가 라운드마다 갈라지고 (b) OpenAI 추론
+    모델은 그 메모를 새 사용자 턴으로 보아 앞 라운드를 이전 턴으로 렌더한다 — 2026-10-20 실측:
+    Luna 라운드1→2 캐시 9,422(시스템 프롬프트만) → 메모를 끝에서 빼면 15,101(라운드1 전체).
+    질문은 function_response가 없는 마지막 user 메시지다. 마지막 Content는 세션 이벤트와 객체를
+    공유할 수 있어 제자리 수정하지 않고 사본으로 바꾼다. None을 돌려 모델 호출을 그대로 진행한다.
     """
     note = types.Part(text=_invocation_clock_note(callback_context.invocation_id))
     contents = llm_request.contents
-    if contents and contents[-1].role == "user":
-        last = contents[-1]
-        contents[-1] = types.Content(role="user", parts=[*(last.parts or []), note])
-    else:
-        contents.append(types.Content(role="user", parts=[note]))
+    for index in range(len(contents) - 1, -1, -1):
+        content = contents[index]
+        parts = content.parts or []
+        if content.role == "user" and not any(part.function_response for part in parts):
+            contents[index] = types.Content(role="user", parts=[*parts, note])
+            return None
+    contents.append(types.Content(role="user", parts=[note]))
     return None
 
 
-def _make_instruction_provider(app):
+def _make_instruction_provider(app, prompt_version: int | None = None):
     """이 에이전트의 구성을 클로저로 고정한 instruction provider를 만든다.
 
     구성은 에이전트 정체성의 일부다(도구 목록이 구성에서 나온다) — 전역을 다시 읽으면
@@ -402,7 +498,9 @@ def _make_instruction_provider(app):
     (build_persona_block, 후보 구성·읽기 권유·강조 관점). 코드가 없거나 무효면 둘 다 ""이라
         base와 바이트 동일(회귀 0). ctx.state는 세션 state의 읽기전용 뷰(MappingProxyType)다.
         """
-        return _instruction_for(ctx.state.get("rbti") or "", app.persona_key, app.active)
+        return _instruction_for(
+            ctx.state.get("rbti") or "", app.persona_key, app.active, prompt_version
+        )
 
     return _instruction_provider
 
@@ -411,36 +509,66 @@ def _make_instruction_provider(app):
 #  테스트는 _make_instruction_provider(get_resolved_app())를 직접 조립한다. 구조 감사 D4.)
 
 
-def create_agent(model_name: str | None = None, app=None) -> LlmAgent:
+def create_agent(
+    model_name: str | None = None,
+    app=None,
+    service_tier: str = "",
+    reasoning_effort: str | None = None,
+    *,
+    prompt_version: int | None = None,
+) -> LlmAgent:
     """루트 LlmAgent를 생성한다(model_name 미지정 시 config 기본 = model_name 필드).
+
+    prompt_version None은 코드 프롬프트 그대로다. prompt_version은 prompt_versions.
+    ensure_loaded로 적재된 id여야 한다 — 아니면 LookupError(조용히 코드 기본으로 돌지 않는다).
+
+    service_tier·reasoning_effort는 LiteLLM(OpenAI) 경로에만 실린다(Gemini 무시). 등급 ""는 표준·
+    미전달, 사고 강도 ""는 미전달(벤더 기본)이고 None이면 전역 litellm_reasoning_effort다 — 모델별
+    값은 런타임 모델 설정이 정한다(model_routing.TurnModels). 모델별 프롬프트 버전 바인딩도 그
+    런타임 설정(model_settings.prompt_versions)이 TurnModels.prompt_version으로 넘긴다.
 
     thinking_budget=-1(동적)은 pro·3.5-flash·3.6-flash 모두 호환(2026-07-28 라이브 실측 —
     3.6-flash는 budget=0만 거부, -1·512·생략 OK). 사용자가 UI에서 고른 모델만 여기로 오고,
     프롬프트·도구·thinking 구성은 모델과 무관하게 동일하다(공정 비교 + 단일 계약).
     """
+    _overlay_for(prompt_version)  # 미적재 id는 조립 전에 끊는다(첫 LLM 요청이 아니라 여기서)
     settings = get_settings()
     app = app if app is not None else get_resolved_app()
     model_id = model_name or settings.model_name
-    if "/" in model_id:
+    effort = settings.litellm_reasoning_effort if reasoning_effort is None else reasoning_effort
+    if uses_litellm(model_id):
         # "provider/model"은 LiteLLM 경로(config.selectable_models 주석 참조).
         # 지연 import — litellm 로드 비용(수 초)은 실제 사용 시에만 지불한다.
         from google.adk.models.lite_llm import LiteLlm
 
         ensure_openai_api_key_env()
-        extra = (
-            {"reasoning_effort": settings.litellm_reasoning_effort}
-            if settings.litellm_reasoning_effort
-            else {}
-        )
-        model = LiteLlm(model=model_id, **extra)
+        # 강도는 reasoning_effort 파라미터가 아니라 Responses 요청의 reasoning 필드로 직접 싣는다
+        # (extra_body — 브리지가 그대로 요청에 옮긴다). reasoning_effort 경로는 litellm이 모델명으로
+        # 두 번 거른다: 모르는 신모델은 거부하고(allowed_openai_params 우회가 필요했다), GPT-5 계열은
+        # 문자열로 평탄화한 뒤 자기 표(none~xhigh)에 없는 값(max)을 조용히 버린다(2026-10-19 실측:
+        # 5.6 Luna의 max → 요청 본문 reasoning=null). 모든 모델×옵션의 실제 본문은 테스트가 계약이다.
+        extra: dict = {}
+        if effort:
+            extra["extra_body"] = {"reasoning": {"effort": effort}}
+        if service_tier:
+            extra["service_tier"] = service_tier
+        # reasoning 아이템을 같은 턴의 다음 도구 라운드로 되돌려 싣는 클라이언트(litellm_reasoning).
+        model = retrying(LiteLlm)(model=model_id, llm_client=ReasoningCarryClient(), **extra)
     else:
-        model = model_id
+        # 문자열이 아니라 인스턴스로 싣는다 — 호출 재시도(model_routing.CallRetry)를 섞기 위해서다.
+        model = retrying(Gemini)(model=model_id)
     return LlmAgent(
         model=model,
         name=AGENT_NAME,
         description="범용 질문에 답하고 Yes24 상품·정책과 웹 사실을 근거로 종합하는 어시스턴트.",
-        instruction=_make_instruction_provider(app),
-        before_model_callback=_append_clock_note,
+        instruction=_make_instruction_provider(app, prompt_version),
+        # 순서 계약: 투영(도구 응답 사본 축약)이 먼저, 시각 메모가 마지막 — 메모는 질문 메시지에
+        # 붙으므로 순서가 바뀌어도 바이트는 같지만, 투영이 메모 Content를 다시 복사하지 않게 둔다.
+        before_model_callback=[
+            make_projection_callback(app.model_input_projectors), _append_clock_note
+        ],
+        # 모델 호출 원본 예외를 턴별로 회수한다(폴백·재시도 판정 재료 — model_routing 주석).
+        on_model_error_callback=record_model_error,
         tools=list(app.tools),
         generate_content_config=types.GenerateContentConfig(
             thinking_config=types.ThinkingConfig(
@@ -458,17 +586,36 @@ def create_agent(model_name: str | None = None, app=None) -> LlmAgent:
 # (모델, 구성) 조합별 에이전트 캐시. 요청마다 재생성하면 LlmAgent 조립 비용이 매 턴 붙는다.
 # 모델은 API 화이트리스트를, 구성은 resolve_app_for의 fail-loud 검증을 이미 통과한 값만
 # 여기 도달한다. 조합 수 = 모델 수 × 활성 조합 수라 유계다.
-_AGENT_CACHE: dict[tuple[str, str, frozenset[str]], LlmAgent] = {}
+_AGENT_CACHE: dict[
+    tuple[str, str, str, int, int | None, str, frozenset[str]], LlmAgent
+] = {}
 
 
-def get_agent(model_name: str | None, app=None) -> LlmAgent:
+def get_agent(
+    model_name: str | None,
+    app=None,
+    service_tier: str = "",
+    reasoning_effort: str | None = None,
+    *,
+    prompt_version: int | None = None,
+) -> LlmAgent:
     """선택된 모델·구성의 에이전트를 돌려준다(미지정이면 config 기본).
 
     **검증은 API 계층(main.py)에서 끝난 상태로 넘어온다** — 여기 도달하는 model_name은
     selectable_models의 값이거나 None이고, app은 해석을 통과한 ResolvedApp이다.
     """
     app = app if app is not None else get_resolved_app()
-    key = (model_name or "", app.persona_key, app.active)
+    settings = get_settings()
+    model_id = model_name or settings.model_name
+    # 키를 실제 조립값으로 정규화한다 — None(전역 기본)과 그 값, Gemini의 등급·강도(안 쓰임)가
+    # 같은 에이전트를 두 번 만들지 않게.
+    if uses_litellm(model_id):
+        effort = settings.litellm_reasoning_effort if reasoning_effort is None else reasoning_effort
+    else:
+        service_tier = effort = ""
+    key = (model_id, service_tier, effort, prompt_version, app.persona_key, app.active)
     if key not in _AGENT_CACHE:
-        _AGENT_CACHE[key] = create_agent(model_name, app)
+        _AGENT_CACHE[key] = create_agent(
+            model_id, app, service_tier, effort, prompt_version=prompt_version
+        )
     return _AGENT_CACHE[key]

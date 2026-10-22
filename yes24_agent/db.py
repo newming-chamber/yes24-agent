@@ -19,12 +19,88 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
 import aiomysql
 from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
+
+
+# 바깥 취소로 분리된 채 끝까지 도는 DB 연산 태스크. 이벤트 루프는 태스크를 약하게만
+# 참조하므로 완료 전 GC되지 않게 여기서 강하게 잡는다(완료 시 자동 제거).
+_detached_ops: set[asyncio.Task] = set()
+
+
+def detached_count() -> int:
+    """아직 도는 분리 DB 연산 수 — 정지 진단용(setup_timeout 로그가 싣는다)."""
+    return sum(1 for t in _detached_ops if not t.done())
+
+
+async def run_detached(coro, pending: set[asyncio.Task] | None = None, *, name: str | None = None):
+    """DB 연산을 내부 태스크로 돌리고 바깥 취소로부터 차폐한다 — 풀을 쓰는 모든 경로의 공통 관문.
+
+    Starlette 스트림 취소(anyio cancel scope)는 await마다 취소를 다시 넣는다. 그러면 벤더
+    `_rollback_on_exception_session`의 rollback과 세션 close가 연달아 취소되고, SQLAlchemy
+    `_finalize_fairy`는 체크인 리셋 중 받은 CancelledError를 로그("Exception during reset or
+    similar")한 뒤 소켓만 닫고 `checkin()` 전에 재발생시켜 풀 슬롯이 장부에 영구 점유된다
+    (2026-10-17 상용 고갈, GC로도 회수 안 됨). aiomysql 풀도 같은 부류다 — 응답 패킷을 읽는
+    도중 취소가 떨어지면 프로토콜이 어긋난 접속이 풀로 되돌아가 다음 사용자가 오지 않을
+    패킷을 영원히 기다릴 수 있다(2026-10-21 QA 정지의 유력 후보). 내부 태스크는 취소를 받지
+    않으므로 "acquire → execute → fetch → release"가 항상 완주해 접속이 정상 상태로 돌아가고,
+    호출자는 즉시 CancelledError를 받는다. 바깥이 취소된 뒤 내부 예외는 shield가 retrieved로
+    표시해 조용히 사라지므로, 바깥이 취소된 경우에만 직접 로그한다(바깥이 살아 있으면 예외가
+    호출자로 전파되니 로그하지 않는다 — 중복 금지). contextvars는 create_task가 생성 시점
+    컨텍스트를 복사해 전파된다. pending은 호출자(턴)가 "내가 띄운 연산"을 모아 두는 집합이다.
+    """
+    name = name or coro.__qualname__
+    task = asyncio.create_task(coro)
+    _detached_ops.add(task)
+    task.add_done_callback(_detached_ops.discard)
+    if pending is not None:
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        task.add_done_callback(lambda done: _log_detached_failure(name, done))
+        raise
+
+
+def _log_detached_failure(name: str, task: asyncio.Task) -> None:
+    """호출자가 떠난 뒤 끝난 내부 연산의 실패 — 받을 사람이 없으니 여기서 남긴다."""
+    if task.cancelled() or task.exception() is None:
+        return
+    exc = task.exception()
+    logger.warning(f"분리된 DB 연산 실패({name}): {type(exc).__name__}: {exc}")
+
+
+async def run_within(context, body, pending: set[asyncio.Task] | None = None):
+    """`async with context as resource: return await body(resource)`를 분리 태스크로 완주시킨다.
+
+    컨텍스트 매니저(접속 획득·트랜잭션)와 본문이 **한 태스크** 안에 있어야 한다 — 본문만
+    호출자 태스크에서 돌면 취소가 문장 중간에 떨어지고, 종료부의 rollback·release가 끊긴다.
+    """
+
+    async def within():
+        async with context as resource:
+            return await body(resource)
+
+    return await run_detached(within(), pending, name=body.__qualname__)
+
+
+async def rollback_unless_closed(conn: Any) -> None:
+    """열린 접속만 되돌린다 — 닫힌 접속의 rollback이 원래 예외를 덮지 않게.
+
+    aiomysql은 응답을 기다리던 중 취소되면 접속을 닫는다(`_close_on_cancel`). 그 접속에
+    rollback을 보내면 `InterfaceError("Cancelled during execution")`가 나 **원래 예외를
+    대체한다** — 클라이언트 이탈의 취소(CancelledError)가 "DB 트랜잭션 실패 503"으로 둔갑해
+    삼켜지고, 커밋 응답 대기 중 취소면 실제로는 커밋된 행을 실패로 보고한다(2026-10-18·19
+    상용 2건 실측). 닫힌 접속의 트랜잭션은 서버가 접속 종료로 버리므로 되돌릴 것이 없다.
+    """
+    if not conn.closed:
+        await conn.rollback()
 
 
 class LazyAiomysqlPool:
@@ -54,6 +130,19 @@ class LazyAiomysqlPool:
             task = asyncio.get_running_loop().create_task(self._create())
             self._task = task
         return await asyncio.shield(task)
+
+    @asynccontextmanager
+    async def connection(self):
+        """풀 접속 1개(최초 호출 시 풀 생성). `run`이 아닌 직접 사용은 취소 차폐가 없다 —
+        본문을 호출자 태스크에서 돌려야 하는 컨텍스트 매니저(admin 트랜잭션)만 쓴다."""
+        pool = await self.get()
+        async with pool.acquire() as conn:
+            yield conn
+
+    async def run(self, body, pending: set[asyncio.Task] | None = None):
+        """acquire → body(conn) → release를 분리 태스크로 완주시킨다(run_detached). 풀 질의의
+        기본 진입점이다 — 드라이버·HTTP 예외는 그대로 올라가고, 바깥 취소는 호출자에게만 간다."""
+        return await run_within(self.connection(), body, pending)
 
     async def close(self) -> None:
         """진행 중인 생성 태스크를 취소하고 풀을 닫는다(앱 종료 훅).
@@ -115,25 +204,18 @@ class MysqlBackedService:
         mysql_pool_kwargs). 그러면 "절반만 지워진 삭제" 같은 중간 상태가 사용자에게 남는다
         — 실패했다고 알렸는데 일부는 이미 사라진 상태다(2026-09-02 적대 감사 F2 실측).
         """
-        if self._db is None:
-            raise HTTPException(status_code=503, detail=self._unavailable_detail)
-        try:
-            pool = await self._db.get()
-            async with pool.acquire() as conn:
-                await conn.begin()
-                try:
-                    async with conn.cursor() as cur:
-                        for sql, params in statements:
-                            await cur.execute(sql, params)
-                    await conn.commit()
-                except Exception:
-                    await conn.rollback()
-                    raise
-        except HTTPException:
-            raise
-        except Exception as exc:  # noqa: BLE001 — 실패를 200으로 숨기지 않는다(fail-loud)
-            logger.error(f"{self._failure_detail} ({type(exc).__name__}): {exc}")
-            raise HTTPException(status_code=503, detail=self._failure_detail) from exc
+        async def transaction(conn):
+            await conn.begin()
+            try:
+                async with conn.cursor() as cur:
+                    for sql, params in statements:
+                        await cur.execute(sql, params)
+                await conn.commit()
+            except Exception:
+                await rollback_unless_closed(conn)
+                raise
+
+        await self._guarded(transaction)
 
     async def _run(self, sql: str, params: tuple, *, fetch_all: bool = False):
         """질의 1건 실행. fetch_all이면 전 행, 아니면 `(rowcount, lastrowid)`를 돌려준다.
@@ -142,16 +224,24 @@ class MysqlBackedService:
         다른 워커가 먼저 잡았다)과 새 행의 id가 필요한 호출자가 있다. DB 오류는 삼키지 않고
         503으로 올린다.
         """
+
+        async def query(conn):
+            async with conn.cursor() as cur:
+                await cur.execute(sql, params)
+                return await cur.fetchall() if fetch_all else (cur.rowcount, cur.lastrowid)
+
+        return await self._guarded(query)
+
+    async def _guarded(self, body):
+        """body(conn)을 풀 접속 위에서 분리 태스크로 완주시킨다(LazyAiomysqlPool.run) — 구성
+        부재는 503, 드라이버 실패도 503(fail-loud), HTTPException은 그대로. 서브클래스의 트랜잭션
+        진입점도 이 한 판정을 쓴다."""
         if self._db is None:
             raise HTTPException(status_code=503, detail=self._unavailable_detail)
         try:
-            pool = await self._db.get()
-            async with pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(sql, params)
-                    return await cur.fetchall() if fetch_all else (cur.rowcount, cur.lastrowid)
+            return await self._db.run(body)
         except HTTPException:
             raise
-        except Exception as exc:  # noqa: BLE001 — 저장 실패를 200으로 숨기지 않는다(fail-loud)
+        except Exception as exc:  # noqa: BLE001 — 실패를 200으로 숨기지 않는다(fail-loud)
             logger.error(f"{self._failure_detail} ({type(exc).__name__}): {exc}")
             raise HTTPException(status_code=503, detail=self._failure_detail) from exc

@@ -20,12 +20,13 @@ yes24_search와 마찬가지로 결과를 세션 state의 출처 레지스트리
 browses로 노출한다 — 빈 성공으로 위장하지 않는다.
 """
 
-import asyncio
 import logging
 
+from bs4 import BeautifulSoup
 from google.adk.tools import ToolContext
 
 from yes24_agent.config import Settings, get_settings
+from yes24_agent.cpu_pool import run_cpu, settings_view
 from yes24_agent.sources import cite_marker, now_checked_at, register_source
 from yes24_agent.tool_progress import ToolProgressGroup, parsed_progress
 from yes24_agent.tools._planning import dropped_queries_message, plan_queries
@@ -50,20 +51,27 @@ from yes24_agent.yes24.urls import (
 logger = logging.getLogger(__name__)
 
 
+# _parse_browse_page가 읽는 설정 필드 — 프로세스 풀로는 이 원시값 묶음만 보낸다.
+_BROWSE_PAGE_SETTINGS = ("yes24_base_url", "browse_result_limit", "browse_categories_limit")
+
+
 def _parse_browse_page(html: str, section: str, settings) -> tuple[list[dict], dict]:
-    """코너 페이지 HTML → (상품 목록, 페이지 메타). 순수 계산이라 워커 스레드에서 돈다.
+    """코너 페이지 HTML → (상품 목록, 페이지 메타). 순수 계산이라 프로세스 풀에서 돈다.
 
     페이지 메타 = 분야 내비(모델이 분야 번호를 발견하는 유일한 표면 — 추측 금지) + 페이지가
-    명시한 집계 기간 원문(표기한 코너만, parse_browse_page_meta). 둘은 전체 트리 한 번으로 나온다.
+    명시한 집계 기간 원문(표기한 코너만, parse_browse_page_meta). 둘은 전체 트리 **한 벌**을
+    나눠 쓴다(parse-once — 종전엔 목록의 부분 트리 + 메타의 전체 트리로 두 번 세웠다). 순서가
+    계약이다: 읽기만 하는 메타가 먼저, 행 저자 UI를 걷어내는(decompose) 목록 파서가 나중이다.
     """
+    soup = BeautifulSoup(html, "lxml")
+    page_meta = parse_browse_page_meta(
+        soup, section=section, limit=settings.browse_categories_limit
+    )
     parsed = parse_browse_list(
-        html,
+        soup,
         base_url=settings.yes24_base_url,
         section=section,
         limit=settings.browse_result_limit,
-    )
-    page_meta = parse_browse_page_meta(
-        html, section=section, limit=settings.browse_categories_limit
     )
     return parsed, page_meta
 
@@ -169,7 +177,10 @@ async def _browse_one(
             )
         except Yes24FetchError as exc:
             return _error(section, "fetch", f"Yes24 코너 조회에 실패했습니다: {exc}")
-        categories = parse_category_links(seed_html, limit=settings.browse_categories_limit)
+        # 분야 내비 파싱(전체 트리)도 순수 계산이다 — 루프 스레드에서 돌리지 않는다.
+        categories = await run_cpu(
+            parse_category_links, seed_html, limit=settings.browse_categories_limit
+        )
         matches = _match_category(categories, category_name, browse_category_prefix(section))
         if not matches:
             return _error(
@@ -200,8 +211,10 @@ async def _browse_one(
         return _error(section, "fetch", f"Yes24 코너 조회에 실패했습니다: {exc}")
 
     try:
-        # 목록·페이지 메타 파싱은 순수 계산이라 한 워커 스레드에서 묶어 처리한다(H17 오프로드).
-        parsed, page_meta = await asyncio.to_thread(_parse_browse_page, html, section, settings)
+        # 목록·페이지 메타 파싱은 순수 계산이라 프로세스 풀에서 한 번에 처리한다(cpu_pool).
+        parsed, page_meta = await run_cpu(
+            _parse_browse_page, html, section, settings_view(settings, *_BROWSE_PAGE_SETTINGS)
+        )
     except ParseError as exc:
         return _error(section, "parse", f"코너 목록을 해석하지 못했습니다: {exc}")
 

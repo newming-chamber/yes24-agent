@@ -22,7 +22,11 @@ from yes24_agent.tools.web_search import (
 )
 from yes24_agent.tools.web_search import start_web_prefetch, web_search
 from yes24_agent.tools.yes24_browse import yes24_browse
-from yes24_agent.tools.yes24_fetch import yes24_fetch
+from yes24_agent.tools.yes24_fetch import (
+    project_detail_for_model,
+    project_fetch_many_for_model,
+    yes24_fetch,
+)
 from yes24_agent.tools.yes24_search import (
     aclose_shared_client as aclose_yes24_client,
 )
@@ -107,6 +111,17 @@ PREFETCH_HOOKS: dict[str, tuple] = {
     "web": (start_web_prefetch,),
 }
 
+# 모델 요청 투영기. 도구 응답을 세션에는 원문 그대로 두고 **모델에 보내는 요청 사본**에서만
+# 줄이는 함수(응답 dict → dict, 무변경이면 같은 객체)를 도구별로 선언한다. PREFETCH_HOOKS와 같은
+# 병행 레지스트리 관례 — 코어(model_input)가 도구명·출처 타입을 모르게 하고, 활성 toolset의
+# 것만 싣는다. 키는 도구 함수 자체라 TOOLSETS와의 정합을 이름 문자열 없이 검사한다.
+MODEL_INPUT_PROJECTORS: dict[str, dict] = {
+    "yes24": {
+        yes24_fetch: project_detail_for_model,
+        fetch_many: project_fetch_many_for_model,
+    },
+}
+
 # lifespan 종료 훅. 활성 여부와 무관하게 전부 호출한다 — 미생성 클라이언트는 no-op
 # (3곳 다 `if _shared_client` 가드 실측 확인)이라 무해하고, 레지스트리 파생이라
 # 새 toolset을 추가해도 main.py는 무수정이다.
@@ -148,6 +163,8 @@ class ResolvedApp:
     tools: tuple
     aclose_hooks: tuple
     prefetch_hooks: tuple
+    # 도구 이름 → 모델 요청 투영기(활성 toolset의 것만). 콜백은 function_response.name으로 찾는다.
+    model_input_projectors: dict
     persona: Persona
     persona_key: str
 
@@ -181,11 +198,17 @@ def resolve_app(settings) -> ResolvedApp:
     prefetch_hooks = tuple(
         hook for key, hooks in PREFETCH_HOOKS.items() if key in active for hook in hooks
     )
+    model_input_projectors = {
+        tool.__name__: projector
+        for key, projectors in MODEL_INPUT_PROJECTORS.items() if key in active
+        for tool, projector in projectors.items()
+    }
     return ResolvedApp(
         active=active,
         tools=tools,
         aclose_hooks=aclose_hooks,
         prefetch_hooks=prefetch_hooks,
+        model_input_projectors=model_input_projectors,
         persona=persona,
         persona_key=persona_key,
     )

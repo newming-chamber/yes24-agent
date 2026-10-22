@@ -287,6 +287,11 @@ class TurnView(BaseModel):
     session_id: str = Field(description="이 턴이 속한 세션 id — done.session_id와 같다")
     started_at: float | None = Field(description="턴 첫 이벤트 시각(epoch 초)")
     user_text: str = Field(description="사용자 발화 원문")
+    input_source: str | None = Field(
+        default=None,
+        description="질문 유입 경로(요청 필드 그대로 — 값 목록은 /chat/stream 요청의 input_source)."
+        " 저장 전 턴이나 필드를 안 보낸 클라이언트의 턴은 null",
+    )
     text: str = Field(
         description="조사 내레이션을 포함한 확정 본문(마크다운). done.text와 동일하며 [n]은"
         " sources의 id에 매핑된다. 최종 답변 범위는 process.answer_start로 구분한다"
@@ -536,6 +541,12 @@ def _assemble_turns(events: list) -> list[dict[str, Any]]:
 
     공개 스냅샷이 있는 턴은 사용자 발화·시각만 읽는다. 스냅샷 없는 구 턴만
     라이브와 같은 TurnProcess로 재조립하며, 구 타이밍 메타데이터는 본문에서 제외한다.
+
+    스냅샷이 없고 모델 쪽 이벤트가 오류 이벤트(ADK가 모델 호출 예외를 바꾼 `error_code`)뿐인
+    invocation은 버린다 — 런너가 첫 프레임 전 실패를 재시도·폴백하면 버려진 시도가 사용자 발화 +
+    오류 이벤트로 남고(같은 질문을 새 invocation이 다시 싣는다), 그대로 두면 같은 질문이 답 없이
+    한 번 더 복원된다. 실제로 끝난 턴(실패 포함)은 마감에서 스냅샷을 남기므로 이 판정에 걸리지
+    않는다.
     """
     snapshots = {
         event.invocation_id: snapshot
@@ -561,6 +572,8 @@ def _assemble_turns(events: list) -> list[dict[str, Any]]:
                 "process": None if invocation_id in snapshots else TurnProcess(),
                 "timing": None,
                 "snapshot": snapshots.get(invocation_id),
+                "model_error": False,
+                "replied": False,
             }
         metadata = event.custom_metadata or {}
         if metadata.get(TURN_SNAPSHOT_KEY) is not None:
@@ -575,6 +588,8 @@ def _assemble_turns(events: list) -> list[dict[str, Any]]:
             turn["user"].append(chunk)
         if turn["snapshot"] is not None:
             continue
+        if event.author != "user":
+            turn["model_error" if event.error_code else "replied"] = True
         process: TurnProcess = turn["process"]
         responses = event.get_function_responses()
         if event.author != "user" and not responses:
@@ -593,7 +608,12 @@ def _assemble_turns(events: list) -> list[dict[str, Any]]:
             process.tool_response(response.response or {}, response=response)
         if event.get_function_calls() or responses:
             turn["tool_ran"] = True
-    return list(turns.values())  # dict 삽입 순서 = 턴 등장 순서(이벤트는 시간순)
+    # dict 삽입 순서 = 턴 등장 순서(이벤트는 시간순). 버려진 시도는 뺀다(docstring).
+    return [
+        turn
+        for turn in turns.values()
+        if turn["snapshot"] is not None or turn["replied"] or not turn["model_error"]
+    ]
 
 
 def _title_of(session, user_title: str | None) -> str | None:
@@ -628,6 +648,7 @@ def _project_session_detail(
             **row["snapshot"],
             started_at=row["started_at"],
             user_text=row["user_text"],
+            input_source=row.get("input_source"),
             feedback=TurnFeedbackState(**feedback_by_turn[row["turn_id"]])
             if row["turn_id"] in feedback_by_turn
             else None,
