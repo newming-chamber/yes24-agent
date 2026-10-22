@@ -380,7 +380,7 @@ class AdminService(MysqlBackedService):
         except HTTPException:
             raise
         except (aiomysql.Error, OSError, asyncio.TimeoutError) as exc:
-            logger.error(f"{self._failure_detail} ({type(exc).__name__}): {exc}")
+            logger.error(f"{self._failure_detail} ({type(exc).__name__}{exc.args[:1]})")
             raise HTTPException(status_code=503, detail=self._failure_detail) from exc
 
     async def _with_connection(self, body):

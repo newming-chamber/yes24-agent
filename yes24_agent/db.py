@@ -243,5 +243,5 @@ class MysqlBackedService:
         except HTTPException:
             raise
         except Exception as exc:  # noqa: BLE001 — 실패를 200으로 숨기지 않는다(fail-loud)
-            logger.error(f"{self._failure_detail} ({type(exc).__name__}): {exc}")
+            logger.error(f"{self._failure_detail} ({type(exc).__name__}{exc.args[:1]})")
             raise HTTPException(status_code=503, detail=self._failure_detail) from exc
