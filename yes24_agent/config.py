@@ -1117,8 +1117,10 @@ class Settings(BaseSettings):
             # 2026-09-22 출시 — 표준·fast 모두 2026-10-19 공식 페이지 확인(≤272K 표준 구간).
             ("openai/responses/gpt-6-luna", "", _PRICE_EPOCH, 0.10, 0.01, 0.50,
              _OPENAI_PRICING, date(2026, 10, 19)),
-            ("openai/responses/gpt-6-luna", "fast", _PRICE_EPOCH, 0.20, 0.02, 1.00,
-             _OPENAI_PRICING, date(2026, 10, 19)),
+            # fast의 캐시 안 된 입력은 청구서에 "cache writes"로 0.25가 찍힌다(2026-10-26 조직 비용
+            # API 실측: 8.35M 토큰 $2.086). 캐시 읽기 0.02·출력 1.00은 공식 페이지와 같다.
+            ("openai/responses/gpt-6-luna", "fast", _PRICE_EPOCH, 0.25, 0.02, 1.00,
+             _OPENAI_PRICING, date(2026, 10, 26)),
             # 프롬프트 10만 토큰 이하 구간. 초과 요청은 캐시 읽기·쓰기 포함 전 항목 5배(공식 페이지
             # Long context pricing, 2026-10-22 확인) — 이 표는 구간 단가를 표현하지 않아 하한 구간만
             # 둔다. 이력 압축 임계를 10만으로 내렸지만 압축은 턴 마감 뒤라 턴 안
