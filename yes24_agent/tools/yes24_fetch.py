@@ -281,15 +281,53 @@ def project_detail_for_model(response):
     return {key: value for key, value in response.items() if key != "snippet"}
 
 
+def _fold_common_info_tables(results: list) -> tuple[list, dict]:
+    """ok 상세 둘 이상이 info_tables의 같은 구간을 같은 값으로 가지면 그 구간을 한 벌로 뺀다.
+
+    배송·반품 안내처럼 상품마다 똑같이 붙는 표가 항목 수만큼 반복 실린다. 구간명은 보지 않고 값
+    비교만 한다 — 하나라도 다르거나 없는 항목이 있으면 그 구간은 항목에 남는다. 구간 순서는 첫
+    상세의 순서라 결정적이다. 공통 구간이 없으면 (results 그대로, {})다.
+    """
+    details = [
+        index for index, item in enumerate(results)
+        if isinstance(item, dict)
+        and item.get("type") == "book_detail" and item.get("status") == "ok"
+    ]
+    tables = [results[index].get("info_tables") for index in details]
+    if len(details) < 2 or not all(isinstance(table, dict) for table in tables):
+        return results, {}
+    common = {
+        caption: value for caption, value in tables[0].items()
+        if all(caption in table and table[caption] == value for table in tables[1:])
+    }
+    if not common:
+        return results, {}
+    folded = list(results)
+    for index in details:
+        rest = {k: v for k, v in results[index]["info_tables"].items() if k not in common}
+        # 표가 없는 상품은 키 자체가 없다는 규약(register_page)을 따라 빈 표는 키째 뺀다.
+        detail = {k: v for k, v in results[index].items() if k != "info_tables"}
+        folded[index] = {**detail, "info_tables": rest} if rest else detail
+    return folded, common
+
+
 def project_fetch_many_for_model(response):
-    """fetch_many 응답의 results 안 상세마다 project_detail_for_model — 오류 항목은 그대로다."""
+    """fetch_many 응답의 results 안 상세마다 project_detail_for_model, 공통 정보 구간은 한 벌로.
+
+    오류 항목은 그대로다. 모든 ok 상세에 똑같이 붙는 info_tables 구간은 최상위
+    common_info_tables(구간명→값)로 한 번만 싣는다(_fold_common_info_tables).
+    """
     if not isinstance(response, dict) or not isinstance(response.get("results"), list):
         return response
     results = response["results"]
     projected = [project_detail_for_model(detail) for detail in results]
-    if all(before is after for before, after in zip(results, projected)):
+    projected, common = _fold_common_info_tables(projected)
+    if not common and all(before is after for before, after in zip(results, projected)):
         return response
-    return {**response, "results": projected}
+    folded = {**response, "results": projected}
+    if common:
+        folded["common_info_tables"] = common
+    return folded
 
 
 def _parse_product_page(

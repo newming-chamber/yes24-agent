@@ -230,9 +230,20 @@ def uses_litellm(model_id: str) -> bool:
     return "/" in model_id
 
 
-def tiered_models(settings: Settings) -> list[str]:
-    """처리 등급을 고를 수 있는 모델 — 선택 가능 모델 중 LiteLLM 경로(선언 순서)."""
-    return [model for model in settings.selectable_models.values() if uses_litellm(model)]
+def per_model_targets(settings: Settings, column: str) -> list[str]:
+    """모델별 열(service_tiers·reasoning_efforts)을 고를 수 있는 모델 — 선택 가능 모델(선언 순서).
+
+    처리 등급은 OpenAI Responses 전용 요청 필드라 openai/*만, 사고 강도는 LiteLLM 경로 전부다
+    (anthropic/*는 output_config.effort로 싣는다 — agent.create_agent)."""
+    if column == "service_tiers":
+        return [m for m in settings.selectable_models.values() if m.startswith("openai/")]
+    return [m for m in settings.selectable_models.values() if uses_litellm(m)]
+
+
+def default_effort(settings: Settings, model: str) -> str:
+    """모델별 값이 없을 때의 사고 강도. anthropic/*는 ""(벤더 기본 — Haiku 5.5는 adaptive·medium):
+    전역 기본(Luna 근거의 high)으로 떨어지면 어드민 설정 없이 강도가 바뀐다."""
+    return "" if model.startswith("anthropic/") else settings.litellm_reasoning_effort
 
 
 def encode_model_map(values: dict[str, str]) -> str | None:
@@ -250,7 +261,7 @@ def storable_setting(settings: Settings, column: str, value: Any) -> bool:
     """model_settings 열에 둘 수 있는 값인가 — 저장(어드민 검증)·서빙(effective_choice) 단일 판정.
 
     - default_model·fallback_model: 선택 가능 모델(폴백만 ""=끔 허용).
-    - service_tiers·reasoning_efforts: {LiteLLM 선택 가능 모델: 그 열의 허용 값} 맵.
+    - service_tiers·reasoning_efforts: {per_model_targets(열) 모델: 그 열의 허용 값} 맵.
     - prompt_versions: {선택 가능 모델 | ANY_MODEL: 양의 정수 버전 id} 맵. 버전의 존재·폐기·모델
       일치·승격 게이트는 DB 판정이라 어드민 라우트가 같은 트랜잭션에서 더한다(admin_prompts).
     NULL(config 따름)은 호출부가 먼저 거른다.
@@ -263,7 +274,8 @@ def storable_setting(settings: Settings, column: str, value: Any) -> bool:
     if column in PER_MODEL_COLUMNS:
         options = getattr(settings, PER_MODEL_COLUMNS[column][1])
         return isinstance(value, dict) and all(
-            model in tiered_models(settings) and item in options for model, item in value.items()
+            model in per_model_targets(settings, column) and item in options
+            for model, item in value.items()
         )
     if column == "fallback_model" and value == "":
         return True
@@ -455,13 +467,13 @@ class TurnModels:
 
     @property
     def reasoning_effort(self) -> str:
-        """지금 도는 모델에 실을 사고 강도 — 모델별 값, 없으면 전역 litellm_reasoning_effort.
+        """지금 도는 모델에 실을 사고 강도 — 모델별 값, 없으면 default_effort.
 
         ""는 미전달(벤더 기본). Gemini는 LiteLLM 경로가 아니라 ""다(thinking_budget이 따로 있다).
         """
         if not uses_litellm(self.active):
             return ""
-        return self.reasoning_efforts.get(self.active, get_settings().litellm_reasoning_effort)
+        return self.reasoning_efforts.get(self.active, default_effort(get_settings(), self.active))
 
     @property
     def fallback_from(self) -> str | None:

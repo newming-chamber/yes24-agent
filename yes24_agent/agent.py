@@ -16,7 +16,7 @@ from google.genai import types
 from yes24_agent.config import ensure_openai_api_key_env, get_settings
 from yes24_agent.litellm_reasoning import ReasoningCarryClient
 from yes24_agent.model_input import make_projection_callback
-from yes24_agent.model_routing import record_model_error, retrying, uses_litellm
+from yes24_agent.model_routing import default_effort, record_model_error, retrying, uses_litellm
 from yes24_agent.rbti.persona import axis_label, build_persona_block
 from yes24_agent.sources import LEDGER_MAX_INVOCATIONS, time_kst, today_kst
 from yes24_agent.toolsets import (
@@ -522,8 +522,8 @@ def create_agent(
     prompt_version None은 코드 프롬프트 그대로다. prompt_version은 prompt_versions.
     ensure_loaded로 적재된 id여야 한다 — 아니면 LookupError(조용히 코드 기본으로 돌지 않는다).
 
-    service_tier·reasoning_effort는 LiteLLM(OpenAI) 경로에만 실린다(Gemini 무시). 등급 ""는 표준·
-    미전달, 사고 강도 ""는 미전달(벤더 기본)이고 None이면 전역 litellm_reasoning_effort다 — 모델별
+    service_tier는 OpenAI 경로에만, reasoning_effort는 LiteLLM 경로(OpenAI·anthropic)에 실린다(Gemini
+    무시). 등급 ""는 표준·미전달, 강도 ""는 미전달(벤더 기본)이고 None이면 default_effort다 — 모델별
     값은 런타임 모델 설정이 정한다(model_routing.TurnModels). 모델별 프롬프트 버전 바인딩도 그
     런타임 설정(model_settings.prompt_versions)이 TurnModels.prompt_version으로 넘긴다.
 
@@ -535,7 +535,7 @@ def create_agent(
     settings = get_settings()
     app = app if app is not None else get_resolved_app()
     model_id = model_name or settings.model_name
-    effort = settings.litellm_reasoning_effort if reasoning_effort is None else reasoning_effort
+    effort = default_effort(settings, model_id) if reasoning_effort is None else reasoning_effort
     if uses_litellm(model_id):
         # "provider/model"은 LiteLLM 경로(config.selectable_models 주석 참조).
         # 지연 import — litellm 로드 비용(수 초)은 실제 사용 시에만 지불한다.
@@ -547,13 +547,33 @@ def create_agent(
         # 두 번 거른다: 모르는 신모델은 거부하고(allowed_openai_params 우회가 필요했다), GPT-5 계열은
         # 문자열로 평탄화한 뒤 자기 표(none~xhigh)에 없는 값(max)을 조용히 버린다(2026-10-19 실측:
         # 5.6 Luna의 max → 요청 본문 reasoning=null). 모든 모델×옵션의 실제 본문은 테스트가 계약이다.
-        extra: dict = {}
-        if effort:
-            extra["extra_body"] = {"reasoning": {"effort": effort}}
-        if service_tier:
-            extra["service_tier"] = service_tier
-        # reasoning 아이템을 같은 턴의 다음 도구 라운드로 되돌려 싣는 클라이언트(litellm_reasoning).
-        model = retrying(LiteLlm)(model=model_id, llm_client=ReasoningCarryClient(), **extra)
+        if model_id.startswith("openai/"):
+            extra: dict = {}
+            if effort:
+                extra["extra_body"] = {"reasoning": {"effort": effort}}
+            if service_tier:
+                extra["service_tier"] = service_tier
+            # reasoning 아이템을 같은 턴의 다음 도구 라운드로 되돌려 싣는 클라이언트(litellm_reasoning).
+            model = retrying(LiteLlm)(model=model_id, llm_client=ReasoningCarryClient(), **extra)
+        else:
+            # OpenAI Responses 전용 장치(reasoning 필드·등급·reasoning carry)는 다른 벤더에 싣지
+            # 않는다 — anthropic/*는 LiteLLM 기본 Messages 경로 그대로(사고는 벤더 기본 adaptive).
+            # Anthropic은 캐시가 명시 표시제다(Gemini·OpenAI는 자동). 시스템 표시가 도구 정의까지
+            # 덮고, 마지막 메시지 표시가 직전 라운드까지를 다음 라운드의 캐시 읽기로 만든다
+            # (2026-10-22 단독 실측: 2번째 호출부터 앞부분 전량 읽기, 새로 붙은 부분만 쓰기).
+            extra = {}
+            if model_id.startswith("anthropic/"):
+                extra["cache_control_injection_points"] = [
+                    {"location": "message", "role": "system"},
+                    {"location": "message", "index": -1},
+                ]
+                # Haiku 5.5는 thinking을 생략하면 adaptive로 사고한다(effort 기본 medium). 강도는 litellm
+                # reasoning_effort가 아니라 output_config.effort로 싣는다 — reasoning_effort는
+                # thinking.type.enabled로 바뀌어 400(2026-10-22 직접 호출 실측). 강도는 어드민 모델별
+                # 값으로만 켠다(TurnModels.reasoning_effort가 anthropic은 전역 기본으로 떨어지지 않는다).
+                if effort:
+                    extra["output_config"] = {"effort": effort}
+            model = retrying(LiteLlm)(model=model_id, **extra)
     else:
         # 문자열이 아니라 인스턴스로 싣는다 — 호출 재시도(model_routing.CallRetry)를 섞기 위해서다.
         model = retrying(Gemini)(model=model_id)
@@ -610,7 +630,7 @@ def get_agent(
     # 키를 실제 조립값으로 정규화한다 — None(전역 기본)과 그 값, Gemini의 등급·강도(안 쓰임)가
     # 같은 에이전트를 두 번 만들지 않게.
     if uses_litellm(model_id):
-        effort = settings.litellm_reasoning_effort if reasoning_effort is None else reasoning_effort
+        effort = default_effort(settings, model_id) if reasoning_effort is None else reasoning_effort
     else:
         service_tier = effort = ""
     key = (model_id, service_tier, effort, prompt_version, app.persona_key, app.active)

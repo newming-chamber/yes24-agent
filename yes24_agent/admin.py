@@ -1051,8 +1051,9 @@ async def fetch_audit(
 class ModelSettingsChanges(EditChanges):
     """null이 정상 입력이다("config 따름") — 그래서 모든 필드가 `T | None`(EditChanges 규칙).
 
-    service_tiers·reasoning_efforts는 {LiteLLM 모델: 값} 전체 맵이다 — 맵에 없는 모델은 config를
-    따른다. prompt_versions는 {모델 | "*": 버전 id} 전체 맵(승격·롤백 — DB 판정은 라우트가 더한다).
+    service_tiers·reasoning_efforts는 {per_model_targets(열) 모델: 값} 전체 맵이다 — 맵에 없는
+    모델은 config를 따른다. prompt_versions는 {모델 | "*": 버전 id} 전체 맵(승격·롤백 — DB 판정은
+    라우트가 더한다).
     """
 
     default_model: str | None = None

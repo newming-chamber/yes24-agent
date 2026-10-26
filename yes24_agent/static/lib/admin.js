@@ -1700,7 +1700,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
         if (!known) wrap.append(el('small', 'error', `저장된 값 ${stored[field]}은(는) 지금 선택할 수 없는 모델이라 무시되고 있습니다 — 저장하면 설정 파일 기본값으로 바뀝니다.`));
         return wrap;
       };
-      // 모델별 맵(처리 등급·사고 강도) — LiteLLM(OpenAI) 경로 모델마다(서버가 ID 형태로 고른 목록). 같은 모델
+      // 모델별 맵(처리 등급·사고 강도) — 서버가 열마다 고른 모델 목록(등급은 OpenAI, 강도는 OpenAI·Claude). 같은 모델
       // ID는 기본이든 폴백이든 같은 값. 두 맵은 같은 기계(서버 PER_MODEL_COLUMNS)라 화면도 한 편집기를 쓴다.
       const MAPS = [
         { column: 'service_tiers', title: '처리 등급', entries: data.service_tiers, options: data.tier_options, value: 'tier', configValue: 'config_tier', label: tierLabel,
@@ -1759,7 +1759,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
         { label: '폴백 모델', value: modelName(data.fallback.model), source: MODEL_SOURCES[data.fallback.source] },
         ...MAPS.flatMap((spec) => spec.entries.map((entry) => ({ label: `${spec.title} · ${names[entry.model] ?? entry.model}`, value: spec.label(entry[spec.value]), source: MODEL_SOURCES[entry.source] }))),
       ]);
-      const settingsCard = analysisCard('답변 모델 설정', current, `대화 화면에서 모델을 직접 고른 질의는 폴백하지 않습니다. 처리 등급·사고 강도는 OpenAI 경로 모델에만 있습니다(Gemini는 사고량을 스스로 정한다). 저장하면 이 서버는 바로, 다른 서버는 ${num(data.settings_ttl_s)}초 안에 반영됩니다.`);
+      const settingsCard = analysisCard('답변 모델 설정', current, `대화 화면에서 모델을 직접 고른 질의는 폴백하지 않습니다. 처리 등급은 OpenAI 경로 모델에만, 사고 강도는 OpenAI·Claude 경로 모델에 있습니다(Gemini는 사고량을 스스로 정한다). 저장하면 이 서버는 바로, 다른 서버는 ${num(data.settings_ttl_s)}초 안에 반영됩니다.`);
       settingsCard.append(form);
       // 쿨다운 — 이 응답을 만든 서버(컨테이너) 하나의 상태다. 남은 0초 = 다음 질의가 그 모델을 다시 시험한다.
       const cooling = data.cooldowns.length

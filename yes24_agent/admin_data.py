@@ -26,8 +26,9 @@ from yes24_agent.model_routing import (
     SETTINGS_COLUMNS,
     SETTINGS_ROW_ID,
     cooldowns,
+    default_effort,
     effective_choice,
-    tiered_models,
+    per_model_targets,
 )
 
 # admin 접속(읽기 전용 조회·AdminService 풀) 공통 디코더 — BOOLEAN 열을 bool로 싣는다.
@@ -538,7 +539,7 @@ async def fetch_model_panel(cur, settings: Settings) -> dict[str, Any]:
         "config": {"default_model": settings.model_name, "fallback_model": settings.fallback_model},
         "stored": jsonable(stored) if stored else None,
         "selectable": settings.selectable_models,
-        # 처리 등급(LiteLLM 모델만 — ID 형태로 판정, model_routing.tiered_models).
+        # 처리 등급(OpenAI 모델만 — model_routing.per_model_targets).
         "service_tiers": [
             {
                 "model": model,
@@ -547,7 +548,7 @@ async def fetch_model_panel(cur, settings: Settings) -> dict[str, Any]:
                 "config_tier": settings.litellm_service_tiers.get(model, ""),
                 "source": "runtime" if model in choice.runtime_tiers else "config",
             }
-            for model in tiered_models(settings)
+            for model in per_model_targets(settings, "service_tiers")
         ],
         "tier_options": list(settings.litellm_service_tier_options),
         "tier_notes": settings.litellm_service_tier_notes,
@@ -556,13 +557,13 @@ async def fetch_model_panel(cur, settings: Settings) -> dict[str, Any]:
             {
                 "model": model,
                 "label": labels.get(model),
-                "effort": choice.reasoning_efforts.get(model, settings.litellm_reasoning_effort),
+                "effort": choice.reasoning_efforts.get(model, default_effort(settings, model)),
                 "config_effort": settings.litellm_reasoning_efforts.get(
-                    model, settings.litellm_reasoning_effort
+                    model, default_effort(settings, model)
                 ),
                 "source": "runtime" if model in choice.runtime_efforts else "config",
             }
-            for model in tiered_models(settings)
+            for model in per_model_targets(settings, "reasoning_efforts")
         ],
         "effort_options": list(settings.litellm_reasoning_effort_options),
         # 비용 계산의 근거 단가(정본 config llm_prices — 화면은 숫자를 들지 않는다).

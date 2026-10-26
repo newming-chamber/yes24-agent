@@ -34,6 +34,7 @@ class ModelPrice(BaseModel):
 
 _GEMINI_PRICING = "https://ai.google.dev/gemini-api/docs/pricing"
 _OPENAI_PRICING = "https://developers.openai.com/api/docs/pricing"
+_ANTHROPIC_PRICING = "https://platform.claude.com/docs/en/about-claude/pricing"
 # 첫 구간의 시작일 — 공식 페이지의 가격 시작일이 아니라 usage_log 기록 전부를 덮는 날짜다.
 _PRICE_EPOCH = date(2026, 1, 1)
 _PRICE_CHECKED = date(2026, 9, 14)  # 공식 페이지 확인일(행마다 다를 수 있다 — 아래 표)
@@ -75,6 +76,10 @@ class Settings(BaseSettings):
         # 2026-10-19 추가(출시 09-22) — 로컬 40케이스 프로브: 지연 13.0s vs gemini 15.3s,
         # 메인 턴 비용 ~1/7, 품질 판정은 QA에서.
         "GPT 6 Luna": "openai/responses/gpt-6-luna",
+        # 2026-10-22 추가 — Luna 표준과 같은 단가대(프롬프트 10만 토큰 이하 0.10/0.01/0.50) 비교
+        # 후보. anthropic/ 접두는 LiteLLM의 Anthropic Messages 경로(OpenAI 전용 reasoning 필드·
+        # service_tier·reasoning carry는 싣지 않는다 — agent.create_agent).
+        "Claude Haiku 5.5": "anthropic/claude-haiku-5-5",
     }
     # 활성 도구셋(toolsets.TOOLSETS 키 부분집합). 도구 등록·프롬프트 fragment 활성·프론트
     # 브랜딩이 여기서 파생된다. 순서는 레지스트리 선언 순서가 정본(이 리스트는 켜고 끄기만).
@@ -105,6 +110,9 @@ class Settings(BaseSettings):
     # 허용 사고 강도: "" = 미전달(벤더 기본 — gpt-6-luna는 medium), 나머지는 gpt-6-luna 공식
     # 문서(2026-10-19) 지원값. Gemini의 -1 같은 적응형(auto) 값은 없다. "none"은 넣지 않았다 —
     # reasoning을 끈 경로가 도구를 회피하고 추천을 창작했다(2026-08-12 프로브 3/3, 위 주석).
+    # Haiku 5.5의 xhigh·max는 LiteLLM이 원격 모델 맵(supports_*_reasoning_effort)을 받았을 때만
+    # 나간다 — 내장 맵엔 haiku-5-5가 없어 ValueError(500으로 감싸져 재시도·폴백). Haiku는 high까지만
+    # 쓴다(2026-10-22 감사; xhigh는 p50 41.8초로 이미 탈락).
     litellm_reasoning_effort_options: tuple[str, ...] = (
         "", "low", "medium", "high", "xhigh", "max"
     )
@@ -190,8 +198,10 @@ class Settings(BaseSettings):
     history_compaction_model: str = "gemini-3.1-flash-lite"
     # 발동 임계값 — 턴의 **마지막 LLM 콜** prompt_token_count(다음 턴이 재전송할 이력 크기).
     # 같은 실측에서 정상 사용자는 대화당 1~3턴, 턴당 프롬프트 중앙값 5~6만·p90 15~18만 토큰이라
-    # p90을 건드리지 않는 20만에서 출발한다(그 위는 사실상 장기 대화뿐).
-    history_compaction_token_threshold: int = 200_000
+    # p90을 건드리지 않는 20만에서 출발했다. 2026-10-22 10만으로 내림 — Claude Haiku 5.5는 프롬프트
+    # 10만 토큰 초과 요청에 전 항목 5배 단가라(llm_prices 주석) 그 경계 아래로 이력을 묶는다. 운영
+    # Flash 최근 7일 실측: 10만 초과 턴 223/10,931(2%) — 이 2%만 더 일찍 요약된다.
+    history_compaction_token_threshold: int = 100_000
     # 압축 뒤 원문 그대로 남길 최근 이벤트 수(ADK event_retention_size — 턴이 아니라 이벤트 단위).
     # 이벤트 = 사용자 발화·함수콜·도구 응답·모델 본문·state 쓰기 각 1건 — 운영 실측 턴당 이벤트
     # p50 4·p90 8이라 24면 최근 3~6턴이 원문으로 남아 "방금 그 책" 류 후속이 요약이 아닌 원문을
@@ -1109,6 +1119,12 @@ class Settings(BaseSettings):
              _OPENAI_PRICING, date(2026, 10, 19)),
             ("openai/responses/gpt-6-luna", "fast", _PRICE_EPOCH, 0.20, 0.02, 1.00,
              _OPENAI_PRICING, date(2026, 10, 19)),
+            # 프롬프트 10만 토큰 이하 구간. 초과 요청은 캐시 읽기·쓰기 포함 전 항목 5배(공식 페이지
+            # Long context pricing, 2026-10-22 확인) — 이 표는 구간 단가를 표현하지 않아 하한 구간만
+            # 둔다. 이력 압축 임계를 10만으로 내렸지만 압축은 턴 마감 뒤라 턴 안
+            # 라운드는 넘을 수 있다(도그푸딩 48턴 중 5라운드) — 어드민 비용은 그만큼 과소 추정.
+            ("anthropic/claude-haiku-5-5", "", _PRICE_EPOCH, 0.10, 0.01, 0.50,
+             _ANTHROPIC_PRICING, date(2026, 10, 22)),
         )
     ]
     # 원화 환산(선택). 환율은 시변이라 코드 상수가 아니라 운영자가 기준일과 함께 넣는 값이다 —
@@ -1196,6 +1212,7 @@ class Settings(BaseSettings):
     # AttributeError 메시지가 통째로 싣는다)에 값이 평문으로 찍혔다(2026-09-14 실측).
     gemini_api_key: str = Field(default="", repr=False)
     openai_api_key: str = Field(default="", repr=False)  # LiteLLM 경로(openai/*) 모델용
+    anthropic_api_key: str = Field(default="", repr=False)  # LiteLLM 경로(anthropic/*) 모델용
     perplexity_api_key: str = Field(default="", repr=False)  # web_search(퍼플렉시티 /search)용
     tavily_api_key: str = Field(default="", repr=False)  # web_fetch(Tavily /extract)용
     slack_webhook_url: str = Field(default="", repr=False)  # ERROR 알림 incoming webhook
@@ -1241,6 +1258,10 @@ def ensure_openai_api_key_env() -> str:
     key = os.environ.get("OPENAI_API_KEY") or get_settings().openai_api_key
     if key:
         os.environ["OPENAI_API_KEY"] = key
+    # 같은 이유(pydantic-settings는 os.environ으로 내보내지 않음)로 anthropic/* 경로 키도 매핑한다.
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY") or get_settings().anthropic_api_key
+    if anthropic_key:
+        os.environ["ANTHROPIC_API_KEY"] = anthropic_key
     return key
 
 
