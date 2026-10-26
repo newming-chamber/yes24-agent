@@ -412,7 +412,8 @@ class UserDataService(MysqlBackedService):
                 *_round_inserts((app_name, user_id, session_id, turn_id), rounds or []),
                 (
                     "SELECT turn_id, user_text, started_at, completed_at, status, text, "
-                    "sources, process, meta, error, rbti_applied, history_saved FROM chat_turn "
+                    "sources, process, meta, error, rbti_applied, history_saved, input_source "
+                    "FROM chat_turn "
                     "WHERE app_name = %s AND user_id = %s AND session_id = %s AND turn_id = %s",
                     (app_name, user_id, session_id, turn_id),
                 ),
