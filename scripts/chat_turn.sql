@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS chat_turn (
     fallback_from VARCHAR(128) NULL,
     -- 그 턴이 답한 프롬프트 버전(prompt_version.id, NULL = 코드 기본). 기존 DB는 prompt_versions.sql.
     prompt_version_id BIGINT NULL,
+    -- 질문 유입 경로(클라이언트 선언, 2026-10-21). 값은 main.py ChatRequest.input_source의
+    -- Literal이 정본이고 DB는 검사하지 않는다 — 구 클라이언트·백필 행은 NULL. 기존 DB는
+    -- chat_turn_input_source.sql.
+    input_source VARCHAR(32) NULL COMMENT '질문 유입 경로: user_written=직접 입력, home_suggestion=홈 제안 칩, followup_suggestion=답변 하단 후속 칩, external_link=URL로 질문을 실어 연 바깥 링크, retry=다시 시도. NULL=구 클라이언트',
     PRIMARY KEY (id),
     UNIQUE KEY uq_chat_turn_scope (app_name, user_id, session_id, turn_id),
     KEY idx_chat_turn_session_time (app_name, user_id, session_id, started_at, id),
