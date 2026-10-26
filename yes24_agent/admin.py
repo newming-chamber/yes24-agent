@@ -322,18 +322,22 @@ async def fetch_sessions(
         f"AND f.rating = '{value}') AS {column}, "
         for value, column in FEEDBACK_RATINGS.items()
     )
+    order = _order(SESSION_SORTS, sort, direction, "s.id", _SESSION_ORDER)
+    # 쪽(페이지)을 먼저 고르고 배지는 그 쪽의 행에만 붙인다. 한 문장에 상관 서브쿼리를 모두 두면
+    # MySQL이 정렬 전에 전 세션(운영 5만+)에 계산해 8초가 걸렸다(10-26 실측, 쪽 먼저 ~1초).
+    # 안쪽에는 정렬 키가 될 수 있는 turn_count만 둔다.
     await cur.execute(
         f"SELECT s.user_id, {nickname_sql('s.user_id')} AS nickname, "
-        "s.id, s.create_time, s.update_time, "
-        f"(SELECT COUNT(*) FROM chat_turn t WHERE {_SESSION_TURNS}) AS turn_count, "
+        "s.id, s.create_time, s.update_time, s.turn_count, "
         f"{refused}{feedback}"
         f"{_SESSION_RBTI} AS rbti, "
         # 미리보기 = 첫 턴의 질문 앞부분. 자르기를 SQL에 맡겨 본문 전체를 끌어오지 않는다.
         f"(SELECT LEFT(t.user_text, %s) FROM chat_turn t WHERE {_SESSION_TURNS} "
         "ORDER BY t.started_at, t.id LIMIT 1) AS preview "
-        f"FROM sessions s {where_sql} "
-        f"ORDER BY {_order(SESSION_SORTS, sort, direction, 's.id', _SESSION_ORDER)} "
-        "LIMIT %s OFFSET %s",
+        "FROM (SELECT s.app_name, s.user_id, s.id, s.create_time, s.update_time, "
+        f"(SELECT COUNT(*) FROM chat_turn t WHERE {_SESSION_TURNS}) AS turn_count "
+        f"FROM sessions s {where_sql} ORDER BY {order} LIMIT %s OFFSET %s) s "
+        f"ORDER BY {order}",
         [settings.admin_preview_max_chars, *params, size, page * size],
     )
     items = [
