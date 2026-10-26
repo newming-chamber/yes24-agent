@@ -277,7 +277,14 @@ async def fetch_sessions(
         "s.update_time", (since, until), settings.admin_utc_offset_hours, excluded, "s.user_id"
     )
     # 질문 없이 열리기만 한 빈 세션은 싣지 않는다 — 대시보드·통계 '세션'(턴 있는 세션)과 같은 정의.
-    where.append(f"EXISTS (SELECT 1 FROM chat_turn t WHERE {_SESSION_TURNS})")
+    # 턴 조건 필터(답변거절)는 이 EXISTS 하나에 얹는다 — 같은 표의 EXISTS를 둘 두면 운영에서 4배
+    # 느렸다(1.2초 대 0.3초, 10-26 실측).
+    turn_condition, turn_params = "", []
+    if status == "refused":  # 답변거절(실패·중단) 턴이 있는 세션 — 대시보드 답변거절률과 같은 정의
+        turn_condition = f" AND t.status IN ({', '.join(['%s'] * len(REFUSED))})"
+        turn_params = list(REFUSED)
+    where.append(f"EXISTS (SELECT 1 FROM chat_turn t WHERE {_SESSION_TURNS}{turn_condition})")
+    params.extend(turn_params)
 
     if query:
         # 닉네임은 세션 행마다 닉네임 식을 돌리지 않고, 닉네임이 맞는 회원번호 집합으로 건다.
@@ -298,12 +305,6 @@ async def fetch_sessions(
     if condition := _rbti_condition(_SESSION_RBTI, rbti):
         where.append(condition[0])
         params.extend(condition[1])
-    if status == "refused":  # 답변거절(실패·중단) 턴이 있는 세션 — 대시보드 답변거절률과 같은 정의
-        marks = ", ".join(["%s"] * len(REFUSED))
-        where.append(
-            f"EXISTS (SELECT 1 FROM chat_turn t WHERE {_SESSION_TURNS} AND t.status IN ({marks}))"
-        )
-        params.extend(REFUSED)
     where_sql = sql_where(where)
     rbti_types = await _rbti_types(cur)  # 필터 선택지(목록 문장보다 먼저 — 목록이 마지막 두 문장)
     await cur.execute(f"SELECT COUNT(*) AS total FROM sessions s {where_sql}", params)
@@ -571,12 +572,16 @@ async def fetch_users(
     if nickname == "any":
         where.append(f"{nickname_by_user_pk_sql('u.id')} IS NOT NULL")
     rbti_types = await _rbti_types(cur)
+    # 표에는 닉네임 원값(없으면 null — 회원번호 칸이 따로 있다). 검색만 회원번호 폴백을 쓴다.
+    # 닉네임 정렬이 아니면 닉네임은 쪽의 회원에만 따로 붙인다 — 목록 문장에 두면 정렬 전에 대화한
+    # 회원 전원(운영 6만)에게 계산된다(1.7초 → 0.8초, 10-26 실측).
+    nickname_column = ""
+    if sort == "nickname":
+        nickname_column = f"{nickname_by_user_pk_sql('u.id')} AS nickname, "
     page_data = await _fetch_page(
         cur,
         settings,
-        # 표에는 닉네임 원값(없으면 null — 회원번호 칸이 따로 있다). 검색만 회원번호 폴백을 쓴다.
-        columns=f"u.id, COALESCE(u.user_no, t.user_id) AS user_no, "
-        f"{nickname_by_user_pk_sql('u.id')} AS nickname, t.rbti, "
+        columns=f"u.id, COALESCE(u.user_no, t.user_id) AS user_no, {nickname_column}t.rbti, "
         "t.turns, t.last_chat_at, u.created_at",
         source=source,
         where=where,
@@ -584,6 +589,18 @@ async def fetch_users(
         order=_order(USER_SORTS, sort, direction, "u.id", "t.last_chat_at DESC, u.id DESC"),
         page=page,
     )
+    if not nickname_column:
+        ids = [item["id"] for item in page_data["items"] if item["id"] is not None]
+        nicknames = {}
+        if ids:
+            await cur.execute(
+                f"SELECT u.id, {nickname_by_user_pk_sql('u.id')} AS nickname FROM users u "
+                f"WHERE u.id IN ({', '.join(['%s'] * len(ids))})",
+                ids,
+            )
+            nicknames = {row["id"]: row["nickname"] for row in await cur.fetchall()}
+        for item in page_data["items"]:
+            item["nickname"] = nicknames.get(item["id"])
     return {**page_data, "rbti_types": rbti_types}
 
 
@@ -933,22 +950,24 @@ async def fetch_starter_popular(
     자르면 표기만 다른 1+1이 빠진다). fits = 칩 문장 길이 상한 안인지(수동 추가 가능 여부).
     """
     first_sql, first_params = _first_turns(days, excluded)
-    # 머리말 — 같은 기간 새 대화 중 첫 화면 질문(칩 문장 그대로)으로 시작한 비율.
+    # 첫 질문을 칩 문장 일치 여부(chip)와 함께 한 번에 묶는다 — chip 묶음은 머리말(첫 화면 질문으로
+    # 시작한 비율)에, 나머지는 인기 질문 목록에 간다. 칩 비교를 SELECT 목록의 EXISTS로 두면 첫 턴
+    # 마다 칩 표를 다시 훑는 상관 서브쿼리가 된다(운영 2만 턴 × 칩 1천 행에 18초) — 조인으로 둔다.
     await cur.execute(
-        "SELECT COUNT(*) AS sessions, COALESCE(SUM(EXISTS(SELECT 1 FROM starters c WHERE "
-        f"c.text {_BIN} = f.user_text {_BIN})), 0) AS chip_sessions FROM ({first_sql}) f",
+        "SELECT TRIM(f.user_text) AS text, c.text IS NOT NULL AS chip, COUNT(*) AS sessions, "
+        f"MAX(f.started_at) AS last_at FROM ({first_sql}) f "
+        f"LEFT JOIN (SELECT DISTINCT text {_BIN} AS text FROM starters) c "
+        f"ON c.text = f.user_text {_BIN} GROUP BY TRIM(f.user_text), chip",
         first_params,
     )
-    summary = jsonable(await cur.fetchone())
-    await cur.execute(
-        "SELECT TRIM(f.user_text) AS text, COUNT(*) AS sessions, MAX(f.started_at) AS last_at "
-        f"FROM ({first_sql}) f WHERE NOT EXISTS (SELECT 1 FROM starters c "
-        f"WHERE c.text {_BIN} = f.user_text {_BIN}) GROUP BY TRIM(f.user_text)",
-        first_params,
-    )
+    summary = {"sessions": 0, "chip_sessions": 0}
     merged: dict[str, dict[str, Any]] = {}
     for row in await cur.fetchall():
         row = jsonable(row)
+        summary["sessions"] += row["sessions"]
+        if row["chip"]:
+            summary["chip_sessions"] += row["sessions"]
+            continue
         key = _squash(row["text"])
         if not key:
             continue

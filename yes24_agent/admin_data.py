@@ -176,6 +176,18 @@ _USAGE_SUMS = (
     f"SUM(CASE WHEN {_MEASURED} THEN total_tokens - prompt_tokens END) AS output_billed, "
     f"COUNT(CASE WHEN {_MEASURED} AND cached_tokens IS NULL THEN 1 END) AS cache_unknown_rows"
 )
+# 질의 수 = 측정된 main 행(묶음의 main_rows) 중 단가가 붙은 것. 단가는 component와 무관해 비용
+# 집계는 component로 나누지 않는다 — 나누면 운영 30일 사용자별에 22만 묶음이 넘어와 8초가
+# 걸렸다(10-26).
+_MAIN_ROWS = (
+    f"COUNT(CASE WHEN component = '{MAIN_COMPONENT}' AND {_MEASURED} THEN 1 END) AS main_rows"
+)
+
+
+def _priced_turns(rows) -> int:
+    return sum(int(row["main_rows"]) for row in rows if row["cost_usd"] is not None)
+
+
 # 답변거절 = 답을 내지 못하고 끝난 턴(실패·중단). unknown은 종료 기록 누락이라 세지 않는다.
 # 대시보드 '답변거절률'·통계 '답변거절수'·대화 목록 배지가 같은 정의를 쓴다. SQL은 상태별 수를
 # 상태 이름 열로 세고, 합계와 세부는 refusal_breakdown이 만든다(화면이 실패·중단을 나눠 보인다).
@@ -206,14 +218,19 @@ _LATENCY_QUANTILES = ", ".join(
 def _ranked_turns(columns: str, where: str, partition: str = "") -> str:
     """응답시간 측정 행끼리 순위를 매긴 chat_turns(`rank_no`·`samples`) — 분위수 서브쿼리.
 
-    NULL 행은 `elapsed_ms IS NULL` 파티션으로 따로 묶여 순위를 나눠 갖지 않는다.
+    NULL 행은 `elapsed_ms IS NULL` 파티션으로 따로 묶여 순위를 나눠 갖지 않는다. columns는 별칭
+    있는 식이면 그 별칭으로 partition을 준다.
+
+    쓸 열만 먼저 물질화한다(NO_MERGE) — 뷰가 병합되면 윈도 정렬이 process JSON이 든 원래 행을
+    끌고 다녀 운영 10만 턴에 5~6초가 걸렸다(물질화 후 0.4초, 결과 동일).
     """
     lead = f"{partition}, " if partition else ""
     samples = f"PARTITION BY {partition}" if partition else ""
     return (
-        f"SELECT {columns}, elapsed_ms, ROW_NUMBER() OVER "
+        f"SELECT /*+ NO_MERGE(measured) */ *, ROW_NUMBER() OVER "
         f"(PARTITION BY {lead}elapsed_ms IS NULL ORDER BY elapsed_ms) AS rank_no, "
-        f"COUNT(elapsed_ms) OVER ({samples}) AS samples FROM chat_turns{where}"
+        f"COUNT(elapsed_ms) OVER ({samples}) AS samples "
+        f"FROM (SELECT {columns}, elapsed_ms FROM chat_turns{where}) measured"
     )
 
 
@@ -290,11 +307,7 @@ async def fetch_analytics(
     daily = await _fetch(
         cur,
         f"SELECT day, {_LATENCY_QUANTILES} FROM ("
-        + _ranked_turns(
-            f"{local_day('asked_at', hours)} AS day",
-            sql_where(turn_where),
-            local_day("asked_at", hours),
-        )
+        + _ranked_turns(f"{local_day('asked_at', hours)} AS day", sql_where(turn_where), "day")
         + ") ranked GROUP BY day ORDER BY day",
         turn_params,
     )
@@ -353,9 +366,9 @@ async def fetch_cost(
             cur,
             # background = 사용자에 귀속되지 않은 행(초기 질문 생성 등 대화 밖 작업) — 열 값으로.
             f"SELECT DATE(created_at) AS day, {local_day('created_at', hours)} AS local_day, "
-            f"model, service_tier, component, user_id IS NULL AS background, {_USAGE_SUMS} "
+            f"model, service_tier, user_id IS NULL AS background, {_USAGE_SUMS}, {_MAIN_ROWS} "
             f"FROM usage_log{sql_where(usage_where)} "
-            "GROUP BY day, local_day, model, service_tier, component, background",
+            "GROUP BY day, local_day, model, service_tier, background",
             usage_params,
         ),
         settings.llm_prices,
@@ -365,25 +378,25 @@ async def fetch_cost(
     user_usage = attach_costs(
         await _fetch(
             cur,
-            f"SELECT user_id, DATE(created_at) AS day, model, service_tier, component, "
-            f"{_USAGE_SUMS} "
+            f"SELECT user_id, DATE(created_at) AS day, model, service_tier, {_USAGE_SUMS}, "
+            f"{_MAIN_ROWS} "
             f"FROM usage_log{sql_where([*user_where, 'user_id IS NOT NULL'])} "
-            "GROUP BY user_id, day, model, service_tier, component",
+            "GROUP BY user_id, day, model, service_tier",
             user_params,
         ),
         settings.llm_prices,
     )
 
     def summary_of(rows) -> dict[str, Any]:
-        main = total(r for r in rows if r["component"] == MAIN_COMPONENT)
+        turns = _priced_turns(rows)
         chat = total(r for r in rows if not r["background"])
         return {
             # 질의(분모) — 단가가 적용되고 측정된 main 행(대화 삭제는 chat_turn만 지우고,
             # 미등록·미측정 행은 금액에 없으니 분모에도 없다). 분자는 대화 비용(사용자 귀속 행 전부
             # — main과 그 턴의 서브콜), 대화 외 작업은 빼서 화면 정의 "대화 비용 ÷ 질의 수"와 같다.
-            "priced_rows": main["priced_rows"],
+            "priced_rows": turns,
             "cost_usd": total(rows)["cost_usd"],
-            "cost_per_turn_usd": per_turn(chat["cost_usd"], main["priced_rows"]),
+            "cost_per_turn_usd": per_turn(chat["cost_usd"], turns),
         }
 
     now, before = _split(usage, since, previous, "local_day")
@@ -397,7 +410,7 @@ async def fetch_cost(
     users = []
     for (user_id,), rows in _grouped(user_usage, "user_id").items():
         cost = total(rows)["cost_usd"]
-        turns = total(r for r in rows if r["component"] == MAIN_COMPONENT)["priced_rows"]
+        turns = _priced_turns(rows)
         users.append({"user_id": user_id, "priced_rows": turns, "cost_usd": cost,
                       "cost_per_turn_usd": per_turn(cost, turns)})
     # 비용 내림차순, 단가 미등록(None)은 뒤로, 동률은 사용자 id순.
