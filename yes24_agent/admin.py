@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import logging
 import random
+import re
+import time
 from collections import Counter
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -35,6 +37,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 from pydantic_core import PydanticCustomError
+from pymysql.constants import ER
 
 from yes24_agent.admin_auth import (
     AdminActor,
@@ -45,9 +48,11 @@ from yes24_agent.admin_auth import (
     require_owner,
 )
 from yes24_agent.admin_data import (
+    _BIN,
     ACTIVE_USERS,
     BOOL_DECODERS,
     REFUSED,
+    admin_now,
     date_range,
     excluded_condition,
     fetch_analytics,
@@ -130,41 +135,112 @@ def admin_headers(settings: Settings) -> dict[str, str]:
 _DB_ERRORS = (aiomysql.Error, OSError, TimeoutError)
 
 
-def readonly_connect_kwargs(session_db_url: str) -> dict[str, Any] | None:
+def readonly_connect_kwargs(session_db_url: str, query_timeout_ms: int) -> dict[str, Any] | None:
     """읽기 전용 접속 kwargs — 세션 DB가 MySQL이 아니면 None(admin 비활성).
 
     접속 정보 파싱은 mysql_pool_kwargs 한 곳이 소유한다(설정 단일 출처). 풀 전용 인자만
-    떼고 UTC init_command 뒤에 읽기 전용 문장을 잇는다(다중 문장 init_command는 라이브 실측).
+    떼고 UTC init_command 뒤에 문장 실행 상한(query_timeout_ms — 설정 admin_query_timeout_ms)과
+    읽기 전용 문장을 잇는다(다중 문장 init_command는 라이브 실측).
     """
     kwargs = mysql_pool_kwargs(session_db_url, maxsize=1)
     if kwargs is None:
         return None
     for pool_only in ("minsize", "maxsize"):
         kwargs.pop(pool_only)
-    kwargs["init_command"] = f"{kwargs['init_command']}; {_READ_ONLY_COMMAND}"
+    kwargs["init_command"] = (
+        f"{kwargs['init_command']}; SET SESSION max_execution_time = {int(query_timeout_ms)}; "
+        f"{_READ_ONLY_COMMAND}"
+    )
     kwargs["conv"] = BOOL_DECODERS
     return kwargs
 
 
+_SNAPSHOT = "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"
+
+
+class _TimedCursor:
+    """문장별 소요(ms)·행 수를 모으는 커서 — 요청당 한 줄 로그(snapshot_query)의 재료.
+
+    느린 요청이 어느 문장에서 시간을 썼는지(운영 이상치 R7 — 같은 조회가 로컬 1초, 운영 12~18초)
+    문장 단위로 귀속하려고 둔다. 나머지 속성은 실 커서 그대로다.
+    """
+
+    def __init__(self, cur) -> None:
+        self._cur = cur
+        self.statements: list[str] = []
+
+    async def execute(self, sql: str, params=None):
+        started = time.perf_counter()
+        outcome = "실패"
+        try:
+            result = await self._cur.execute(sql, params)
+            outcome = f"{getattr(self._cur, 'rowcount', '?')}행"  # 계측이 조회를 깨지 않게
+            return result
+        finally:
+            table = _FIRST_TABLE.search(sql)
+            self.statements.append(
+                f"{table.group(1) if table else '?'} {_ms(started)}ms/{outcome}"
+            )
+
+    def __getattr__(self, name: str):
+        return getattr(self._cur, name)
+
+
+_FIRST_TABLE = re.compile(r"\bFROM\s+(\w+)")
+
+
+def _ms(started: float) -> int:
+    return round((time.perf_counter() - started) * 1000)
+
+
+def _fetch_name(fetch) -> str:
+    """로그 라벨 — 조회 함수 이름(라우트 안 람다는 감싼 라우트 함수 이름)."""
+    parts = [part for part in getattr(fetch, "__qualname__", "?").split(".") if part != "<locals>"]
+    return parts[-2] if parts[-1] == "<lambda>" and len(parts) > 1 else parts[-1]
+
+
 def snapshot_query(connect, connect_kwargs: dict[str, Any]):
     """요청 단위 조회기 — `query(fetch, *args)`는 한 요청의 모든 SELECT를 동일한 읽기 전용
-    스냅샷에서 실행한다(admin·admin_prompts 라우트 공통 골격). DB 실패는 503이다."""
+    스냅샷에서 실행한다(admin·admin_prompts 라우트 공통 골격). DB 실패는 503, 문장 실행 상한
+    초과(max_execution_time)는 504다.
+
+    요청마다 한 줄을 남긴다: 시작 시각(UTC)·접속·스냅샷 시작·문장별 ms와 행 수(성공·실패 모두).
+    """
 
     async def query(fetch, *args):
+        started_at = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+        started = time.perf_counter()
+        steps: list[str] = []
+        timed = None
         try:
             conn = await connect(**connect_kwargs)
+            steps.append(f"접속 {_ms(started)}ms")
             try:
                 async with conn.cursor(aiomysql.DictCursor) as cur:
-                    await cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
-                    return await fetch(cur, *args)
+                    snapshot = time.perf_counter()
+                    await cur.execute(_SNAPSHOT)
+                    steps.append(f"스냅샷 {_ms(snapshot)}ms")
+                    timed = _TimedCursor(cur)
+                    return await fetch(timed, *args)
             finally:
                 try:
                     await conn.rollback()
                 finally:
                     conn.close()
         except _DB_ERRORS as exc:
-            logger.warning(f"admin DB 조회 실패: {type(exc).__name__}")
+            logger.warning(f"admin DB 조회 실패: {type(exc).__name__} {exc.args[:1]}")
+            if isinstance(exc, aiomysql.OperationalError) and exc.args[:1] == (ER.QUERY_TIMEOUT,):
+                raise HTTPException(
+                    status_code=504, detail="조회 시간이 너무 깁니다. 기간을 줄여 주세요."
+                ) from None
             raise HTTPException(status_code=503, detail="데이터를 불러올 수 없습니다.") from None
+        finally:
+            statements = ", ".join(timed.statements) if timed else ""
+            logger.info(
+                f"admin 조회 {_fetch_name(fetch)} 시작 {started_at} 합 {_ms(started)}ms "
+                f"({', '.join(steps)}; 문장 {len(timed.statements) if timed else 0}개: "
+                f"{statements})"
+            )
 
     return query
 
@@ -285,7 +361,12 @@ async def fetch_sessions(
     if status == "refused":  # 답변거절(실패·중단) 턴이 있는 세션 — 대시보드 답변거절률과 같은 정의
         turn_condition = f" AND t.status IN ({', '.join(['%s'] * len(REFUSED))})"
         turn_params = list(REFUSED)
-    where.append(f"EXISTS (SELECT 1 FROM chat_turn t WHERE {_SESSION_TURNS}{turn_condition})")
+    # 턴 조건이 없으면 세미조인 변환을 끈다(LooseScan이 기간과 무관하게 chat_turn을 다 훑는다 — 오늘
+    # 0.99→0.15초, 10-27 실측). 답변거절 조건이 붙으면 세미조인 쪽이 싸서 힌트를 얹지 않는다.
+    hint = "" if turn_condition else "/*+ NO_SEMIJOIN() */ "
+    where.append(
+        f"EXISTS (SELECT {hint}1 FROM chat_turn t WHERE {_SESSION_TURNS}{turn_condition})"
+    )
     params.extend(turn_params)
 
     if query:
@@ -496,27 +577,31 @@ STARTER_SORTS = {
 _STARTER_ORDER = "x.live DESC, x.active DESC, x.created_at DESC, x.id DESC"
 
 
-def _first_turns(days: int, excluded: tuple[str, ...]) -> tuple[str, list[Any]]:
+def _first_turns(
+    settings: Settings, days: int, excluded: tuple[str, ...]
+) -> tuple[str, list[Any]]:
     """새 세션의 첫 턴(최근 days일) — 칩으로 시작한 대화·인기 질문이 같은 정의를 쓴다.
 
-    첫 턴 = 같은 세션에 더 이른 턴이 없는 턴(idx_chat_turn_session_time으로 찾는다). 시각은 UTC
-    저장. 내부·테스트 계정(excluded)은 다른 지표 탭과 같은 기준으로 뺀다.
+    첫 턴 = 같은 세션에 더 이른 턴이 없는 턴(idx_chat_turn_session_time으로 찾는다). 최근 days일
+    = 오늘(어드민 시간대) 포함 달력일 days개 — 대시보드·통계의 기간 경계(period_filter)와 같다
+    (지금부터 거꾸로 센 24시간×days가 아니다). 내부·테스트 계정(excluded)은 다른 탭과 같이 뺀다.
     """
-    excluding, params = excluded_condition("t.user_id", excluded)
+    today = admin_now(settings).date()
+    where, params = period_filter(
+        "t.started_at", (today - timedelta(days=days - 1), today),
+        settings.admin_utc_offset_hours, excluded, "t.user_id",
+    )
     return (
-        "SELECT t.user_text, t.started_at FROM chat_turn t "
-        "WHERE t.started_at >= UTC_TIMESTAMP() - INTERVAL %s DAY"
-        + "".join(f" AND {condition}" for condition in excluding)
-        + " AND NOT EXISTS (SELECT 1 FROM chat_turn p WHERE p.app_name = t.app_name "
+        f"SELECT t.user_text, t.started_at FROM chat_turn t{sql_where(where)}"
+        " AND NOT EXISTS (SELECT 1 FROM chat_turn p WHERE p.app_name = t.app_name "
         "AND p.user_id = t.user_id AND p.session_id = t.session_id "
         "AND (p.started_at < t.started_at OR (p.started_at = t.started_at AND p.id < t.id)))",
-        [days, *params],
+        params,
     )
 
 
-# 칩 문장 비교는 이진 — 두 표의 콜레이션이 다르고(chat_turn utf8mb4_unicode_ci, starters 서버 기본)
-# 칩은 누르면 그대로 전송되는 문장이라 대소문자·전각을 접으면 다른 문장까지 칩 시작으로 센다.
-_BIN = "COLLATE utf8mb4_bin"
+# 칩 문장 비교는 이진(_BIN) — 두 표의 콜레이션이 다르고(chat_turn utf8mb4_unicode_ci, starters 서버
+# 기본) 칩은 누르면 그대로 전송되는 문장이라 대소문자·전각을 접으면 다른 문장까지 칩 시작으로 센다.
 SORT_DIRECTIONS = ("asc", "desc")
 
 
@@ -650,7 +735,7 @@ async def fetch_starters(
     )
     reason_params = [param for _, _, params in clauses for param in params]
     slots = await _starter_slots(cur, settings)
-    first_sql, first_params = _first_turns(settings.starter_uses_days, excluded)
+    first_sql, first_params = _first_turns(settings, settings.starter_uses_days, excluded)
     where, params = [], []
     if query:
         # 분야 이름은 행 라벨이 비어 있는 경우가 많다(직접 등록·옛 자동 행) — 선택지와 같은 출처
@@ -951,7 +1036,7 @@ async def fetch_starter_popular(
     파이썬에서 한 번 더 합친 뒤 starter_popular_min_sessions번 이상만 남긴다(합치기 전에
     자르면 표기만 다른 1+1이 빠진다). fits = 칩 문장 길이 상한 안인지(수동 추가 가능 여부).
     """
-    first_sql, first_params = _first_turns(days, excluded)
+    first_sql, first_params = _first_turns(settings, days, excluded)
     # 첫 질문을 칩 문장 일치 여부(chip)와 함께 한 번에 묶는다 — chip 묶음은 머리말(첫 화면 질문으로
     # 시작한 비율)에, 나머지는 인기 질문 목록에 간다. 칩 비교를 SELECT 목록의 EXISTS로 두면 첫 턴
     # 마다 칩 표를 다시 훑는 상관 서브쿼리가 된다(운영 2만 턴 × 칩 1천 행에 18초) — 조인으로 둔다.
@@ -1138,7 +1223,9 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
     읽기 전용 접속 kwargs를 만드는 김에 그 결과로 판정한다.
     connect는 테스트 주입점이다(실 DB 없이 전 경로를 돈다 — AuthService의 pool_factory 패턴).
     """
-    connect_kwargs = readonly_connect_kwargs(settings.session_db_url)
+    connect_kwargs = readonly_connect_kwargs(
+        settings.session_db_url, settings.admin_query_timeout_ms
+    )
     if connect_kwargs is None:
         return
     router = APIRouter(prefix="/admin", include_in_schema=False)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -12,11 +12,13 @@ from pymysql.constants import FIELD_TYPE
 from pymysql.converters import decoders
 
 from yes24_agent.admin_cost import (
+    _BIN,
     attach_costs,
     cache_hit_rate,
     cost_notes,
     per_turn,
     price_for,
+    row_cost_sql,
     tokens_of,
     total,
 )
@@ -140,24 +142,50 @@ def excluded_condition(column: str, excluded: tuple[str, ...]) -> tuple[list[str
     return [f"({column} IS NULL OR {column} NOT IN ({marks}))"], list(excluded)
 
 
-def period_filter(
-    column: str,
-    period: tuple[date | None, date | None],
-    offset_hours: int,
-    excluded: tuple[str, ...] = (),
-    user_column: str = "user_id",
-) -> tuple[list[str], list[Any]]:
-    """어드민 집계 범위 — 어드민 시간대 달력일 [since, until](until은 그날 하루를 통째로 포함)
-    + 제외 계정(excluded가 있으면 user_column 기준, excluded_condition)."""
+# 집계 기간 — 어드민 시간대 달력일 (since, until). until이 datetime이면 그 시각(어드민 시간대)에서
+# 끊는 배타 상한이다 — 진행 중인 기간과 견주는 비교 기간만 쓴다(_periods).
+Period = tuple[date | None, date | None]
+
+
+def admin_now(settings: Settings) -> datetime:
+    """지금의 어드민 시간대 시각(naive) — 기간 경계가 쓰는 '오늘'은 이 날짜다."""
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+        hours=settings.admin_utc_offset_hours
+    )
+
+
+def _range(column: str, period: Period, offset_hours: int) -> tuple[list[str], list[Any]]:
     since, until = period
     shift = f" - INTERVAL {int(offset_hours)} HOUR"
     where, params = [], []
     if since:
         where.append(f"{column} >= %s{shift}")
         params.append(since)
-    if until and until < date.max:
+    if isinstance(until, datetime):
+        where.append(f"{column} < %s{shift}")
+        params.append(until)
+    elif until and until < date.max:
         where.append(f"{column} < %s + INTERVAL 1 DAY{shift}")
         params.append(until)
+    return where, params
+
+
+def period_filter(
+    column: str,
+    period: Period | list[Period],
+    offset_hours: int,
+    excluded: tuple[str, ...] = (),
+    user_column: str = "user_id",
+) -> tuple[list[str], list[Any]]:
+    """어드민 집계 범위 — 어드민 시간대 달력일 [since, until](until은 그날 하루를 통째로 포함,
+    datetime이면 그 시각 전까지) + 제외 계정(excluded가 있으면 user_column 기준,
+    excluded_condition). 기간 목록이면 그중 어느 하나에 드는 행이다(떨어진 두 기간)."""
+    ranges = [_range(column, one, offset_hours) for one in
+              (period if isinstance(period, list) else [period])]
+    where, params = ranges[0]
+    if len(ranges) > 1:
+        where = ["(" + " OR ".join(f"({' AND '.join(w)})" for w, _ in ranges) + ")"]
+        params = [param for _, p in ranges for param in p]
     excluding, excluded_params = excluded_condition(user_column, excluded)
     return [*where, *excluding], [*params, *excluded_params]
 
@@ -254,22 +282,40 @@ def _sums(rows, keys: tuple[str, ...]) -> dict[str, int]:
     return {key: sum(int(row[key]) for row in rows) for key in keys}
 
 
-def _periods(settings: Settings, period: tuple[date | None, date | None]):
-    """(이번 기간 표기, 비교 기간|None, 기간 표기 함수, 두 기간을 잇는 조회 범위).
+def _periods(settings: Settings, period: Period):
+    """(이번 기간 표기, 비교 기간|None, 기간 표기 함수, 두 기간을 읽는 범위 — period_filter 인자).
 
-    비교 기간 = 바로 앞의 같은 길이 기간.
+    비교 기간 = 바로 앞의 같은 길이 기간. 이번 기간이 진행 중이면(오늘이 기간 안) 비교 기간도 같은
+    경과 시각에서 끊는다 — 오늘 16:01이면 '오늘'의 비교는 어제 00:00~16:01이다. 전일 전체와 견주면
+    오늘의 증감 부호가 뒤집혔다(10-27 운영 16:01: 오늘 5,640건 대 어제 전일 6,120건 −8%, 같은
+    시각까지면 2,880건 +96%). 다일 기간(최근 7·30일·이번 달)도 같은 규칙이라 마지막 날만 잘린다 —
+    두 기간의 경과 길이가 같아야 증감이 뜻을 가지며, 지난 날들은 이미 하루를 다 채웠다. 끝이 미래인
+    기간(10-01~10-31)은 전체 길이가 아니라 경과한 날 수만큼 바로 앞을 잡는다(10-27이면 09-04부터
+    09-30 같은 시각까지). 끊은 시각은 표기의 until_time("HH:MM")으로 싣고, 끊지 않은 비교 기간에는
+    키가 없다.
     """
     since, until = period
     previous = None
+    spanned: list[Period] = [period]
     if since and until:
-        length = (until - since).days + 1
+        now = admin_now(settings)
+        live = since <= now.date() <= until
+        length = ((now.date() if live else until) - since).days + 1
         if (since - date.min).days >= length:
-            previous = (since - timedelta(days=length), since - timedelta(days=1))
+            start, end = since - timedelta(days=length), since - timedelta(days=1)
+            if live:
+                end = datetime.combine(start, time()) + (now - datetime.combine(since, time()))
+            previous = (start, end)
+            # 이어진 두 기간은 한 범위로(문장이 그대로), 끊겨 틈이 생기면 두 범위로 읽는다.
+            spanned = [previous, period] if isinstance(end, datetime) else [(start, until)]
 
     def stamp(start, end) -> dict[str, Any]:
+        if isinstance(end, datetime):
+            return {"since": start, "until": end.date(), "until_time": end.strftime("%H:%M"),
+                    "timezone": settings.admin_timezone_label}
         return {"since": start, "until": end, "timezone": settings.admin_timezone_label}
 
-    return stamp(since, until), previous, stamp, ((previous[0], until) if previous else period)
+    return stamp(since, until), previous, stamp, spanned
 
 
 def _split(rows, since, previous, key: str = "day") -> tuple[list, list]:
@@ -300,6 +346,7 @@ async def fetch_analytics(
     hours = settings.admin_utc_offset_hours
     current, previous, stamp, spanned = _periods(settings, period)
 
+    # 기간 요약은 기간마다 한 문장(한 번에 훑는 통합안은 7·30일에서 더 느렸다, 10-27 실측).
     async def turn_summary(selected) -> dict[str, Any]:
         where, params = period_filter("asked_at", selected, hours, excluded)
         [row] = await _fetch(
@@ -363,7 +410,8 @@ async def fetch_cost(
     """비용 패널(owner 전용 라우트) — 기간·비교 기간 비용·토큰, 일별 비용·토큰(모델별 포함),
     사용자별 비용 상위, 각주.
 
-    금액은 SQL이 아니라 admin_cost가 행의 **UTC 날짜**(`day`)에 유효한 단가로 붙인다 — 단가
+    금액은 admin_cost가 행의 **UTC 날짜**(`day`)에 유효한 단가로 붙인다(사용자 상위 N은 같은 판정의
+    SQL 식 row_cost_sql로 SQL 안에서) — 단가
     유효일은 과금 사실의 기준일이라 표시 시간대를 바꿔도 금액이 흔들리지 않게 UTC로 둔다. 표시
     날짜는 `local_day`다. 일별 모델 칸은 같은 집계 행을 모델로 다시 묶은 것이다(usage_log를 더
     읽지 않는다). 모델 ID·표시 이름을 싣는다 — owner 전용 라우트이고 모델 설정 패널도 owner에게
@@ -386,17 +434,18 @@ async def fetch_cost(
         settings.llm_prices,
     )
     # 사용자별 = 그 사용자에 귀속된 행 전부(대화 비용 — 요약 카드와 같은 정의), 질의는 main 행.
+    # 단가 붙이기·합·정렬·상위 N은 SQL에서(14만 묶음 행을 파이썬으로 받으면 6초였다, 10-27 실측).
+    # 규칙은 summary_of·total과 같다: 질의 = 단가 붙은 측정 main 행, 단가 붙은 행이 없으면 금액
+    # NULL(미등록)이고 뒤로, 동률은 사용자 id순(이진 — 파이썬 문자열 순).
     user_where, user_params = period_filter("created_at", period, hours, excluded)
-    user_usage = attach_costs(
-        await _fetch(
-            cur,
-            f"SELECT user_id, DATE(created_at) AS day, model, service_tier, {_USAGE_SUMS}, "
-            f"{_MAIN_ROWS} "
-            f"FROM usage_log{sql_where([*user_where, 'user_id IS NOT NULL'])} "
-            "GROUP BY user_id, day, model, service_tier",
-            user_params,
-        ),
-        settings.llm_prices,
+    row_cost, cost_params = row_cost_sql(settings.llm_prices, _MEASURED)
+    users = await _fetch(
+        cur,
+        f"SELECT user_id, COUNT(CASE WHEN component = %s AND {_MEASURED} THEN {row_cost} END) "
+        f"AS priced_rows, SUM({row_cost}) AS cost_usd "
+        f"FROM usage_log{sql_where([*user_where, 'user_id IS NOT NULL'])} GROUP BY user_id "
+        f"ORDER BY cost_usd IS NULL, cost_usd DESC, user_id {_BIN} LIMIT %s",
+        [MAIN_COMPONENT, *cost_params, *cost_params, *user_params, settings.admin_top_users],
     )
 
     def summary_of(rows) -> dict[str, Any]:
@@ -433,15 +482,10 @@ async def fetch_cost(
                 **tokens_of(sums), "models": models}
 
     daily = [day_of(day, rows) for (day,), rows in sorted(_grouped(now, "local_day").items())]
-    users = []
-    for (user_id,), rows in _grouped(user_usage, "user_id").items():
-        cost = total(rows)["cost_usd"]
-        turns = _priced_turns(rows)
-        users.append({"user_id": user_id, "priced_rows": turns, "cost_usd": cost,
-                      "cost_per_turn_usd": per_turn(cost, turns)})
-    # 비용 내림차순, 단가 미등록(None)은 뒤로, 동률은 사용자 id순.
-    users.sort(key=lambda u: (u["cost_usd"] is None, -(u["cost_usd"] or 0), u["user_id"]))
-    users = users[: settings.admin_top_users]
+    users = [
+        {**row, "cost_per_turn_usd": per_turn(row["cost_usd"], row["priced_rows"])}
+        for row in users
+    ]
     if users:
         # 표에 실을 사용자들의 닉네임을 한 문장으로(사용자마다 따로 묻지 않는다).
         ids = [u["user_id"] for u in users]

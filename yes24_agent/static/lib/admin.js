@@ -210,17 +210,18 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
    *  스크립트 예외)은 console에만 남기고 fallback(원시 예외 문구를 화면에 내지 않는다). */
   const errorText = (error, fallback = '불러오지 못했습니다.') => { if (error.constructor === Error) return error.message; console.error(error); return fallback; };
 
-  async function request(key, path, render) {
+  async function request(key, path, render, again = () => request(key, path, render)) {
     pending.get(key)?.abort();
     const controller = new AbortController();
     pending.set(key, controller);
     try {
       const data = await api(path, { signal: controller.signal });
-      if (!controller.signal.aborted) render(data);
+      // 렌더 예외도 아래 오류 자리로 간다(await — 렌더가 promise를 돌려줘도 삼키지 않는다).
+      if (!controller.signal.aborted) await render(data);
     } catch (error) {
       if (error.name !== 'AbortError' && !controller.signal.aborted) {
         // 그릴 자리가 있으면 그 자리에(문구 + 다시 시도), 없으면 상단 띠에 — 같은 말을 두 곳에 띄우지 않는다.
-        const again = () => request(key, path, render), target = $(key), message = errorText(error);
+        const target = $(key), message = errorText(error);
         if (!target) return showError(message, again);
         const bar = key === 'detail' ? target.querySelector('#detail-bar') : null;
         const retry = el('button', 'link-button', '다시 시도');
@@ -742,7 +743,11 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
    *  open이 있으면 타일 전체가 버튼이다(그 숫자의 목록으로 간다 — title이 어디로 가는지 말한다). */
   /** sample(비율의 분모 — 두 기간 중 작은 쪽)이 설정 하한(change_min_base)보다 작으면 증감을 색 없이
    *  '표본 적음(n질의)'으로만 보인다 — 질의 3건 중 1건 실패가 '+33%p 악화'로 빨갛게 뜨지 않게. */
-  function kpi(label, value, { current, previous, format, upIsBad, sub, open, sample, hint } = {}) {
+  /** 비교 기간 이름(versus = 응답의 comparison) — 진행 중인 기간이면 서버가 이전 기간도 같은 경과 시각까지 자르고
+   *  until_time을 싣는다. 시각은 툴팁에만 둔다(응답마다 분 단위로 달라 칸끼리 어긋나 보이고, 타일 줄이 늘어난다). */
+  const priorLabel = (versus) => `이전 기간${versus?.period?.until_time ? '(같은 시각까지)' : ''}`;
+  const priorTitle = (versus) => (versus?.period?.until_time ? `이전 기간을 ${versus.period.until_time}까지로 잘라 견줍니다` : '');
+  function kpi(label, value, { current, previous, format, upIsBad, sub, open, sample, hint, versus } = {}) {
     const box = el(open ? 'button' : 'div', 'kpi');
     if (open) { box.type = 'button'; box.onclick = open.go; box.title = open.title; }
     const name = el('span', null, label);
@@ -751,7 +756,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     if (sample != null && sample < state.changeMinBase) box.append(el('span', 'delta', `표본 적음(${num(sample)}질의)`));
     else if (format && current != null && previous != null && (previous !== 0 || format === points)) {
       const worse = upIsBad && current !== previous ? (current > previous ? ' bad' : ' good') : '';
-      box.append(el('span', `delta${worse}`, `${change(current, previous, format)} · 이전 기간 대비`));
+      box.append(Object.assign(el('span', `delta${worse}`, `${change(current, previous, format)} · ${priorLabel(versus)} 대비`), { title: priorTitle(versus) }));
     }
     if (sub) box.append(el('span', 'kpi-sub', sub));
     return box;
@@ -759,8 +764,9 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
 
   /** 피드백 KPI — 좋아요·싫어요 각각을 누르면 이 기간 + 그 평가로 걸러 대화 탭을 연다.
    *  (대화 목록 기간은 세션 최근 갱신 기준이라 평가 시각 기준인 카드 수와 조금 다를 수 있다.) */
-  function feedbackKpi(summary, prior, period) {
-    const box = kpi('피드백 (좋아요 · 싫어요)', `${num(summary.likes)} · ${num(summary.dislikes)}`, { hint: METRIC_HINTS.feedback, sub: prior?.likes || prior?.dislikes ? `이전 기간 좋아요 ${num(prior.likes)} · 싫어요 ${num(prior.dislikes)}` : '' });
+  function feedbackKpi(summary, prior, period, versus) {
+    const box = kpi('피드백 (좋아요 · 싫어요)', `${num(summary.likes)} · ${num(summary.dislikes)}`, { hint: METRIC_HINTS.feedback, sub: prior?.likes || prior?.dislikes ? `${priorLabel(versus)} 좋아요 ${num(prior.likes)} · 싫어요 ${num(prior.dislikes)}` : '' });
+    box.querySelector('.kpi-sub')?.setAttribute('title', priorTitle(versus));
     const links = el('span', 'kpi-links');
     for (const rating of Object.keys(FEEDBACK_LABELS)) {
       const link = el('button', 'link-button', `${FEEDBACK_LABELS[rating]} 대화 보기`);
@@ -773,21 +779,29 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     return box;
   }
 
-  function loadDashboard() {
-    const params = new URLSearchParams({ since: $('dashboard-since').value, until: $('dashboard-until').value, ...scope() });
-    showPeriod('dashboard');
-    // 재조회는 이전 렌더를 흐리게 유지한다 — 자리표시자로 갈아 끼우면 화면이 튄다.
-    if ($('dashboard').childElementCount) $('dashboard').classList.add('is-loading');
-    else $('dashboard').replaceChildren(el('div', 'placeholder', '운영 지표를 불러오는 중…'));
-    // 비용은 owner 전용 엔드포인트다 — 다른 역할은 부르지도 않는다(서버도 403).
-    const cost = hasRole('owner') ? api(`/admin/api/analytics/cost?${params}`).catch((error) => error) : Promise.resolve(null);
-    return request('dashboard', `/admin/api/analytics?${params}`, async (data) => renderDashboard(data, await cost))
-      .finally(() => { if (!pending.has('dashboard')) $('dashboard').classList.remove('is-loading'); });
+  /** 칸 하나 읽기(칸 id = request 키). 재조회는 이전 렌더를 흐리게 유지한다 — 자리표시자로 갈아 끼우면 화면이 튄다.
+   *  흐림은 그 칸의 최신 요청이 끝날 때 걷힌다(같은 키 새 요청이 옛 요청을 끊는다). */
+  function loadSection(key, path, render, waiting) {
+    const box = $(key);
+    if (box.childElementCount) box.classList.add('is-loading');
+    else box.replaceChildren(el('div', 'placeholder', waiting));
+    return request(key, path, render, () => loadSection(key, path, render, waiting))
+      .finally(() => { if (!pending.has(key)) box.classList.remove('is-loading'); });
   }
 
-  /** 대시보드(모든 역할): 기간 KPI 5개(이전 기간 대비) · 응답 시간 추이 · 시간대별 질의. owner면 비용 패널을 덧붙인다. */
-  function renderDashboard(data, cost) {
-    const summary = data.summary, prior = data.comparison?.summary;
+  /** 비용은 owner 전용 엔드포인트다 — 다른 역할은 칸도 없고(start) 부르지도 않는다(서버도 403).
+   *  비용 집계는 지표보다 훨씬 느려서 자기 칸에 따로 읽는다 — 지표가 비용을 기다리지 않는다. */
+  function loadDashboard() {
+    const params = periodQuery('dashboard');
+    return Promise.all([
+      loadSection('dashboard', `/admin/api/analytics?${params}`, renderDashboard, '운영 지표를 불러오는 중…'),
+      ...(hasRole('owner') ? [loadSection('dashboard-cost', `/admin/api/analytics/cost?${params}`, renderCost, '비용을 불러오는 중…')] : []),
+    ]);
+  }
+
+  /** 대시보드(모든 역할): 기간 KPI 5개(이전 기간 대비) · 응답 시간 추이 · 시간대별 질의. 비용은 자기 칸(renderCost). */
+  function renderDashboard(data) {
+    const summary = data.summary, prior = data.comparison?.summary, versus = data.comparison;
     const days = periodDays(data.period);
     const byDay = new Map(data.daily.map((row) => [row.day, row]));
     const daily = (pick, missing) => days.map((day) => byDay.has(day) ? pick(byDay.get(day)) : missing);
@@ -795,12 +809,12 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     const { since, until } = data.period;
     const kpis = el('div', 'kpis');
     kpis.append(
-      kpi(`${TERMS.users} (기간)`, metric(summary.users), { hint: METRIC_HINTS.users, current: summary.users, previous: prior?.users, format: num, sub: '이 기간에 대화한 사용자', open: { title: '회원 목록 보기', go: () => switchTab('users') } }),
-      kpi(TERMS.turns, metric(summary.turns), { hint: METRIC_HINTS.queries, current: summary.turns, previous: prior?.turns, format: num, open: { title: '이 기간의 대화 보기', go: () => openSessions({ since, until }) } }),
-      kpi('답변거절률', percent(refusalRate(summary)), { current: refusalRate(summary), previous: refusalRate(prior), format: points, upIsBad: true, sub: `${refusedText(summary.refused)} / ${num(summary.turns)}질의`,
+      kpi(`${TERMS.users} (기간)`, metric(summary.users), { versus, hint: METRIC_HINTS.users, current: summary.users, previous: prior?.users, format: num, sub: '이 기간에 대화한 사용자', open: { title: '회원 목록 보기', go: () => switchTab('users') } }),
+      kpi(TERMS.turns, metric(summary.turns), { versus, hint: METRIC_HINTS.queries, current: summary.turns, previous: prior?.turns, format: num, open: { title: '이 기간의 대화 보기', go: () => openSessions({ since, until }) } }),
+      kpi('답변거절률', percent(refusalRate(summary)), { versus, current: refusalRate(summary), previous: refusalRate(prior), format: points, upIsBad: true, sub: `${refusedText(summary.refused)} / ${num(summary.turns)}질의`,
         sample: Math.min(summary.turns ?? 0, prior?.turns ?? Infinity), hint: REFUSAL_HINT, open: { title: '이 기간의 거절(실패·중단) 대화 보기', go: () => openSessions({ since, until, status: 'refused' }) } }),
-      feedbackKpi(summary, prior, data.period),
-      kpi(TERMS.clicks, metric(summary.clicks), { hint: METRIC_HINTS.clicks, current: summary.clicks, previous: prior?.clicks, format: num, open: { title: '통계의 클릭 보기(같은 기간)', go: () => openStatistics('click') } }),
+      feedbackKpi(summary, prior, data.period, versus),
+      kpi(TERMS.clicks, metric(summary.clicks), { versus, hint: METRIC_HINTS.clicks, current: summary.clicks, previous: prior?.clicks, format: num, open: { title: '통계의 클릭 보기(같은 기간)', go: () => openStatistics('click') } }),
     );
     // 하루(오늘)면 선이 점 하나라 차트 대신 요약 수치. 여러 날이면 질의 없는 날은 선이 끊긴다(0초가 아니라 미측정).
     const latencyChart = days.length === 1 ? analysisCard('응답 시간', latencySummary(summary)) : charts.lines({
@@ -816,7 +830,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       tick: (hour) => `${hour}시`, axisTitle: '시각',
       series: [{ label: TERMS.turns, className: 'series-1', values: hours.map((hour) => byHour.get(hour) ?? 0) }],
     });
-    $('dashboard').replaceChildren(kpis, latencyChart, hourly, ...(cost ? costPanel(cost, days) : []));
+    $('dashboard').replaceChildren(kpis, latencyChart, hourly);
   }
 
   /** 응답 시간 요약 수치(하루 기간) — p50 · p95 두 칸. */
@@ -833,19 +847,18 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   const MODEL_TONES = ['series-1', 'series-2', 'tone-green', 'tone-yellow', 'tone-red', 'tone-grey'];
   const TOKEN_SERIES = [['input_uncached', '캐시 안 된 입력'], ['input_cached', '캐시 입력'], ['output_billed', '출력']];
 
-  /** 비용 패널(owner) — 비용·토큰 KPI 4개 · 일별 모델별 비용 · 일별 토큰 · 사용자별 비용 상위. 모델 이름은 서버가 싣는다(모델 설정 패널과 같은 표시 이름). */
-  function costPanel(cost, days) {
-    if (cost instanceof Error) return [analysisCard('비용', el('p', 'error', `비용을 불러오지 못했습니다: ${cost.message}`))];
-    const summary = cost.summary, prior = cost.comparison?.summary;
+  /** 비용 칸(owner) — 비용·토큰 KPI 4개 · 일별 모델별 비용 · 일별 토큰 · 사용자별 비용 상위. 모델 이름은 서버가 싣는다(모델 설정 패널과 같은 표시 이름). */
+  function renderCost(cost) {
+    const summary = cost.summary, prior = cost.comparison?.summary, versus = cost.comparison, days = periodDays(cost.period);
     const { krw_per_usd: krw, krw_as_of: krwAsOf } = cost.currency;
     const totalTokens = (s) => s && TOKEN_SERIES.reduce((sum, [key]) => sum + (s[key] ?? 0), 0);
     const hitRate = (s) => s?.cache_hit_rate == null ? null : s.cache_hit_rate * 100;
     const kpis = el('div', 'kpis');
     kpis.append(
-      kpi('비용 (USD 예상치)', usd(summary.cost_usd), { hint: METRIC_HINTS.cost, current: summary.cost_usd, previous: prior?.cost_usd, format: usd, sub: krw && summary.cost_usd != null ? `≈ ₩${num(Math.round(summary.cost_usd * krw))} · 환율 ${krwAsOf ?? '기준일 미기재'} 기준` : '' }),
-      kpi('대화 질의당 비용', usd(summary.cost_per_turn_usd), { hint: METRIC_HINTS.cost_per_turn, current: summary.cost_per_turn_usd, previous: prior?.cost_per_turn_usd, format: usd, sub: `/ ${num(summary.priced_rows)} 질의` }),
-      kpi('총 토큰', tokens(totalTokens(summary)), { hint: METRIC_HINTS.tokens, current: totalTokens(summary), previous: totalTokens(prior), format: tokens, sub: TOKEN_SERIES.map(([key, label]) => `${label} ${tokens(summary[key])}`).join(' · ') }),
-      kpi('캐시 적중률', percent(hitRate(summary)), { hint: METRIC_HINTS.cache_hit, current: hitRate(summary), previous: hitRate(prior), format: points, sub: '입력 토큰 중 캐시 입력' }),
+      kpi('비용 (USD 예상치)', usd(summary.cost_usd), { versus, hint: METRIC_HINTS.cost, current: summary.cost_usd, previous: prior?.cost_usd, format: usd, sub: krw && summary.cost_usd != null ? `≈ ₩${num(Math.round(summary.cost_usd * krw))} · 환율 ${krwAsOf ?? '기준일 미기재'} 기준` : '' }),
+      kpi('대화 질의당 비용', usd(summary.cost_per_turn_usd), { versus, hint: METRIC_HINTS.cost_per_turn, current: summary.cost_per_turn_usd, previous: prior?.cost_per_turn_usd, format: usd, sub: `/ ${num(summary.priced_rows)} 질의` }),
+      kpi('총 토큰', tokens(totalTokens(summary)), { versus, hint: METRIC_HINTS.tokens, current: totalTokens(summary), previous: totalTokens(prior), format: tokens, sub: TOKEN_SERIES.map(([key, label]) => `${label} ${tokens(summary[key])}`).join(' · ') }),
+      kpi('캐시 적중률', percent(hitRate(summary)), { versus, hint: METRIC_HINTS.cache_hit, current: hitRate(summary), previous: hitRate(prior), format: points, sub: '입력 토큰 중 캐시 입력' }),
     );
     const byDay = new Map(cost.daily.map((row) => [row.day, row]));
     // 모델 = 모델 ID 순(서버 일별 칸과 같은 순서 — 범례·스택 순서). 값: 기록 없는 날은 0, 그날 전부 단가 미등록이면
@@ -892,7 +905,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     const head = el('div', 'section-head');
     head.append(el('h3', null, '비용'), el('span', null, `${roleLabel('owner')} 전용 · 예상치`));
     // 각주 = 예상치 안내 · '대화 외' 정의(서버 cost_notes) — 산식 상세는 운영 문서(docs/admin-operations.md).
-    return [head, kpis, el('p', 'analysis-note cost-note', cost.notes.join(' ')), ...(chart ? [chart] : []), users];
+    $('dashboard-cost').replaceChildren(head, kpis, el('p', 'analysis-note cost-note', cost.notes.join(' ')), ...(chart ? [chart] : []), users);
   }
 
   /** 기록 표 — 라벨 · 값 두 열. columns가 있으면 그 순서·라벨·시각 서식, 없으면 키 이름 그대로. */
@@ -1943,14 +1956,18 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     for (const id of Object.values(fields)) clearField($(id), true);
     if (submit) $(form).requestSubmit();
   }
-  /** 칸 값 → 세그먼트 눌림 표시 — 기간 칸은 값이 있으면 '직접'(마지막 버튼)을 누르고 칸을 연다. */
+  /** 기간 세그먼트 버튼 값 → [since, until] — '전체 기간'(값 '')은 빈 칸. */
+  const rangeDates = (range) => (range ? presetRange(range) : ['', '']);
+  /** 칸 값 → 세그먼트 눌림 표시 — 기간 칸은 값이 프리셋 하나와 같으면 그 버튼, 아니면 '직접'(마지막 버튼)을 누르고,
+   *  값이 있으면 날짜 칸을 연다(프리셋이 눌려도 — 자정을 넘긴 '오늘' 아래 어제 날짜가 숨지 않게). */
   function syncSegments(name) {
     for (const input of Object.values(queryForms[name].fields).map($).filter((node) => node.dataset.segment)) {
       const group = $(input.dataset.segment), custom = input.closest('.crema-custom');
       if (custom) {
-        const open = [...custom.querySelectorAll('input')].some((node) => node.value);
-        custom.hidden = !open;
-        press(group, open ? group.lastElementChild : group.firstElementChild);
+        const dates = [...custom.querySelectorAll('input')].map((node) => node.value);
+        const preset = [...group.children].find((button) => button.dataset.range !== 'custom' && rangeDates(button.dataset.range).join() === dates.join());
+        custom.hidden = !dates.some(Boolean);
+        press(group, preset ?? group.lastElementChild);
       } else press(group, [...group.children].find((button) => button.dataset.value === input.value) ?? group.firstElementChild);
     }
   }
@@ -2034,10 +2051,19 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     if (range === 'custom') return;
     [$(`${name}-since`).value, $(`${name}-until`).value] = presetRange(range);
   }
-  const PERIOD_TABS = ['dashboard', 'statistics'];
+  const PERIOD_TABS = ['dashboard', 'statistics'], DEFAULT_PERIOD = '7';
+  const pressedRange = (name) => $(`${name}-filters`).querySelector('[data-range][aria-pressed="true"]').dataset.range;
+  /** 기간 화면 로더 첫머리 — 눌린 프리셋으로 날짜를 다시 계산하고(자정을 넘긴 화면도 '오늘'이 오늘 — 탭끼리 같은 날),
+   *  기간 표시·주소를 맞춘 뒤 조회 조건을 돌려준다. */
+  function periodQuery(name) {
+    if (pressedRange(name) !== 'custom') setPeriod(name, pressedRange(name));
+    showPeriod(name);
+    writeHash();
+    return new URLSearchParams({ since: $(`${name}-since`).value, until: $(`${name}-until`).value, ...scope() });
+  }
   /** 기간 옮기기(대시보드 ↔ 통계) — 같은 프리셋이면 그 버튼을, '직접'이면 날짜 칸 값을 그대로. */
   function sharePeriod(from, to) {
-    const range = $(`${from}-filters`).querySelector('[data-range][aria-pressed="true"]').dataset.range;
+    const range = pressedRange(from);
     setPeriod(to, range);
     if (range === 'custom') for (const end of ['since', 'until']) $(`${to}-${end}`).value = $(`${from}-${end}`).value;
   }
@@ -2053,14 +2079,10 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   const showPeriod = (name) => { $(`${name}-range`).textContent = `${$(`${name}-since`).value} ~ ${$(`${name}-until`).value}`; };
 
   function loadStatistics() {
-    const params = new URLSearchParams({ since: $('statistics-since').value, until: $('statistics-until').value, ...scope() });
-    showPeriod('statistics');
+    const params = periodQuery('statistics');
     // 받기 전엔 이전 기간 데이터를 버린다 — 실패하면 화면은 오류인데 이전 기간 표가 내려받히면 안 된다.
     state.statistics = null;
-    if ($('statistics').childElementCount) $('statistics').classList.add('is-loading');
-    else $('statistics').replaceChildren(el('div', 'placeholder', '통계를 불러오는 중…'));
-    return request('statistics', `/admin/api/stats?${params}`, (data) => { state.statistics = data; renderStatistics(); })
-      .finally(() => { if (!pending.has('statistics')) $('statistics').classList.remove('is-loading'); });
+    return loadSection('statistics', `/admin/api/stats?${params}`, (data) => { state.statistics = data; renderStatistics(); }, '통계를 불러오는 중…');
   }
 
   /** crema SummaryCard: 라벨 · 큰 숫자+단위 · 보조 문구(세부가 있는 열은 세부, 아니면 기간). */
@@ -2447,7 +2469,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     const range = button.dataset.range;
     $(since).closest('.crema-custom').hidden = range !== 'custom';
     if (range === 'custom') return;
-    [$(since).value, $(until).value] = range ? presetRange(range) : ['', ''];
+    [$(since).value, $(until).value] = rangeDates(range);
     $(since).form.requestSubmit();
   };
   // 목록 필터 선택 상자 — 바꾸면 바로 다시 읽는다.
@@ -2493,6 +2515,11 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     if (state.sort[tab]) { params.set('sort', state.sort[tab].key); params.set('dir', state.sort[tab].dir); }
     if (VIEWS[tab] && state[`${tab}View`] !== VIEWS[tab].initial) params.set('view', state[`${tab}View`]);
     if (SCOPED_TABS.includes(tab) && state.includeInternal) params.set('internal', '1');
+    // 기간 화면 = 프리셋 키(range, 기본 7일은 생략) 또는 '직접'의 since·until.
+    if (PERIOD_TABS.includes(tab)) {
+      if (pressedRange(tab) === 'custom') for (const end of ['since', 'until']) params.set(end, $(`${tab}-${end}`).value);
+      else if (pressedRange(tab) !== DEFAULT_PERIOD) params.set('range', pressedRange(tab));
+    }
     if (tab === 'starters' && state.startersView === 'calendar' && state.calMonth && state.calMonth !== state.calendar?.today.slice(0, 7)) params.set('month', state.calMonth);
     if (tab === 'sessions' && state.currentSession) { params.set('s', state.currentSession.id); if (state.currentSession.user_id) params.set('u', state.currentSession.user_id); }
     const hash = `#${tab}${[...params].length ? `?${params}` : ''}`;
@@ -2521,6 +2548,16 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     state.sort[tab] = sort && SORT_KEYS[tab]?.().includes(tab === 'sessions' ? `${sort.key}:${sort.dir}` : sort.key) ? sort : undefined;
     if (VIEWS[tab]) setView(tab, params.get('view'));
     if (SCOPED_TABS.includes(tab)) { state.includeInternal = params.get('internal') === '1'; renderInternalToggles(); }
+    // 주소에 기간이 있으면 그 기간이 이 화면의 마지막 선택이다(다른 기간 화면에서 옮겨 오지 않는다). 모르는 값은 무시.
+    if (PERIOD_TABS.includes(tab)) {
+      const range = params.get('range'), [since, until] = [$(`${tab}-since`), $(`${tab}-until`)];
+      if (params.has('since') || params.has('until')) {
+        // 날짜 칸(type=date)이 값을 정화한다 — 없는 날짜(2026-13-45)는 빈 값이 되고, 그러면 기본 기간.
+        [since.value, until.value] = [params.get('since') ?? '', params.get('until') ?? ''];
+        setPeriod(tab, since.value && until.value ? 'custom' : DEFAULT_PERIOD);
+        state.periodFrom = tab;
+      } else if (PERIOD_PRESETS.some(([key]) => key === range)) { setPeriod(tab, range); state.periodFrom = tab; }
+    }
     if (tab === 'starters') state.calMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(params.get('month') ?? '') ? params.get('month') : null;
     if (tab === 'sessions') {
       state.currentSession = params.get('s') ? { id: params.get('s'), user_id: params.get('u') ?? '' } : null;
@@ -2652,8 +2689,8 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     state.tz = me.timezone;
     for (const node of document.querySelectorAll('.tz')) node.textContent = state.tz.label;
     for (const group of [$('dashboard-filters').querySelector('.crema-segment'), $('statistics-filters').querySelector('.crema-segment'), $('sessions-range'), $('audit-range')]) segmentSelect(group);
-    setPeriod('dashboard', '7');
-    setPeriod('statistics', '7');
+    for (const name of PERIOD_TABS) setPeriod(name, DEFAULT_PERIOD);
+    $('dashboard-cost').hidden = !hasRole('owner');
     $('account').replaceChildren(document.createTextNode(me.username), el('small', null, roleLabel(me.role)));
     $('toolbar-owner').hidden = me.role !== 'owner';
     $('gate').hidden = true;

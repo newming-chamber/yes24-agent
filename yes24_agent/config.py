@@ -1084,6 +1084,11 @@ class Settings(BaseSettings):
     admin_session_touch_s: int = 60
     # 관리자 쓰기·세션 판정 풀 상한(AdminService). 운영자 한 자릿수의 클릭이 전부다.
     admin_pool_max: int = 2
+    # 어드민 읽기 전용 조회 한 문장의 실행 시간 상한(ms, MySQL max_execution_time — SELECT만).
+    # 넘으면 504 "기간을 줄여 달라"로 끝난다 — 브라우저가 떠나도 서버는 쿼리를 끝까지 돌리므로
+    # 버려진 조회가 DB를 붙잡지 않게 ALB 60초 전에 끊는다. 2026-10-27 운영 읽기 전용 실측의
+    # 정상 경로 최대가 6.6초(전 기간 대화 본문 검색), 나머지는 5초 이하라 4배 넘게 둔다. 0 = 없음.
+    admin_query_timeout_ms: int = Field(default=30_000, ge=0)
     # scrypt 동시 실행 상한(프로세스 단위). 1회에 128·r·n(기본 32 MiB)을 쓰므로, 인증 없는 로그인
     # 폭주가 메모리를 무한히 끌어가지 않게 묶는다. 대기 중에는 DB 커넥션을 쥐지 않는다.
     admin_password_hash_concurrency: int = 2

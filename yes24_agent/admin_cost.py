@@ -28,6 +28,9 @@ from typing import Any
 
 from yes24_agent.config import ModelPrice
 
+# 이진 비교·정렬 — 콜레이션이 대소문자·전각을 접지 않게(파이썬 문자열 비교와 같은 순서).
+_BIN = "COLLATE utf8mb4_bin"
+
 TOKEN_KINDS = ("input_uncached", "input_cached", "output_billed")
 
 
@@ -55,6 +58,41 @@ def cost_of(tokens: Mapping[str, Any], price: ModelPrice) -> float:
         + int(tokens["input_cached"] or 0) * price.cached_input_usd_per_mtok
         + int(tokens["output_billed"] or 0) * price.output_usd_per_mtok
     ) / 1_000_000 + int(tokens.get("search_queries") or 0) * price.search_usd_per_kquery / 1000
+
+
+def row_cost_sql(prices: list[ModelPrice], measured: str) -> tuple[str, list[Any]]:
+    """usage_log 한 행의 금액(단가 없으면 NULL) — price_for로 고른 단가에 cost_of를 곱한 SQL 식.
+
+    CASE는 처음 맞는 WHEN이 이긴다. 등급 행을 먼저(그 등급과 정확 일치), 표준 행을 뒤에(등급
+    WHEN이 안 맞은 행 — 표준 행, 또는 그 날짜·등급의 등급 단가가 없어 표준가로 대체되는 행) 두고,
+    같은 판정 안에서는 늦은 구간부터 둔다. 구간 시작일 비교는 행의 UTC 날짜다(DATE(created_at) >=
+    시작일 ⇔ created_at >= 시작일 0시). 정렬이 안정이라 같은 시작일이 겹치면 목록 앞 행이 이긴다
+    (price_for의 max와 같다). WHEN은 prices에서 생성하므로 구간·등급을 더해도 식을 고치지 않는다.
+
+    measured = 토큰 측정 성립 조건(측정 불성립 행은 토큰 0, 검색 과금만). 단가는 DOUBLE로 곱한다
+    — DECIMAL 나눗셈은 소수 4자리씩만 늘어 1e-6 단위 금액이 잘린다. 모델·등급 비교는 이진(_BIN)
+    — price_for의 ==와 같다(열 콜레이션이 대소문자를 접으면 'A'가 'a' 단가를 얻는다).
+    """
+    order = sorted(
+        range(len(prices)),
+        key=lambda i: (prices[i].service_tier == "", -prices[i].effective_from.toordinal()),
+    )
+    rate = "CAST(%s AS DOUBLE)"
+    cost = (
+        f"(CASE WHEN {measured} THEN (prompt_tokens - COALESCE(cached_tokens, 0)) * {rate} "
+        f"+ COALESCE(cached_tokens, 0) * {rate} + (total_tokens - prompt_tokens) * {rate} "
+        f"ELSE 0 END) / 1000000 + COALESCE(search_queries, 0) * {rate} / 1000"
+    )
+    whens, params = [], []
+    for price in (prices[i] for i in order):
+        tier = f"AND COALESCE(service_tier, '') {_BIN} = %s " if price.service_tier else ""
+        whens.append(f"WHEN model {_BIN} = %s {tier}AND created_at >= %s THEN {cost}")
+        params.extend([
+            price.model, *([price.service_tier] if price.service_tier else []),
+            price.effective_from, price.input_usd_per_mtok, price.cached_input_usd_per_mtok,
+            price.output_usd_per_mtok, price.search_usd_per_kquery,
+        ])
+    return (f"CASE {' '.join(whens)} END" if whens else "NULL"), params
 
 
 def attach_costs(rows: Iterable[Mapping[str, Any]], prices: list[ModelPrice]) -> list[dict]:
