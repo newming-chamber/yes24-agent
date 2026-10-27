@@ -13,9 +13,11 @@ from pymysql.converters import decoders
 
 from yes24_agent.admin_cost import (
     attach_costs,
+    cache_hit_rate,
     cost_notes,
     per_turn,
     price_for,
+    tokens_of,
     total,
 )
 from yes24_agent.config import Settings
@@ -186,6 +188,11 @@ _MAIN_ROWS = (
 )
 
 
+def model_labels(settings: Settings) -> dict[str, str]:
+    """모델 ID → 표시 이름(config selectable_models의 역). 목록 밖 모델은 키가 없다(화면이 ID)."""
+    return {model: label for label, model in settings.selectable_models.items()}
+
+
 def _priced_turns(rows) -> int:
     return sum(int(row["main_rows"]) for row in rows if row["cost_usd"] is not None)
 
@@ -353,11 +360,14 @@ async def fetch_cost(
     period: tuple[date | None, date | None],
     excluded: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """비용 패널(owner 전용 라우트) — 기간·비교 기간 비용, 일별 비용, 사용자별 비용 상위, 각주.
+    """비용 패널(owner 전용 라우트) — 기간·비교 기간 비용·토큰, 일별 비용·토큰(모델별 포함),
+    사용자별 비용 상위, 각주.
 
     금액은 SQL이 아니라 admin_cost가 행의 **UTC 날짜**(`day`)에 유효한 단가로 붙인다 — 단가
     유효일은 과금 사실의 기준일이라 표시 시간대를 바꿔도 금액이 흔들리지 않게 UTC로 둔다. 표시
-    날짜는 `local_day`다. 모델명은 싣지 않는다(모델별 단가는 행에 붙여 합산만 한다).
+    날짜는 `local_day`다. 일별 모델 칸은 같은 집계 행을 모델로 다시 묶은 것이다(usage_log를 더
+    읽지 않는다). 모델 ID·표시 이름을 싣는다 — owner 전용 라우트이고 모델 설정 패널도 owner에게
+    같은 이름을 보인다.
     """
     since, _ = period
     hours = settings.admin_utc_offset_hours
@@ -391,24 +401,38 @@ async def fetch_cost(
 
     def summary_of(rows) -> dict[str, Any]:
         turns = _priced_turns(rows)
+        sums = total(rows)
         chat = total(r for r in rows if not r["background"])
         return {
             # 질의(분모) — 단가가 적용되고 측정된 main 행(대화 삭제는 chat_turn만 지우고,
             # 미등록·미측정 행은 금액에 없으니 분모에도 없다). 분자는 대화 비용(사용자 귀속 행 전부
             # — main과 그 턴의 서브콜), 대화 외 작업은 빼서 화면 정의 "대화 비용 ÷ 질의 수"와 같다.
             "priced_rows": turns,
-            "cost_usd": total(rows)["cost_usd"],
+            "cost_usd": sums["cost_usd"],
             "cost_per_turn_usd": per_turn(chat["cost_usd"], turns),
+            **tokens_of(sums),
+            "cache_hit_rate": cache_hit_rate(sums),
         }
 
     now, before = _split(usage, since, previous, "local_day")
-    daily = [
-        # 단가 미등록 모델만 있는 날은 None(금액을 모름) — 0으로 바꾸지 않는다. background_usd =
-        # 그중 대화 밖 작업(사용자 귀속 없음) 몫 — 질의 없는 날에도 비용이 있는 이유를 나눠 보인다.
-        {"day": day, "cost_usd": total(rows)["cost_usd"],
-         "background_usd": total(r for r in rows if r["background"])["cost_usd"]}
-        for (day,), rows in sorted(_grouped(now, "local_day").items())
-    ]
+    labels = model_labels(settings)
+
+    def day_of(day, rows) -> dict[str, Any]:
+        # 단가 미등록 모델만 있는 날(·모델)은 None(금액을 모름) — 0으로 바꾸지 않는다.
+        # background_usd = 그중 대화 밖 작업(사용자 귀속 없음) 몫 — 질의 없는 날에도 비용이
+        # 있는 이유를 나눠 보인다.
+        sums = total(rows)
+        models = []
+        by_model = sorted(_grouped(rows, "model").items(), key=lambda kv: kv[0][0] or "")
+        for (model,), group in by_model:
+            group_sums = total(group)
+            models.append({"model": model, "label": labels.get(model),
+                           "cost_usd": group_sums["cost_usd"], **tokens_of(group_sums)})
+        return {"day": day, "cost_usd": sums["cost_usd"],
+                "background_usd": total(r for r in rows if r["background"])["cost_usd"],
+                **tokens_of(sums), "models": models}
+
+    daily = [day_of(day, rows) for (day,), rows in sorted(_grouped(now, "local_day").items())]
     users = []
     for (user_id,), rows in _grouped(user_usage, "user_id").items():
         cost = total(rows)["cost_usd"]
@@ -526,7 +550,7 @@ async def fetch_model_panel(cur, settings: Settings) -> dict[str, Any]:
         for model in {*turns, *(row["model"] for row in usage)}
     ]
     today = datetime.now(timezone.utc).date()
-    labels = {model: label for label, model in settings.selectable_models.items()}
+    labels = model_labels(settings)
     in_use = {choice.default, choice.fallback} - {""}
     prices = []
     for price in settings.llm_prices:

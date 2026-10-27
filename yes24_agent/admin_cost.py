@@ -117,6 +117,17 @@ def per_turn(cost_usd: float | None, turns: int) -> float | None:
     return cost_usd / turns if cost_usd is not None and turns else None
 
 
+def tokens_of(sums: Mapping[str, Any]) -> dict[str, int]:
+    """total()의 과금 토큰 세 갈래만(단가 유무와 무관한 측정 토큰 합)."""
+    return {kind: sums[kind] for kind in TOKEN_KINDS}
+
+
+def cache_hit_rate(sums: Mapping[str, Any]) -> float | None:
+    """캐시 적중률 = 캐시 입력 ÷ 입력 전체(캐시 안 된 입력 + 캐시 입력). 입력이 없으면 None."""
+    prompt = sums["input_uncached"] + sums["input_cached"]
+    return sums["input_cached"] / prompt if prompt else None
+
+
 # 비용 각주 — 사용자에게 보이는 문장이라 config가 아니라 여기 둔다. 산식·제외·과대/과소 요인의
 # 상세는 운영 문서(docs/admin-operations.md '비용 계산 방법')에 있고, 화면은 예상치라는 사실과
 # '대화 외'의 뜻만 말한다(개발 용어 없이). 모델명은 싣지 않는다(2026-09-28 사용자 결정).

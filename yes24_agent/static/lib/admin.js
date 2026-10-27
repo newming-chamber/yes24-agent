@@ -157,6 +157,8 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     feedback: '피드백 = 답변에 남긴 좋아요·싫어요 수(평가한 시각 기준).',
     cost: '비용 = 모델 사용량에 단가를 곱한 예상치(USD). 실제 청구액과 다를 수 있어요.',
     cost_per_turn: '대화 질의당 비용 = 대화 비용 ÷ 질의 수(대화 외 작업 비용은 빼고, 비용이 계산된 질의만 셉니다).',
+    tokens: '총 토큰 = 캐시 안 된 입력 + 캐시 입력 + 출력. 단가가 등록되지 않아 비용에서 빠진 기록의 토큰도 셉니다.',
+    cache_hit: '캐시 적중률 = 캐시 입력 토큰 ÷ 입력 토큰 전체(캐시 안 된 입력 + 캐시 입력). 캐시 입력은 단가가 훨씬 낮아 높을수록 같은 대화가 싸집니다. 캐시 수치를 주지 않는 기록은 캐시 안 된 입력으로 셉니다.',
     rbti_rate: 'RBTI 적용률 = RBTI 유형이 적용된 질의 ÷ 기간 전체 질의.',
     rbti_users: '회원 수 = 이 기간에 그 유형으로 대화한 사람 수(기간 중 유형이 바뀐 사람은 두 유형에 모두 셉니다).',
     uses: '사용 수 = 최근 새 대화 중 첫 질문이 이 문장과 똑같았던 대화 수(첫 화면 질문을 눌러 시작한 횟수).',
@@ -824,23 +826,61 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     return box;
   }
 
-  /** 비용 패널(owner) — 비용 KPI 2개 · 일별 비용 · 사용자별 비용 상위. 모델명은 서버가 싣지 않는다. */
+  // 토큰 수 — 하루 수천만 단위라 축·툴팁·KPI 모두 백만(M) 한 단위로 쓴다(한 축에 단위가 섞이지 않게).
+  const tokens = (value) => value == null ? '—' : `${(value / 1e6).toLocaleString('en-US', { maximumFractionDigits: 2 })}M`;
+  // 모델 스택 색 — 모델 ID 순서대로 차례로 입힌다(기간을 바꿔도 같은 모델 구성이면 같은 색, 모델 이름→색 표는 두지 않는다).
+  // 모델이 색 수보다 많으면 마지막 색 자리를 '그 외' 한 계열이 쓴다.
+  const MODEL_TONES = ['series-1', 'series-2', 'tone-green', 'tone-yellow', 'tone-red', 'tone-grey'];
+  const TOKEN_SERIES = [['input_uncached', '캐시 안 된 입력', 'series-2'], ['input_cached', '캐시 입력', 'series-1'], ['output_billed', '출력', 'tone-green']];
+
+  /** 비용 패널(owner) — 비용·토큰 KPI 4개 · 일별 모델별 비용 · 일별 토큰 · 사용자별 비용 상위. 모델 이름은 서버가 싣는다(모델 설정 패널과 같은 표시 이름). */
   function costPanel(cost, days) {
     if (cost instanceof Error) return [analysisCard('비용', el('p', 'error', `비용을 불러오지 못했습니다: ${cost.message}`))];
     const summary = cost.summary, prior = cost.comparison?.summary;
     const { krw_per_usd: krw, krw_as_of: krwAsOf } = cost.currency;
+    const totalTokens = (s) => s && TOKEN_SERIES.reduce((sum, [key]) => sum + (s[key] ?? 0), 0);
+    const hitRate = (s) => s?.cache_hit_rate == null ? null : s.cache_hit_rate * 100;
     const kpis = el('div', 'kpis');
     kpis.append(
       kpi('비용 (USD 예상치)', usd(summary.cost_usd), { hint: METRIC_HINTS.cost, current: summary.cost_usd, previous: prior?.cost_usd, format: usd, sub: krw && summary.cost_usd != null ? `≈ ₩${num(Math.round(summary.cost_usd * krw))} · 환율 ${krwAsOf ?? '기준일 미기재'} 기준` : '' }),
       kpi('대화 질의당 비용', usd(summary.cost_per_turn_usd), { hint: METRIC_HINTS.cost_per_turn, current: summary.cost_per_turn_usd, previous: prior?.cost_per_turn_usd, format: usd, sub: `/ ${num(summary.priced_rows)} 질의` }),
+      kpi('총 토큰', tokens(totalTokens(summary)), { hint: METRIC_HINTS.tokens, current: totalTokens(summary), previous: totalTokens(prior), format: tokens, sub: TOKEN_SERIES.map(([key, label]) => `${label} ${tokens(summary[key])}`).join(' · ') }),
+      kpi('캐시 적중률', percent(hitRate(summary)), { hint: METRIC_HINTS.cache_hit, current: hitRate(summary), previous: hitRate(prior), format: points, sub: '입력 토큰 중 캐시 입력' }),
     );
     const byDay = new Map(cost.daily.map((row) => [row.day, row]));
-    // 일별 = 대화 + 대화 외(초기 질문 자동 생성처럼 사용자 귀속이 없는 작업 — 질의가 없는 날에도 비용이 있는 이유).
-    // 그날 비용이 null(전부 단가 미등록)이면 0으로 그리되 표·툴팁은 막대 합으로 읽힌다.
-    const part = (day, chat) => { const row = byDay.get(day); if (!row) return 0; const background = row.background_usd ?? 0; return chat ? (row.cost_usd ?? 0) - background : background; };
+    // 모델 = 모델 ID 순(서버 일별 칸과 같은 순서 — 범례·스택 순서). 값: 기록 없는 날은 0, 그날 전부 단가 미등록이면
+    // 전 계열 null(합계 '—'), 일부만 미등록이면 그 모델만 null('—') — 서버 None을 0으로 바꾸지 않는다.
+    const labels = new Map();
+    for (const row of cost.daily) for (const m of row.models) labels.set(m.model, m.label ?? m.model ?? '모델 미기록');
+    const ids = [...labels.keys()].sort((a, b) => (a ?? '').localeCompare(b ?? ''));
+    const modelCost = (day, model) => {
+      const row = byDay.get(day);
+      if (!row) return 0;
+      if (row.cost_usd == null) return null;
+      const entry = row.models.find((m) => m.model === model);
+      return entry ? entry.cost_usd : 0;
+    };
+    // '그 외' 합산은 서버 일 합계(admin_cost.total)와 같은 규칙 — 등록분만 더하고, 구성원이 전부 null일 때만 null.
+    const othersCost = (day, members) => {
+      const values = members.map((model) => modelCost(day, model));
+      return values.every((value) => value == null) ? null : values.reduce((sum, value) => sum + (value ?? 0), 0);
+    };
+    const own = ids.length > MODEL_TONES.length ? ids.slice(0, MODEL_TONES.length - 1) : ids;
+    const others = ids.slice(own.length);
+    const modelSeries = [
+      ...own.map((model, k) => ({ label: labels.get(model), className: MODEL_TONES[k], values: days.map((day) => modelCost(day, model)) })),
+      ...(others.length ? [{ label: `그 외 ${others.length}개 모델`, className: MODEL_TONES.at(-1), values: days.map((day) => othersCost(day, others)) }] : []),
+    ];
+    // '대화 외'(초기 질문 자동 생성처럼 사용자 귀속이 없는 작업 — 질의가 없는 날에도 비용이 있는 이유)는 모델 칸에 섞여 있어 기간 합만 노트로 밝힌다.
+    const background = cost.daily.reduce((sum, row) => sum + (row.background_usd ?? 0), 0);
     const chart = days.length > 1 && charts.stackedBars({
-      title: '일별 비용', categories: days, unit: 'usd', format: usd, onPick: (day) => openSessions({ since: day, until: day }),
-      series: [{ label: '대화', className: 'series-1', values: days.map((day) => part(day, true)) }, { label: '대화 외', className: 'tone-grey', values: days.map((day) => part(day, false)) }],
+      title: '일별 비용 (모델별)', categories: days, unit: 'usd', format: usd, onPick: (day) => openSessions({ since: day, until: day }),
+      note: `기간 비용 중 ‘대화 외’ 작업 ${usd(background)} 포함`,
+      series: modelSeries,
+    });
+    const tokenChart = days.length > 1 && charts.stackedBars({
+      title: '일별 토큰', categories: days, unit: 'count', format: tokens,
+      series: TOKEN_SERIES.map(([key, label, className]) => ({ label, className, values: days.map((day) => byDay.get(day)?.[key] ?? 0) })),
     });
     const users = analysisCard('사용자별 비용 상위', cost.users.length ? table([
       {key: 'nickname', label: '닉네임', format: day}, {key: 'user_id', label: '회원번호'}, {key: 'priced_rows', label: TERMS.turns, format: metric}, {key: 'cost_usd', label: '대화 비용', format: usd}, {key: 'cost_per_turn_usd', label: '대화 질의당 비용', format: usd, hint: METRIC_HINTS.cost_per_turn},
@@ -848,7 +888,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     const head = el('div', 'section-head');
     head.append(el('h3', null, '비용'), el('span', null, `${roleLabel('owner')} 전용 · 예상치`));
     // 각주 = 예상치 안내 · '대화 외' 정의(서버 cost_notes) — 산식 상세는 운영 문서(docs/admin-operations.md).
-    return [head, kpis, el('p', 'analysis-note cost-note', cost.notes.join(' ')), ...(chart ? [chart] : []), users];
+    return [head, kpis, el('p', 'analysis-note cost-note', cost.notes.join(' ')), ...(chart ? [chart, tokenChart] : []), users];
   }
 
   /** 기록 표 — 라벨 · 값 두 열. columns가 있으면 그 순서·라벨·시각 서식, 없으면 키 이름 그대로. */
