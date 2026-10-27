@@ -2175,23 +2175,27 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   const giftcardPeriod = (period) => `${period.starts_on} ~ ${period.ends_on}`;
   /** 구간 상태(서버가 KST 오늘로 판정 — admin_data.period_status) 표기. */
   const PERIOD_STATUS = { active: '진행 중', scheduled: '예정', ended: '종료' };
+  /** 이벤트 화면(설정) — 전체 구간 목록(날짜 범위 무관)과 편집 폼. 통계는 통계 > 이벤트 참여가 본다. */
+  function loadEvents() {
+    writeHash();
+    return request('events', '/admin/api/giftcard/periods', (data) => $('events').replaceChildren(giftcardPeriodsBlock(data.items)));
+  }
   /** 이벤트 기간 — 표(진행 중 행 강조) + 편집 폼(editor 이상). 행을 누르면 그 구간을 고친다(시작 전 = 전 필드·삭제,
-   *  진행 중 = 종료일·상품권번호만, 종료 = 읽기 전용 — 규칙의 정본은 서버 giftcard.py). 상품권번호는 서버가 마스킹한 값만 온다. */
+   *  진행 중 = 종료일·상품권번호만, 종료 = 읽기 전용 — 규칙의 정본은 서버 giftcard.py). 상태·마스킹 번호는 서버가 준다. */
   function giftcardPeriodsBlock(periods) {
     const editable = hasRole('editor');
     const form = editable ? giftcardPeriodForm(periods) : null;
-    let content = el('div', 'placeholder', '진행 중인 이벤트가 없습니다.');
+    let content = el('div', 'placeholder', '등록된 이벤트 기간이 없습니다.');
     if (periods.length) {
       content = el('div', 'bleed');
       const grid = table([
         { key: 'event_key', label: '이벤트명' }, { key: 'starts_on', label: '기간', text: giftcardPeriod },
         { key: 'status', label: '상태', format: (s) => PERIOD_STATUS[s] ?? s }, { key: 'goods_tic_no_masked', label: '상품권번호' },
-        { key: 'attempts', label: '시도', format: num }, { key: 'users', label: '시도 회원', format: num }, { key: 'received_users', label: '받은 회원', format: num },
       ], periods, editable ? Object.assign((row) => form.edit(row), { enabled: (row) => row.status !== 'ended' }) : undefined);
       periods.forEach((row, i) => { if (row.status === 'active') grid.querySelectorAll('tbody tr')[i]?.classList.add('is-active-period'); });
       content.append(grid);
     }
-    const card = analysisCard('이벤트 기간', content, `날짜는 KST, 양 끝 포함. 시도·회원 수는 위 조회 기간 안의 기록입니다.${editable ? ' 행을 누르면 그 기간을 고칩니다(종료된 기간 제외).' : ''}`);
+    const card = analysisCard('이벤트 기간', content, `날짜는 KST, 양 끝 포함. 기간별 발급 현황은 통계 > 이벤트 참여에 있습니다.${editable ? ' 행을 누르면 그 기간을 고칩니다(종료된 기간 제외).' : ''}`);
     if (form) card.append(form);
     return card;
   }
@@ -2204,7 +2208,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     return { event_key: last.event_key, starts_on: monday, ends_on: addDays(monday, 4) };
   }
   /** 추가·수정 폼 하나 — edit(row)로 수정 모드(상태별 잠금), 취소로 추가 모드. 한 번에 한 주(상품권번호가 주마다 다르다).
-   *  번호는 문자열 그대로 보낸다 — Number()는 16자리부터 정밀도를 잃는다(서버가 정수로 받는다). 저장 뒤 통계를 다시 읽는다. */
+   *  번호는 문자열 그대로 보낸다 — Number()는 16자리부터 정밀도를 잃는다(서버가 정수로 받는다). 저장 뒤 목록을 다시 읽는다. */
   function giftcardPeriodForm(periods) {
     const form = el('form', 'manage-form'), title = el('h3', null, '기간 추가');
     const field = (name, label, type, attrs = {}) => {
@@ -2242,7 +2246,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       help.textContent = active ? '진행 중인 기간은 종료일(오늘 이후)과 상품권번호만 바꿀 수 있습니다.' : '시작 전인 기간은 모든 항목을 바꾸거나 삭제할 수 있습니다.';
       form.scrollIntoView({ block: 'nearest' });
     };
-    const done = (message) => { showToast(message); loadStatistics(); };
+    const done = (message) => { showToast(message); loadEvents(); };
     cancel.onclick = reset;
     remove.onclick = async () => {
       if (!editing || !(await confirmDialog({ title: '기간 삭제', message: `${editing.event_key} ${giftcardPeriod(editing)} 기간을 삭제합니다.`, confirmLabel: '삭제', danger: true }))) return;
@@ -2272,11 +2276,11 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     reset();
     return form;
   }
-  /** 상품권 묶음 — 이벤트 기간 표·편집, 시도·회원 수, 일별 시도(받음 · 그 외), 결과 코드별 건수. 받음 = 서버 판정(codes[].received).
-   *  일별 11열 표·엑셀(고객 양식)에는 넣지 않는다. 구간 행이 하나도 없으면 안내(+ editor는 추가 폼)만. */
+  /** 상품권 묶음(통계만) — 시도·회원 수, 일별·시간대별 시도(받음 · 그 외), 구간별 표, 결과 코드별 건수. 받음 = 서버 판정
+   *  (codes[].received). 일별 11열 표·엑셀(고객 양식)에는 넣지 않는다. 구간 설정은 이벤트 메뉴, 구간이 없으면 안내만. */
   function giftcardBlocks(data, range) {
     const gift = data.giftcard;
-    if (!gift) return [giftcardPeriodsBlock([])];
+    if (!gift) return [el('div', 'placeholder', '진행 중인 이벤트가 없습니다.')];
     const note = el('p', 'crema-note', GIFTCARD_NOTE);
     const cards = el('div', 'crema-cards'), line = el('div', 'crema-row');
     line.append(cardBox('발급 시도', num(gift.summary.attempts), '건', range), cardBox('시도 회원', num(gift.summary.users), '명', range),
@@ -2295,11 +2299,14 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       series: split(gift.hourly, 'hour', hours),
     });
     for (const chart of [bars, hourly]) chart.classList.add('crema-bars');
-    const periods = giftcardPeriodsBlock(gift.periods);
-    if (!gift.codes.length) return [periods, note, cards, bars, hourly];
+    // 구간별 — 조회 기간 안의 기록을 귀속 구간으로 묶은 수(기록 없는 구간은 0, 최신 구간 먼저).
+    const periods = el('div', 'bleed');
+    periods.append(table([{ key: 'event_key', label: '이벤트명' }, { key: 'starts_on', label: '기간', text: giftcardPeriod }, { key: 'attempts', label: '시도', format: num },
+      { key: 'users', label: '시도 회원', format: num }, { key: 'received_users', label: '받은 회원', format: num }], gift.periods));
+    if (!gift.codes.length) return [note, cards, bars, hourly, periods];
     const wrap = el('div', 'bleed');
     wrap.append(table([{ key: 'result_code', label: '결과', format: giftcardResult }, { key: 'received', label: '받음 판정', format: (v) => flag(v, '받음') }, { key: 'attempts', label: '건수', format: num }], gift.codes));
-    return [periods, note, cards, bars, hourly, wrap];
+    return [note, cards, bars, hourly, periods, wrap];
   }
 
   function renderStatistics() {
@@ -2453,7 +2460,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
 
   // 프롬프트 버전(관리자 전용) — 화면은 admin_prompts.js가 그리고, 여기서는 공용 렌더(표·카드·패널·대화상자)를 넘긴다.
   const prompts = initPrompts({ $, el, api, table, analysisCard, openDialog, confirmDialog, showToast, errorText, placeholder });
-  const loaders = { dashboard: loadDashboard, statistics: loadStatistics, sessions: loadSessions, users: loadUsers, starters: loadStarters, audit: loadAudit, models: loadModels, prompts: prompts.load };
+  const loaders = { dashboard: loadDashboard, statistics: loadStatistics, events: loadEvents, sessions: loadSessions, users: loadUsers, starters: loadStarters, audit: loadAudit, models: loadModels, prompts: prompts.load };
   // 감사 로그 필터 — 작업 종류 세그먼트·계정 선택, 바꾸면 첫 페이지부터 다시 읽는다.
   $('audit-filters').onsubmit = (event) => { event.preventDefault(); applyQuery('audit'); loadAudit(); };
   $('audit-actor').onchange = () => $('audit-filters').requestSubmit();

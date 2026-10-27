@@ -831,8 +831,7 @@ async def _giftcard_stats(
     hours = settings.admin_utc_offset_hours
     where, params = period_filter("g.created_at", period, hours, excluded, "g.user_id")
     await cur.execute(
-        "SELECT p.id, p.event_key, p.starts_on, p.ends_on, RIGHT(p.goods_tic_no, 4) AS tail, "
-        "COUNT(g.id) AS attempts, "
+        "SELECT p.id, p.event_key, p.starts_on, p.ends_on, COUNT(g.id) AS attempts, "
         "COUNT(DISTINCT g.user_id) AS users, "
         f"COUNT(DISTINCT CASE WHEN g.{GIFTCARD_RECEIVED} THEN g.user_id END) AS received_users "
         "FROM giftcard_period p LEFT JOIN giftcard_issue g ON "
@@ -840,15 +839,7 @@ async def _giftcard_stats(
         "GROUP BY p.id ORDER BY p.starts_on DESC, p.id DESC",
         params,
     )
-    today = local_today(hours)
-    periods = [
-        jsonable({
-            **{k: v for k, v in row.items() if k != "tail"},
-            "status": period_status(row["starts_on"], row["ends_on"], today),
-            "goods_tic_no_masked": mask_goods_tic_no(str(row["tail"])),
-        })
-        for row in await cur.fetchall()
-    ]
+    periods = [jsonable(row) for row in await cur.fetchall()]
     if not periods:
         return None
     where, params = period_filter("created_at", period, hours, excluded)
@@ -889,6 +880,24 @@ async def _giftcard_stats(
             for (hour,), group in sorted(_grouped(rows, "hour").items())
         ],
     }
+
+
+async def fetch_giftcard_periods(cur, settings: Settings) -> dict[str, Any]:
+    """이벤트 설정 화면 — 전체 구간(최신 시작 먼저)과 상태(KST 오늘 기준)·마스킹 번호. 날짜 범위와
+    무관하다. 상품권번호는 뒤 4자리(SQL RIGHT)만 읽는다 — 원문은 DB 밖으로 나오지 않는다."""
+    await cur.execute(
+        "SELECT id, event_key, starts_on, ends_on, RIGHT(goods_tic_no, 4) AS tail "
+        "FROM giftcard_period ORDER BY starts_on DESC, id DESC"
+    )
+    today = local_today(settings.admin_utc_offset_hours)
+    return {"items": [
+        jsonable({
+            **{k: v for k, v in row.items() if k != "tail"},
+            "status": period_status(row["starts_on"], row["ends_on"], today),
+            "goods_tic_no_masked": mask_goods_tic_no(str(row["tail"])),
+        })
+        for row in await cur.fetchall()
+    ]}
 
 
 async def fetch_user_giftcard(cur, settings: Settings, user_no: str) -> dict[str, Any]:

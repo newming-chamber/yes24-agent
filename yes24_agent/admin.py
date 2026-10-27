@@ -57,6 +57,7 @@ from yes24_agent.admin_data import (
     excluded_condition,
     fetch_analytics,
     fetch_cost,
+    fetch_giftcard_periods,
     fetch_model_panel,
     fetch_stats,
     fetch_turn_trace,
@@ -1338,6 +1339,11 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
             return await with_user_giftcard(cur, period, listed)
 
         return await _query(users_page)
+
+    @router.get("/api/giftcard/periods", dependencies=[Depends(require_admin)])
+    async def admin_giftcard_periods() -> Any:
+        """이벤트 설정 화면의 구간 목록(조회는 viewer 이상, 쓰기는 giftcard.py의 editor 라우트)."""
+        return await _query(fetch_giftcard_periods, settings)
 
     @router.get("/api/users/{user_no}/giftcard", dependencies=[Depends(require_admin)])
     async def admin_user_giftcard(user_no: str) -> Any:
