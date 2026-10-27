@@ -57,6 +57,7 @@ from yes24_agent.admin_data import (
     fetch_turn_trace,
     fetch_user_giftcard,
     jsonable,
+    latest_giftcard_period,
     local_day,
     nickname_by_user_pk_sql,
     nickname_sql,
@@ -68,6 +69,7 @@ from yes24_agent.admin_data import (
 )
 from yes24_agent.admin_prompts import check_prompt_bindings, register_admin_prompts
 from yes24_agent.config import Settings, get_settings
+from yes24_agent.giftcard import AUDIT_TARGET as GIFTCARD_AUDIT_TARGET
 from yes24_agent.model_routing import AUDIT_TARGET as MODEL_AUDIT_TARGET
 from yes24_agent.model_routing import (
     PER_MODEL_COLUMNS,
@@ -992,6 +994,7 @@ async def fetch_starter_popular(
 # 감사 기록 대상 종류(admin_management.sql target_type) — 화면 필터 값이 곧 이 값이다.
 AUDIT_TARGETS = (
     "login", "admin", "user", "starter", "session", MODEL_AUDIT_TARGET, PROMPT_AUDIT_TARGET,
+    GIFTCARD_AUDIT_TARGET,
 )
 # 대상 이름 — 계정은 계정명, 회원은 회원번호로 바꿔 싣고(행 id는 사람이 못 읽는다) 나머지는
 # target_id 그대로.
@@ -1232,6 +1235,8 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
         excluded: tuple[str, ...] = scope,
     ) -> Any:
         async def users_page(cur):
+            # 상품권 열의 기준 구간을 먼저 읽는다 — 목록 문장들이 응답 조립의 마지막 질의로 남는다.
+            period = await latest_giftcard_period(cur, settings)
             listed = await fetch_users(
                 cur,
                 settings,
@@ -1243,7 +1248,7 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
                 nickname=nickname,
                 excluded=excluded,
             )
-            return await with_user_giftcard(cur, settings, listed)
+            return await with_user_giftcard(cur, period, listed)
 
         return await _query(users_page)
 

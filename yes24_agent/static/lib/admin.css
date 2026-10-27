@@ -698,6 +698,8 @@
   .select::after { content: ""; position: absolute; right: 16px; top: 50%; width: 7px; height: 7px; border: solid var(--crema-grey-400); border-width: 0 1.5px 1.5px 0; transform: translateY(-70%) rotate(45deg); pointer-events: none; }
   .manage-form label.check { display: flex; align-items: center; gap: 8px; cursor: pointer; }
   .manage-form button.primary { justify-self: start; }
+  .manage-form .period-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  tr.is-active-period { background: var(--crema-row-hover); box-shadow: inset 3px 0 0 var(--accent); }  /* 진행 중 상품권 구간 */
   .manage-form .analysis-note { margin: 0; overflow-wrap: anywhere; }
 
   /* crema lg(1024px) 미만: 사이드바는 서랍, 상단 바가 메뉴를 연다(RootLayout.tsx). */

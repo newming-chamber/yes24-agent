@@ -119,6 +119,9 @@ _ACCESS_EXEMPT_PATHS = frozenset(
     {
         "/health", "/login", "/logout", "/docs", "/redoc", "/openapi.json",
         "/admin", "/admin/", "/admin/api/login", "/admin/api/logout",
+        # 상품권 배너 노출 판정(GET) — 비로그인 화면도 부른다(키가 없어 월을 대신할 판정자가 없다).
+        # 응답은 진행 여부·구간 날짜뿐이고 상품권번호는 인증된 eligibility에만 실린다(giftcard.py).
+        "/event/giftcard",
     }
 )
 # 정적 라이브러리 디렉터리(_STATIC_LIB_DIR)는 통째로 월 밖이다 — 어드민 로그인 화면이 세션 전에
@@ -1118,8 +1121,8 @@ def create_app() -> FastAPI:
 
     # Yes24 백엔드 조회(POST /partner/chat-activity). partner_api_key가 비면 미등록(404).
     register_partner(app, settings)
-    # 크레마AI 상품권 이벤트(POST /event/giftcard/*). giftcard_event_key가 비면 미등록(404).
-    register_giftcard(app, settings)
+    # 크레마AI 상품권 이벤트(/event/giftcard*). 켜고 끄는 건 구간 테이블이다(빈 테이블 = closed).
+    register_giftcard(app)
 
     # 초기 질문 회전 풀(GET /chat/starters·/admin/starters/*). starter_model이 빈 값이면 미등록
     # (404 — overview_model 관례). 라우트·풀·생성의 소유자는 starters.py다.

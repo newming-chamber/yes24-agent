@@ -877,13 +877,14 @@ class Settings(BaseSettings):
     # 미등록(404)**이 배포 기본이다(overview_model 관례의 구조적 off 스위치). 호출자가 회원 쿠키가
     # 없는 Yes24 백엔드라 x-api-key(회원 식별)와 다른 헤더 `x-partner-key`로 받는다.
     partner_api_key: str = Field(default="", repr=False)
-    # 크레마AI 상품권 이벤트(`/event/giftcard/*`). 키는 Yes24 발급 API의 eventNm과 같은 값으로,
-    # 결과 기록의 이벤트 구분값이자 **비우면 라우트 미등록(404)**인 종료 스위치다. 기간은 대상자
-    # 판정의 질문 구간(KST 날짜, 양 끝 포함). 시작은 메일 첨부의 10/14가 아니라 10/16(2026-10-16
-    # 사용자 결정 — 기간 전 질문만 있는 회원은 이벤트 중 새로 질문해야 대상).
-    giftcard_event_key: str = Field(default="2026_CremaAI_Event", max_length=64)  # DDL 폭
-    giftcard_event_start: date = date(2026, 10, 16)
-    giftcard_event_end: date = date(2026, 11, 1)
+    # 크레마AI 상품권 발급 요청의 상품권번호 암호화 키·IV 원천(Yes24 「상품권 발급 API — 암호화 연동
+    # 가이드」 v1.3 ENCKEY·VECTOR). 값은 .env만. 둘 중 하나라도 비면 eligible 판정이 503이다(발급
+    # 불가) — 나머지 상태(closed·not_eligible·already_issued)와 배너 조회는 키 없이 돈다.
+    giftcard_enc_key: str = Field(default="", repr=False)
+    giftcard_enc_vector: str = Field(default="", repr=False)
+    # 인증 없는 배너 조회(GET /event/giftcard) 메모 수명(초). 어드민 구간 쓰기는 그 프로세스 메모만
+    # 비우므로 다른 서버·컨테이너는 최대 이만큼 늦게 반영한다.
+    giftcard_event_cache_s: float = 60.0
     # 인증 DB 커넥션 풀 상한. 세션 DB 풀(SQLAlchemy)과 별도로 잡히는 aiomysql 풀이라,
     # 요청당 짧은 조회 몇 건이 전부인 용도에 맞춰 작게 둔다.
     auth_pool_max: int = 5

@@ -739,39 +739,76 @@ async def fetch_stats(
     }
 
 
-# ── 상품권 이벤트 기록(giftcard_issue) ──────────────────────────────────────
+# ── 상품권 이벤트 기록(giftcard_issue · giftcard_period) ─────────────────────
 # 클라이언트가 전달한 발급 결과를 모은 운영 참고 이력이다(giftcard.py) — Yes24 실제 발급 수와 다를
-# 수 있고 잔여 수량의 근거가 아니다. 조회는 설정의 현재 이벤트 키 하나로 한정하고, 키가 비면(이벤트
-# 종료 스위치) 조회하지 않는다.
+# 수 있고 잔여 수량의 근거가 아니다. 이벤트의 정의는 구간 테이블이다 — 구간 행이 하나도 없으면
+# 이벤트 꺼짐과 같은 화면이다(통계 None, 회원 목록 열 없음, 패널 기록 없음).
 
 # "받은 회원" 판정 식 — Yes24가 "이 회원은 받았다"고 답한 코드(giftcard.py 독스트링). 대상자 확인
 # (user_data.giftcard_issued)과 어드민 집계가 이 식 하나를 쓴다. 이 모듈에 두는 이유는 import 방향 —
 # user_data가 admin 계층(admin_auth → admin_data)을 이미 읽는다.
 GIFTCARD_RECEIVED = "result_code IN ('SUCCESS', 'ALREADY_APPLIED')"
+# "오늘 기준 가장 최근에 시작한 구간" 한 행의 FROM 이하 — 인자 (오늘, 끝 하한, 끝 하한). 끝 하한이
+# 오늘이면 오늘을 포함하는 구간(현재 구간), NULL이면 이미 끝난 구간도 받는다(결과 귀속·회원 목록).
+# 같은 이유로 여기 한 벌만 둔다(user_data·어드민 공용). 겹침 검증은 하지 않는다(운영 데이터 책임).
+GIFTCARD_LATEST_PERIOD = (
+    "FROM giftcard_period WHERE starts_on <= %s AND (%s IS NULL OR ends_on >= %s) "
+    "ORDER BY starts_on DESC, id DESC LIMIT 1"
+)
 
 
-def _giftcard_event(settings: Settings) -> dict[str, Any] | None:
-    key = settings.giftcard_event_key
-    if not key:
-        return None
-    return {"key": key, "start": settings.giftcard_event_start, "end": settings.giftcard_event_end}
+def local_today(offset_hours: int) -> date:
+    """어드민 시간대(KST)의 오늘 — 구간 날짜와 utc_bound(partner)가 쓰는 시간대와 같다."""
+    return datetime.now(timezone(timedelta(hours=offset_hours))).date()
+
+
+def period_status(starts_on: date, ends_on: date, today: date) -> str:
+    """구간 상태 — scheduled(시작 전)·active(진행 중)·ended(종료). 화면 표기와 쓰기 규칙
+    (giftcard.py)이 이 판정 하나를 쓴다."""
+    return "scheduled" if starts_on > today else "active" if ends_on >= today else "ended"
+
+
+def mask_goods_tic_no(tail: str) -> str:
+    """상품권번호 표기 — 뒤 4자리만, 길이도 감춘다. 어드민 응답·감사 기록에 원문 대신 싣는다."""
+    return f"****{tail[-4:]}"
 
 
 async def _giftcard_stats(
     cur, settings: Settings, period: tuple[date, date], excluded: tuple[str, ...]
 ) -> dict[str, Any] | None:
-    """통계 '상품권' 묶음 — 기간(어드민 시간대) 안의 시도를 결과 코드별·일별·시간대별(기간 합계)로,
-    회원은 고유 수로. 세 묶음은 (날짜, 시, 코드) 한 문장에서 나눠 센다.
+    """통계 '이벤트 참여' 묶음 — 기간(어드민 시간대) 안의 기록 전체를 결과 코드별·일별·시간대별(기간
+    합계)로, 회원은 고유 수로. 세 묶음은 (날짜, 시, 코드) 한 문장에서 나눠 센다. 구간별 표는 같은
+    범위의 기록을 귀속 구간(period_id)으로 묶는다 — 기록 없는 구간도 0으로 싣고, 구간 도입 전 기록
+    (period_id NULL)은 합계에만 들어간다.
 
     received = 그 코드가 "받은" 판정(GIFTCARD_RECEIVED)인가 — 묶음 열(result_code)의 식이라 행마다
     같다. 받은 회원은 일별 값을 더하지 않고 기간 전체에서 다시 센다(여러 번 시도한 회원은 한 번).
     """
-    event = _giftcard_event(settings)
-    if event is None:
-        return None
     hours = settings.admin_utc_offset_hours
+    where, params = period_filter("g.created_at", period, hours, excluded, "g.user_id")
+    await cur.execute(
+        "SELECT p.id, p.event_key, p.starts_on, p.ends_on, RIGHT(p.goods_tic_no, 4) AS tail, "
+        "COUNT(g.id) AS attempts, "
+        "COUNT(DISTINCT g.user_id) AS users, "
+        f"COUNT(DISTINCT CASE WHEN g.{GIFTCARD_RECEIVED} THEN g.user_id END) AS received_users "
+        "FROM giftcard_period p LEFT JOIN giftcard_issue g ON "
+        f"{' AND '.join(['g.period_id = p.id', *where])} "
+        "GROUP BY p.id ORDER BY p.starts_on DESC, p.id DESC",
+        params,
+    )
+    today = local_today(hours)
+    periods = [
+        jsonable({
+            **{k: v for k, v in row.items() if k != "tail"},
+            "status": period_status(row["starts_on"], row["ends_on"], today),
+            "goods_tic_no_masked": mask_goods_tic_no(str(row["tail"])),
+        })
+        for row in await cur.fetchall()
+    ]
+    if not periods:
+        return None
     where, params = period_filter("created_at", period, hours, excluded)
-    scope, params = sql_where(["event_key = %s", *where]), [event["key"], *params]
+    scope = sql_where(where)
     await cur.execute(
         f"SELECT {local_day('created_at', hours)} AS day, "
         f"HOUR{local_time('created_at', hours)} AS hour, result_code, "
@@ -796,7 +833,7 @@ async def _giftcard_stats(
         for (code,), group in _grouped(rows, "result_code").items()
     ]
     return {
-        "event": event,
+        "periods": periods,
         "summary": summary,
         "codes": sorted(codes, key=lambda row: (-row["attempts"], row["result_code"])),
         "daily": [
@@ -811,37 +848,48 @@ async def _giftcard_stats(
 
 
 async def fetch_user_giftcard(cur, settings: Settings, user_no: str) -> dict[str, Any]:
-    """회원 옆 패널 — 그 회원의 현재 이벤트 시도 기록(최신순, 한 화면 분량). 한 행 더 읽어
-    truncated(더 있음)를 알린다. idx_giftcard_issue_owner (user_id, event_key) 등치로 찾는다."""
-    event = _giftcard_event(settings)
-    if event is None:
-        return {"event": None, "items": [], "truncated": False}
+    """회원 옆 패널 — 그 회원의 시도 기록(최신순, 한 화면 분량, 귀속 구간 날짜 포함). 한 행 더 읽어
+    truncated(더 있음)를 알린다. 구간에 귀속된 기록만 싣는다(구간 행이 없으면 빈 목록 = 꺼짐).
+    idx_giftcard_issue_period (user_id, period_id)의 user_id 등치로 찾는다."""
     size = settings.admin_page_size
     await cur.execute(
-        "SELECT created_at, result_code FROM giftcard_issue WHERE user_id = %s AND event_key = %s "
-        "ORDER BY created_at DESC, id DESC LIMIT %s",
-        [user_no, event["key"], size + 1],
+        "SELECT g.created_at, g.result_code, p.event_key, p.starts_on, p.ends_on "
+        "FROM giftcard_issue g JOIN giftcard_period p ON p.id = g.period_id "
+        "WHERE g.user_id = %s ORDER BY g.created_at DESC, g.id DESC LIMIT %s",
+        [user_no, size + 1],
     )
     rows = await cur.fetchall()
-    return {"event": event, "items": [jsonable(row) for row in rows[:size]],
-            "truncated": len(rows) > size}
+    return {"items": [jsonable(row) for row in rows[:size]], "truncated": len(rows) > size}
 
 
-async def with_user_giftcard(cur, settings: Settings, page: dict[str, Any]) -> dict[str, Any]:
-    """회원 목록 한 페이지에 상품권 상태(giftcard)를 붙인다 — 목록 쿼리는 그대로 두고 그 페이지
-    회원번호만 한 번 더 조회한다(페이지당 1문장, 인덱스 (user_id, event_key)).
+async def latest_giftcard_period(cur, settings: Settings) -> dict[str, Any] | None:
+    """오늘 기준 가장 최근 시작 구간(GIFTCARD_LATEST_PERIOD, 끝난 구간 포함) — 회원 목록 열의 기준.
+    상품권번호는 읽지 않는다(어드민 화면에 나가지 않는다)."""
+    await cur.execute(
+        f"SELECT id, event_key, starts_on, ends_on {GIFTCARD_LATEST_PERIOD}",
+        [local_today(settings.admin_utc_offset_hours), None, None],
+    )
+    latest = await cur.fetchone()
+    return jsonable(latest) if latest else None
+
+
+async def with_user_giftcard(
+    cur, period: dict[str, Any] | None, page: dict[str, Any]
+) -> dict[str, Any]:
+    """회원 목록 한 페이지에 상품권 상태(giftcard)를 붙인다 — 기준은 period(latest_giftcard_period).
+    목록 쿼리는 그대로 두고 그 페이지 회원번호만 한 번 더 조회한다(페이지당 1문장, 인덱스
+    (user_id, period_id)).
 
     giftcard = {received: 받은 판정 기록이 있는가, last_result: 시각순 마지막 결과 코드}, 기록이
-    없으면 None. 이벤트가 꺼져 있으면 조회도 필드도 없다(giftcard_event None)."""
-    event = _giftcard_event(settings)
-    if event is None or not page["items"]:
-        return {**page, "giftcard_event": event}
+    없으면 None. 시작한 구간이 없으면 회원 조회도 필드도 없다(giftcard_period None)."""
+    if period is None or not page["items"]:
+        return {**page, "giftcard_period": period}
     ids = sorted({str(row["user_no"]) for row in page["items"]})
     await cur.execute(
         f"SELECT user_id, result_code, {GIFTCARD_RECEIVED} AS received FROM giftcard_issue "
-        f"WHERE event_key = %s AND user_id IN ({', '.join(['%s'] * len(ids))}) "
+        f"WHERE period_id = %s AND user_id IN ({', '.join(['%s'] * len(ids))}) "
         "ORDER BY created_at, id",
-        [event["key"], *ids],
+        [period["id"], *ids],
     )
     status: dict[str, dict[str, Any]] = {}
     for row in await cur.fetchall():
@@ -851,7 +899,7 @@ async def with_user_giftcard(cur, settings: Settings, page: dict[str, Any]) -> d
             "last_result": row["result_code"],
         }
     items = [{**row, "giftcard": status.get(str(row["user_no"]))} for row in page["items"]]
-    return {**page, "items": items, "giftcard_event": event}
+    return {**page, "items": items, "giftcard_period": period}
 
 
 # 추적 화면의 도구 스텝 칩 — 공개 process.steps에서 칩에 필요한 키만(출처 목록은 세션 상세 몫).

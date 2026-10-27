@@ -35,8 +35,8 @@ mysql이 아니면(로컬 sqlite) 스택이 자연 비활성이다(구조 분기
 (전부 unread·자동 제목) 목록·복원이 그대로 동작한다.
 
 DDL은 `scripts/chat_turn.sql`·`scripts/turn_round.sql`·`scripts/turn_feedback.sql`·
-`scripts/turn_click.sql`·`scripts/giftcard_issue.sql`·`scripts/session_ui.sql`
-(기존 DB는 `scripts/session_ui_deleted_at.sql`)(usage_log 관례).
+`scripts/turn_click.sql`·`scripts/giftcard_issue.sql`·`scripts/giftcard_period.sql`·
+`scripts/session_ui.sql`(기존 DB는 `scripts/session_ui_deleted_at.sql`)(usage_log 관례).
 """
 
 from __future__ import annotations
@@ -44,14 +44,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException
 
 from yes24_agent.admin_auth import AUDIT_INSERT, audit_params
-from yes24_agent.admin_data import GIFTCARD_RECEIVED
+from yes24_agent.admin_data import GIFTCARD_LATEST_PERIOD, GIFTCARD_RECEIVED
 from yes24_agent.config import get_settings
 from yes24_agent.db import MysqlBackedService, rollback_unless_closed
 from yes24_agent.session_service import mysql_pool_kwargs
@@ -108,8 +108,20 @@ class SessionUi:
     deleted_at: datetime | None = None
 
 
+@dataclass(frozen=True)
+class GiftcardPeriod:
+    """상품권 지급 구간 한 행(giftcard_period). 날짜는 KST, 양 끝 포함."""
+
+    id: int
+    event_key: str
+    starts_on: date
+    ends_on: date
+    goods_tic_no: int = field(repr=False)  # 원문 상품권번호 — 로그·예외 문자열에 남기지 않는다
+
+
 class UserDataService(MysqlBackedService):
-    """chat_turn·turn_feedback·turn_click·session_ui·giftcard_issue 서비스(프로세스 싱글턴, 풀 1개).
+    """chat_turn·turn_feedback·turn_click·session_ui·giftcard_issue·giftcard_period 서비스
+    (프로세스 싱글턴, 풀 1개).
 
     풀 보유·활성 판정·질의·마감은 db.MysqlBackedService가 소유한다 — 여기 남는 것은 SQL뿐이다.
     풀 팩토리를 주입할 수 있어 테스트는 실 DB 없이 전 경로를 돈다(AuthService·UsageLogger 패턴).
@@ -145,7 +157,8 @@ class UserDataService(MysqlBackedService):
             "t.model, t.fallback_from, t.prompt_version_id, t.input_source, "
             "f.app_name, c.app_name, "
             "s.app_name, s.deleted_at, "
-            "l.app_name, d.target_type, g.user_id, g.event_key, g.result_code, "
+            "l.app_name, d.target_type, g.user_id, g.event_key, g.result_code, g.period_id, "
+            "gp.id, gp.event_key, gp.starts_on, gp.ends_on, gp.goods_tic_no, "
             # 운영 뷰 chat_turns(operational_views.sql)도 모델 열을 싣는 판이어야 한다 — 어드민
             # 세션 상세가 이 뷰에서 모델을 읽는다(재적용 누락이 상세 503으로 숨지 않게 기동 실패).
             "v.model, v.fallback_from, v.prompt_version_id, l.service_tier, l.reasoning_effort, "
@@ -154,8 +167,8 @@ class UserDataService(MysqlBackedService):
             "p.activated_at, p.retired_at, r.seq, r.attempt, r.round_index, r.started_ms, "
             "r.thinking_tokens, r.tool_calls, r.error_status "
             "FROM users u, auth_keys a, chat_turn t, turn_feedback f, turn_click c, "
-            "session_ui s, usage_log l, admin_audit d, giftcard_issue g, chat_turns v, "
-            "model_settings m, prompt_version p, turn_round r WHERE 1 = 0",
+            "session_ui s, usage_log l, admin_audit d, giftcard_issue g, giftcard_period gp, "
+            "chat_turns v, model_settings m, prompt_version p, turn_round r WHERE 1 = 0",
             (),
             fetch_all=True,
         )
@@ -518,26 +531,39 @@ class UserDataService(MysqlBackedService):
             ),
         )
 
-    # ── giftcard_issue ─────────────────────────────────────────────────────
+    # ── giftcard_period · giftcard_issue ──────────────────────────────────
 
-    async def giftcard_issued(self, *, user_id: str, event_key: str) -> bool:
-        """이 이벤트로 Yes24가 "받았다"고 답한 기록(SUCCESS·ALREADY_APPLIED)이 있는가."""
+    async def giftcard_period(self, *, today: date, current: bool) -> GiftcardPeriod | None:
+        """KST 오늘 기준 구간 한 행. current면 오늘을 포함하는 구간(대상자 확인·공개 조회), 아니면
+        이미 시작한 구간 중 최신(결과 귀속 — 끝난 직후의 기록도 그 구간에 붙는다). 없으면 None."""
+        bound = today if current else None
+        rows = await self._run(
+            "SELECT id, event_key, starts_on, ends_on, goods_tic_no "
+            f"{GIFTCARD_LATEST_PERIOD}",
+            (today, bound, bound),
+            fetch_all=True,
+        )
+        return GiftcardPeriod(*rows[0]) if rows else None
+
+    async def giftcard_issued(self, *, user_id: str, period_id: int) -> bool:
+        """이 구간으로 Yes24가 "받았다"고 답한 기록(SUCCESS·ALREADY_APPLIED)이 있는가."""
         return bool(
             await self._run(
-                "SELECT 1 FROM giftcard_issue WHERE user_id = %s AND event_key = %s "
+                "SELECT 1 FROM giftcard_issue WHERE user_id = %s AND period_id = %s "
                 f"AND {GIFTCARD_RECEIVED} LIMIT 1",
-                (user_id, event_key),
+                (user_id, period_id),
                 fetch_all=True,
             )
         )
 
     async def record_giftcard_result(
-        self, *, user_id: str, event_key: str, result_code: str
+        self, *, user_id: str, period_id: int, event_key: str, result_code: str
     ) -> None:
         """발급 시도 1건 기록 — 행 추가만 한다(시각은 DB가 찍는다)."""
         await self._run(
-            "INSERT INTO giftcard_issue (user_id, event_key, result_code) VALUES (%s, %s, %s)",
-            (user_id, event_key, result_code),
+            "INSERT INTO giftcard_issue (user_id, period_id, event_key, result_code) "
+            "VALUES (%s, %s, %s, %s)",
+            (user_id, period_id, event_key, result_code),
         )
 
     # ── session_ui ─────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-import { initManage, roleLabel } from "/static/lib/admin_manage.js?v=33";
+import { initManage, jsonBody, roleLabel } from "/static/lib/admin_manage.js?v=34";
 import { initCharts } from "/static/lib/admin_charts.js?v=10";
 import { initPrompts } from "/static/lib/admin_prompts.js?v=1";
 import { renderBody } from "/static/lib/md.js";
@@ -1071,9 +1071,10 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       cremaPager($(key + '-pager'), data.total, data.page_size, page, (to) => { state[key + 'Page'] = to; loaders[key](); });
     });
   }
-  // 상품권 열 — 이벤트가 켜져 있을 때만(서버 giftcard_event). 받음이 우선, 아니면 마지막 결과 코드 원문. 정렬·필터·CSV 없음.
+  // 상품권 열 — 시작한 구간이 있을 때만, 가장 최근 시작 구간 기준(서버 giftcard_period). 받음이 우선, 아니면 마지막 결과 코드 원문. 정렬·필터·CSV 없음.
   const GIFTCARD_COLUMN = { key: 'giftcard', label: '이벤트 참여', format: (g) => (!g ? '-' : g.received ? '✓' : giftcardLabel(g.last_result)) };
-  const userColumns = (data) => (data.giftcard_event ? [...USER_COLUMNS, GIFTCARD_COLUMN] : USER_COLUMNS);
+  const userColumns = (data) => (data.giftcard_period
+    ? [...USER_COLUMNS, { ...GIFTCARD_COLUMN, hint: `구간 ${giftcardPeriod(data.giftcard_period)} 기준` }] : USER_COLUMNS);
   const loadUsers = () => loadList('users', `/admin/api/users?${new URLSearchParams({ ...state.applied.users, ...scope() })}`, userColumns, openUser, undefined, (data) => {
     addMissingOptions($('users-rbti'), data.rbti_types, rbtiLabel);
     // 대화 상세의 '회원 보기'로 왔으면 그 회원 패널을 연다(회원번호 정확 일치 검색의 결과 행).
@@ -1633,7 +1634,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   // ── 감사 로그(관리자 전용): 서버가 준 행(target_type·action·before/after JSON)을 사람이 읽는 줄로 옮긴다.
   // 라벨 표는 이 한 곳이다 — 모르는 값은 원문 그대로 보인다(새 작업이 생겨도 빈칸이 되지 않게).
   const CLI_LABEL = '서버 관리 도구(CLI)';
-  const AUDIT_TARGETS = { '': '전체', login: '로그인', admin: '계정', user: '회원', starter: '초기 질문', session: '대화', model: '모델 설정', prompt: '프롬프트' };
+  const AUDIT_TARGETS = { '': '전체', login: '로그인', admin: '계정', user: '회원', starter: '초기 질문', session: '대화', model: '모델 설정', prompt: '프롬프트', giftcard: '이벤트 기간' };
   // 작업명은 동사만 — 무엇에 대한 작업인지는 바로 옆 '대상' 칸("초기 질문 #151 · …", "계정 owner")이 말한다.
   const AUDIT_ACTIONS = {
     'login:ok': '로그인', 'login:failed': '로그인 실패', 'login:logout': '로그아웃',
@@ -1642,10 +1643,12 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     'starter:create': '직접 등록', 'starter:update': '수정', 'starter:deactivate': '노출 끄기', 'starter:generate': '자동 생성',
     'session:purge': '영구 삭제',
     'model:update': '변경',
+    'giftcard:create': '추가', 'giftcard:update': '수정', 'giftcard:delete': '삭제',
   };
   const AUDIT_FIELDS = {
     username: '계정명', role: '역할', is_active: '활성', note: '메모', text: '문장', pinned: '고정', active: '노출 설정', valid_from: '노출 시작일', valid_until: '노출 종료일',
     slot: '분야', status: '결과', inserted: '추가 수', force: '다시 생성', user_id: '회원번호', turns: '질의 수', deleted_at: '삭제 요청 시각', app_name: '앱',
+    event_key: '이벤트명', starts_on: '시작일', ends_on: '종료일', goods_tic_no_masked: '상품권번호',
     default_model: '기본 모델', fallback_model: '폴백 모델', service_tiers: '처리 등급', reasoning_efforts: '사고 강도',
   };
   // 모델 설정 값: null = 설정 파일 기본값 따름, '' = 폴백 끔(서버 model_settings 규칙).
@@ -1850,15 +1853,15 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     const sessions = el('button', null, '이 회원의 대화 보기');
     sessions.onclick = () => openSessions({ q: row.user_no });
     $('record-actions').append(sessions);
-    // 상품권 이벤트 시도 기록(조회 전용) — 이벤트가 꺼져 있거나 기록이 없으면 비워 둔다. 자리를 먼저 붙여 두면
+    // 상품권 이벤트 시도 기록(조회 전용, 구간에 귀속된 기록만) — 기록이 없으면 비워 둔다. 자리를 먼저 붙여 두면
     // 그 사이 패널이 다른 행으로 바뀌어도(본문 교체로 자리가 떨어져 나감) 엉뚱한 패널에 붙지 않는다.
     const box = el('div');
     $('record-view').append(box);
     api(`/admin/api/users/${encodeURIComponent(row.user_no)}/giftcard`).then((gift) => {
-      if (!gift.event || !gift.items.length) return;
+      if (!gift.items.length) return;
       const head = el('div', 'section-head');
-      head.append(el('h3', null, '이벤트 참여 기록'), el('span', null, giftcardEvent(gift.event)));
-      box.append(head, table([{ key: 'created_at', label: '시각', format: when }, { key: 'result_code', label: '결과', format: giftcardResult }], gift.items),
+      head.append(el('h3', null, '이벤트 참여 기록'));
+      box.append(head, table([{ key: 'starts_on', label: '구간', text: giftcardPeriod }, { key: 'created_at', label: '시각', format: when }, { key: 'result_code', label: '결과', format: giftcardResult }], gift.items),
         ...(gift.truncated ? [el('p', 'crema-note', `최근 ${num(gift.items.length)}건만 표시합니다.`)] : []), el('p', 'crema-note', GIFTCARD_NOTE));
     }, (error) => console.error(error));
   }
@@ -2146,13 +2149,113 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     cell.append(el('small', null, code));
     return cell;
   };
-  const giftcardEvent = (event) => `${event.key} · 이벤트 기간 ${event.start} ~ ${event.end}`;
-  /** 상품권 묶음 — 시도·회원 수, 일별 시도(받음 · 그 외), 결과 코드별 건수. 받음 = 서버 판정(codes[].received).
-   *  일별 11열 표·엑셀(고객 양식)에는 넣지 않는다. 이벤트가 꺼져 있으면(설정 키 없음) 안내만. */
+  /** 지급 구간 표기(KST, 양 끝 포함) — 구간 행(starts_on·ends_on)을 받는다. */
+  const giftcardPeriod = (period) => `${period.starts_on} ~ ${period.ends_on}`;
+  /** 구간 상태(서버가 KST 오늘로 판정 — admin_data.period_status) 표기. */
+  const PERIOD_STATUS = { active: '진행 중', scheduled: '예정', ended: '종료' };
+  /** 이벤트 기간 — 표(진행 중 행 강조) + 편집 폼(editor 이상). 행을 누르면 그 구간을 고친다(시작 전 = 전 필드·삭제,
+   *  진행 중 = 종료일·상품권번호만, 종료 = 읽기 전용 — 규칙의 정본은 서버 giftcard.py). 상품권번호는 서버가 마스킹한 값만 온다. */
+  function giftcardPeriodsBlock(periods) {
+    const editable = hasRole('editor');
+    const form = editable ? giftcardPeriodForm(periods) : null;
+    let content = el('div', 'placeholder', '진행 중인 이벤트가 없습니다.');
+    if (periods.length) {
+      content = el('div', 'bleed');
+      const grid = table([
+        { key: 'event_key', label: '이벤트명' }, { key: 'starts_on', label: '기간', text: giftcardPeriod },
+        { key: 'status', label: '상태', format: (s) => PERIOD_STATUS[s] ?? s }, { key: 'goods_tic_no_masked', label: '상품권번호' },
+        { key: 'attempts', label: '시도', format: num }, { key: 'users', label: '시도 회원', format: num }, { key: 'received_users', label: '받은 회원', format: num },
+      ], periods, editable ? Object.assign((row) => form.edit(row), { enabled: (row) => row.status !== 'ended' }) : undefined);
+      periods.forEach((row, i) => { if (row.status === 'active') grid.querySelectorAll('tbody tr')[i]?.classList.add('is-active-period'); });
+      content.append(grid);
+    }
+    const card = analysisCard('이벤트 기간', content, `날짜는 KST, 양 끝 포함. 시도·회원 수는 위 조회 기간 안의 기록입니다.${editable ? ' 행을 누르면 그 기간을 고칩니다(종료된 기간 제외).' : ''}`);
+    if (form) card.append(form);
+    return card;
+  }
+  /** 추가 폼의 미리 채움 — 마지막 기간(시작일 최신) 다음 주 월~금과 그 이벤트명. 화면 편의일 뿐 서버 판정이 아니다. */
+  function nextWeekDraft(periods) {
+    const last = periods.reduce((a, b) => (!a || b.starts_on > a.starts_on ? b : a), null);
+    if (!last) return null;
+    const after = addDays(last.ends_on, 1);
+    const monday = addDays(after, (7 - weekdayOf(after)) % 7);  // 캘린더의 날짜 도우미(월 = 0) 재사용
+    return { event_key: last.event_key, starts_on: monday, ends_on: addDays(monday, 4) };
+  }
+  /** 추가·수정 폼 하나 — edit(row)로 수정 모드(상태별 잠금), 취소로 추가 모드. 한 번에 한 주(상품권번호가 주마다 다르다).
+   *  번호는 문자열 그대로 보낸다 — Number()는 16자리부터 정밀도를 잃는다(서버가 정수로 받는다). 저장 뒤 통계를 다시 읽는다. */
+  function giftcardPeriodForm(periods) {
+    const form = el('form', 'manage-form'), title = el('h3', null, '기간 추가');
+    const field = (name, label, type, attrs = {}) => {
+      const input = Object.assign(el('input'), { name, type, ...attrs });
+      const wrap = el('label', null, label);
+      wrap.append(input);
+      return [wrap, input];
+    };
+    const [keyWrap, key] = field('event_key', '이벤트명(Yes24 eventNm)', 'text', { maxLength: 64, required: true });
+    const [startWrap, start] = field('starts_on', '시작일', 'date', { required: true });
+    const [endWrap, end] = field('ends_on', '종료일', 'date', { required: true });
+    const [noWrap, no] = field('goods_tic_no', '상품권번호(그 주의 원문 숫자)', 'text', { inputMode: 'numeric', pattern: '[1-9][0-9]*', autocomplete: 'off' });
+    const help = el('p', 'field-help');
+    const save = el('button', 'primary', '추가'), cancel = el('button', null, '수정 취소'), remove = el('button', 'primary danger', '삭제');
+    save.type = 'submit'; cancel.type = 'button'; remove.type = 'button';
+    const actions = el('div', 'period-actions');
+    actions.append(save, cancel, remove);
+    form.append(title, keyWrap, startWrap, endWrap, noWrap, help, actions);
+    let editing = null;
+    const reset = () => {
+      editing = null; form.reset(); title.textContent = '기간 추가'; save.textContent = '추가';
+      const draft = nextWeekDraft(periods);
+      if (draft) { key.value = draft.event_key; start.value = draft.starts_on; end.value = draft.ends_on; }
+      for (const input of [key, start, end]) input.disabled = false;
+      no.required = true; no.placeholder = ''; cancel.hidden = true; remove.hidden = true;
+      help.textContent = `${draft ? '마지막 기간 다음 주 월~금과 이벤트명을 미리 채웠습니다. ' : ''}상품권번호는 주마다 다릅니다 — 그 주 번호를 넣으세요. 기존 기간과 날짜가 겹치면 추가되지 않습니다.`;
+    };
+    form.edit = (row) => {
+      editing = row; title.textContent = `기간 수정 · ${row.event_key} ${giftcardPeriod(row)}`; save.textContent = '저장';
+      key.value = row.event_key; start.value = row.starts_on; end.value = row.ends_on; no.value = '';
+      const active = row.status === 'active';
+      key.disabled = active; start.disabled = active; end.disabled = false;
+      no.required = false; no.placeholder = `${row.goods_tic_no_masked} — 바꿀 때만 입력`;
+      cancel.hidden = false; remove.hidden = active;
+      help.textContent = active ? '진행 중인 기간은 종료일(오늘 이후)과 상품권번호만 바꿀 수 있습니다.' : '시작 전인 기간은 모든 항목을 바꾸거나 삭제할 수 있습니다.';
+      form.scrollIntoView({ block: 'nearest' });
+    };
+    const done = (message) => { showToast(message); loadStatistics(); };
+    cancel.onclick = reset;
+    remove.onclick = async () => {
+      if (!editing || !(await confirmDialog({ title: '기간 삭제', message: `${editing.event_key} ${giftcardPeriod(editing)} 기간을 삭제합니다.`, confirmLabel: '삭제', danger: true }))) return;
+      try { await api(`/admin/giftcard/periods/${editing.id}`, { method: 'DELETE' }); done('기간을 삭제했습니다.'); } catch (error) { if (error.name !== 'AbortError') showError(errorText(error, '삭제하지 못했습니다.')); }
+    };
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      save.disabled = true;
+      try {
+        if (editing) {
+          const changes = {};
+          if (!key.disabled && key.value !== editing.event_key) changes.event_key = key.value;
+          if (!start.disabled && start.value !== editing.starts_on) changes.starts_on = start.value;
+          if (end.value !== editing.ends_on) changes.ends_on = end.value;
+          if (no.value) changes.goods_tic_no = no.value;
+          if (!Object.keys(changes).length) { showToast('바뀐 항목이 없습니다.'); return; }
+          await api(`/admin/giftcard/periods/${editing.id}`, jsonBody('PATCH', { changes }));
+          done('기간을 저장했습니다.');
+        } else {
+          await api('/admin/giftcard/periods', jsonBody('POST', { event_key: key.value, starts_on: start.value, ends_on: end.value, goods_tic_no: no.value }));
+          done('기간을 추가했습니다.');
+        }
+      } catch (error) {
+        if (error.name !== 'AbortError') showError(errorText(error, '저장하지 못했습니다.'));
+      } finally { save.disabled = false; }
+    };
+    reset();
+    return form;
+  }
+  /** 상품권 묶음 — 이벤트 기간 표·편집, 시도·회원 수, 일별 시도(받음 · 그 외), 결과 코드별 건수. 받음 = 서버 판정(codes[].received).
+   *  일별 11열 표·엑셀(고객 양식)에는 넣지 않는다. 구간 행이 하나도 없으면 안내(+ editor는 추가 폼)만. */
   function giftcardBlocks(data, range) {
     const gift = data.giftcard;
-    if (!gift) return [el('div', 'placeholder', '진행 중인 이벤트가 없습니다.')];
-    const note = el('p', 'crema-note', `${giftcardEvent(gift.event)} — ${GIFTCARD_NOTE}`);
+    if (!gift) return [giftcardPeriodsBlock([])];
+    const note = el('p', 'crema-note', GIFTCARD_NOTE);
     const cards = el('div', 'crema-cards'), line = el('div', 'crema-row');
     line.append(cardBox('발급 시도', num(gift.summary.attempts), '건', range), cardBox('시도 회원', num(gift.summary.users), '명', range),
       cardBox('받은 회원', num(gift.summary.received_users), '명', range, 'SUCCESS·ALREADY_APPLIED 기록이 있는 회원'));
@@ -2170,10 +2273,11 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       series: split(gift.hourly, 'hour', hours),
     });
     for (const chart of [bars, hourly]) chart.classList.add('crema-bars');
-    if (!gift.codes.length) return [note, cards, bars, hourly];
+    const periods = giftcardPeriodsBlock(gift.periods);
+    if (!gift.codes.length) return [periods, note, cards, bars, hourly];
     const wrap = el('div', 'bleed');
     wrap.append(table([{ key: 'result_code', label: '결과', format: giftcardResult }, { key: 'received', label: '받음 판정', format: (v) => flag(v, '받음') }, { key: 'attempts', label: '건수', format: num }], gift.codes));
-    return [note, cards, bars, hourly, wrap];
+    return [periods, note, cards, bars, hourly, wrap];
   }
 
   function renderStatistics() {

@@ -29,7 +29,7 @@ function inputOf(type) {
 export const ROLE_LABELS = Object.freeze({ viewer: '뷰어', editor: '운영자', owner: '관리자' });
 export const roleLabel = (role) => ROLE_LABELS[role] ?? role;
 
-const jsonBody = (method, body) => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+export const jsonBody = (method, body) => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 /** 편집 요청 한 벌 — 초기 질문 PATCH의 {changes, expected} 본문. */
 const editBody = (changes, expected) => jsonBody('PATCH', { changes, expected });
 
