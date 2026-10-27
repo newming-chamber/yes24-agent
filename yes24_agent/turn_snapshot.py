@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from google.adk.events import Event
 from google.adk.sessions import BaseSessionService, DatabaseSessionService
+from google.adk.sessions.base_session_service import GetSessionConfig
 
 from yes24_agent.agent import AGENT_NAME
 from yes24_agent.config import get_settings
@@ -74,10 +75,12 @@ async def persist_turn_snapshot(
 
         if table_storage and user_text is not None and started_at is not None:
             return await save(user_text, started_at)
+        # 이번 턴 이벤트만 필요하다 — 턴 시작 시각 이후만 읽는다(긴 세션 전량 적재 금지).
         session = await service.get_session(
             app_name=get_settings().app_name,
             user_id=user_id,
             session_id=session_id,
+            config=GetSessionConfig(after_timestamp=started_at),
         )
         if session is None:
             logger.warning(f"턴 스냅샷 저장 생략: 세션 없음(turn_id={turn_id})")

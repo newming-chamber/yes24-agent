@@ -208,6 +208,11 @@ class Settings(BaseSettings):
     # 본다.
     # 함수콜↔응답 짝은 ADK가 가르지 않으므로 실제 보존 수는 이 값 이상일 수 있다.
     history_compaction_retention_events: int = 24
+    # 턴 경로 세션 적재가 압축 경계를 찾을 때 처음 읽는 최근 이벤트 수(session_service.
+    # load_history_session — 못 찾으면 두 배씩 넓힌다). 운영 최악 세션(2026-10-25, 1,707턴)의 경계
+    # 뒤 창이 184건이라 그 위의 256이면 1회 조회로 덮는다 — 작은 세션은 한 번에 전부 읽힌다.
+    # 정확성과 무관한 비용 손잡이다(개수는 경계 탐색에만 쓰고 적재 창은 경계 시각이 정한다).
+    history_probe_events: int = Field(default=256, ge=1)
     # 세션 제목 표시 상한(문자). 목록 한 줄에 담기는 길이 — status_detail_max_chars와는
     # 다른 축이라 따로 둔다(우연히 비슷해도 서로 따라가면 안 된다).
     session_title_max_chars: int = 60

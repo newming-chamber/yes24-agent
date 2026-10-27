@@ -70,6 +70,8 @@ from yes24_agent.session_service import (
     _get_session_lock,
     _get_session_service,
     _resolve_session,
+    history_window,
+    load_history_session,
 )
 from yes24_agent.sources import (
     SOURCES_STATE_KEY,
@@ -507,6 +509,26 @@ def _trace_columns(models: TurnModels, process) -> dict:
     }
 
 
+class _WindowedRunner(Runner):
+    """세션을 이력 창(마지막 압축 경계 이후 — `history_window`)으로만 적재하는 Runner.
+
+    ADK 2.3.0의 chat 모드 LlmAgent 경로(run_async → _run_node_async)는 `RunConfig.
+    get_session_config`를 `_get_or_create_session`에 넘기지 않아, 매 턴 세션을 **두 번 전량**
+    적재했다(2026-10-26 계측: 128MB 합성 세션에서 RSS +590MB·+390MB). 조회 설정이 들어가는 지점이
+    그 메서드 하나라 여기서 채운다.
+    """
+
+    def __init__(self, window: GetSessionConfig, **kwargs):
+        super().__init__(**kwargs)
+        self._window = window
+
+    async def _get_or_create_session(self, *, user_id, session_id, get_session_config=None):
+        return await super()._get_or_create_session(
+            user_id=user_id, session_id=session_id,
+            get_session_config=get_session_config or self._window,
+        )
+
+
 def _agent_for(models: TurnModels, app):
     """이 턴의 지금 모델로 에이전트를 고른다 — 첫 시도·재시도가 같은 구성 축을 싣는 한 지점."""
     return get_agent(
@@ -616,7 +638,10 @@ async def run_agent_stream(
                 )
             ).deleted_at is not None:
                 session_id = None
-            session = await _resolve_session(service, session_id, session_user_id)
+            # 이벤트는 마지막 압축 경계 이후만 싣는다(직전 턴·Runner 적재 창의 재료).
+            session = (
+                session_id and await load_history_session(service, session_id, session_user_id)
+            ) or await _resolve_session(service, session_id, session_user_id)
             usage_scope.session_id = session.id
             # 현재 UI 요청을 RBTI state의 정본으로 본다. 유효 코드는 저장하고 None·무효 코드는
             # 기존 값을 명시적으로 지워, 이전 요청의 페르소나가 다음 기본 채팅에 남지 않게 한다.
@@ -796,8 +821,11 @@ async def run_agent_stream(
                 max_llm_calls=settings.max_llm_calls,
             )
             agent = _agent_for(models, app)
+            # Runner도 같은 창만 적재한다 — 압축 범위의 원시 이벤트는 어차피 요약으로 갈음된다.
+            window = history_window(session.events)
 
-            runner = Runner(
+            runner = _WindowedRunner(
+                window,
                 agent=agent,
                 app_name=settings.app_name,
                 session_service=service,
@@ -899,7 +927,8 @@ async def run_agent_stream(
                                 task.cancel()
                             thought_tasks.clear()
                             final_text = ""
-                            retry_runner = Runner(
+                            retry_runner = _WindowedRunner(
+                                window,
                                 agent=agent,
                                 app_name=settings.app_name,
                                 session_service=service,

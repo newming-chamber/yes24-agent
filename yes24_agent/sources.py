@@ -7,6 +7,12 @@
 ADK State 주의사항: State는 dict처럼 보이지만 변경 추적이 재할당 기반이다.
 `state["sources"].append(...)` 같은 내부 변형은 델타로 기록되지 않을 수 있으므로,
 반드시 새 리스트를 만들어 `state[SOURCES_STATE_KEY] = new_list`로 재할당한다.
+
+읽기는 두 형태를 다 본다: 이 리스트와 **출처별 키**(`sources:{id}` → 레코드 하나). 리스트 재할당은
+도구 응답마다 누적 레지스트리 전체를 그 이벤트 state_delta에 다시 실어 세션 이벤트를 O(턴²)로
+키운다(운영 2026-10-25: 1,707턴 세션 events 146MB·최대 1.9MB/건). 쓰기를 키 단위로 옮기는 것은
+별도 배포이고, 그 배포를 이 리더로 되돌려도(롤백·혼합 버전) 키에 쓰인 출처를 잃지 않게 리더를
+먼저 깐다(expand/contract의 expand).
 """
 
 import threading
@@ -14,10 +20,14 @@ from collections.abc import MutableMapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from google.adk.sessions.state import State
+
 from yes24_agent.config import get_settings
 
-# 세션 스코프 키 (temp: 접두사 금지 — 멀티턴에서 이전 턴 출처도 유지되어야 함)
+# 세션 스코프 키 (temp: 접두사 금지 — 멀티턴에서 이전 턴 출처도 유지되어야 함). 접두사 형태
+# `sources:{id}`는 출처별 키다(모듈 docstring) — 키 규칙을 바꾸면 이전 배포의 리더가 못 읽는다.
 SOURCES_STATE_KEY = "sources"
+_RECORD_KEY_PREFIX = f"{SOURCES_STATE_KEY}:"
 # 관측 충실도. **등록하는 도구가 선언하고 코어는 크기만 비교한다** — 코어가 "book_detail이면
 # 더 충실"을 알면 그 순간 yes24 전용 지식이 엔진에 박힌다(T1). 척도 정의만 코어 몫이다:
 # 0 = 목록·요약 관측, 1 이상 = 상세 관측(같은 URL의 요약보다 우선하고 meta를 평면으로 올린다).
@@ -254,7 +264,7 @@ def register_source(
     `None`은 이번 도구가 해당 필드를 관측하지 않았다는 뜻이므로 기존 값을 유지한다.
     레코드의 필드 계약은 `REGISTRY_RECORD_FIELDS`이며, state에 남는 형태는 이것뿐이다.
     """
-    existing = state.get(SOURCES_STATE_KEY, [])
+    existing = get_sources(state)
     for index, source in enumerate(existing):
         if source["url"] == url:
             incoming = {
@@ -290,6 +300,24 @@ def register_source(
     return new_id
 
 
-def get_sources(state: MutableMapping[str, Any]) -> list[dict]:
-    """등록 순서대로 출처 목록을 반환한다. state는 변형하지 않는다."""
-    return list(state.get(SOURCES_STATE_KEY, []))
+def get_sources(state: MutableMapping[str, Any] | State) -> list[dict]:
+    """출처 목록을 id 순(= 발급 순 — id는 단조 발급이다)으로 반환한다. state는 변형하지 않는다.
+
+    리스트와 출처별 키를 합친다. 같은 id가 양쪽에 있으면 두 관측으로 보고 `merge_source_records`로
+    합친다 — 늦게 확인한 쪽을 incoming으로 넘겨 관측값·동률 본문은 최신이 이기고, 상세는 충실도가
+    지킨다. 키를 쓰는 배포 뒤 리스트를 쓰는 배포로 돌아가도(그 반대도) 어느 한쪽이 낡은 값으로
+    다른 쪽을 덮지 않는다. ADK `State`는 키 순회를 제공하지 않아 `to_dict()`(값 ∪ 미커밋
+    델타)로 본다.
+    """
+    view = state.to_dict() if isinstance(state, State) else state
+    records = {record["id"]: record for record in view.get(SOURCES_STATE_KEY) or ()}
+    for key, record in view.items():
+        if not key.startswith(_RECORD_KEY_PREFIX):
+            continue
+        prior = records.get(record["id"])
+        if prior is None:
+            records[record["id"]] = record
+        else:
+            newer, older = _by_observation_time(prior, record)
+            records[record["id"]] = merge_source_records(older, newer)
+    return [records[source_id] for source_id in sorted(records)]

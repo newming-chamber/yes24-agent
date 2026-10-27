@@ -13,10 +13,12 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 from weakref import WeakValueDictionary
 
+from google.adk.apps.compaction import _latest_compaction_end_timestamp
 from google.adk.sessions import (
     BaseSessionService,
     InMemorySessionService,
 )
+from google.adk.sessions.base_session_service import GetSessionConfig
 from google.adk.sessions.schemas.shared import DynamicJSON
 from google.adk.sessions.session import Session
 
@@ -39,6 +41,11 @@ SQLITE_DIALECT = "sqlite"
 # 나오는 구조 분기다.
 MYSQL_DIALECT = "mysql"
 _MYSQL_UTC_INIT_COMMAND = "SET time_zone = '+00:00'"
+
+# 이벤트 없이 세션 행(state)만 읽는 조회 — 존재 확인·state 읽기·append용 재조회는 이벤트가
+# 필요 없다. 긴 세션의 이벤트 전량 적재가 운영 OOM의 직접 원인이었다(2026-10-25: 146MB 세션을
+# 턴마다 여러 번 파이썬 객체로 올렸다).
+STATE_ONLY = GetSessionConfig(num_recent_events=0)
 
 # 세션 서비스 싱글턴(lazy). 프로세스 전체가 하나의 DB 연결 풀을 공유한다.
 _session_service: BaseSessionService | None = None
@@ -222,18 +229,20 @@ def persistence_mode() -> str:
 async def _resolve_session(
     service: BaseSessionService, session_id: str | None, user_id: str | None = None
 ) -> Session:
-    """기존 세션을 조회하거나, 없으면 새로 만든다.
+    """기존 세션을 **이벤트 없이**(state만) 조회하거나, 없으면 새로 만든다.
 
     session_id가 주어졌지만 조회에 실패(만료·오타·재시작 후 인메모리 유실)하면
     클라이언트가 준 id를 그대로 재사용해 신규 세션을 만든다. user_id가 None이면
     인증 없는 단일 사용자(_POC_USER_ID)로 취급한다 — 조회·생성이 같은 키를 써야
-    남의 session_id로 요청해도 자기 user_id 밑에서만 세션이 성립한다.
+    남의 session_id로 요청해도 자기 user_id 밑에서만 세션이 성립한다. 이벤트가 필요한
+    호출자(턴 준비)는 `load_history_session`을 먼저 쓴다.
     """
     if session_id:
         existing = await service.get_session(
             app_name=get_settings().app_name,
             user_id=user_id or _POC_USER_ID,
             session_id=session_id,
+            config=STATE_ONLY,
         )
         if existing is not None:
             return existing
@@ -243,3 +252,41 @@ async def _resolve_session(
         user_id=user_id or _POC_USER_ID,
         session_id=session_id,
     )
+
+
+async def load_history_session(
+    service: BaseSessionService, session_id: str, user_id: str | None = None
+) -> Session | None:
+    """마지막 이력 압축이 덮은 끝 시각 이후 이벤트가 **빠짐없이** 실린 세션(없으면 None).
+
+    ADK contents 조립·token-threshold 압축은 압축 범위 안의 원시 이벤트를 요약으로 갈음하므로,
+    최신 압축 요약 이벤트와 그 끝 시각 이후 이벤트만 있으면 전량 적재와 같은 결과를 낸다(테스트가
+    등식으로 잠근다). 개수로 자르면 요약을 잘라낼 수 있어, 개수는 경계를 **찾는** 데만 쓴다 —
+    최근 이벤트를 두 배씩 넓혀 읽다가 압축 요약을 만나고 읽은 범위가 그 끝 시각까지 닿으면(또는
+    세션 전부를 읽으면) 멈춘다. 압축 요약은 늘 가장 최근 것이 롤링 요약이라(앞 요약을 seed로 받아
+    시작 시각을 물려받는다) 최근 쪽에서 처음 만나는 요약이 곧 유효 요약이다.
+
+    돌려주는 이벤트에는 경계 앞 이벤트가 섞일 수 있다(어차피 요약 범위라 결과가 같다). Runner
+    적재에는 `history_window(session.events)`로 같은 경계를 넘긴다.
+    """
+    count = get_settings().history_probe_events
+    while True:
+        session = await service.get_session(
+            app_name=get_settings().app_name,
+            user_id=user_id or _POC_USER_ID,
+            session_id=session_id,
+            config=GetSessionConfig(num_recent_events=count),
+        )
+        if session is None or len(session.events) < count:
+            return session
+        until = _latest_compaction_end_timestamp(session.events)
+        if until and session.events[0].timestamp <= until:
+            return session
+        count *= 2
+
+
+def history_window(events) -> GetSessionConfig:
+    """`load_history_session`이 읽은 이벤트에서 얻은 경계로, 같은 창을 다시 읽는 조회 설정.
+
+    경계는 ADK가 압축 판정에 쓰는 함수 그대로다(압축 없음 = 0.0 → 필터 없음)."""
+    return GetSessionConfig(after_timestamp=_latest_compaction_end_timestamp(events) or None)

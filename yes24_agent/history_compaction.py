@@ -41,7 +41,7 @@ from google.adk.sessions import BaseSessionService
 from google.genai import types
 
 from yes24_agent.config import get_settings
-from yes24_agent.session_service import _get_session_lock
+from yes24_agent.session_service import _get_session_lock, load_history_session
 from yes24_agent.usage import record_usage
 
 logger = logging.getLogger(__name__)
@@ -152,14 +152,14 @@ async def compact_history(
 
     세션은 **여기서 다시 읽는다** — 턴 스냅샷은 Runner가 이벤트를 영속한 순간 stale이라
     DatabaseSessionService 낙관적 락이 append를 거부한다(runner.py의 재조회 관례와 같다).
+    이벤트는 직전 압축 경계 이후만 싣는다 — ADK 판정(후보 = 직전 요약 끝 시각 이후, seed = 직전
+    요약)이 그 창 밖을 보지 않으므로 전량 적재와 결과가 같다.
     부가 채널이라 어떤 실패도 밖으로 던지지 않는다 — 다음 턴이 같은 판정으로 재시도한다.
     """
     settings = get_settings()
     try:
         async with _get_session_lock(session_id):
-            session = await service.get_session(
-                app_name=settings.app_name, user_id=user_id, session_id=session_id
-            )
+            session = await load_history_session(service, session_id, user_id)
             if session is None:
                 return False
             session.events = close_dangling_calls(session.events)
