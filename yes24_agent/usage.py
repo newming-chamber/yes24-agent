@@ -2,7 +2,7 @@
 
 모든 LLM 호출의 토큰 사용량을 MySQL `usage_log`에 남긴다: 메인 에이전트 턴
 (runner.py, component="main" 1행/턴)과 경량 서브콜들(enrichment·thought_translation·
-web_grounding·web_prefetch_hint, 콜당 1행). component는 호출부가 넘기는 파라미터일
+web_grounding·web_prefetch_hint·web_perplexity, 콜당 1행). component는 호출부가 넘기는 파라미터일
 뿐이고 이 모듈엔 어떤 사례 분기도 없다.
 
 접속 정보는 인증(auth.py)과 같은 단일 출처 — `config.session_db_url`을
@@ -170,8 +170,8 @@ class UsageLogger:
                 service_tier,
                 # 실제로 실은 사고 강도(LiteLLM만) — 사고 토큰·지연을 강도별로 가르는 축.
                 reasoning_effort,
-                # 그라운딩 서브콜이 실행한 검색 쿼리 수 — 쿼리당 과금(Gemini 3). usage 객체 밖
-                # (grounding_metadata)이라 호출부가 넘긴다. NULL = 그라운딩 외 행·기존 행.
+                # 검색 과금 단위 수 — 그라운딩 쿼리(Gemini 3)·퍼플렉시티 요청. usage 객체 밖이라
+                # 호출부가 넘긴다. NULL = 검색 과금이 없는 행·열 추가 전 기록.
                 search_queries,
                 created_at or datetime.now(timezone.utc).replace(tzinfo=None),
             )

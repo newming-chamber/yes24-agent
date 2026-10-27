@@ -5,7 +5,7 @@
 -- 무시될 뿐 서비스는 정상이다(부가 채널 계약).
 --
 -- 행 단위: component='main'은 턴당 1행(그 턴의 모든 LLM 콜 합산 + latency_ms),
--- 서브콜(enrichment·thought_translation·web_grounding·web_prefetch_hint)은 콜당 1행.
+-- 서브콜(enrichment·thought_translation·web_grounding·web_prefetch_hint·web_perplexity)은 콜당 1행.
 -- component 값은 호출부가 넘기는 파라미터라 새 값이 생겨도 스키마 변경이 없다.
 CREATE TABLE IF NOT EXISTS usage_log (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS usage_log (
     response_tokens INT NULL,       -- 응답(후보) 토큰 — genai candidates_token_count
     total_tokens INT NULL,          -- 벤더 합계(사고 토큰 포함) — genai total_token_count
     latency_ms INT NULL,            -- 메인 턴만(턴 시작~마감 벽시계), 서브콜은 NULL
-    -- 그라운딩 서브콜이 실행한 검색 쿼리 수(쿼리당 과금). NULL = 그라운딩 외 행·열 추가 전 기록,
+    -- 검색 과금 단위 수(그라운딩 쿼리·퍼플렉시티 요청). NULL = 검색 과금 없는 행·열 추가 전 기록,
     -- 0 = 그라운딩 콜이 검색을 안 돌림. 기존 DB는 usage_log_search_queries.sql.
     search_queries INT NULL,
     -- 기간별 비용 집계·세션 추적·모델별 히스토리가 주 조회 축.

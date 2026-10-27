@@ -28,7 +28,7 @@ class ModelPrice(BaseModel):
     input_usd_per_mtok: float
     cached_input_usd_per_mtok: float  # 캐시 단가가 없는 벤더면 입력 단가와 같은 값(할인 없음)
     output_usd_per_mtok: float  # 사고·reasoning 포함 출력 단가
-    # 검색 그라운딩 쿼리 단가(USD / 1,000 queries) — usage_log.search_queries에 곱한다(0 = 없음).
+    # 검색 과금 단가(USD / 1,000 — 그라운딩 쿼리·퍼플렉시티 요청) — usage_log.search_queries에 곱한다(0 = 없음).
     search_usd_per_kquery: float = 0.0
     source: str  # 공식 가격 페이지
     checked_on: date
@@ -37,6 +37,7 @@ class ModelPrice(BaseModel):
 _GEMINI_PRICING = "https://ai.google.dev/gemini-api/docs/pricing"
 _OPENAI_PRICING = "https://developers.openai.com/api/docs/pricing"
 _ANTHROPIC_PRICING = "https://platform.claude.com/docs/en/about-claude/pricing"
+_PERPLEXITY_PRICING = "https://docs.perplexity.ai/getting-started/pricing"
 # 첫 구간의 시작일 — 공식 페이지의 가격 시작일이 아니라 usage_log 기록 전부를 덮는 날짜다.
 _PRICE_EPOCH = date(2026, 1, 1)
 _PRICE_CHECKED = date(2026, 9, 14)  # 공식 페이지 확인일(행마다 다를 수 있다 — 아래 표)
@@ -783,6 +784,8 @@ class Settings(BaseSettings):
     # "화면은 프론트가 줄 수로 제한, 안전 상한은 서버"로 책임을 나눈다.
     source_preview_max_chars: int = 200
     perplexity_search_url: str = "https://api.perplexity.ai/search"
+    # /search 호출의 usage_log.model 값이자 llm_prices 키(LLM이 아니라 요청 단위 과금 API).
+    perplexity_search_model: str = "perplexity-search"
     # 웹 열람(web_fetch)은 여전히 Tavily /extract 사용 — 특정 URL 전문 확보용.
     tavily_extract_url: str = "https://api.tavily.com/extract"
 
@@ -1138,6 +1141,9 @@ class Settings(BaseSettings):
             # 라운드는 넘을 수 있다(도그푸딩 48턴 중 5라운드) — 어드민 비용은 그만큼 과소 추정.
             ("anthropic/claude-haiku-5-5", "", _PRICE_EPOCH, 0.10, 0.01, 0.50, 0.0,
              _ANTHROPIC_PRICING, date(2026, 10, 22)),
+            # Search API는 요청 1건당 $5/1,000이고 토큰 과금이 없다(2026-10-27 공식 페이지 확인).
+            ("perplexity-search", "", _PRICE_EPOCH, 0.0, 0.0, 0.0, 5.0,
+             _PERPLEXITY_PRICING, date(2026, 10, 27)),
         )
     ]
     # 원화 환산(선택). 환율은 시변이라 코드 상수가 아니라 운영자가 기준일과 함께 넣는 값이다 —

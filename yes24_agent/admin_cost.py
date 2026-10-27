@@ -1,7 +1,7 @@
 """어드민 분석의 비용 추정 — usage_log 집계 행에 단가를 붙이고 합산하는 순수 함수(DB 없음).
 
 핵심 정의(화면 각주의 근거 — 상세는 docs/admin-operations.md §7, docs는 저장소 밖):
-- 금액 = 사용량(토큰·검색 그라운딩 쿼리 수) × 단가(settings.llm_prices, 행의 UTC 날짜·처리 등급에
+- 금액 = 사용량(토큰·검색 과금 단위 수 — 그라운딩 쿼리·퍼플렉시티 요청) × 단가(settings.llm_prices, 행의 UTC 날짜·처리 등급에
   유효한 구간). 예상치다.
   처리 등급(usage_log.service_tier — LiteLLM fast 등) 행이 없으면 표준 행으로 추정하고 각주가
   밝힌다.
@@ -49,7 +49,7 @@ def price_for(
 
 
 def cost_of(tokens: Mapping[str, Any], price: ModelPrice) -> float:
-    """토큰 비용 + 검색 그라운딩 쿼리 비용. 쿼리 수 NULL(그라운딩 외 행·열 추가 전 기록)은 0이다."""
+    """토큰 비용 + 검색 과금 비용. search_queries NULL(검색 과금 없는 행·열 추가 전 기록)은 0이다."""
     return (
         int(tokens["input_uncached"] or 0) * price.input_usd_per_mtok
         + int(tokens["input_cached"] or 0) * price.cached_input_usd_per_mtok

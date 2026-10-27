@@ -668,6 +668,16 @@ async def search_raw(
             settings.perplexity_search_url, json=payload, headers=headers
         )
         response.raise_for_status()
+        # 2xx면 본문 검증 결과와 무관하게 요청 1건이 과금된다(4xx·5xx·전송 오류는 과금 없음 —
+        # 위에서 예외로 빠져 기록하지 않는다). 토큰 과금이 없는 API라 토큰 0의 측정 행이다.
+        record_usage(
+            "web_perplexity",
+            genai_types.GenerateContentResponseUsageMetadata(
+                prompt_token_count=0, candidates_token_count=0, total_token_count=0,
+                cached_content_token_count=0,
+            ),
+            model=settings.perplexity_search_model, search_queries=1,
+        )
         data = response.json()
         if not isinstance(data, dict):
             # 유효 JSON이지만 객체가 아닌 본문(배열·null·스칼라)이면 data.get()이
