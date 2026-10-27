@@ -14,12 +14,18 @@
 #     로그 파일은 컨테이너 이름으로 갈라 RotatingFileHandler 회전 경합을 피한다.
 #   - 고정 세션(stickiness)을 켠 이유: 세션 직렬화 락이 프로세스 내부라(runner.py
 #     `_get_session_lock`), 같은 세션의 연속 턴이 두 프로세스로 갈라지면 락이 걸리지 않는다.
+#   - 컨테이너마다 메모리 상한(CONTAINER_MEMORY)을 건다(2026-10-26, 10-23~25 호스트 전역 OOM kill 29건 —
+#     상한이 없어 호스트가 꽉 차면 thrashing 뒤 커널이 python을 죽였다). RAM에서 비컨테이너 상주 ~400을
+#     빼고 2개로 나눈 값이다. 스왑은 주지 않는다(--memory-swap=--memory): 스왑을 주면 상한 근처에서
+#     수 분간 느려진 뒤 죽고 같은 서버의 다른 컨테이너까지 I/O 경합을 받는다. 넘으면 그 컨테이너만
+#     cgroup OOM으로 죽고 --restart로 다시 뜬다. 빈 값을 주면 상한이 빠진다(롤백 레버).
 #   - 시크릿은 이미지에 굽지 않는다. 로컬 .env + 배포 주입값을 stdin 한 스트림으로 보내
 #     원격 ~/yes24-agent/.env(600)를 매번 새로 쓴다(deploy-mq.sh와 같은 방식).
 #
 # 사용:  ./scripts/deploy-prod.sh            # 빌드+푸시+롤링
 #        SKIP_BUILD=1 ./scripts/deploy-prod.sh   # ECR :latest 그대로 롤링만
 #        SERVE_FRONTEND=false ./scripts/deploy-prod.sh   # 백엔드 전용
+#        상한만 재배포 없이 라이브 적용: 서버에서 docker update --memory <값> --memory-swap <같은 값> yes24-agent yes24-agent-2
 #
 # 롤백:  IMAGE_TAG=<이전 날짜태그> SKIP_BUILD=1 ./scripts/deploy-prod.sh
 #        배포 가드 이전 이미지(커밋 라벨 없음)로 되돌릴 때는 ALLOW_DIRTY=1을 함께 준다(라벨 없음 = 출처 불명).
@@ -49,6 +55,9 @@ CONTAINERS="${CONTAINERS:-yes24-agent:8010 yes24-agent-2:8011}"
 read -r -a CONTAINERS <<< "$CONTAINERS"
 CONTAINER_NAMES="${CONTAINERS[*]%%:*}"
 CONTAINER_PORT=8010
+# 메모리 상한(헤더 "왜 이 구조인가"). 빈 값이면 플래그를 붙이지 않는다.
+CONTAINER_MEMORY="${CONTAINER_MEMORY-1600m}"
+MEM_FLAGS="${CONTAINER_MEMORY:+--memory $CONTAINER_MEMORY --memory-swap $CONTAINER_MEMORY}"
 REMOTE_DIR="~/yes24-agent"
 REMOTE_DATA="~/yes24-agent-data"
 export AWS_PAGER=""
@@ -127,7 +136,7 @@ for entry in "${PROD_SERVERS[@]}"; do
     aws elbv2 deregister-targets --target-group-arn "$TG_ARN" --targets Id="$iid",Port="$host_port" --region "$REGION"
     sleep 35
     ssh_cmd "$ip" "docker rm -f $name >/dev/null 2>&1 || true
-docker run -d --name $name -p $host_port:$CONTAINER_PORT \
+docker run -d --name $name -p $host_port:$CONTAINER_PORT $MEM_FLAGS \
   --env-file $REMOTE_DIR/.env -e LOG_FILE_PATH=$LOG_DIR/$name.log -v $REMOTE_DATA:/app/data \
   --log-driver json-file --log-opt max-size=50m --log-opt max-file=3 \
   --restart unless-stopped $ECR/$REPO:$IMAGE_TAG >/dev/null"
