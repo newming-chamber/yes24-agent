@@ -302,6 +302,12 @@ def _take_turn_prefetch() -> tuple[str, asyncio.Task] | None:
     return holder.pop()
 
 
+def _grounding_metadata(response):
+    """응답 첫 후보의 grounding_metadata(없으면 None) — 출처 분해와 쿼리 수 기록의 단일 접근점."""
+    candidates = getattr(response, "candidates", None) or []
+    return getattr(candidates[0], "grounding_metadata", None) if candidates else None
+
+
 def _grounding_response_to_results(response) -> list[dict]:
     """그라운딩 응답을 출처별 원시 재료 목록으로 분해한다.
 
@@ -320,8 +326,7 @@ def _grounding_response_to_results(response) -> list[dict]:
     서술을 **원자 단위 목록**으로만 담고, "어느 서술을 어느 출처들이 함께 뒷받침하는가"는
     호출부가 도구 결과의 evidence에 한 번씩만 표현한다.
     """
-    candidates = getattr(response, "candidates", None) or []
-    metadata = getattr(candidates[0], "grounding_metadata", None) if candidates else None
+    metadata = _grounding_metadata(response)
     chunks = getattr(metadata, "grounding_chunks", None) or []
     supports = getattr(metadata, "grounding_supports", None) or []
 
@@ -433,9 +438,13 @@ async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
                 ),
             )
             # 재시도 루프 **안**에서 기록한다 — 실패·빈 결과로 버려진 시도도 각각 과금
-            # 콜이라 시도별 1행이 정직하다(부가 채널·무실패).
+            # 콜이라 시도별 1행이 정직하다(부가 채널·무실패). Gemini 3는 실행된 검색 쿼리
+            # 1건당 따로 과금돼 그 수도 싣는다(목록 없음 = 0).
             record_usage(
-                "web_grounding", response.usage_metadata, model=settings.web_grounding_model
+                "web_grounding", response.usage_metadata, model=settings.web_grounding_model,
+                search_queries=len(
+                    getattr(_grounding_metadata(response), "web_search_queries", None) or []
+                ),
             )
             raw_results = _grounding_response_to_results(response)
             last_error = None

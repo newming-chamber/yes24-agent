@@ -28,6 +28,8 @@ class ModelPrice(BaseModel):
     input_usd_per_mtok: float
     cached_input_usd_per_mtok: float  # 캐시 단가가 없는 벤더면 입력 단가와 같은 값(할인 없음)
     output_usd_per_mtok: float  # 사고·reasoning 포함 출력 단가
+    # 검색 그라운딩 쿼리 단가(USD / 1,000 queries) — usage_log.search_queries에 곱한다(0 = 없음).
+    search_usd_per_kquery: float = 0.0
     source: str  # 공식 가격 페이지
     checked_on: date
 
@@ -1093,44 +1095,48 @@ class Settings(BaseSettings):
     # 반영하지 않는다(어드민 각주가 밝힌다 — admin_cost.cost_notes).
     # 해당 없음(각주에도 싣지 않는다): Gemini 명시 캐시 저장 시간당 요금 — cachedContents·
     # caches.create 사용 0건(암묵 캐시만), 3.1-flash-lite 오디오 입력 2배 — 텍스트 입력만 쓴다.
-    # 그라운딩 요청료(무료 한도·초과 단가)는 금액 계산에 쓰지 않아 여기에 두지 않는다.
+    # 검색 그라운딩은 Gemini 3 계열이 실행된 쿼리 1건당 $14/1,000이라 그 행들에 쿼리 단가를 둔다.
+    # 검색 단가는 2026-10-27 확인 — 행의 checked_on은 토큰 단가 확인일(09-14) 그대로다. 월 무료
+    # 제공분은 빼지 않는다(각주가 밝힌다). 2.5-pro는 그라운딩 요금 체계가 다르지만(요청당)
+    # 그라운딩에 쓰지 않아 0이다.
     # env: LLM_PRICES='[{"model": ..., ...}]'
     llm_prices: list[ModelPrice] = [
         ModelPrice(model=model, service_tier=tier, effective_from=start,
                    input_usd_per_mtok=p_in, cached_input_usd_per_mtok=p_cache,
-                   output_usd_per_mtok=p_out, source=source, checked_on=checked)
-        for model, tier, start, p_in, p_cache, p_out, source, checked in (
-            ("gemini-3.6-flash", "", _PRICE_EPOCH, 0.75, 0.075, 3.75, _GEMINI_PRICING,
+                   output_usd_per_mtok=p_out, search_usd_per_kquery=p_search, source=source,
+                   checked_on=checked)
+        for model, tier, start, p_in, p_cache, p_out, p_search, source, checked in (
+            ("gemini-3.6-flash", "", _PRICE_EPOCH, 0.75, 0.075, 3.75, 14.0, _GEMINI_PRICING,
              _PRICE_CHECKED),
-            ("gemini-3.6-flash", "", date(2027, 1, 1), 1.50, 0.15, 7.50, _GEMINI_PRICING,
+            ("gemini-3.6-flash", "", date(2027, 1, 1), 1.50, 0.15, 7.50, 14.0, _GEMINI_PRICING,
              _PRICE_CHECKED),
-            ("gemini-3.7-flash", "", _PRICE_EPOCH, 0.75, 0.075, 3.75, _GEMINI_PRICING,
+            ("gemini-3.7-flash", "", _PRICE_EPOCH, 0.75, 0.075, 3.75, 14.0, _GEMINI_PRICING,
              _PRICE_CHECKED),
-            ("gemini-3.7-flash", "", date(2027, 1, 1), 1.50, 0.15, 7.50, _GEMINI_PRICING,
+            ("gemini-3.7-flash", "", date(2027, 1, 1), 1.50, 0.15, 7.50, 14.0, _GEMINI_PRICING,
              _PRICE_CHECKED),
-            ("gemini-3.5-flash", "", _PRICE_EPOCH, 1.50, 0.15, 9.00, _GEMINI_PRICING,
+            ("gemini-3.5-flash", "", _PRICE_EPOCH, 1.50, 0.15, 9.00, 14.0, _GEMINI_PRICING,
              _PRICE_CHECKED),
-            ("gemini-3.1-flash-lite", "", _PRICE_EPOCH, 0.25, 0.025, 1.50, _GEMINI_PRICING,
+            ("gemini-3.1-flash-lite", "", _PRICE_EPOCH, 0.25, 0.025, 1.50, 14.0, _GEMINI_PRICING,
              _PRICE_CHECKED),
-            ("gemini-2.5-pro", "", _PRICE_EPOCH, 1.25, 0.125, 10.00, _GEMINI_PRICING,
+            ("gemini-2.5-pro", "", _PRICE_EPOCH, 1.25, 0.125, 10.00, 0.0, _GEMINI_PRICING,
              _PRICE_CHECKED),
-            ("openai/responses/gpt-5.6-luna", "", _PRICE_EPOCH, 0.20, 0.02, 1.20,
+            ("openai/responses/gpt-5.6-luna", "", _PRICE_EPOCH, 0.20, 0.02, 1.20, 0.0,
              _OPENAI_PRICING, _PRICE_CHECKED),
             # fast 등급 = 표준의 정확히 2배(공식 가격 페이지, 2026-10-19 확인).
-            ("openai/responses/gpt-5.6-luna", "fast", _PRICE_EPOCH, 0.40, 0.04, 2.40,
+            ("openai/responses/gpt-5.6-luna", "fast", _PRICE_EPOCH, 0.40, 0.04, 2.40, 0.0,
              _OPENAI_PRICING, date(2026, 10, 19)),
             # 2026-09-22 출시 — 표준·fast 모두 2026-10-19 공식 페이지 확인(≤272K 표준 구간).
-            ("openai/responses/gpt-6-luna", "", _PRICE_EPOCH, 0.10, 0.01, 0.50,
+            ("openai/responses/gpt-6-luna", "", _PRICE_EPOCH, 0.10, 0.01, 0.50, 0.0,
              _OPENAI_PRICING, date(2026, 10, 19)),
             # fast의 캐시 안 된 입력은 청구서에 "cache writes"로 0.25가 찍힌다(2026-10-26 조직 비용
             # API 실측: 8.35M 토큰 $2.086). 캐시 읽기 0.02·출력 1.00은 공식 페이지와 같다.
-            ("openai/responses/gpt-6-luna", "fast", _PRICE_EPOCH, 0.25, 0.02, 1.00,
+            ("openai/responses/gpt-6-luna", "fast", _PRICE_EPOCH, 0.25, 0.02, 1.00, 0.0,
              _OPENAI_PRICING, date(2026, 10, 26)),
             # 프롬프트 10만 토큰 이하 구간. 초과 요청은 캐시 읽기·쓰기 포함 전 항목 5배(공식 페이지
             # Long context pricing, 2026-10-22 확인) — 이 표는 구간 단가를 표현하지 않아 하한 구간만
             # 둔다. 이력 압축 임계를 10만으로 내렸지만 압축은 턴 마감 뒤라 턴 안
             # 라운드는 넘을 수 있다(도그푸딩 48턴 중 5라운드) — 어드민 비용은 그만큼 과소 추정.
-            ("anthropic/claude-haiku-5-5", "", _PRICE_EPOCH, 0.10, 0.01, 0.50,
+            ("anthropic/claude-haiku-5-5", "", _PRICE_EPOCH, 0.10, 0.01, 0.50, 0.0,
              _ANTHROPIC_PRICING, date(2026, 10, 22)),
         )
     ]

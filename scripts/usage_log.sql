@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS usage_log (
     response_tokens INT NULL,       -- 응답(후보) 토큰 — genai candidates_token_count
     total_tokens INT NULL,          -- 벤더 합계(사고 토큰 포함) — genai total_token_count
     latency_ms INT NULL,            -- 메인 턴만(턴 시작~마감 벽시계), 서브콜은 NULL
+    -- 그라운딩 서브콜이 실행한 검색 쿼리 수(쿼리당 과금). NULL = 그라운딩 외 행·열 추가 전 기록,
+    -- 0 = 그라운딩 콜이 검색을 안 돌림. 기존 DB는 usage_log_search_queries.sql.
+    search_queries INT NULL,
     -- 기간별 비용 집계·세션 추적·모델별 히스토리가 주 조회 축.
     KEY idx_usage_log_created_at (created_at),
     KEY idx_usage_log_session_id (session_id),

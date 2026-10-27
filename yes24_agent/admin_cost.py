@@ -1,7 +1,8 @@
 """어드민 분석의 비용 추정 — usage_log 집계 행에 단가를 붙이고 합산하는 순수 함수(DB 없음).
 
 핵심 정의(화면 각주의 근거 — 상세는 docs/admin-operations.md §7, docs는 저장소 밖):
-- 금액 = 사용량(토큰) × 단가(settings.llm_prices, 행의 UTC 날짜·처리 등급에 유효한 구간). 예상치다.
+- 금액 = 사용량(토큰·검색 그라운딩 쿼리 수) × 단가(settings.llm_prices, 행의 UTC 날짜·처리 등급에
+  유효한 구간). 예상치다.
   처리 등급(usage_log.service_tier — LiteLLM fast 등) 행이 없으면 표준 행으로 추정하고 각주가
   밝힌다.
 - 대화 / 대화 외 = usage_log.user_id가 있는 행 / 없는 행(user_id IS NULL — 초기 질문 자동
@@ -48,11 +49,12 @@ def price_for(
 
 
 def cost_of(tokens: Mapping[str, Any], price: ModelPrice) -> float:
+    """토큰 비용 + 검색 그라운딩 쿼리 비용. 쿼리 수 NULL(그라운딩 외 행·열 추가 전 기록)은 0이다."""
     return (
         int(tokens["input_uncached"] or 0) * price.input_usd_per_mtok
         + int(tokens["input_cached"] or 0) * price.cached_input_usd_per_mtok
         + int(tokens["output_billed"] or 0) * price.output_usd_per_mtok
-    ) / 1_000_000
+    ) / 1_000_000 + int(tokens.get("search_queries") or 0) * price.search_usd_per_kquery / 1000
 
 
 def attach_costs(rows: Iterable[Mapping[str, Any]], prices: list[ModelPrice]) -> list[dict]:
@@ -122,7 +124,8 @@ def per_turn(cost_usd: float | None, turns: int) -> float | None:
 # Luna 272K — config llm_prices 주석).
 _ESTIMATE = (
     "모델 사용량에 그 모델·처리 등급 단가를 곱한 예상치(USD)예요. 긴 컨텍스트 구간 할증과 "
-    "캐시 쓰기 단가는 반영하지 않아 실제 청구액과 다를 수 있어요."
+    "캐시 쓰기 단가는 반영하지 않아 실제 청구액과 다를 수 있어요. 웹 검색 무료 제공분은 빼지 "
+    "않아 실제보다 조금 높을 수 있어요."
 )
 _BACKGROUND = (
     "‘대화 외’는 초기 질문 자동 생성·AI 오버뷰처럼 특정 사용자의 대화가 아닌 작업의 비용이에요."

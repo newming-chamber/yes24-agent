@@ -174,7 +174,9 @@ _USAGE_SUMS = (
     "AS input_uncached, "
     f"SUM(CASE WHEN {_MEASURED} THEN COALESCE(cached_tokens, 0) END) AS input_cached, "
     f"SUM(CASE WHEN {_MEASURED} THEN total_tokens - prompt_tokens END) AS output_billed, "
-    f"COUNT(CASE WHEN {_MEASURED} AND cached_tokens IS NULL THEN 1 END) AS cache_unknown_rows"
+    f"COUNT(CASE WHEN {_MEASURED} AND cached_tokens IS NULL THEN 1 END) AS cache_unknown_rows, "
+    # 검색 쿼리는 토큰 측정 여부와 독립인 과금 단위라 측정 조건 밖에서 합한다(NULL = 0).
+    "SUM(search_queries) AS search_queries"
 )
 # 질의 수 = 측정된 main 행(묶음의 main_rows) 중 단가가 붙은 것. 단가는 component와 무관해 비용
 # 집계는 component로 나누지 않는다 — 나누면 운영 30일 사용자별에 22만 묶음이 넘어와 8초가

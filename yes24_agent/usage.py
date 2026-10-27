@@ -131,6 +131,7 @@ class UsageLogger:
         cited_sources: int | None = None,
         service_tier: str | None = None,
         reasoning_effort: str | None = None,
+        search_queries: int | None = None,
         created_at: datetime | None = None,
     ) -> None:
         """사용량 1행 기록을 예약한다(fire-and-forget) — 어떤 실패도 밖으로 던지지 않는다.
@@ -169,6 +170,9 @@ class UsageLogger:
                 service_tier,
                 # 실제로 실은 사고 강도(LiteLLM만) — 사고 토큰·지연을 강도별로 가르는 축.
                 reasoning_effort,
+                # 그라운딩 서브콜이 실행한 검색 쿼리 수 — 쿼리당 과금(Gemini 3). usage 객체 밖
+                # (grounding_metadata)이라 호출부가 넘긴다. NULL = 그라운딩 외 행·기존 행.
+                search_queries,
                 created_at or datetime.now(timezone.utc).replace(tzinfo=None),
             )
             # 본류(스트리밍·서브콜)와 분리된 task로 쓴다 — DB 왕복이 턴 지연에 얹히지 않는다.
@@ -188,8 +192,8 @@ class UsageLogger:
                     "component, model, prompt_tokens, response_tokens, total_tokens, "
                     "thinking_tokens, cached_tokens, latency_ms, turn_id, outcome, "
                     "llm_calls, tool_calls, cited_sources, service_tier, reasoning_effort, "
-                    "created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                    "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    "search_queries, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                    "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     row,
                 )
 
@@ -235,6 +239,7 @@ def record_usage(
     cited_sources: int | None = None,
     service_tier: str | None = None,
     reasoning_effort: str | None = None,
+    search_queries: int | None = None,
 ) -> None:
     """모듈 진입점 — 호출부(runner·서브콜들)는 이 함수 하나만 안다(최소 결합).
 
@@ -259,6 +264,7 @@ def record_usage(
         cited_sources=cited_sources,
         service_tier=service_tier,
         reasoning_effort=reasoning_effort,
+        search_queries=search_queries,
         created_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     if scope is not None:

@@ -1788,7 +1788,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       const priceTable = table([
         { key: 'use', label: '사용 중', format: (v) => (v ? el('b', null, v) : '') },
         { key: 'model_name', label: '모델' }, { key: 'service_tier', label: '등급', format: tierLabel },
-        { key: 'input_usd_per_mtok', label: '입력', format: usd }, { key: 'cached_input_usd_per_mtok', label: '캐시 입력', format: usd }, { key: 'output_usd_per_mtok', label: '출력', format: usd },
+        { key: 'input_usd_per_mtok', label: '입력', format: usd }, { key: 'cached_input_usd_per_mtok', label: '캐시 입력', format: usd }, { key: 'output_usd_per_mtok', label: '출력', format: usd }, { key: 'search_usd_per_kquery', label: '검색 1천 건', format: usd },
         { key: 'effective_from', label: '적용 시작일', format: day }, { key: 'checked_on', label: '확인일', format: day }, { key: 'source', label: '출처', format: sourceLink },
       ], priceRows);
       for (const [i, row] of priceRows.entries()) if (row.current) priceTable.querySelectorAll('tbody tr')[i].setAttribute('aria-current', 'true');

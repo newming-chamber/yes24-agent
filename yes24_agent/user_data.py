@@ -149,6 +149,7 @@ class UserDataService(MysqlBackedService):
             # 운영 뷰 chat_turns(operational_views.sql)도 모델 열을 싣는 판이어야 한다 — 어드민
             # 세션 상세가 이 뷰에서 모델을 읽는다(재적용 누락이 상세 503으로 숨지 않게 기동 실패).
             "v.model, v.fallback_from, v.prompt_version_id, l.service_tier, l.reasoning_effort, "
+            "l.search_queries, "
             "m.service_tiers, m.reasoning_efforts, m.prompt_versions, p.slots, p.base_hash, "
             "p.activated_at, p.retired_at, r.seq, r.attempt, r.round_index, r.started_ms, "
             "r.thinking_tokens, r.tool_calls, r.error_status "
