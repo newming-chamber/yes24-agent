@@ -1,5 +1,5 @@
 import { initManage, roleLabel } from "/static/lib/admin_manage.js?v=33";
-import { initCharts } from "/static/lib/admin_charts.js?v=9";
+import { initCharts } from "/static/lib/admin_charts.js?v=10";
 import { initPrompts } from "/static/lib/admin_prompts.js?v=1";
 import { renderBody } from "/static/lib/md.js";
 import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceDomain, sourceTitle, CARD_LABELS } from "/static/lib/sources.js";
@@ -831,7 +831,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
   // 모델 스택 색 — 모델 ID 순서대로 차례로 입힌다(기간을 바꿔도 같은 모델 구성이면 같은 색, 모델 이름→색 표는 두지 않는다).
   // 모델이 색 수보다 많으면 마지막 색 자리를 '그 외' 한 계열이 쓴다.
   const MODEL_TONES = ['series-1', 'series-2', 'tone-green', 'tone-yellow', 'tone-red', 'tone-grey'];
-  const TOKEN_SERIES = [['input_uncached', '캐시 안 된 입력', 'series-2'], ['input_cached', '캐시 입력', 'series-1'], ['output_billed', '출력', 'tone-green']];
+  const TOKEN_SERIES = [['input_uncached', '캐시 안 된 입력'], ['input_cached', '캐시 입력'], ['output_billed', '출력']];
 
   /** 비용 패널(owner) — 비용·토큰 KPI 4개 · 일별 모델별 비용 · 일별 토큰 · 사용자별 비용 상위. 모델 이름은 서버가 싣는다(모델 설정 패널과 같은 표시 이름). */
   function costPanel(cost, days) {
@@ -873,14 +873,18 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     ];
     // '대화 외'(초기 질문 자동 생성처럼 사용자 귀속이 없는 작업 — 질의가 없는 날에도 비용이 있는 이유)는 모델 칸에 섞여 있어 기간 합만 노트로 밝힌다.
     const background = cost.daily.reduce((sum, row) => sum + (row.background_usd ?? 0), 0);
+    // 토큰 = 오른쪽 축 선(일별 총량). 세 갈래는 툴팁·표에만 싣는다. 기록 없는 날은 막대와 같이 0(사용 없음)이다 —
+    // 서버 토큰은 측정된 행의 합이라 null이 없다(미측정 행은 0으로 합에서 빠진다). 선의 null 끊김은 차트가 맡는다.
+    const dayTokens = (day, key) => (byDay.has(day) ? byDay.get(day)[key] : 0);
     const chart = days.length > 1 && charts.stackedBars({
-      title: '일별 비용 (모델별)', categories: days, unit: 'usd', format: usd, onPick: (day) => openSessions({ since: day, until: day }),
-      note: `기간 비용 중 ‘대화 외’ 작업 ${usd(background)} 포함`,
+      title: '일별 비용·토큰', categories: days, unit: 'usd', format: usd, onPick: (day) => openSessions({ since: day, until: day }),
+      note: `막대 = 모델별 비용(왼쪽 축), 선 = 총 토큰(오른쪽 축) · 기간 비용 중 ‘대화 외’ 작업 ${usd(background)} 포함`,
       series: modelSeries,
-    });
-    const tokenChart = days.length > 1 && charts.stackedBars({
-      title: '일별 토큰', categories: days, unit: 'count', format: tokens,
-      series: TOKEN_SERIES.map(([key, label, className]) => ({ label, className, values: days.map((day) => byDay.get(day)?.[key] ?? 0) })),
+      line: {
+        label: '총 토큰', className: 'tone-ink', format: tokens,
+        values: days.map((day) => (byDay.has(day) ? totalTokens(byDay.get(day)) : 0)),
+        extra: TOKEN_SERIES.map(([key, label]) => ({ label, values: days.map((day) => dayTokens(day, key)) })),
+      },
     });
     const users = analysisCard('사용자별 비용 상위', cost.users.length ? table([
       {key: 'nickname', label: '닉네임', format: day}, {key: 'user_id', label: '회원번호'}, {key: 'priced_rows', label: TERMS.turns, format: metric}, {key: 'cost_usd', label: '대화 비용', format: usd}, {key: 'cost_per_turn_usd', label: '대화 질의당 비용', format: usd, hint: METRIC_HINTS.cost_per_turn},
@@ -888,7 +892,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     const head = el('div', 'section-head');
     head.append(el('h3', null, '비용'), el('span', null, `${roleLabel('owner')} 전용 · 예상치`));
     // 각주 = 예상치 안내 · '대화 외' 정의(서버 cost_notes) — 산식 상세는 운영 문서(docs/admin-operations.md).
-    return [head, kpis, el('p', 'analysis-note cost-note', cost.notes.join(' ')), ...(chart ? [chart, tokenChart] : []), users];
+    return [head, kpis, el('p', 'analysis-note cost-note', cost.notes.join(' ')), ...(chart ? [chart] : []), users];
   }
 
   /** 기록 표 — 라벨 · 값 두 열. columns가 있으면 그 순서·라벨·시각 서식, 없으면 키 이름 그대로. */

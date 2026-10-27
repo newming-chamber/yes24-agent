@@ -32,13 +32,14 @@ export function initCharts({ template, el, table }) {
     svg.setAttribute('height', height);
   };
 
-  /** 0에서 시작하는 깨끗한 눈금(1·2·2.5·5 × 10^k). 건수는 정수 간격. */
-  function scale(max, integer) {
-    if (!(max > 0)) return { top: 1, ticks: [0, 1] };
-    const raw = max / 4, magnitude = 10 ** Math.floor(Math.log10(raw));
+  /** 0에서 시작하는 깨끗한 눈금(1·2·2.5·5 × 10^k). 건수는 정수 간격. intervals를 주면 그 칸 수로 맞춘다
+   *  (보조 축이 주 축 격자선에 눈금을 얹도록). */
+  function scale(max, integer, intervals) {
+    if (!(max > 0)) return intervals ? { top: intervals, ticks: Array.from({ length: intervals + 1 }, (_, i) => i) } : { top: 1, ticks: [0, 1] };
+    const raw = max / (intervals ?? 4), magnitude = 10 ** Math.floor(Math.log10(raw));
     let step = [1, 2, 2.5, 5, 10].map((m) => m * magnitude).find((s) => s >= raw);
     if (integer) step = Math.max(1, Math.ceil(step));
-    const count = Math.ceil(max / step);
+    const count = intervals ?? Math.ceil(max / step);
     return { top: count * step, ticks: Array.from({ length: count + 1 }, (_, i) => i * step) };
   }
 
@@ -181,8 +182,10 @@ export function initCharts({ template, el, table }) {
     return `M${x},${bottom}V${top + r}Q${x},${top} ${x + r},${top}H${x + width - r}Q${x + width},${top} ${x + width},${top + r}V${bottom}Z`;
   };
 
-  /** 날짜별 누적 막대. 첫 시리즈가 기준선에 붙는다. 날짜가 아닌 칸(요일·시각)은 tick·axisTitle로 그린다. */
-  function stackedBars({ title, note, notes, categories, series, unit, format, tick, axisTitle = '날짜', onPick, pickHint = PICK_HINT }) {
+  /** 날짜별 누적 막대. 첫 시리즈가 기준선에 붙는다. 날짜가 아닌 칸(요일·시각)은 tick·axisTitle로 그린다.
+   *  line({ label, className, values, format, extra })을 주면 막대 위에 꺾은선을 오른쪽 축으로 덧그린다 — null은 선을
+   *  끊는다. extra([{ label, values }])는 그리지 않고 툴팁·표에만 싣는 선의 세부 값이다. 없으면 막대만 그린다. */
+  function stackedBars({ title, note, notes, categories, series, unit, format, tick, axisTitle = '날짜', onPick, pickHint = PICK_HINT, line }) {
     // null(미측정·단가 미등록)은 0이 아니다 — 막대는 그리지 않고 표·툴팁엔 포맷터의 null 표기로 간다.
     // 칸 이름 — tick(축 라벨 서식)이 있으면 툴팁·낭독·표도 같은 이름(예: 13 → '13시'). 날짜는 원문 그대로.
     const name = (category) => (tick ? tick(category) : category);
@@ -191,8 +194,12 @@ export function initCharts({ template, el, table }) {
     const draw = (svg, width) => {
       size(svg, width, TOP + PLOT_H + AXIS_H);
       const { top, ticks } = scale(Math.max(...totals), unit === 'count');
-      const { left, y } = yAxis(svg, width, RIGHT, ticks, top, format);
-      const band = (width - left - RIGHT) / categories.length;
+      // 보조 축 — 주 축과 같은 칸 수의 눈금을 같은 격자선에 오른쪽 라벨로 얹는다(격자선은 한 벌).
+      const side = line && scale(Math.max(...line.values.filter((value) => value != null)), true, ticks.length - 1);
+      const sideLabels = side ? side.ticks.map((value) => node(svg, 'text', {}, null, line.format(value))) : [];
+      const right = Math.max(RIGHT, ...sideLabels.map((label) => Math.ceil(label.getComputedTextLength()) + 10));
+      const { left, y } = yAxis(svg, width, right, ticks, top, format);
+      const band = (width - left - right) / categories.length;
       // 칸보다 넓어지면 이웃 막대와 맞닿는다 — 칸이 간격보다 좁을 땐 칸의 절반만 칠한다.
       const barWidth = band - GAP >= 1 ? Math.min(BAR_MAX, band - GAP) : band / 2;
       const highlight = node(svg, 'rect', { y: TOP, width: band, height: PLOT_H, display: 'none' }, 'cursor');
@@ -211,19 +218,28 @@ export function initCharts({ template, el, table }) {
           else node(svg, 'rect', { x, y: upper, width: barWidth, height: lower - upper }, `bar ${item.className}`);
         });
       });
+      if (side) {
+        const ySide = (value) => TOP + PLOT_H - (value / side.top) * PLOT_H;
+        const x = (i) => left + band * (i + 0.5);
+        sideLabels.forEach((label, i) => { label.setAttribute('x', width - right + 8); label.setAttribute('y', Math.round(ySide(side.ticks[i])) + 4.5); });
+        node(svg, 'path', { d: path(line.values, x, ySide) }, `line ${line.className}`);
+        // 양옆이 비어 선분이 없는 점은 점으로 보인다(lines와 같은 규칙).
+        line.values.forEach((value, i) => { if (value != null && line.values[i - 1] == null && line.values[i + 1] == null) node(svg, 'circle', { cx: x(i), cy: ySide(value), r: 4 }, `dot ${line.className}`); });
+      }
       xAxis(svg, categories, left, band, tick);
-      const layer = node(svg, 'rect', { x: left, y: TOP, width: width - left - RIGHT, height: PLOT_H }, 'hit');
+      const layer = node(svg, 'rect', { x: left, y: TOP, width: width - left - right, height: PLOT_H }, 'hit');
       const tooltip = tip(svg, width);
       cursor(svg, layer, {
         count: categories.length,
         keys: KEYS,
-        pick: (px) => (px < left || px > width - RIGHT ? null : Math.min(categories.length - 1, Math.floor((px - left) / band))),
+        pick: (px) => (px < left || px > width - right ? null : Math.min(categories.length - 1, Math.floor((px - left) / band))),
         show: (i) => {
           highlight.setAttribute('x', left + band * i);
           highlight.removeAttribute('display');
           // 계열이 하나면 값 한 줄뿐 — 계열명(제목·범례가 이미 말함)·합계 줄을 붙이면 '100질의 질의 / 100질의 합계'로 겹친다.
           const rows = single ? [{ value: format(totals[i]), className: series[0].className }]
             : [...series.filter((item) => item.values[i] > 0).map((item) => ({ value: format(item.values[i]), label: item.label, className: item.className })), { value: format(totals[i]), label: '합계' }];
+          if (line) rows.push({ value: line.format(line.values[i]), label: line.label, className: line.className }, ...(line.extra ?? []).map((item) => ({ value: line.format(item.values[i]), label: item.label })));
           tooltip.show(left + band * (i + 0.5), name(categories[i]), rows, onPick && pickHint);
           return `${name(categories[i])} ${rows.map((row) => [row.label, row.value].filter(Boolean).join(' ')).join(', ')}`;
         },
@@ -233,12 +249,16 @@ export function initCharts({ template, el, table }) {
     };
     return card({
       title, note, notes, draw,
-      empty: totals.every((total) => !total),
-      legend: series.map(({ label, legend, className }) => ({ label: legend ?? label, className })),
-      tableView: () => table(
-        [{ key: 'category', label: axisTitle }, ...series.map((item, k) => ({ key: k, label: item.label, format })), ...(single ? [] : [{ key: 'total', label: '합계', format }])],
-        categories.map((category, i) => ({ category: name(category), total: totals[i], ...series.map((item) => item.values[i]) })),
-      ),
+      empty: totals.every((total) => !total) && !line?.values.some((value) => value > 0),
+      legend: [...series.map(({ label, legend, className }) => ({ label: legend ?? label, className })), ...(line ? [{ label: line.label, className: line.className, line: true }] : [])],
+      tableView: () => {
+        const extras = line ? [line, ...(line.extra ?? [])] : [];
+        return table(
+          [{ key: 'category', label: axisTitle }, ...series.map((item, k) => ({ key: k, label: item.label, format })), ...(single ? [] : [{ key: 'total', label: '합계', format }]),
+            ...extras.map((item, k) => ({ key: `line${k}`, label: item.label, format: line.format }))],
+          categories.map((category, i) => ({ category: name(category), total: totals[i], ...series.map((item) => item.values[i]), ...Object.fromEntries(extras.map((item, k) => [`line${k}`, item.values[i]])) })),
+        );
+      },
     });
   }
 

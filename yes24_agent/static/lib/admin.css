@@ -467,7 +467,7 @@
   .swatch.key-line { width: 14px; height: 2px; border-radius: 1px; }
   .series-1 { --c: var(--series-1); } .series-2 { --c: var(--series-2); }
   .tone-blue { --c: var(--crema-blue); } .tone-green { --c: var(--crema-green); } .tone-grey { --c: var(--crema-grey-600); }
-  .tone-red { --c: var(--crema-red); } .tone-yellow { --c: var(--crema-yellow); }
+  .tone-red { --c: var(--crema-red); } .tone-yellow { --c: var(--crema-yellow); } .tone-ink { --c: var(--crema-grey-900); }  /* 막대 위 보조 선(비용 차트의 총 토큰) */
   .chart-plot { min-width: 0; }
   .chart { display: block; overflow: visible; font-size: 11px; }
   .chart text { fill: var(--text-meta); font-variant-numeric: tabular-nums; }
