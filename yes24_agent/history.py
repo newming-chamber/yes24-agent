@@ -38,13 +38,19 @@ from pydantic import (
 )
 from typing_extensions import TypedDict
 
+from yes24_agent.adk_utc import UtcDatabaseSessionService
 from yes24_agent.auth import AuthenticatedUser, AuthService, get_authenticated_user
 from yes24_agent.config import get_settings
 from yes24_agent.enrichment import SESSION_TITLE_STATE_KEY
 from yes24_agent.event_translate import PROCESS_TIMING_KEY, TurnProcess
 from yes24_agent.postprocess import finalize_answer, finalize_text
 from yes24_agent.runner import _event_text, _round_boundary_prefix
-from yes24_agent.session_service import _POC_USER_ID, _get_session_lock, _get_session_service
+from yes24_agent.session_service import (
+    _POC_USER_ID,
+    STATE_ONLY,
+    _get_session_lock,
+    _get_session_service,
+)
 from yes24_agent.sources import get_sources
 from yes24_agent.toolsets import TOOLSET_PUBLIC_SOURCE_TYPE, TOOLSET_SOURCE_TYPES
 from yes24_agent.turn_snapshot import TURN_SNAPSHOT_KEY
@@ -462,11 +468,14 @@ async def owned_session(session_id: str, user: _UserDep = None) -> OwnedSession:
     가드(test_history)가 빨강이다. 삭제는 존재를 노출하지 않는다 — 사용자 경로에서 "삭제됨"은
     "부재"와 같은 규칙 하나다. 인증 의존성을 품어도 로그인월 위임 집합은 추이적으로 파생된다
     (main._delegating_routes).
+
+    세션은 **이벤트 없이**(state만) 싣는다 — 이벤트가 필요한 라우트는 `_invocation_events`로
+    필요한 턴만 읽는다(긴 세션 전량 적재가 2026-10-25 운영 OOM의 원인이었다).
     """
     user_no = _require_identified(user)
     service = _get_session_service()
     session = await service.get_session(
-        app_name=get_settings().app_name, user_id=user_no, session_id=session_id
+        app_name=get_settings().app_name, user_id=user_no, session_id=session_id, config=STATE_ONLY
     )
     ui = await UserDataService.get_instance().ui_get(user_id=user_no, session_id=session_id)
     if session is None or ui.deleted_at is not None:
@@ -475,6 +484,27 @@ async def owned_session(session_id: str, user: _UserDep = None) -> OwnedSession:
 
 
 _OwnedDep = Annotated[OwnedSession, Depends(owned_session)]
+
+
+async def _invocation_events(
+    owned: OwnedSession, invocation_ids: set[str], *, exclude: bool = False
+) -> list:
+    """소유 세션 이벤트 중 그 invocation들 것만(exclude면 그 밖의 것만), 시간순.
+
+    프로젝트 어댑터가 아닌 서비스(인메모리 폴백·테스트)는 개수·시각 말고 자를 수단이 없어
+    전량을 읽어 같은 규칙으로 거른다.
+    """
+    service, session = owned.service, owned.session
+    if isinstance(service, UtcDatabaseSessionService):
+        return await service.get_invocation_events(session, invocation_ids, exclude=exclude)
+    full = await service.get_session(
+        app_name=session.app_name, user_id=session.user_id, session_id=session.id
+    )
+    return [
+        event
+        for event in (full.events if full else ())
+        if event.invocation_id and (event.invocation_id in invocation_ids) != exclude
+    ]
 
 
 async def owned_turn(turn_id: str, owned: _OwnedDep) -> OwnedSession:
@@ -488,7 +518,7 @@ async def owned_turn(turn_id: str, owned: _OwnedDep) -> OwnedSession:
         session_id=owned.session.id,
         turn_id=turn_id,
     )
-    if not saved and not any(event.invocation_id == turn_id for event in owned.session.events):
+    if not saved and not await _invocation_events(owned, {turn_id}):
         raise HTTPException(status_code=404, detail="해당 턴을 찾을 수 없습니다.")
     return owned
 
@@ -655,10 +685,7 @@ def _project_session_detail(
         )
         for row in saved_turns or ()
     ]
-    saved_ids = {turn.turn_id for turn in turns}
-    for raw in _assemble_turns(
-        [event for event in session.events if event.invocation_id not in saved_ids]
-    ):
+    for raw in _assemble_turns(session.events):
         snapshot = raw["snapshot"]
         if snapshot is not None:
             payload = dict(snapshot)
@@ -789,7 +816,17 @@ def register_history(app: FastAPI) -> None:
         saved_turns = await data.turns_for_session(
             app_name=get_settings().app_name, user_id=user_no, session_id=session.id
         )
-        detail = _project_session_detail(session, feedback_by_turn, owned.ui.title, saved_turns)
+        # 이벤트는 chat_turn에 없는 턴(구 턴·저장 실패·진행 중)만 읽는다 — 시각으로 자르면 중간에
+        # 빠진 턴을 놓친다. 저장된 턴의 이벤트는 투영이 어차피 버린다.
+        events = await _invocation_events(
+            owned, {row["turn_id"] for row in saved_turns}, exclude=True
+        )
+        detail = _project_session_detail(
+            session.model_copy(update={"events": events}),
+            feedback_by_turn,
+            owned.ui.title,
+            saved_turns,
+        )
         await _mark_read_best_effort(data, user_no, session, owned.ui.last_read_at)
         return detail
 

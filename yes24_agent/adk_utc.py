@@ -14,6 +14,7 @@ from google.adk.sessions.base_session_service import (
 from google.adk.sessions.schemas.v1 import StorageEvent, StorageSession
 from google.adk.sessions.session import Session
 from sqlalchemy import event as sqlalchemy_event
+from sqlalchemy import select
 from sqlalchemy.orm.attributes import set_committed_value
 
 from yes24_agent.db import run_detached
@@ -106,6 +107,38 @@ class UtcDatabaseSessionService(DatabaseSessionService):
         return await run_detached(super().get_session(
             app_name=app_name, user_id=user_id, session_id=session_id, config=config,
         ))
+
+    async def get_invocation_events(
+        self, session: Session, invocation_ids: set[str], *, exclude: bool = False
+    ) -> list[Event]:
+        """세션 이벤트 중 그 invocation들 것만(exclude면 그 밖만) — get_session과 같은 변환·순서.
+
+        ADK 조회 설정은 개수·시각으로만 자른다. 기록 화면은 턴(invocation) 단위로 필요한 것만
+        읽어야 긴 세션을 통째로 올리지 않는다(2026-10-25 운영 OOM). invocation_id가 빈 이벤트
+        (runner의 시스템 쓰기 — rbti·제목·출처 복구는 `''`로 남는다)는 exclude여도 싣지 않는다.
+        대화 재료가 아니라 투영 `_assemble_turns`도 버리고, 인메모리 폴백과 같은 집합이 된다."""
+        return await run_detached(self._select_invocation_events(session, invocation_ids, exclude))
+
+    async def _select_invocation_events(
+        self, session: Session, invocation_ids: set[str], exclude: bool
+    ) -> list[Event]:
+        await self._prepare_tables()
+        column = StorageEvent.invocation_id
+        stmt = (
+            select(StorageEvent)
+            .filter(StorageEvent.app_name == session.app_name)
+            .filter(StorageEvent.user_id == session.user_id)
+            .filter(StorageEvent.session_id == session.id)
+            .filter(
+                (column != "") & column.not_in(invocation_ids)
+                if exclude
+                else column.in_(invocation_ids)
+            )
+            .order_by(StorageEvent.timestamp.desc())
+        )
+        async with self._rollback_on_exception_session(read_only=True) as sql_session:
+            rows = (await sql_session.execute(stmt)).scalars().all()
+        return [row.to_event() for row in reversed(rows)]
 
     async def create_session(self, **kwargs: Any) -> Session:
         return await run_detached(super().create_session(**kwargs))
