@@ -13,6 +13,10 @@
   자체 ERROR를 2건 남기는데, 턴 실패 여부와 심각도(정상→전환 ERROR, 재프로브 WARNING, 실패 마감
   ERROR)는 runner·model_routing이 판정해 따로 남긴다 — 그대로 보내면 폴백 1회가 알림 3건이 되고
   재프로브(WARNING)도 ADK ERROR 2건으로 새 장애와 구분되지 않는다(2026-10-20 실 Runner 실측).
+- OpenTelemetry(`opentelemetry.*`)의 ERROR도 보내지 않는다: 사용자가 답변 도중 스트림을 끊으면 ADK가
+  루트 에이전트를 취소하고("Root node … was cancelled"), 그 span의 context 토큰이 다른 Context에서
+  detach돼 "Failed to detach context"가 남는다 — 응답·기록과 무관한 추적 계측 소음이다(2026-10-29
+  운영: 취소 직후 1ms 안에 매번, 서버1에서만 하루 90건).
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ _KEY_CHARS = 80
 _MESSAGE_CHARS = 500
 _EXC_CHARS = 300
 _STOP = object()
-_ADK_LOGGER = "google_adk"
+_QUIET_LOGGERS = ("google_adk", "opentelemetry")  # 최상위 로거명 — 위 docstring
 
 
 def _escape(text: str) -> str:
@@ -68,7 +72,7 @@ class SlackAlertHandler(logging.Handler):
         self._thread.start()
 
     def emit(self, record: logging.LogRecord) -> None:
-        if record.name == logger.name or record.name.split(".", 1)[0] == _ADK_LOGGER:
+        if record.name == logger.name or record.name.split(".", 1)[0] in _QUIET_LOGGERS:
             return
         try:
             first = record.getMessage().strip().split("\n", 1)[0]
