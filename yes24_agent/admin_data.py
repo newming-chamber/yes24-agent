@@ -705,8 +705,9 @@ async def fetch_stats(
         f"SELECT {local_day('started_at', hours)} AS day, app_name, user_id, session_id, "
         "COUNT(*) AS queries, "
         f"{_REFUSALS}, "
-        # sources는 그 턴에 공개(인용)된 출처 배열이다(chat_turn.sql ck_chat_turn_sources).
-        "SUM(JSON_LENGTH(sources)) AS links, "
+        # source_count = JSON_LENGTH(sources) 가상 열 — 그 턴에 공개(인용)된 출처 수. 이 문장이
+        # 읽는 열은 전부 idx_chat_turn_admin에 있어 JSON 본문 행을 읽지 않는다(chat_turn.sql).
+        "SUM(source_count) AS links, "
         "TIMESTAMPDIFF(MICROSECOND, MIN(started_at), MAX(completed_at)) / 1000000 AS seconds "
         f"FROM chat_turn{sql_where(where)} GROUP BY day, app_name, user_id, session_id",
         params,

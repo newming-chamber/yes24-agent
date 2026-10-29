@@ -28,9 +28,15 @@ CREATE TABLE IF NOT EXISTS chat_turn (
     -- Literal이 정본이고 DB는 검사하지 않는다 — 구 클라이언트·백필 행은 NULL. 기존 DB는
     -- chat_turn_input_source.sql.
     input_source VARCHAR(32) NULL COMMENT '질문 유입 경로: user_written=직접 입력, home_suggestion=홈 제안 칩, followup_suggestion=답변 하단 후속 칩, external_link=URL로 질문을 실어 연 바깥 링크, retry=다시 시도. NULL=구 클라이언트',
+    -- 어드민 집계용 가상 열(저장 안 함)과 그 덮는 인덱스(2026-10-29). 분석·통계 탭이 JSON 본문이 든
+    -- 행을 읽지 않고 인덱스만으로 끝나게 한다. 기존 DB는 chat_turn_admin_covering.sql.
+    elapsed_ms BIGINT UNSIGNED AS (JSON_VALUE(process, '$.elapsed_ms' RETURNING UNSIGNED)) VIRTUAL,
+    source_count INT AS (JSON_LENGTH(sources)) VIRTUAL,
     PRIMARY KEY (id),
     UNIQUE KEY uq_chat_turn_scope (app_name, user_id, session_id, turn_id),
     KEY idx_chat_turn_session_time (app_name, user_id, session_id, started_at, id),
+    KEY idx_chat_turn_admin (started_at, app_name, user_id, session_id, status, completed_at,
+        rbti_applied, elapsed_ms, source_count),
     CONSTRAINT fk_chat_turn_session FOREIGN KEY (app_name, user_id, session_id)
         REFERENCES sessions (app_name, user_id, id) ON DELETE CASCADE ON UPDATE RESTRICT,
     CONSTRAINT ck_chat_turn_status CHECK (status IN ('completed','failed','interrupted','unknown')),

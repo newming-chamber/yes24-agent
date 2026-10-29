@@ -4,7 +4,8 @@ SELECT app_name,user_id,session_id,turn_id,started_at AS asked_at,
        completed_at,user_text AS user_message,text AS assistant_message,status,error,
        sources,process,meta,rbti_applied,model,fallback_from,prompt_version_id,input_source,
        JSON_EXTRACT(sources,'$[*].id') AS cited_ids,
-       JSON_VALUE(process,'$.elapsed_ms' RETURNING UNSIGNED) AS elapsed_ms,
+       -- chat_turn의 가상 열(같은 식) — 어드민 집계가 덮는 인덱스로 끝난다(chat_turn_admin_covering.sql).
+       elapsed_ms,
        history_saved
 FROM chat_turn;
 

@@ -154,7 +154,7 @@ class UserDataService(MysqlBackedService):
             "SELECT u.user_no, a.key_hash, t.id, t.app_name, t.user_id, t.session_id, "
             "t.turn_id, t.started_at, t.completed_at, t.user_text, t.text, t.status, "
             "t.sources, t.process, t.meta, t.error, t.rbti_applied, t.history_saved, "
-            "t.model, t.fallback_from, t.prompt_version_id, t.input_source, "
+            "t.model, t.fallback_from, t.prompt_version_id, t.input_source, t.source_count, "
             "f.app_name, c.app_name, "
             "s.app_name, s.deleted_at, "
             "l.app_name, d.target_type, g.user_id, g.event_key, g.result_code, g.period_id, "
@@ -197,6 +197,18 @@ class UserDataService(MysqlBackedService):
                 f"FK가 ON DELETE CASCADE가 아닙니다({', '.join(missing)}) — 대화 파기가 본문을 "
                 "남깁니다. migrate_database.py의 session_integrity 단계·scripts/turn_round.sql을 "
                 "먼저 적용하세요."
+            )
+        # 어드민 분석·통계 집계는 이 덮는 인덱스로만 JSON 본문 행을 피한다 — 열만 있고 인덱스
+        # 단계가 실패한 DB는 동작은 하되 매 집계가 전체 스캔이라(운영 콜드 13~30초 → 504) 기동에서 막는다.
+        if not await self._run(
+            "SELECT 1 FROM information_schema.statistics WHERE table_schema = DATABASE() "
+            "AND table_name = 'chat_turn' AND index_name = 'idx_chat_turn_admin' LIMIT 1",
+            (),
+            fetch_all=True,
+        ):
+            raise RuntimeError(
+                "chat_turn에 idx_chat_turn_admin 인덱스가 없습니다 — 어드민 집계가 전체 스캔합니다. "
+                "scripts/chat_turn_admin_covering.sql을 먼저 적용하세요."
             )
 
     async def _in_transaction(self, body):
