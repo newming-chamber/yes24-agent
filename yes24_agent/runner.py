@@ -73,10 +73,7 @@ from yes24_agent.session_service import (
     history_window,
     load_history_session,
 )
-from yes24_agent.sources import (
-    SOURCES_STATE_KEY,
-    get_sources,
-)
+from yes24_agent.sources import get_sources, merge_source_records, record_key
 from yes24_agent.sse import (
     STREAM_ERROR_MESSAGE,
     sse_content,
@@ -290,6 +287,21 @@ _EMPTY_RESPONSE_FALLBACK = (
 # 히스토리 복원(history.py)도 같은 조립기를 써야 해서 조립 소유권을 postprocess로 옮겼다.
 
 
+def _registry_repairs(registry: list[dict], settled: list[dict]) -> dict[str, dict]:
+    """화해본 중 레지스트리와 달라지는 출처만 `{출처별 키: 레코드}`로 돌려준다.
+
+    판정 근거는 `_settle_turn_sources`의 복구 write 절이다.
+    """
+    current = {record["id"]: record for record in registry}
+    repairs = {}
+    for record in settled:
+        prior = current.get(record["id"])
+        repaired = record if prior is None else merge_source_records(prior, record)
+        if repaired != prior:
+            repairs[record_key(record["id"])] = repaired
+    return repairs
+
+
 async def _settle_turn_sources(
     service: BaseSessionService,
     session_id: str,
@@ -304,12 +316,17 @@ async def _settle_turn_sources(
     스트림 관측본만 넘기던 시절에는 도구를 다시 부르지 않는 연속성 턴에서 유효 집합이
     공집합이 되어 **정상 인용이 통째로 폐기**됐다(실측 재현 3/5, `removed=True sources=0`).
 
-    **복구 write**: 병렬 도구의 state_delta는 리스트 키에서 last-wins라 레지스트리가 한
-    도구의 출처를 통째로 잃을 수 있다(settle_sources 주석). 유실분이 있으면 화해본을
-    state_delta로 1회 되쓴다 — 그러지 않으면 다음 턴의 `_next_source_id`가 `max(기존 id)+1`로
-    **이미 쓴 번호를 다른 URL에 재발급**해, 모델이 히스토리의 `[9]`(책A)로 인용한 답변이
-    책C를 가리키는 카드와 함께 나간다(턴 간 오귀속). 매 턴 우회하던 유실을 턴 마감 한
-    지점에서 복구하는 구조라, 우회 코드가 늘어난 것이 아니라 자리를 옮긴 것이다.
+    **복구 write**: 화해본이 레지스트리와 다른 출처(없거나 내용이 다른 것)만 출처별 키로 1회
+    되쓴다. 두 경로가 있다. ① 레지스트리에 없는 id — 되쓰지 않으면 다음 턴의
+    `_next_source_id`가 `max(기존 id)+1`로 **이미 쓴 번호를 다른 URL에 재발급**해, 모델이
+    히스토리의 `[9]`(책A)로 인용한 답변이 책C를 가리키는 카드와 함께 나간다(턴 간 오귀속).
+    알려진 원인이던 병렬 도구 리스트 last-wins는 출처별 키 쓰기로 사라졌다. ② 같은 출처를
+    병렬 도구가 함께 관측해 ADK 병합이 같은 키 레코드를 필드 단위 last-wins로 합친 경우 —
+    목록 요약이 상세를 덮은 채 영속되므로(settle_sources 주석) 충실도로 판정한 화해본을
+    되써야 다음 턴 레지스트리가 상세로 남는다. 비교는 레지스트리 레코드에 화해본을
+    `merge_source_records`로 얹은 결과로 한다 — 화해본은 공개 필드로 투영돼 있어(레지스트리
+    meta의 비공개 관측값이 빠진다) 그대로 쓰면 그 값을 지운다. 정상 턴은 등록이 같은 병합을
+    이미 거쳤으므로 결과가 레지스트리와 같아 쓰지 않는다(tests/test_sources_keyed_writes.py).
 
     레지스트리 재조회가 실패해도 마감은 멈추지 않는다 — 턴 시작 스냅샷(prior)으로 화해해
     기존 동작으로 폴백한다(비파괴 원칙을 마감 전체로).
@@ -329,22 +346,16 @@ async def _settle_turn_sources(
         logger.warning(f"턴 마감 레지스트리 재조회 실패 — 턴 시작 스냅샷으로 화해합니다: {exc}")
 
     settled = settle_sources(registry, observed_sources)
-    registry_ids = {source.get("id") for source in registry}
-    lost_ids = sorted(
-        source["id"] for source in observed_sources if source.get("id") not in registry_ids
-    )
-    if lost_ids and session is not None:
+    repairs = _registry_repairs(registry, settled)
+    if repairs and session is not None:
+        repaired_ids = [record["id"] for record in repairs.values()]
         try:
             await service.append_event(
-                session,
-                Event(
-                    author="system",
-                    actions=EventActions(state_delta={SOURCES_STATE_KEY: settled}),
-                ),
+                session, Event(author="system", actions=EventActions(state_delta=repairs))
             )
-            logger.warning(f"병렬 도구가 잃은 출처 {lost_ids}를 레지스트리에 복구했습니다.")
+            logger.warning(f"레지스트리와 어긋난 출처 {repaired_ids}를 화해본으로 되썼습니다.")
         except Exception as exc:  # noqa: BLE001 — 복구 실패가 답변 마감을 막지 않는다
-            logger.warning(f"유실 출처 {lost_ids} 레지스트리 복구 write 실패: {exc}")
+            logger.warning(f"출처 {repaired_ids} 레지스트리 복구 write 실패: {exc}")
     return settled
 
 

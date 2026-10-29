@@ -126,7 +126,7 @@ from yes24_agent.postprocess import (
     validate_citations,
 )
 from yes24_agent.session_service import _POC_USER_ID, _get_session_service
-from yes24_agent.sources import SOURCES_STATE_KEY, now_checked_at
+from yes24_agent.sources import get_sources, now_checked_at, registry_entries
 from yes24_agent.sse import (
     STREAM_ERROR_MESSAGE,
     sse_delta,
@@ -647,7 +647,7 @@ def _cached_rows(
         return None
     result, sources, boost_tried = deepcopy(entry)
     state = _new_search_state(settings)
-    state[SOURCES_STATE_KEY] = sources
+    state.update(registry_entries(sources))
     logger.info(f"overview 행 캐시 히트(G2) qlen={len(query)} rows={result.get('result_count')}")
     return result, state, boost_tried
 
@@ -682,7 +682,7 @@ def _store_rows(
         return
     _rows.set(
         _rows_key(query, section, settings, arm),
-        deepcopy((result, state.get(SOURCES_STATE_KEY, []), boost_tried)),
+        deepcopy((result, get_sources(state), boost_tried)),
         settings.overview_rows_ttl_s,
         settings.overview_cache_max_entries,
     )
@@ -2254,7 +2254,7 @@ async def _attempt(
         _dispatch(*renumberer.feed("".join(raw_body), prompt_ids))
 
     def _prompt_sources() -> list[dict]:
-        return [s for s in state.get(SOURCES_STATE_KEY, []) if s["id"] in prompt_ids]
+        return [s for s in get_sources(state) if s["id"] in prompt_ids]
 
     try:
         text = await _call_model(
@@ -2822,7 +2822,7 @@ async def _generate_with_planner(
         if augmented is not None and _consume_budget(settings):
             # 공개 출처는 상세 관측으로 갱신된 레지스트리 현재본이다(같은 id — URL 멱등).
             prompt_ids = {source["id"] for source in sources}
-            sources = [s for s in state.get(SOURCES_STATE_KEY, []) if s["id"] in prompt_ids]
+            sources = [s for s in get_sources(state) if s["id"] in prompt_ids]
             citation, streamed = await _append_details(
                 raw_query, attempt._replace(sources=sources), augmented, settings, emit,
                 append_deadline,
@@ -3153,9 +3153,9 @@ async def _seed_chat_session(
 ) -> str:
     """오버뷰 교환을 챗 세션의 첫 턴으로 시딩하고 session_id를 돌려준다.
 
-    챗 runner와 같은 세션 서비스·같은 키 공간을 쓴다: 출처 레지스트리는
-    `state[SOURCES_STATE_KEY]`(register_source가 남긴 내부 id 레코드 그대로 —
-    runner의 검증 집합 `_citable_sources`가 읽는 형식), 대화는 ADK 이벤트 2건 —
+    챗 runner와 같은 세션 서비스·같은 키 공간을 쓴다: 출처 레지스트리는 오버뷰가 프롬프트에
+    실은 내부 id 레코드를 출처별 키(`sources:{id}`, register_source와 같은 형태)로 깐 것이고
+    (runner의 검증 집합 `_citable_sources`가 get_sources로 읽는다), 대화는 ADK 이벤트 2건 —
     사용자 질의(author="user")와 오버뷰 본문(author=AGENT_NAME, **내부 마커** 텍스트).
     author가 에이전트 이름과 일치해야 ADK contents 조립이 이 턴을 모델 자신의 발화
     (role=model 히스토리)로 넣는다(agent.AGENT_NAME 주석). append_event는 runner의
@@ -3171,7 +3171,7 @@ async def _seed_chat_session(
     session = await service.create_session(
         app_name=settings.app_name,
         user_id=uid,
-        state={SOURCES_STATE_KEY: seed["sources"], SESSION_TITLE_STATE_KEY: query},
+        state={**registry_entries(seed["sources"]), SESSION_TITLE_STATE_KEY: query},
     )
     # 두 이벤트는 **한 턴**이므로 같은 invocation_id를 공유한다. 이게 없으면 대화 복원
     # (history._assemble_turns)이 "invocation_id 없는 이벤트 = 러너의 시스템 write"로 보고

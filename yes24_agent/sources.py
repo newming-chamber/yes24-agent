@@ -4,15 +4,17 @@
 `register_source`로 출처를 등록해 source_id를 받고, 모델은 답변에서 이 id를 `[n]` 마커로만
 참조한다. postprocess 단계에서 `validate_citations`가 마커를 출처와 대조해 무효 인용을 제거한다.
 
-ADK State 주의사항: State는 dict처럼 보이지만 변경 추적이 재할당 기반이다.
-`state["sources"].append(...)` 같은 내부 변형은 델타로 기록되지 않을 수 있으므로,
-반드시 새 리스트를 만들어 `state[SOURCES_STATE_KEY] = new_list`로 재할당한다.
+**쓰기는 출처별 키**(`sources:{id}` → 레코드 하나)다. 바뀐 레코드 하나만 대입하므로 이벤트
+state_delta가 출처 하나 크기에 머문다. 예전엔 리스트(`sources`)를 통째로 재할당해 도구 응답마다
+누적 레지스트리 전체가 그 이벤트에 다시 실렸고, 세션 이벤트가 O(턴²)로 자랐다(운영 2026-10-25:
+1,707턴 세션 events 146MB·최대 1.9MB/건, 2026-10-29 표본: sources 키 평균 44.7KB/이벤트).
+ADK State 변경 추적은 대입 기반이라 레코드를 제자리 변형하지 말고 새 dict를 대입한다.
 
-읽기는 두 형태를 다 본다: 이 리스트와 **출처별 키**(`sources:{id}` → 레코드 하나). 리스트 재할당은
-도구 응답마다 누적 레지스트리 전체를 그 이벤트 state_delta에 다시 실어 세션 이벤트를 O(턴²)로
-키운다(운영 2026-10-25: 1,707턴 세션 events 146MB·최대 1.9MB/건). 쓰기를 키 단위로 옮기는 것은
-별도 배포이고, 그 배포를 이 리더로 되돌려도(롤백·혼합 버전) 키에 쓰인 출처를 잃지 않게 리더를
-먼저 깐다(expand/contract의 expand).
+**읽기는 두 형태를 다 본다**: 키 쓰기 이전 세션이 남긴 리스트와 출처별 키를 합친다(`get_sources`).
+리스트는 이제 쓰지 않고 읽기만 한다 — 옛 세션의 레지스트리이고, 이 배포를 키를 읽는 직전 배포로
+되돌려도(롤백·혼합 버전) 그 리더가 키를 읽으므로 출처를 잃지 않는다(expand 873030d → contract).
+키는 서로 다른 출처가 서로 다른 state 키라, 병렬 도구의 delta 병합(ADK deep_merge_dicts)에서도
+겹치지 않는다(리스트 시절의 last-wins 유실 — event_translate.settle_sources 주석).
 """
 
 import threading
@@ -265,7 +267,7 @@ def register_source(
     레코드의 필드 계약은 `REGISTRY_RECORD_FIELDS`이며, state에 남는 형태는 이것뿐이다.
     """
     existing = get_sources(state)
-    for index, source in enumerate(existing):
+    for source in existing:
         if source["url"] == url:
             incoming = {
                 "id": source["id"],
@@ -279,9 +281,7 @@ def register_source(
             }
             updated = merge_source_records(source, incoming)
             if updated != source:
-                refreshed = list(existing)
-                refreshed[index] = updated
-                state[SOURCES_STATE_KEY] = refreshed
+                state[record_key(source["id"])] = updated
             return source["id"]
 
     new_id = _next_source_id(existing, invocation_id, url)
@@ -295,9 +295,18 @@ def register_source(
         "meta": meta,
         "fidelity": fidelity,
     }
-    # 재할당 패턴: 기존 리스트를 변형하지 않고 새 리스트를 만들어 대입한다.
-    state[SOURCES_STATE_KEY] = [*existing, new_source]
+    state[record_key(new_id)] = new_source
     return new_id
+
+
+def record_key(source_id: int) -> str:
+    """출처 하나의 state 키(`sources:{id}`). 레지스트리 쓰기는 이 키로만 한다(모듈 docstring)."""
+    return f"{_RECORD_KEY_PREFIX}{source_id}"
+
+
+def registry_entries(records: list[dict]) -> dict[str, dict]:
+    """레코드 묶음을 state에 넣을 출처별 키 항목으로 바꾼다(세션 시딩·요청 로컬 state 복원)."""
+    return {record_key(record["id"]): record for record in records}
 
 
 def get_sources(state: MutableMapping[str, Any] | State) -> list[dict]:

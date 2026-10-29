@@ -337,17 +337,20 @@ def _sources_from_response(payload: dict) -> list[dict]:
 def settle_sources(registry: list[dict], observed_sources: list[dict]) -> list[dict]:
     """세션 레지스트리에 이번 턴 스트림 관찰본을 화해해 인용 가능 집합을 만든다.
 
-    ADK 2.3.0은 한 턴에 나온 병렬 function call을 asyncio.gather로 동시 실행하고,
-    각 도구의 state_delta를 deep_merge_dicts가 **리스트 키에 대해 last-wins로 덮어쓴다**
-    (flows/llm_flows/functions.py). 그래서 도구 완료 순서에 따라 세션 state["sources"]에서
-    한 도구의 출처가 통째로 유실될 수 있고, postprocess가 유효한 [n] 인용을 잘라낸다.
+    ADK 2.3.0은 한 턴에 나온 병렬 function call을 asyncio.gather로 동시 실행하고, 각 도구의
+    state_delta를 **호출 순서로** deep_merge_dicts한다(flows/llm_flows/functions.py) — dict
+    값은 재귀 병합, 그 밖의 값은 last-wins다. 레지스트리를 리스트(`sources`) 하나로 쓰던
+    시절엔 호출 순서상 뒤 도구의 낡은 리스트가 앞 도구의 더 늦은 리스트를 덮어 출처가
+    통째로 유실됐다. 지금은 출처별 키(`sources:{id}`)로 써서 서로 다른 출처는 서로 다른 키라
+    그 유실이 없다(tests/test_sources_keyed_writes.py가 ADK 병합 함수로 잠근다). 남은 것은
+    **같은 출처를 두 병렬 도구가 함께 관측한 경우**다: 같은 키의 레코드 dict가 필드 단위
+    last-wins로 합쳐져 충실도 판정 없이 목록 관측이 상세를 덮을 수 있다(리스트 시절에도 같았다).
 
-    반면 병렬 function_response는 merge 시 parts가 모두 보존되므로, 런너가 스트림에서
-    관찰해 누적한 출처(observed)는 유실되지 않는다. 둘을 합치면 **레지스트리는 판정을,
-    관찰본은 완전성을** 담당한다: 레지스트리 레코드가 base가 되어 `register_source`가
-    선언한 fidelity로 상세 관측이 목록 관측에 격하되는 것을 막고, 레지스트리가 잃은
-    출처는 관찰본이 되살린다. 병합 판정은 `merge_source_records` 한 곳뿐이라 레지스트리
-    (`register_source`)와 이번 턴 스냅샷이 서로 다른 규칙을 쓰는 드리프트가 없다.
+    그래서 레지스트리(판정)와 관찰본(완전성)을 다시 합친다. 병렬 function_response는 merge
+    시 parts가 모두 보존되므로 런너가 스트림에서 관찰해 누적한 출처(observed)는 빠지지 않는다:
+    레지스트리 레코드가 base가 되고, 관찰본은 `merge_source_records`(충실도·관측 시각 판정)로
+    얹힌다. 병합 판정은 그 함수 한 곳뿐이라 레지스트리(`register_source`)와 이번 턴 스냅샷이
+    서로 다른 규칙을 쓰는 드리프트가 없다.
 
     **양쪽 모두 레지스트리 스키마로 맞춘 뒤 합친다.** 병합이 두 축(최상위=정체성,
     meta=관측값)을 구분하려면 관측값이 meta에 있어야 하는데 도구 응답은 그것을 평면으로
