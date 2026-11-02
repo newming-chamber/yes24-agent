@@ -2,7 +2,8 @@
 
 이벤트는 **구간 테이블(giftcard_period)**이 정한다. 한 행 = 회원이 한 번 받을 수 있는 구간(KST
 날짜, 양 끝 포함)이고, "주 1회·주말 미지급"은 주마다 월~금 한 행으로 데이터가 표현한다 — 여기엔
-요일 판정이 없다. 오늘을 포함하는 구간이 없으면(주말·기간 밖·빈 테이블) `closed`다. 판정은 겹침을
+요일 판정이 없다. 오늘을 포함하는 구간이 없으면(주말·기간 밖·빈 테이블) `closed`다(공개 조회는
+같은 event_key의 앞뒤 구간 사이인 날을 `paused`로 따로 알린다 — 주말 안내 배너). 판정은 겹침을
 검증하지 않고 starts_on 최신 1개를 쓴다(admin_data.GIFTCARD_LATEST_PERIOD) — 겹침은 어드민 쓰기
 경로(아래 구간 관리)가 막고, SQL로 직접 넣은 행은 운영 데이터 책임이다.
 
@@ -89,8 +90,24 @@ def encrypt_goods_tic_no(number: int, key: str, vector: str) -> str:
 
 class EventResponse(BaseModel):
     active: bool = Field(description="오늘(KST)이 지급 구간 안인가 — 배너 노출 여부")
-    starts_on: date | None = Field(description="현재 구간 시작일(KST, 포함). 비활성이면 null")
-    ends_on: date | None = Field(description="현재 구간 종료일(KST, 포함). 비활성이면 null")
+    paused: bool = Field(
+        description="지급 구간은 아니지만 같은 이벤트가 이어지는 쉬는 날(주말)인가 — 배너를 두고"
+        " 평일 응모 안내를 띄운다. active면 false"
+    )
+    starts_on: date | None = Field(
+        description="이벤트 전체 기간 시작일(KST, 포함) — 같은 이벤트명 구간의 첫 날."
+        " active·paused가 아니면 null"
+    )
+    ends_on: date | None = Field(
+        description="이벤트 전체 기간 종료일(KST, 포함) — 같은 이벤트명 구간의 마지막 날."
+        " active·paused가 아니면 null"
+    )
+    period_starts_on: date | None = Field(
+        description="이번 주 구간 시작일(KST, 포함). active가 아니면 null"
+    )
+    period_ends_on: date | None = Field(
+        description="이번 주 구간 종료일(KST, 포함). active가 아니면 null"
+    )
 
 
 class EligibilityResponse(BaseModel):
@@ -319,7 +336,8 @@ def register_giftcard(app: FastAPI) -> None:
         response_model=EventResponse,
         responses={503: {"description": "조회 실패 — '이벤트 없음'으로 간주 금지"}},
         summary="상품권 이벤트 진행 여부(배너 노출)",
-        description="오늘(KST)이 지급 구간 안인지와 그 구간 날짜를 돌려준다. 인증 없음(비로그인"
+        description="오늘(KST)이 지급 구간 안인지(active), 같은 이벤트의 구간 사이 쉬는 날인지"
+        "(paused)와 이벤트 전체 기간·이번 주 구간 날짜를 돌려준다. 인증 없음(비로그인"
         " 배너 판정용). 상품권번호는 싣지 않는다.",
     )
     async def event(response: Response) -> EventResponse:
@@ -327,11 +345,17 @@ def register_giftcard(app: FastAPI) -> None:
         today = _today()
         if _EVENT_MEMO.get("day") == today and _EVENT_MEMO["expires"] > time.monotonic():
             return _EVENT_MEMO["body"]
-        period = await UserDataService.get_instance().giftcard_period(today=today, current=True)
+        data = UserDataService.get_instance()
+        period = await data.giftcard_period(today=today, current=True)
+        key = period.event_key if period else await data.giftcard_paused_key(today=today)
+        starts_on, ends_on = await data.giftcard_event_span(event_key=key) if key else (None, None)
         body = EventResponse(
             active=period is not None,
-            starts_on=period and period.starts_on,
-            ends_on=period and period.ends_on,
+            paused=period is None and key is not None,
+            starts_on=starts_on,
+            ends_on=ends_on,
+            period_starts_on=period and period.starts_on,
+            period_ends_on=period and period.ends_on,
         )
         _EVENT_MEMO.update(
             day=today, expires=time.monotonic() + get_settings().giftcard_event_cache_s, body=body

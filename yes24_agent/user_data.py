@@ -557,6 +557,27 @@ class UserDataService(MysqlBackedService):
         )
         return GiftcardPeriod(*rows[0]) if rows else None
 
+    async def giftcard_paused_key(self, *, today: date) -> str | None:
+        """오늘이 같은 이벤트(event_key)의 끝난 구간과 시작 전 구간 사이면 그 event_key — 주 1회
+        이벤트의 주말. 다음 주 행이 아직 없으면 None이다(다음 구간이 들어와야 쉬는 날로 보인다)."""
+        rows = await self._run(
+            "SELECT done.event_key FROM giftcard_period done JOIN giftcard_period ahead "
+            "ON ahead.event_key = done.event_key "
+            "WHERE done.ends_on < %s AND ahead.starts_on > %s LIMIT 1",
+            (today, today),
+            fetch_all=True,
+        )
+        return rows[0][0] if rows else None
+
+    async def giftcard_event_span(self, *, event_key: str) -> tuple[date, date]:
+        """이벤트 전체 기간 — 같은 event_key 구간들의 첫 시작일·마지막 종료일(배너 기간 표기)."""
+        rows = await self._run(
+            "SELECT MIN(starts_on), MAX(ends_on) FROM giftcard_period WHERE event_key = %s",
+            (event_key,),
+            fetch_all=True,
+        )
+        return rows[0][0], rows[0][1]
+
     async def giftcard_issued(self, *, user_id: str, period_id: int) -> bool:
         """이 구간으로 Yes24가 "받았다"고 답한 기록(SUCCESS·ALREADY_APPLIED)이 있는가."""
         return bool(

@@ -11,7 +11,8 @@
 
 ## 흐름
 
-1. 화면 진입 시 클라이언트 → 크레마AI: `GET /event/giftcard` → `active`가 `true`일 때만 배너 노출
+1. 화면 진입 시 클라이언트 → 크레마AI: `GET /event/giftcard` → `active`면 배너, `paused`면 배너 +
+   주말 안내(평일에 응모해주세요), 둘 다 `false`면 배너를 숨긴다
 2. 참여 시 클라이언트 → 크레마AI: `POST /event/giftcard/eligibility`
 3. `status`가 `eligible`일 때만 클라이언트 → Yes24: `POST /api/event/giftcard/issue`
    — 바디 값은 2의 응답(`event_nm`·`goods_tic_no_encrypted`)을 그대로 쓴다
@@ -39,13 +40,29 @@ GET {BASE_URL}/event/giftcard
 ```
 
 ```json
-{"active": true, "starts_on": "2026-11-02", "ends_on": "2026-11-06"}
+{
+  "active": true, "paused": false,
+  "starts_on": "2026-11-02", "ends_on": "2026-11-27",
+  "period_starts_on": "2026-11-02", "period_ends_on": "2026-11-06"
+}
 ```
 
 | 필드 | 의미 |
 |---|---|
-| `active` | 오늘이 지급 구간 안인가 — `false`면 배너를 숨긴다(주말·기간 밖) |
-| `starts_on`·`ends_on` | 현재 구간(이번 주 월~금). `active`가 `false`면 `null` |
+| `active` | 오늘이 지급 구간 안인가(평일) — 배너 노출, 참여 가능 |
+| `paused` | 지급 구간은 아니지만 이벤트가 이어지는 쉬는 날인가(주말) — 배너는 두고 참여 대신 "평일에 응모해주세요" 안내 |
+| `starts_on`·`ends_on` | 이벤트 전체 기간(배너 기간 표기용) — 같은 이벤트명(eventNm) 구간의 첫 시작일·마지막 종료일. `active`·`paused`가 아니면 `null` |
+| `period_starts_on`·`period_ends_on` | 이번 주 구간(월~금, 그 주 상품권 유효기간). `active`가 아니면 `null` |
+
+| `active` | `paused` | 화면 |
+|---|---|---|
+| `true` | `false` | 배너 + 참여 |
+| `false` | `true` | 배너 + 주말 안내(평일에 응모해주세요) |
+| `false` | `false` | 배너 숨김(이벤트 기간 밖·종료) |
+
+`paused`는 오늘이 **같은 이벤트명(eventNm)의 끝난 구간과 시작 전 구간 사이**일 때 `true`다. 배너의
+이벤트 기간 문구(26.11.02 ~ 26.11.27)는 `starts_on`·`ends_on`으로 채울 수 있다 — 행을 추가·단축하면
+따라 바뀌므로 연장 시 클라이언트 배포가 필요 없다.
 
 응답은 캐시하지 않는다(`Cache-Control: no-store`) — 자정에 값이 바뀐다. 진입 시 1회 호출이면
 충분하다. 503은 조회 실패다 — "이벤트 없음"으로 단정하지 말고 배너를 숨긴 채 다음 진입에 다시 묻는다.
@@ -156,7 +173,13 @@ Content-Type: application/json
 - 상품권번호는 화면·API 응답 어디에도 원문으로 나오지 않는다(뒤 4자리 마스킹). 암호화 키·IV 원천은
   서버 `.env`의 `GIFTCARD_ENC_KEY`·`GIFTCARD_ENC_VECTOR`이고, 비어 있으면 대상자 확인의 `eligible`이
   503이 된다.
+- **이벤트명은 이벤트마다 다르게 둔다.** 배너 전체 기간(`starts_on`·`ends_on`)은 같은 이벤트명 행들의
+  최소·최대 날짜다 — 11월 이벤트가 10월과 같은 이름이면 기간이 10/16부터로 나간다.
 - 날짜는 KST, 양 끝 포함. 행이 없는 날은 전부 `closed`이고, 테이블이 비면 이벤트 종료다.
+- **주말 안내는 다음 주 행이 있어야 뜬다.** 토·일의 `paused`는 "같은 이벤트명의 다음 구간이 이미
+  들어 있다"로 판단하므로, 다음 주 행을 그 주 **금요일까지** 넣어 둔다(4주치를 한 번에 넣어도 된다).
+  늦으면 그 주말엔 배너가 숨겨지고(이벤트 종료와 같은 모양), 행을 넣으면 1분 안에 돌아온다.
+  마지막 주 뒤에는 다음 행이 없으므로 자연스럽게 종료(배너 숨김)가 된다.
 
 SQL로 직접 넣을 때(어드민의 겹침 검사를 거치지 않는다 — 겹치게 넣지 않는다. 겹치면 서버는 오늘을
 포함하는 행 중 `starts_on`이 가장 늦은 1개를 쓴다):
