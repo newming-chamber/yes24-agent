@@ -15,8 +15,9 @@
 발급 API를 부를 수 있다. 중복 차단의 정본은 Yes24 쪽 판정(`ALREADY_APPLIED`·`EXCEED`)이고, 여기
 판정은 화면 안내용이다.
 
-대상자 = 현재 구간에 크레마AI에 질문한 회원. 판정 재료는 파트너 API와 같은 `question_activity`
-한 곳이다(같은 판정을 두 벌 만들지 않는다). 이미 받은 회원 = 현재 구간으로 `SUCCESS`·
+대상자 = 현재 구간에 크레마AI에 질문해 **답변까지 받은** 회원(완료 턴만 — 응답 전에 화면을 떠난
+`interrupted`·실패 턴은 세지 않는다, 2026-11-02). 판정 재료는 파트너 API와 같은 `question_activity`
+한 곳이다(같은 판정을 두 벌 만들지 않는다 — 파트너는 전부 세는 기본값). 이미 받은 회원 = 현재 구간으로 `SUCCESS`·
 `ALREADY_APPLIED`가 기록된 회원 — 둘 다 Yes24가 "이 회원은 받았다"고 답한 코드다.
 
 결과 기록은 클라이언트가 전달한 운영 참고 이력이다. 시각은 서버가 찍는다(클라이언트 시각을 받지
@@ -112,11 +113,13 @@ class EventResponse(BaseModel):
 
 class EligibilityResponse(BaseModel):
     status: Literal["eligible", "not_eligible", "already_issued", "closed"] = Field(
-        description="eligible=발급 요청 가능 · not_eligible=이번 구간 질문 이력 없음 ·"
+        description="eligible=발급 요청 가능 · not_eligible=이번 구간 완료된 질문 없음 ·"
         " already_issued=이번 구간에 이미 받음(SUCCESS·ALREADY_APPLIED 기록 있음) ·"
         " closed=지금은 지급 구간이 아님(주말·기간 밖)"
     )
-    question_count: int = Field(description="현재 구간 안에 보낸 질문 수(closed면 0)")
+    question_count: int = Field(
+        description="현재 구간 안에 답변까지 받은 질문 수(closed면 0)"
+    )
     period_ends_on: date | None = Field(description="현재 구간 종료일(KST, 포함). closed면 null")
     event_nm: str | None = Field(description="Yes24 발급 요청의 eventNm — eligible일 때만")
     goods_tic_no_encrypted: str | None = Field(
@@ -371,7 +374,8 @@ def register_giftcard(app: FastAPI) -> None:
             503: {"description": "조회 실패·암호화 설정 누락 — '대상 아님'으로 간주 금지"},
         },
         summary="상품권 발급 대상자 여부",
-        description="x-api-key 회원이 현재 지급 구간(KST, 양 끝 포함)에 크레마AI에 질문했는지와"
+        description="x-api-key 회원이 현재 지급 구간(KST, 양 끝 포함)에 크레마AI에 질문해 답변까지"
+        " 받았는지와"
         " 이번 구간에 이미 받았는지를 돌려준다. eligible일 때만 Yes24 발급 API를 호출하고, 그"
         " 바디에는 이 응답의 event_nm·goods_tic_no_encrypted를 쓴다.",
     )
@@ -389,6 +393,7 @@ def register_giftcard(app: FastAPI) -> None:
             user_id=user_no,
             since=utc_bound(period.starts_on),
             until=utc_bound(period.ends_on, days=1),
+            completed_only=True,
         )
         if await data.giftcard_issued(user_id=user_no, period_id=period.id):
             status = "already_issued"

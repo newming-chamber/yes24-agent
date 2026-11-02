@@ -323,9 +323,19 @@ class UserDataService(MysqlBackedService):
         )
 
     async def question_activity(
-        self, *, app_name: str, user_id: str, since: datetime | None, until: datetime | None
+        self,
+        *,
+        app_name: str,
+        user_id: str,
+        since: datetime | None,
+        until: datetime | None,
+        completed_only: bool = False,
     ) -> tuple[int, datetime | None, datetime | None]:
         """[since, until) UTC 구간에 시작한 이 사용자의 턴 수와 첫·마지막 시작 시각(UTC).
+
+        completed_only면 답변까지 끝난 턴(status='completed')만 센다 — 상품권 지급 기준(2026-11-02
+        사용자 결정: 질문만 보내고 응답 전에 떠난 `interrupted`는 참여로 치지 않는다). 파트너 API는
+        "오류·중단된 질문도 1회"가 Yes24와의 문서 계약이라 기본값(전부)을 쓴다.
 
         None인 끝은 열린 구간이다(분기 대신 `%s IS NULL OR` — 인덱스는 어차피 (app_name,
         user_id) 등치까지만 타므로 실행 계획이 같다).
@@ -336,8 +346,9 @@ class UserDataService(MysqlBackedService):
         rows = await self._run(
             "SELECT COUNT(*), MIN(started_at), MAX(started_at) FROM chat_turn "
             "WHERE app_name = %s AND user_id = %s "
-            "AND (%s IS NULL OR started_at >= %s) AND (%s IS NULL OR started_at < %s)",
-            (app_name, user_id, since, since, until, until),
+            "AND (%s IS NULL OR started_at >= %s) AND (%s IS NULL OR started_at < %s) "
+            "AND (NOT %s OR status = 'completed')",
+            (app_name, user_id, since, since, until, until, completed_only),
             fetch_all=True,
         )
         count, first, last = rows[0]
