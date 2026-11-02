@@ -167,10 +167,14 @@ class UserDataService(MysqlBackedService):
             "m.perplexity_search_type, "
             "p.slots, p.base_hash, "
             "p.activated_at, p.retired_at, r.seq, r.attempt, r.round_index, r.started_ms, "
-            "r.thinking_tokens, r.tool_calls, r.error_status "
+            "r.thinking_tokens, r.tool_calls, r.error_status, "
+            # web_search_log는 부가 채널이라 테이블이 없으면 INSERT마다 warning으로 조용히 유실된다
+            # — 수집이 목적인 표라 유실 대신 기동에서 막는다(scripts/web_search_log.sql 선행).
+            "w.backend, w.search_type, w.domain_filters, w.result_count, w.results, w.response "
             "FROM users u, auth_keys a, chat_turn t, turn_feedback f, turn_click c, "
             "session_ui s, usage_log l, admin_audit d, giftcard_issue g, giftcard_period gp, "
-            "chat_turns v, model_settings m, prompt_version p, turn_round r WHERE 1 = 0",
+            "chat_turns v, model_settings m, prompt_version p, turn_round r, web_search_log w "
+            "WHERE 1 = 0",
             (),
             fetch_all=True,
         )

@@ -1081,6 +1081,10 @@ class Settings(BaseSettings):
     # 없이 기다리면 SIGTERM 후 lifespan 종료가 매달려 오케스트레이터 SIGKILL(배포 지연)
     # 로만 끝난다. 상한 초과분은 취소한다 — 부가 채널이라 기록 유실이 종료 지연보다 싸다.
     usage_close_timeout_s: float = 5.0
+    # 웹 검색 원문 기록(usage.py → web_search_log 테이블, scripts/web_search_log.sql) 스위치.
+    # 백엔드 요청 1건마다 질의·결과 전체(행당 수십 KB)를 남긴다 — 결과 수집·재사용 재료라 비용
+    # 집계와 무관하게 끌 수 있어야 한다. mysql이 아니면 값과 무관하게 비활성(usage_log와 같은 분기).
+    web_search_log_enabled: bool = True
 
     # 운영자 데이터 조회(admin). 세션 DB가 MySQL일 때만 등록되고(admin_auth.admin_enabled),
     # 접근은 개인 계정(admin_users)·서버측 세션(admin_sessions)으로 가린다.

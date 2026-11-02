@@ -55,7 +55,7 @@ from yes24_agent.tools._planning import (
     plan_queries,
 )
 from yes24_agent.tools._text import truncate
-from yes24_agent.usage import record_usage
+from yes24_agent.usage import record_usage, record_web_search
 
 logger = logging.getLogger(__name__)
 
@@ -270,7 +270,9 @@ async def _prefetch_pipeline(message: str, settings: Settings) -> list[dict] | N
     if not await _prefetch_hint_needs_web(message, settings):
         logger.info("web_search prefetch hint=no_web")
         return None
-    raw_results = await _grounding_raw_results(_grounding_prompt([message]), settings)
+    raw_results = await _grounding_raw_results(
+        _grounding_prompt([message]), settings, queries=[message]
+    )
     logger.info(f"web_search prefetch ready results={len(raw_results)}")
     # 빈 근거는 서빙하지 않는다 — 정상 경로가 자기 재시도 규약대로 다시 시도하게 둔다.
     return raw_results or None
@@ -329,6 +331,23 @@ def _take_turn_prefetch() -> tuple[str, asyncio.Task] | None:
     if not holder:
         return None
     return holder.pop()
+
+
+def _log_search(
+    backend: str, query: str, started: float, *, ended: float | None = None,
+    exc: Exception | None = None, results: list | None = None, response: dict | None = None,
+    search_type: str | None = None, domain_filters: list[str] | None = None,
+) -> None:
+    """백엔드 요청 1건 → web_search_log 1행(세 백엔드 공용, 실패 무해). 지연은 started~ended
+    (기본 지금) monotonic 구간 — 호출부가 백엔드 호출만 감싼다."""
+    record_web_search(
+        backend, query,
+        outcome="ok" if exc is None else f"error:{type(exc).__name__}",
+        error=None if exc is None else f"{exc!r:.120}",
+        latency_ms=int(((ended or time.monotonic()) - started) * 1000),
+        results=results, response=response, search_type=search_type,
+        domain_filters=domain_filters,
+    )
 
 
 def _grounding_metadata(response):
@@ -437,8 +456,13 @@ async def _fetch_page_meta(
         return None, None
 
 
-async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
+async def _grounding_raw_results(
+    prompt: str, settings: Settings, *, queries: list[str] | None = None
+) -> list[dict]:
     """그라운딩 서브콜을 실행해 출처별 원시 재료를 돌려준다(빈 목록 가능, 종단 실패는 raise).
+
+    web_search_log에는 호출 1건(재시도 포함)을 1행으로 남긴다 — 질의는 queries(계획된 각도),
+    없으면 프롬프트. 결과는 제목·최종 URL 보강 후 값, 지연은 서브콜 구간만이다.
 
     일시 실패 2종을 재시도로 흡수한다(시도 횟수는 config web_grounding_max_attempts,
     Yes24Client의 전송 오류 재시도와 동일 철학):
@@ -452,6 +476,8 @@ async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
         raise _QuotaExhausted("grounding quota cooldown")
     last_error: Exception | None = None
     raw_results: list[dict] = []
+    query = " | ".join(queries) if queries else prompt
+    started = time.monotonic()
     for _ in range(settings.web_grounding_max_attempts):
         try:
             response = await asyncio.to_thread(
@@ -486,7 +512,9 @@ async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
         except Exception as exc:  # noqa: BLE001 — 비일시 오류: 재시도 없이 종단 실패로 올린다
             last_error = exc
             break
+    ended = time.monotonic()
     if last_error is not None:
+        _log_search("grounding", query, started, ended=ended, exc=last_error)
         raise last_error
     _clear_quota_mark("grounding")  # 서브콜 성공 = 전환 해제
     if raw_results:
@@ -544,6 +572,7 @@ async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
             if kept is not item:
                 kept["claims"] = list(dict.fromkeys(kept["claims"] + item["claims"]))
         raw_results = list(merged.values())
+    _log_search("grounding", query, started, ended=ended, results=raw_results)
     return raw_results
 
 
@@ -594,7 +623,9 @@ async def _grounded_search(
 
     if raw_results is None:
         try:
-            raw_results = await _grounding_raw_results(_grounding_prompt(planned), settings)
+            raw_results = await _grounding_raw_results(
+                _grounding_prompt(planned), settings, queries=planned
+            )
         except Exception as exc:  # noqa: BLE001 — 도구 계약: 예외를 밖으로 던지지 않는다
             logger.info(
                 f"web_search backend=grounding status=error error_type=fetch ({exc!r:.120})"
@@ -783,6 +814,7 @@ async def search_raw(
     }
     if domain_filters:
         payload["search_domain_filter"] = domain_filters
+    started = time.monotonic()
     try:
         response = await client.post(
             settings.perplexity_search_url, json=payload, headers=headers
@@ -822,6 +854,10 @@ async def search_raw(
         # ValueError: 응답이 JSON이 아니거나(response.json()) JSON 객체가 아닐 때.
         # 예외 repr은 status 앞에 둔다 — 감시기 정규식이 줄 끝(error_type=fetch$)을 묶는다.
         logger.info(f"web_search query={query!r} exc={exc!r:.120} status=error error_type=fetch")
+        _log_search(
+            "perplexity", query, started, exc=exc, search_type=search_type,
+            domain_filters=domain_filters,
+        )
         discard_client_on_pool_timeout(exc, client, settings)
         return {
             "query": query,
@@ -829,6 +865,10 @@ async def search_raw(
             "error_type": "fetch",
             "message": f"웹 검색 요청에 실패했습니다: {exc}",
         }
+    _log_search(
+        "perplexity", query, started, results=raw, search_type=search_type,
+        domain_filters=domain_filters,
+    )
     normalized = []
     for item in raw:
         url = item["url"]
@@ -936,6 +976,7 @@ async def searchapi_raw(
     if _quota_exhausted("searchapi"):
         return fail("fetch", "웹 검색(SearchApi) 쿼터 쿨다운 중입니다", "quota cooldown")
     client = get_client(settings)
+    started = time.monotonic()
     try:
         # wall-clock 시한 — httpx 타임아웃은 위상별이라 청크가 느리게 이어지면 총 지연을 못 막는다.
         response = await asyncio.wait_for(
@@ -963,8 +1004,12 @@ async def searchapi_raw(
         raw = _ai_mode_to_raw(data)
         raw_result_count = len(data.get("reference_links") or [])
     except Exception as exc:  # noqa: BLE001 — 도구 계약: 200의 이상 형식(타입·깊은 중첩)도 밖으로 던지지 않는다
+        _log_search("searchapi", sent, started, exc=exc, domain_filters=domain_filters)
         discard_client_on_pool_timeout(exc, client, settings)
         return fail("fetch", f"웹 검색 요청에 실패했습니다: {exc!r:.120}", repr(exc))
+    _log_search(
+        "searchapi", sent, started, results=raw, response=data, domain_filters=domain_filters
+    )
     domain_filters = domain_filters or []
     if domain_filters and domain_filters[0].startswith("-"):
         raw = [item for item in raw if _url_in_domain_scope(item["url"], domain_filters)]

@@ -1,4 +1,4 @@
-"""LLM 토큰 사용량 기록 — usage_log 테이블 (비용 측정·모델별 히스토리 재료).
+"""LLM 토큰 사용량(usage_log)·웹 검색 원문(web_search_log) 기록 — 요청 스코프를 공유하는 부가 채널.
 
 모든 LLM 호출의 토큰 사용량을 MySQL `usage_log`에 남긴다: 메인 에이전트 턴
 (runner.py, component="main" 1행/턴)과 경량 서브콜들(enrichment·thought_translation·
@@ -16,15 +16,22 @@ session_service.mysql_pool_kwargs로 파싱한다. 세션 DB가 mysql이 아니�
   warning 로그 후 무시한다(풀 생성 실패 포함).
 - 부가 호출은 요청의 최종 turn_id가 확정될 때 모아 fire-and-forget으로 쓴다.
   created_at은 호출 당시 UTC를 보존한다. 늦게 끝나는 공유 prefetch도 최초 요청에 귀속한다.
+
+web_search_log(scripts/web_search_log.sql)는 웹 검색 백엔드 요청 1건마다 질의·결과 전체를 남긴다
+(수집·재사용 재료). usage_log와 같은 풀·스코프·실패 정책을 타되 테이블을 나눈다 — 어드민 비용·
+통계가 매번 훑는 usage_log에 수십 KB JSON을 섞지 않기 위해서다.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from collections.abc import Callable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any
 
 from yes24_agent.config import get_settings
@@ -36,33 +43,45 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class UsageScope:
-    """요청 1건의 usage 귀속 문맥 — turn_id·session_id가 채워진 뒤(finish 이후) 행마다 기록한다."""
+    """요청 1건의 귀속 문맥 — turn_id·session_id가 채워진 뒤(finish 이후) 행마다 기록한다.
+
+    pending은 (쓰기 함수, 필드)다 — usage_log·web_search_log가 같은 보류→마감 경로를 탄다.
+    """
 
     user_id: str
     endpoint: str
     session_id: str | None = None
     turn_id: str | None = None
     closed: bool = False
-    pending: list[tuple[str, Any, dict]] = field(default_factory=list)
+    pending: list[tuple[Callable[..., None], dict]] = field(default_factory=list)
 
-    def record(self, component: str, usage: Any, fields: dict) -> None:
+    def record(self, write: Callable[..., None], fields: dict) -> None:
         if not self.closed:
-            self.pending.append((component, usage, fields))
+            self.pending.append((write, fields))
             return
         for name in ("session_id", "user_id", "endpoint", "turn_id"):
             if fields.get(name) is None:
                 fields[name] = getattr(self, name)
-        UsageLogger.get_instance().record(component, usage, **fields)
+        write(**fields)
 
     def finish(self, turn_id: str | None) -> None:
         self.turn_id = turn_id
         self.closed = True
         pending, self.pending = self.pending, []
-        for component, usage, fields in pending:
-            self.record(component, usage, fields)
+        for write, fields in pending:
+            self.record(write, fields)
 
 
 _usage_scope: ContextVar[UsageScope | None] = ContextVar("usage_scope", default=None)
+
+
+def _route(write: Callable[..., None], fields: dict) -> None:
+    """요청 스코프가 있으면 그 스코프로(턴 id 확정까지 보류), 없으면 바로 쓴다."""
+    scope = _usage_scope.get()
+    if scope is not None:
+        scope.record(write, fields)
+    else:
+        write(**fields)
 
 
 def begin_usage_scope(user_id: str, endpoint: str) -> tuple[UsageScope, Token]:
@@ -80,8 +99,20 @@ def finish_usage_scope(scope: UsageScope, token: Token, turn_id: str | None) -> 
             _usage_scope.set(None)
 
 
+# INSERT 열 순서 — record()의 row 튜플·record_web_search의 필드 이름과 1:1이다.
+_USAGE_COLUMNS = tuple(
+    "app_name session_id user_id endpoint component model prompt_tokens response_tokens "
+    "total_tokens thinking_tokens cached_tokens latency_ms turn_id outcome llm_calls tool_calls "
+    "cited_sources service_tier reasoning_effort search_queries created_at".split()
+)
+_WEB_SEARCH_COLUMNS = tuple(
+    "app_name created_at session_id user_id endpoint turn_id backend search_type query "
+    "domain_filters outcome error latency_ms result_count results response".split()
+)
+
+
 class UsageLogger:
-    """usage_log 쓰기 전용 서비스(프로세스 싱글턴).
+    """usage_log·web_search_log 쓰기 전용 서비스(프로세스 싱글턴, 풀 1개).
 
     풀 팩토리를 생성자로 주입할 수 있다 — 테스트는 실 DB 없이 스텁으로 전 경로를 돈다
     (AuthService와 같은 패턴).
@@ -175,32 +206,44 @@ class UsageLogger:
                 search_queries,
                 created_at or datetime.now(timezone.utc).replace(tzinfo=None),
             )
-            # 본류(스트리밍·서브콜)와 분리된 task로 쓴다 — DB 왕복이 턴 지연에 얹히지 않는다.
-            task = asyncio.get_running_loop().create_task(self._insert(row))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            self._schedule("usage_log", _USAGE_COLUMNS, row)
         except Exception as exc:  # noqa: BLE001 — 부가 채널: 예약 실패(루프 없음 등)도 삼킨다
             logger.warning(f"usage_log 기록 예약 실패(무시): {exc}")
 
-    async def _insert(self, row: tuple) -> None:
-        """usage_log INSERT 1건. 풀 생성 실패·테이블 부재·연결 끊김 전부 warning 후 무시."""
+    def record_web_search(self, **fields: Any) -> None:
+        """web_search_log 1행 예약(fire-and-forget) — JSON 열은 호출부가 이미 직렬화해 넘긴다."""
+        try:
+            if not self.enabled:
+                return
+            fields["app_name"] = get_settings().app_name
+            self._schedule(
+                "web_search_log", _WEB_SEARCH_COLUMNS,
+                tuple(fields.get(column) for column in _WEB_SEARCH_COLUMNS),
+            )
+        except Exception as exc:  # noqa: BLE001 — 부가 채널: 예약 실패(루프 없음 등)도 삼킨다
+            logger.warning(f"web_search_log 기록 예약 실패(무시): {exc}")
+
+    def _schedule(self, table: str, columns: tuple[str, ...], row: tuple) -> None:
+        """본류(스트리밍·서브콜)와 분리된 task로 쓴다 — DB 왕복이 턴 지연에 얹히지 않는다."""
+        sql = (
+            f"INSERT INTO {table} ({', '.join(columns)}) "
+            f"VALUES ({', '.join(['%s'] * len(columns))})"
+        )
+        task = asyncio.get_running_loop().create_task(self._insert(table, sql, row))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _insert(self, table: str, sql: str, row: tuple) -> None:
+        """INSERT 1건. 풀 생성 실패·테이블 부재·연결 끊김 전부 warning 후 무시."""
 
         async def insert(conn):
             async with conn.cursor() as cur:
-                await cur.execute(
-                    "INSERT INTO usage_log (app_name, session_id, user_id, endpoint, "
-                    "component, model, prompt_tokens, response_tokens, total_tokens, "
-                    "thinking_tokens, cached_tokens, latency_ms, turn_id, outcome, "
-                    "llm_calls, tool_calls, cited_sources, service_tier, reasoning_effort, "
-                    "search_queries, created_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                    "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                    row,
-                )
+                await cur.execute(sql, row)
 
         try:
             await self._db.run(insert)
         except Exception as exc:  # noqa: BLE001 — 부가 채널: 기록 실패가 턴을 막으면 안 된다
-            logger.warning(f"usage_log INSERT 실패(무시): {exc}")
+            logger.warning(f"{table} INSERT 실패(무시): {exc}")
 
     async def close(self) -> None:
         """진행 중인 기록을 상한 안에서 배수하고 풀을 닫는다(앱 종료 훅).
@@ -250,7 +293,6 @@ def record_usage(
         return
     if not UsageLogger.get_instance().enabled:
         return
-    scope = _usage_scope.get()
     fields = dict(
         model=model,
         session_id=session_id,
@@ -267,10 +309,46 @@ def record_usage(
         search_queries=search_queries,
         created_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
-    if scope is not None:
-        scope.record(component, usage, fields)
-    else:
-        UsageLogger.get_instance().record(component, usage, **fields)
+    _route(partial(UsageLogger.get_instance().record, component, usage), fields)
+
+
+def record_web_search(
+    backend: str,
+    query: str,
+    *,
+    outcome: str,
+    latency_ms: int,
+    results: Any = None,
+    response: Any = None,
+    error: str | None = None,
+    search_type: str | None = None,
+    domain_filters: list[str] | None = None,
+) -> None:
+    """웹 검색 백엔드 요청 1건 → web_search_log 1행(질의·결과 전체, 잘라내지 않는다).
+
+    results·response는 **여기서 즉시** 직렬화한다 — 스코프가 턴 id 확정까지 행을 보류하는 동안
+    호출부가 같은 dict를 고쳐도(제목 보강 등) 기록은 호출 시점 값이다. 어떤 실패도 삼킨다.
+    """
+    try:
+        if not get_settings().web_search_log_enabled:
+            return
+        if not UsageLogger.get_instance().enabled:
+            return
+
+        def dump(value: Any) -> str | None:
+            return None if value is None else json.dumps(value, ensure_ascii=False, default=str)
+
+        _route(UsageLogger.get_instance().record_web_search, dict(
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            session_id=None, user_id=None, endpoint=None, turn_id=None,
+            backend=backend, search_type=search_type, query=query,
+            domain_filters=dump(domain_filters or None), outcome=outcome, error=error,
+            latency_ms=latency_ms,
+            result_count=len(results) if isinstance(results, list) else None,
+            results=dump(results), response=dump(response),
+        ))
+    except Exception as exc:  # noqa: BLE001 — 부가 채널: 직렬화 실패도 검색을 막지 않는다
+        logger.warning(f"web_search_log 기록 실패(무시): {exc}")
 
 
 async def close_usage_logger() -> None:
