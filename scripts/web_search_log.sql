@@ -8,8 +8,9 @@
 --
 -- turn_id·session_id·user_id·endpoint는 usage_log와 같은 요청 스코프(UsageScope)에서 채운다 —
 -- 턴 안의 요청은 턴 종료 시 turn_id를 받아 쓰이고, 스코프 밖(공유 프리페치가 다른 요청에서
--- 시작된 경우 등)은 아는 만큼만 채운다(NULL 허용). FK는 없다: 대화 파기(sessions CASCADE)가
--- 이 표를 지우지 않는다 — 질의 원문에 사용자 입력이 섞일 수 있으니 보존 정책은 따로 정한다.
+-- 시작된 경우 등)은 아는 만큼만 채운다(NULL 허용). 대화 파기는 sessions FK CASCADE로 이 표도
+-- 지운다 — 프리페치 질의는 사용자 메시지 원문이라 chat_turn과 같은 삭제 집합이어야 한다
+-- (user_data._CASCADE_FKS, verify_schema가 CASCADE를 확인). 세션 키가 NULL인 행은 FK 검사 밖이다.
 --
 -- 적용(재적용 안전): mysql -h <RDS> -u <user> -p <db> < scripts/web_search_log.sql
 -- 순서: 이 DDL → 코드 배포(새 코드는 표가 없으면 verify_schema에서 기동 실패). 끄기는
@@ -41,5 +42,7 @@ CREATE TABLE IF NOT EXISTS web_search_log (
     KEY idx_web_search_log_created_at (created_at),
     KEY idx_web_search_log_session_id (session_id),
     KEY idx_web_search_log_turn_id (turn_id),
-    CONSTRAINT ck_web_search_log_app_name CHECK (CHAR_LENGTH(TRIM(app_name)) > 0)
+    CONSTRAINT ck_web_search_log_app_name CHECK (CHAR_LENGTH(TRIM(app_name)) > 0),
+    CONSTRAINT fk_web_search_log_session FOREIGN KEY (app_name, user_id, session_id)
+        REFERENCES sessions (app_name, user_id, id) ON DELETE CASCADE ON UPDATE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

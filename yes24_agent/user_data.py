@@ -65,6 +65,7 @@ _CASCADE_FKS = (
     ("chat_turn", "sessions"),
     ("turn_feedback", "sessions"),
     ("session_ui", "sessions"),
+    ("web_search_log", "sessions"),   # 프리페치 질의 = 사용자 메시지 원문
     ("turn_round", "chat_turn"),
 )
 # TurnProcess.rounds 행 키(event_translate.TurnProcess.round_usage) — 열 이름은 "round"만
@@ -709,7 +710,7 @@ class UserDataService(MysqlBackedService):
         빠지고, 잠금부터 커밋까지 그 행은 한 트랜잭션의 것이라 **같은 세션의 파기 감사가 두 번
         남거나 대장과 실제가 어긋나는 일이 구조적으로 없다**. 감사 행은 DELETE가 실제로 지운
         경우에만 쓴다. 삭제 집합의 정의는 FK CASCADE 하나다(events·chat_turn·turn_feedback·
-        session_ui). 대장에는 내용이 아니라 "언제 삭제 요청 → 언제 파기, 턴 몇 개"만 남는다.
+        session_ui·web_search_log). 대장에는 내용이 아니라 "언제 삭제 요청 → 언제 파기, 턴 몇 개"만 남는다.
         트랜잭션이 RC라 막히는 것은 지금 파기 중인 그 대화뿐이다(`_transaction`).
         """
 
