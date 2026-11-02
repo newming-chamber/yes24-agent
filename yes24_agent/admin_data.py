@@ -27,12 +27,15 @@ from yes24_agent.model_routing import (
     AUDIT_TARGET as MODEL_AUDIT_TARGET,
 )
 from yes24_agent.model_routing import (
+    PERPLEXITY_SEARCH_TYPES,
     SETTINGS_COLUMNS,
     SETTINGS_ROW_ID,
+    WEB_SEARCH_BACKENDS,
     cooldowns,
     default_effort,
     effective_choice,
     per_model_targets,
+    storable_setting,
 )
 
 # admin 접속(읽기 전용 조회·AdminService 풀) 공통 디코더 — BOOLEAN 열을 bool로 싣는다.
@@ -649,6 +652,22 @@ async def fetch_model_panel(cur, settings: Settings) -> dict[str, Any]:
             for model in per_model_targets(settings, "reasoning_efforts")
         ],
         "effort_options": list(settings.litellm_reasoning_effort_options),
+        # 웹 검색 주 백엔드 — 고를 수 있는 값은 키가 있는 백엔드(저장 판정과 같은 함수).
+        "web_search_backend": {
+            "value": choice.web_search_backend,
+            "source": choice.web_search_backend_source,
+            "config": settings.web_search_backend,
+            "options": [
+                backend for backend in WEB_SEARCH_BACKENDS
+                if storable_setting(settings, "web_search_backend", backend)
+            ],
+        },
+        "perplexity_search_type": {
+            "value": choice.perplexity_search_type,
+            "source": choice.perplexity_search_type_source,
+            "config": settings.perplexity_search_type,
+            "options": list(PERPLEXITY_SEARCH_TYPES),
+        },
         # 비용 계산의 근거 단가(정본 config llm_prices — 화면은 숫자를 들지 않는다).
         "prices": prices,
         "cooldown_s": settings.model_fallback_cooldown_s,

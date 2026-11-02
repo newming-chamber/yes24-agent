@@ -163,7 +163,9 @@ class UserDataService(MysqlBackedService):
             # 세션 상세가 이 뷰에서 모델을 읽는다(재적용 누락이 상세 503으로 숨지 않게 기동 실패).
             "v.model, v.fallback_from, v.prompt_version_id, l.service_tier, l.reasoning_effort, "
             "l.search_queries, "
-            "m.service_tiers, m.reasoning_efforts, m.prompt_versions, p.slots, p.base_hash, "
+            "m.service_tiers, m.reasoning_efforts, m.prompt_versions, m.web_search_backend, "
+            "m.perplexity_search_type, "
+            "p.slots, p.base_hash, "
             "p.activated_at, p.retired_at, r.seq, r.attempt, r.round_index, r.started_ms, "
             "r.thinking_tokens, r.tool_calls, r.error_status "
             "FROM users u, auth_keys a, chat_turn t, turn_feedback f, turn_click c, "

@@ -38,6 +38,7 @@ _GEMINI_PRICING = "https://ai.google.dev/gemini-api/docs/pricing"
 _OPENAI_PRICING = "https://developers.openai.com/api/docs/pricing"
 _ANTHROPIC_PRICING = "https://platform.claude.com/docs/en/about-claude/pricing"
 _PERPLEXITY_PRICING = "https://docs.perplexity.ai/getting-started/pricing"
+_SEARCHAPI_PRICING = "https://www.searchapi.io/pricing"
 # 첫 구간의 시작일 — 공식 페이지의 가격 시작일이 아니라 usage_log 기록 전부를 덮는 날짜다.
 _PRICE_EPOCH = date(2026, 1, 1)
 _PRICE_CHECKED = date(2026, 9, 14)  # 공식 페이지 확인일(행마다 다를 수 있다 — 아래 표)
@@ -713,7 +714,15 @@ class Settings(BaseSettings):
     # "perplexity" = 기존 원시 검색 경로(임시 비활 — 코드 유지, 이 값으로 즉시 복귀).
     # 도메인 필터(domains)가 지정된 호출은 그라운딩에 구조적 필터가 없어 항상 퍼플렉시티
     # 경로로 처리한다(능력 기반 라우팅 — 콘텐츠 분기 아님).
-    web_search_backend: Literal["grounding", "perplexity"] = "grounding"
+    # "searchapi" = SearchApi.io Google AI 모드(종합 답+출처 1회 요청)를 출처별 서술로 분해한
+    # 경로(2026-10-29 A/B 후보 — 기본 아님). 실패하면 grounding → perplexity 순으로 전환한다
+    # (web_search._BACKEND_CHAIN). domains 지정 호출도 받는다: 제외 필터("-x.com")는 결과를
+    # 사후 필터해 지키고, 포함 필터는 무시한다(searches에 domains_ignored로 표기) — AI 모드 출처엔
+    # 지정 도메인이 거의 없어 사후 필터하면 퍼플렉시티로 넘어가는데, 10-30 시세 6건 실측에서
+    # 도메인 무시 AI 모드 6/6, 퍼플렉시티 도메인 필터 2/6이 정답이었다
+    # (site:도 16회 중 3회만 지켜짐).
+    # 같은 이유로 질의의 site: 연산자도 빼고 보낸다(10-30 실측 성공 11/16 → 16/16, web_search).
+    web_search_backend: Literal["grounding", "perplexity", "searchapi"] = "grounding"
     # 그라운딩 서브콜 모델·타임아웃. 서브콜은 "검색해 출처별 근거를 모아오는" 유틸이라 깊은
     # 추론이 불필요하다(종합은 메인 에이전트 몫) — flash-lite A/B 실측(2026-07-28): 3.1s vs
     # 3.5-flash 12~55s, 출처 수·당일 시황 정확도 동급. thought_translation과 같은 경량 유틸
@@ -738,6 +747,7 @@ class Settings(BaseSettings):
     # 값으로, Yes24 재시도(http_max_retries)와 같은 성격의 상한이라 config에 둔다.
     web_grounding_max_attempts: int = 2
     # 그라운딩 429(쿼터 소진) 뒤 그라운딩을 건너뛰고 퍼플렉시티로 처리할 쿨다운(초)
+    # — SearchApi 429(크레딧·시간당 한도)도 같은 값으로 건너뛴다(필드명은 env 호환으로 유지)
     # (2026-10-19 상용 장애, web_search.py). 실제 429 본문 details엔 google.rpc.Help 링크뿐이고
     # QuotaFailure(어느 한도인지)가 없어 RPM 버스트·월 지출 한도·일일 RPD를 구조적으로 구분할
     # 수 없다 — 리셋 시각(태평양시 자정)에 묶으면 분당 429 한 번에 최대 24시간 고정되고 한도
@@ -794,6 +804,21 @@ class Settings(BaseSettings):
     perplexity_search_url: str = "https://api.perplexity.ai/search"
     # /search 호출의 usage_log.model 값이자 llm_prices 키(LLM이 아니라 요청 단위 과금 API).
     perplexity_search_model: str = "perplexity-search"
+    # search_type="fast" 요청의 usage_log.model 값이자 llm_prices 키(단가가 web과 달라 키를 나눈다).
+    perplexity_search_fast_model: str = "perplexity-search-fast"
+    # /search search_type(응답 형식 동일, fast $1/1K vs web $5/1K). 런타임 값은 model_settings 열.
+    # 근거: 2026-11-02 상용 질문 A/B 품질 동급·검색비 −81%.
+    perplexity_search_type: Literal["web", "fast"] = "fast"
+    # SearchApi.io(web_search_backend="searchapi"). 요청 1건에 종합 답+출처가 오고, HTTP 200만
+    # 1건 과금된다(토큰 없음). gl·hl은 검색 국가·언어.
+    searchapi_base_url: str = "https://www.searchapi.io/api/v1/search"
+    searchapi_gl: str = "kr"
+    searchapi_hl: str = "ko"
+    # 요청 전체의 wall-clock 상한(httpx 타임아웃은 위상별이라 총 지연을 못 막는다). 실측 지연
+    # 6~12s, 가끔 20s 근처(2026-10-29~30) — 꼬리를 살리되 그 너머는 다음 백엔드로 넘긴다.
+    searchapi_timeout_s: float = 20.0
+    # usage_log.model 값이자 llm_prices 키(perplexity_search_model과 같은 역할).
+    searchapi_model: str = "searchapi-google"
     # 웹 열람(web_fetch)은 여전히 Tavily /extract 사용 — 특정 URL 전문 확보용.
     tavily_extract_url: str = "https://api.tavily.com/extract"
 
@@ -1158,6 +1183,13 @@ class Settings(BaseSettings):
             # Search API는 요청 1건당 $5/1,000이고 토큰 과금이 없다(2026-10-27 공식 페이지 확인).
             ("perplexity-search", "", _PRICE_EPOCH, 0.0, 0.0, 0.0, 5.0,
              _PERPLEXITY_PRICING, date(2026, 10, 27)),
+            # search_type="fast"는 요청 1건당 $1/1,000(2026-11-02 확인).
+            ("perplexity-search-fast", "", _PRICE_EPOCH, 0.0, 0.0, 0.0, 1.0,
+             _PERPLEXITY_PRICING, date(2026, 11, 2)),
+            # 정액 요금제의 건당 환산(HTTP 200만 과금): BigData/Scale 플랜 $250/10만 건 =
+            # $2.5/1,000(2026-10-29 확인).
+            ("searchapi-google", "", _PRICE_EPOCH, 0.0, 0.0, 0.0, 2.5,
+             _SEARCHAPI_PRICING, date(2026, 10, 29)),
         )
     ]
     # 원화 환산(선택). 환율은 시변이라 코드 상수가 아니라 운영자가 기준일과 함께 넣는 값이다 —
@@ -1251,6 +1283,7 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(default="", repr=False)  # LiteLLM 경로(openai/*) 모델용
     anthropic_api_key: str = Field(default="", repr=False)  # LiteLLM 경로(anthropic/*) 모델용
     perplexity_api_key: str = Field(default="", repr=False)  # web_search(퍼플렉시티 /search)용
+    searchapi_api_key: str = Field(default="", repr=False)  # web_search(SearchApi.io)용
     tavily_api_key: str = Field(default="", repr=False)  # web_fetch(Tavily /extract)용
     slack_webhook_url: str = Field(default="", repr=False)  # ERROR 알림 incoming webhook
 

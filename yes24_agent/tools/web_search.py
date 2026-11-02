@@ -36,6 +36,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable
 from functools import lru_cache
 from urllib.parse import urlsplit
 
@@ -46,6 +47,7 @@ from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
 from yes24_agent.config import Settings, get_settings
+from yes24_agent.model_routing import current_models, web_backend_configured
 from yes24_agent.sources import cite_marker, now_checked_at, register_source
 from yes24_agent.tools._planning import (
     angle_error_summary,
@@ -155,37 +157,43 @@ def _grounding_client(timeout_ms: int) -> genai.Client:
     return genai.Client(http_options=genai_types.HttpOptions(timeout=timeout_ms))
 
 
-# 그라운딩 쿼터 소진 표시(프로세스 전역, monotonic 시각): 이 시각 전까지 그라운딩을 건너뛴다.
-# 2026-10-19 상용 장애 — 검색 그라운딩 한도가 소진되면 매 호출이 429라, 호출마다 429를 맞고
-# 전환하면 왕복만 낭비한다. 쿨다운(config web_grounding_quota_cooldown_s)이 지나면 시각
-# 비교만으로 풀린다. 표시·건너뛰기 지점은 _grounding_raw_results 하나다(프리페치·정상 경로 공통).
-# None이 아닌 동안이 "전환 중"이다 — 시각이 지나도 그라운딩이 성공할 때까지 남겨, 재시도
-# 프로브의 재429를 새 전환(운영 Slack 알림 = ERROR)과 구분한다.
-_grounding_quota_cooldown_until: float | None = None
+# 백엔드별 쿼터 소진 표시(프로세스 전역, 백엔드 → monotonic 시각): 이 시각 전까지 그 백엔드를
+# 건너뛴다. 2026-10-19 상용 장애 — 검색 그라운딩 한도가 소진되면 매 호출이 429라, 호출마다 429를
+# 맞고 전환하면 왕복만 낭비한다. SearchApi도 크레딧·시간당 한도 초과가 429다. 쿨다운(config
+# web_grounding_quota_cooldown_s)이 지나면 시각 비교만으로 풀린다. 표시·건너뛰기 지점은 각
+# 백엔드 입구 하나다(그라운딩은 _grounding_raw_results — 프리페치·정상 경로 공통, SearchApi는
+# searchapi_raw). 키가 있는 동안이 "전환 중"이다 — 시각이 지나도 그 백엔드가 성공할 때까지
+# 남겨, 재시도 프로브의 재429를 새 전환(운영 Slack 알림 = ERROR)과 구분한다.
+_quota_cooldown_until: dict[str, float] = {}
 
 
-class _GroundingQuotaExhausted(RuntimeError):
-    """소진 표시 중이라 그라운딩을 호출하지 않았다(종단 실패와 같은 경로로 처리된다)."""
+class _QuotaExhausted(RuntimeError):
+    """소진 표시 중이라 백엔드를 호출하지 않았다(종단 실패와 같은 경로로 처리된다)."""
 
 
-def _grounding_quota_exhausted() -> bool:
-    """그라운딩 쿼터 소진 표시가 살아 있는지(쿨다운 중인지) 판정한다."""
-    until = _grounding_quota_cooldown_until
+def _quota_exhausted(backend: str) -> bool:
+    """백엔드의 쿼터 소진 표시가 살아 있는지(쿨다운 중인지) 판정한다."""
+    until = _quota_cooldown_until.get(backend)
     return until is not None and time.monotonic() < until
 
 
-def _mark_grounding_quota_exhausted(settings: Settings) -> None:
+def _mark_quota_exhausted(backend: str, settings: Settings) -> None:
     """쿨다운 동안 소진 표시를 건다(살아 있으면 무동작). 정상→전환은 ERROR, 재시도 프로브의
     재429는 WARNING이다."""
-    global _grounding_quota_cooldown_until
-    if _grounding_quota_exhausted():
+    if _quota_exhausted(backend):
         return
-    log = logger.error if _grounding_quota_cooldown_until is None else logger.warning
-    _grounding_quota_cooldown_until = time.monotonic() + settings.web_grounding_quota_cooldown_s
+    log = logger.error if backend not in _quota_cooldown_until else logger.warning
+    _quota_cooldown_until[backend] = time.monotonic() + settings.web_grounding_quota_cooldown_s
     log(
-        f"web_search grounding quota exhausted → switched to perplexity "
+        f"web_search {backend} quota exhausted → switched to next backend "
         f"(retry every {settings.web_grounding_quota_cooldown_s:.0f}s)"
     )
+
+
+def _clear_quota_mark(backend: str) -> None:
+    """백엔드 호출 성공 = 전환 해제(표시가 있었을 때만 복귀 INFO 1회)."""
+    if _quota_cooldown_until.pop(backend, None) is not None:
+        logger.info(f"web_search {backend} recovered")
 
 
 # ── 웹 선제 실행(prefetch) ─────────────────────────────────────────────────────
@@ -245,8 +253,20 @@ async def _prefetch_hint_needs_web(message: str, settings: Settings) -> bool:
     return json.loads(response.text or "{}").get("needs_web") is True
 
 
+async def _primary_backend() -> str:
+    """웹 검색 주 백엔드 — owner 어드민 런타임 설정(model_settings.web_search_backend)이 있으면 그
+    값, 없으면 config. 읽기 실패는 current_models가 config로 접는다(요청을 실패시키지 않는다)."""
+    return (await current_models()).web_search_backend
+
+
 async def _prefetch_pipeline(message: str, settings: Settings) -> list[dict] | None:
-    """힌트 판정 → (필요 시) 그라운딩 서브콜. 서빙 불가 상태는 None(정상 경로 폴백)."""
+    """힌트 판정 → (필요 시) 그라운딩 서브콜. 서빙 불가 상태는 None(정상 경로 폴백).
+
+    주 백엔드가 그라운딩이 아니면 힌트도 부르지 않는다 — 서빙 표면이 없다(능력 기반). 판정이 이
+    task 안에 있는 이유: 주 백엔드는 런타임 설정(비동기 읽기)이고, 프리페치 시작은 동기 훅이다.
+    """
+    if await _primary_backend() != "grounding":
+        return None
     if not await _prefetch_hint_needs_web(message, settings):
         logger.info("web_search prefetch hint=no_web")
         return None
@@ -272,7 +292,7 @@ def start_web_prefetch(message: str, active: frozenset[str]) -> None:
     if "web" not in active:
         return
     settings = get_settings()
-    if not (settings.web_prefetch_enabled and settings.web_search_backend == "grounding"):
+    if not settings.web_prefetch_enabled:
         return
     message = message.strip()
     if not message:
@@ -426,11 +446,10 @@ async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
     — 그라운딩 종합은 확률적이라 같은 질의가 다음 시도에서 출처를 붙인다(영화 질의 실측:
     E2E 1회 empty → 직호출 3/3 성공). 4xx(ClientError)는 반복해도 같으므로 즉시 실패.
     그중 429(쿼터 소진)는 소진 표시를 남기고(예외는 그대로 올린다), 표시 중에는 서브콜 없이
-    즉시 실패한다 — 호출부는 다른 종단 실패와 똑같이 처리한다(퍼플렉시티 전환은 web_search).
+    즉시 실패한다 — 호출부는 다른 종단 실패와 똑같이 처리한다(백엔드 전환은 web_search).
     """
-    global _grounding_quota_cooldown_until
-    if _grounding_quota_exhausted():
-        raise _GroundingQuotaExhausted("grounding quota cooldown")
+    if _quota_exhausted("grounding"):
+        raise _QuotaExhausted("grounding quota cooldown")
     last_error: Exception | None = None
     raw_results: list[dict] = []
     for _ in range(settings.web_grounding_max_attempts):
@@ -461,7 +480,7 @@ async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
             last_error = exc
         except genai_errors.ClientError as exc:
             if exc.code == 429:
-                _mark_grounding_quota_exhausted(settings)
+                _mark_quota_exhausted("grounding", settings)
             last_error = exc
             break
         except Exception as exc:  # noqa: BLE001 — 비일시 오류: 재시도 없이 종단 실패로 올린다
@@ -469,9 +488,7 @@ async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
             break
     if last_error is not None:
         raise last_error
-    if _grounding_quota_cooldown_until is not None:  # 서브콜 성공 = 전환 해제
-        _grounding_quota_cooldown_until = None
-        logger.info("web_search grounding recovered → back from perplexity")
+    _clear_quota_mark("grounding")  # 서브콜 성공 = 전환 해제
     if raw_results:
         # 최종 URL·제목 보강(병렬·실패 무해, 요청 1회로 둘 다). 프리페치 파이프라인 안에서도
         # 실행되므로 대부분의 지연이 모델 사고 시간에 숨는다.
@@ -528,6 +545,24 @@ async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
                 kept["claims"] = list(dict.fromkeys(kept["claims"] + item["claims"]))
         raw_results = list(merged.values())
     return raw_results
+
+
+def _claims_snippet(claims: list[str], settings: Settings) -> tuple[list[str], str]:
+    """출처가 뒷받침한 서술들 → (서술별로 자른 서술, 그 출처의 snippet).
+
+    snippet은 **그 출처가 뒷받침한 서술들의 사영**이다. 다대다 관계를 출처별로 사영하면
+    공동 근거는 반드시 겹치지만, 이 필드는 공개 출처 DTO의 근거 본문이라 출처마다 자기
+    몫을 들고 있어야 한다(공개 DTO는 세션 레지스트리가 아니라 **이 도구 결과**에서
+    조립되고, QA 심사관은 source id별 snippet을 읽어 인용을 판정한다 — 여기서 빼면
+    웹 인용이 통째로 검증 불가가 된다. 2026-08-04 라이브 실측으로 확인).
+    총량도 같은 상한으로 자른다 — 클레임별 truncate만 있으면 클레임 수에 비례해
+    snippet이 자라 공개 DTO의 bounded-snippet 계약(상한 = 이 설정값)을 넘는다
+    (실측 최대 4,472자/28클레임 — 아직 안 터졌지만 결정론 지뢰라 커밋 전 봉합).
+    그라운딩·SearchApi 공용.
+    """
+    limit = settings.web_search_snippet_max_chars
+    clipped = [truncate(claim, limit) for claim in claims]
+    return clipped, truncate("\n".join(clipped), limit)
 
 
 async def _grounded_search(
@@ -592,18 +627,7 @@ async def _grounded_search(
     evidence: dict[str, list[int]] = {}
     # 출처 등록은 순차 루프(단일 state, source_id 유일·단조 — 기존 규약).
     for item in raw_results:
-        claims = [
-            truncate(claim, settings.web_search_snippet_max_chars) for claim in item["claims"]
-        ]
-        # snippet은 **그 출처가 뒷받침한 서술들의 사영**이다. 다대다 관계를 출처별로 사영하면
-        # 공동 근거는 반드시 겹치지만, 이 필드는 공개 출처 DTO의 근거 본문이라 출처마다 자기
-        # 몫을 들고 있어야 한다(공개 DTO는 세션 레지스트리가 아니라 **이 도구 결과**에서
-        # 조립되고, QA 심사관은 source id별 snippet을 읽어 인용을 판정한다 — 여기서 빼면
-        # 웹 인용이 통째로 검증 불가가 된다. 2026-08-04 라이브 실측으로 확인).
-        # 총량도 같은 상한으로 자른다 — 클레임별 truncate만 있으면 클레임 수에 비례해
-        # snippet이 자라 공개 DTO의 bounded-snippet 계약(상한 = 이 설정값)을 넘는다
-        # (실측 최대 4,472자/28클레임 — 아직 안 터졌지만 결정론 지뢰라 커밋 전 봉합).
-        snippet = truncate("\n".join(claims), settings.web_search_snippet_max_chars)
+        claims, snippet = _claims_snippet(item["claims"], settings)
         source_id = register_source(
             tool_context.state,
             title=item["title"],
@@ -713,6 +737,22 @@ async def aclose_shared_client() -> None:
         _shared_client = None
 
 
+def _record_request_usage(component: str, model: str) -> None:
+    """요청 단위 과금 검색 API의 usage_log 1행(토큰 0의 측정 행, 검색 1건).
+
+    2xx면 본문 검증 결과와 무관하게 요청 1건이 과금된다(4xx·5xx·전송 오류는 과금 없음 —
+    호출부가 raise_for_status 뒤에만 부른다). 퍼플렉시티·SearchApi 공용.
+    """
+    record_usage(
+        component,
+        genai_types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=0, candidates_token_count=0, total_token_count=0,
+            cached_content_token_count=0,
+        ),
+        model=model, search_queries=1,
+    )
+
+
 async def search_raw(
     query: str, settings: Settings, domain_filters: list[str] | None = None,
     *, max_results: int | None = None,
@@ -732,11 +772,14 @@ async def search_raw(
         }
     client = get_client(settings)
     headers = {"Authorization": f"Bearer {settings.perplexity_api_key}"}
+    # owner 어드민 런타임 값(model_settings.perplexity_search_type), 없거나 읽기 실패면 config.
+    search_type = (await current_models()).perplexity_search_type
     payload = {
         "query": query,
         "max_results": settings.web_search_max_results if max_results is None else max_results,
         "max_tokens_per_page": settings.web_search_max_tokens_per_page,
         "max_tokens": settings.web_search_max_tokens,
+        "search_type": search_type,
     }
     if domain_filters:
         payload["search_domain_filter"] = domain_filters
@@ -745,16 +788,10 @@ async def search_raw(
             settings.perplexity_search_url, json=payload, headers=headers
         )
         response.raise_for_status()
-        # 2xx면 본문 검증 결과와 무관하게 요청 1건이 과금된다(4xx·5xx·전송 오류는 과금 없음 —
-        # 위에서 예외로 빠져 기록하지 않는다). 토큰 과금이 없는 API라 토큰 0의 측정 행이다.
-        record_usage(
-            "web_perplexity",
-            genai_types.GenerateContentResponseUsageMetadata(
-                prompt_token_count=0, candidates_token_count=0, total_token_count=0,
-                cached_content_token_count=0,
-            ),
-            model=settings.perplexity_search_model, search_queries=1,
-        )
+        _record_request_usage("web_perplexity", (
+            settings.perplexity_search_fast_model if search_type == "fast"
+            else settings.perplexity_search_model
+        ))
         data = response.json()
         if not isinstance(data, dict):
             # 유효 JSON이지만 객체가 아닌 본문(배열·null·스칼라)이면 data.get()이
@@ -809,6 +846,139 @@ async def search_raw(
             "date": item.get("date"), "last_updated": item.get("last_updated"),
         })
     return {"query": query, "status": "ok", "raw": normalized, "raw_result_count": len(raw)}
+
+
+def _ai_mode_claims(
+    blocks: list, claims: dict[int, list[str]], inherited: list | None = None
+) -> None:
+    """AI 모드 text_blocks의 answer를 reference_indexes별 서술로 모은다(중첩 items 포함).
+
+    출처가 연결되지 않은 블록(머리말·맺음말)은 버린다: 그라운딩 분해와 같은 규칙으로, 벤더
+    종합문을 출처 없이 실으면 마커 세탁 경로가 된다. 목록의 refs(inherited)는 **자식이 하나도
+    자기 refs를 달지 않고 목록 refs가 정확히 1개인 목록**에만 자식의 출처가 된다 — 출처 하나에
+    목록 단위로 단 것이다(종가·시가·고가 목록, 실측 2026-10-30: 물려주지 않으면 숫자가 전부
+    빠진다). 목록 refs가 여럿이면 어느 항목이 어느 출처 몫인지 알 수 없어 물려주면 오귀속이다
+    (적대 검증 2026-10-30: 뉴스 목록 refs 4개 → 항목 2개가 출처 4개를 모두 받아 4/8 오귀속).
+    자식 일부가 refs를 달면 부모 refs는 자식 합집합이라 독립 근거가 아니고, 물려주면 출처 없는
+    자식 문장이 남의 출처를 얻는다(적대 검증 2026-10-29).
+    """
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        refs = block.get("reference_indexes") or inherited or []
+        answer = block.get("answer")
+        if isinstance(answer, str) and answer.strip():
+            for index in refs:
+                claims.setdefault(index, []).append(answer.strip())
+        items = block.get("items") or []
+        child_cited = any(
+            isinstance(item, dict) and item.get("reference_indexes") for item in items
+        )
+        _ai_mode_claims(items, claims, refs if not child_cited and len(refs) == 1 else None)
+
+
+def _ai_mode_to_raw(data: dict) -> list[dict]:
+    """AI 모드 응답 → 출처별 {url, title, claims} 원시 재료(서술이 실린 출처만, 링크 순서).
+
+    같은 링크가 여러 index로 오면 출처 하나로 합친다. goto 리다이렉트 링크는 풀지 않는다.
+    """
+    claims_by_index: dict[int, list[str]] = {}
+    _ai_mode_claims(data.get("text_blocks") or [], claims_by_index)
+    merged: dict[str, dict] = {}
+    for position, link in enumerate(data.get("reference_links") or []):
+        if not isinstance(link, dict):
+            continue
+        url = link.get("link")
+        claims = claims_by_index.get(link.get("index", position))
+        if not (isinstance(url, str) and claims and _url_in_domain_scope(url, [])):
+            continue
+        title = link.get("title")
+        if not (isinstance(title, str) and title.strip()):
+            title = url
+        item = merged.setdefault(url, {"url": url, "title": title, "claims": []})
+        item["claims"] = list(dict.fromkeys(item["claims"] + claims))  # 순서 보존 중복 제거
+    return list(merged.values())
+
+
+# SearchApi 엔진. 파서(_ai_mode_to_raw)가 이 엔진의 응답 형식(text_blocks·reference_links)
+# 전용이라 설정 레버가 아니다 — 다른 엔진이면 항상 empty_results가 된다. 바꾸지 말 것.
+_SEARCHAPI_ENGINE = "google_ai_mode"
+# SearchApi에 보내는 질의에서 뺄 site: 연산자 토큰(`site:x`, `-site:x`). AI 모드는 도메인 필터를
+# 지원하지 않아(domains 포함 필터를 무시하는 것과 같은 근거) 연산자가 질의만 망친다 — 10-30
+# 실측(site: 포함 실제 질의 16개): 원문 성공 11/16·중앙 12.3s → 제거 후 16/16·7.5s.
+_SITE_OPERATOR_RE = re.compile(r"(?<!\S)-?site:\S+", re.IGNORECASE)
+
+
+async def searchapi_raw(
+    query: str, settings: Settings, domain_filters: list[str] | None = None
+) -> dict:
+    """SearchApi(Google AI 모드) 요청 1건 → search_raw 모양의 원시 결과(출처별 claims).
+
+    결과 0건은 empty_results 오류다(빈 성공 위장 금지). 429는 쿨다운 표시를 걸고, 표시 중에는
+    요청하지 않고 즉시 실패한다(_quota_cooldown_until). domain_filters(정규화된 목록)는 제외
+    필터만 사후 적용하고, 포함 필터는 무시한 채 결과에 domains_ignored로 밝힌다(근거는 config
+    web_search_backend 주석).
+    """
+    # 로그·searches의 query는 모델이 보낸 원문 그대로(정직 표기), 제거 후 비면 원문을 보낸다.
+    sent = " ".join(_SITE_OPERATOR_RE.sub(" ", query).split()) or query
+
+    def fail(error_type: str, message: str, cause: str = "") -> dict:
+        detail = f" ({cause:.120})" if cause else ""
+        sent_note = f" sent={sent!r}" if sent != query else ""
+        logger.info(
+            f"web_search backend=searchapi query={query!r}{sent_note} results=0 status=error "
+            f"error_type={error_type}{detail}"
+        )
+        return {"query": query, "status": "error", "error_type": error_type, "message": message}
+
+    if not settings.searchapi_api_key:
+        return fail("not_configured", "웹 검색(SearchApi)이 설정되지 않았습니다")
+    if _quota_exhausted("searchapi"):
+        return fail("fetch", "웹 검색(SearchApi) 쿼터 쿨다운 중입니다", "quota cooldown")
+    client = get_client(settings)
+    try:
+        # wall-clock 시한 — httpx 타임아웃은 위상별이라 청크가 느리게 이어지면 총 지연을 못 막는다.
+        response = await asyncio.wait_for(
+            client.get(
+                settings.searchapi_base_url,
+                params={
+                    "engine": _SEARCHAPI_ENGINE, "q": sent,
+                    "gl": settings.searchapi_gl, "hl": settings.searchapi_hl,
+                },
+                headers={"Authorization": f"Bearer {settings.searchapi_api_key}"},
+                timeout=settings.searchapi_timeout_s,
+            ),
+            settings.searchapi_timeout_s,
+        )
+        if response.status_code == 429:
+            _mark_quota_exhausted("searchapi", settings)
+        response.raise_for_status()
+        _record_request_usage("web_searchapi", settings.searchapi_model)
+        _clear_quota_mark("searchapi")
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError(f"응답이 JSON 객체가 아닙니다: {type(data).__name__}")
+        if data.get("error"):
+            raise ValueError(f"응답 error: {data['error']}")
+        raw = _ai_mode_to_raw(data)
+        raw_result_count = len(data.get("reference_links") or [])
+    except Exception as exc:  # noqa: BLE001 — 도구 계약: 200의 이상 형식(타입·깊은 중첩)도 밖으로 던지지 않는다
+        discard_client_on_pool_timeout(exc, client, settings)
+        return fail("fetch", f"웹 검색 요청에 실패했습니다: {exc!r:.120}", repr(exc))
+    domain_filters = domain_filters or []
+    if domain_filters and domain_filters[0].startswith("-"):
+        raw = [item for item in raw if _url_in_domain_scope(item["url"], domain_filters)]
+    if not raw:
+        return fail("empty_results", "웹 검색 결과에 인용 가능한 출처가 없습니다")
+    outcome = {"query": query, "status": "ok", "raw": raw, "raw_result_count": raw_result_count}
+    if domain_filters and not domain_filters[0].startswith("-"):
+        outcome["domains_ignored"] = domain_filters
+    return outcome
+
+
+# 실패 전환 순서(제어 흐름 — config 값이 아니다). 실제 체인은 web_search_backend 위치부터 자른
+# 것이다: grounding → perplexity / searchapi → grounding → perplexity / perplexity 단독.
+_BACKEND_CHAIN = ("searchapi", "grounding", "perplexity")
 
 
 async def web_search(
@@ -869,24 +1039,51 @@ async def web_search(
             "result_count": 0,
         }
 
-    # 백엔드 라우팅(config web_search_backend): 그라운딩이 기본. 도메인 필터는 그라운딩에
-    # 구조적 필터가 없어 원시(퍼플렉시티) 경로로 처리한다 — 능력 기반 라우팅(콘텐츠 분기 아님).
-    # 그라운딩이 실패하면(쿼터 소진 표시 중의 즉시 실패 포함 — _grounding_raw_results) 그 호출만
-    # 퍼플렉시티로 다시 처리한다(2026-10-19 상용 429 장애). 퍼플렉시티 키가 없으면 전환할 곳이
-    # 없으므로 그라운딩 결과(오류 포함)를 그대로 돌려준다 — 키 유무가 곧 전환 가용성이다.
+    # 백엔드 체인(_BACKEND_CHAIN을 주 백엔드 — 런타임 설정 > config — 부터 자른 것): 앞에서부터
+    # 시도해 첫 성공을 돌려준다(2026-10-19 상용 429 장애의 그라운딩 → 퍼플렉시티 전환을 일반화).
+    # 건너뛰는 경우는
+    # 둘이다. ① domains 지정 호출의 그라운딩: 구조적 필터가 없다 — 능력 기반 라우팅(콘텐츠 분기
+    # 아님). SearchApi도 필터를 지키지 않지만 domains를 무시하고 받는다(config 근거 주석). ② 전환
+    # 대상인데 키가 없는 백엔드: 전환할 곳이 없으므로 앞 백엔드의 오류를 그대로 돌려준다 — 키
+    # 유무가 곧 전환 가용성이다. 첫 시도는 키가 없어도 실행해 not_configured를 정직하게 돌려준다.
+    # 쿼터 소진 쿨다운은 각 백엔드 입구가 즉시 실패로 처리한다.
+    runners = {
+        "searchapi": lambda: _raw_search(
+            planned, tool_context, settings, lambda q: searchapi_raw(q, settings, domain_filters),
+            backend="searchapi", dropped=len(dropped_queries),
+        ),
+        "grounding": lambda: _grounded_search(planned, tool_context, settings),
+        "perplexity": lambda: _raw_search(
+            planned, tool_context, settings, lambda q: search_raw(q, settings, domain_filters),
+            backend="perplexity", dropped=len(dropped_queries),
+        ),
+    }
+    chain = _BACKEND_CHAIN[_BACKEND_CHAIN.index(await _primary_backend()):]
     outcome: dict | None = None
-    if settings.web_search_backend == "grounding" and not domain_filters:
-        outcome = await _grounded_search(planned, tool_context, settings)
-        if outcome["status"] != "ok" and settings.perplexity_api_key:
+    failed: list[dict] = []  # 전환 전에 실패한 백엔드
+    for name in chain:
+        if name == "grounding" and domain_filters:
+            continue
+        if outcome is not None:
+            if not web_backend_configured(settings, name):
+                continue
             logger.info(
-                f"web_search backend=grounding fallback=perplexity "
-                f"reason={outcome['error_type']}"
+                f"web_search backend={failed[-1]['backend']} fallback={name} "
+                f"reason={failed[-1]['error_type']}"
             )
-            outcome = None
-    if outcome is None:
-        outcome = await _perplexity_search(
-            planned, domain_filters, tool_context, settings, dropped=len(dropped_queries)
+        outcome = await runners[name]()
+        if outcome["status"] == "ok":
+            if failed:
+                # 전환이 일어난 호출만 searches에 백엔드를 밝힌다(실패한 앞 백엔드 + 처리한 백엔드).
+                outcome["searches"] = failed + [
+                    {**entry, "backend": name} for entry in outcome["searches"]
+                ]
+            break
+        failed.append(
+            {**angle_error_summary(" | ".join(planned), outcome["error_type"]), "backend": name}
         )
+    if outcome["status"] != "ok" and len(failed) > 1:
+        outcome["searches"] = failed
 
     if dropped_queries and outcome["status"] == "ok":
         # 상한 초과 각도를 조용히 버리지 않는다(fail-loud) — 두 경로 공통 규약(가법 필드:
@@ -899,89 +1096,104 @@ async def web_search(
     return outcome
 
 
-async def _perplexity_search(
+async def _raw_search(
     planned: list[str],
-    domain_filters: list[str],
     tool_context: ToolContext,
     settings: Settings,
+    provider: Callable[[str], Awaitable[dict]],
     *,
+    backend: str,
     dropped: int,
 ) -> dict:
-    """퍼플렉시티 /search 원시 경로 — 각도별 병렬 검색 후 출처를 순차 등록해 도구 결과를 조립한다.
+    """원시 검색 경로 — 각도별 병렬 검색 후 출처를 순차 등록해 도구 결과를 조립한다.
 
-    도메인 필터 지정·`web_search_backend="perplexity"`·그라운딩 실패 전환이 모두 이 함수를
-    부른다(경로 하나). dropped는 로그용 카운트이고, dropped_* 필드는 호출부가 붙인다.
+    provider는 질의 하나를 받아 search_raw 모양({query,status,raw,raw_result_count})을 돌려주는
+    벤더 함수다(퍼플렉시티 search_raw·SearchApi searchapi_raw). 원시 결과가 claims를 들고
+    오면(SearchApi) 그라운딩과 같은 evidence 계약(서술 → 뒷받침한 source_ids, 서술당 1항목)과
+    서술 사영 snippet을 따르고, claims가 없는 백엔드(퍼플렉시티)는 결과에 evidence 키가 없다.
+    dropped는 로그용 카운트이고, dropped_* 필드는 호출부가 붙인다.
     """
-    searched = await asyncio.gather(
-        *(search_raw(q, settings, domain_filters) for q in planned)
-    )
+    searched = await asyncio.gather(*(provider(q) for q in planned))
 
     checked_at = now_checked_at()
 
-    results: list[dict] = []
-    url_to_index: dict[str, int] = {}  # url → results 인덱스(각도 간 중복제거·교차확증 병합용)
+    # 1단계: url별로 모은다(각도 간 중복제거·교차확증 병합). 같은 url이 여러 각도에서 걸리면
+    # 출처 하나에 어느 각도에서 나왔는지(queries)와 서술(claims)을 합친다.
+    merged: dict[str, dict] = {}
     searches: list[dict] = []  # 각도별 성공/실패 요약(부분 실패 fail-loud)
     for outcome in searched:
         query = outcome["query"]
         if outcome["status"] == "error":
             searches.append(angle_error_summary(query, outcome["error_type"]))
             continue
-        matched = 0
         for item in outcome["raw"]:
-            url = item["url"]
-            snippet = item["snippet"]
-            matched += 1
-            existing = url_to_index.get(url)
-            if existing is not None:
-                # 같은 url이 다른 각도에서도 걸렸다 — 재등록하지 않고 어느 각도에서 나왔는지만
-                # 합쳐 교차 확증 신호로 남긴다(source_id 중복 방지).
-                if query not in results[existing]["queries"]:
-                    results[existing]["queries"].append(query)
+            kept = merged.get(item["url"])
+            if kept is None:
+                merged[item["url"]] = {**item, "queries": [query]}
                 continue
-            title = item["title"]
-            published_at = item.get("date")
-            last_updated = item.get("last_updated")
-            source_id = register_source(
-                tool_context.state,
-                title=title,
-                url=url,
-                source_type="web",
-                snippet=snippet,
-                checked_at=checked_at,
-                meta={"published_at": published_at, "last_updated": last_updated},
-                invocation_id=getattr(tool_context, "invocation_id", None),
-            )
-            url_to_index[url] = len(results)
-            results.append(
-                {
-                    "source_id": source_id,
-                    # 퍼플렉시티 원시 경로도 복사용 마커 동봉 — 그라운딩 경로와 같은 계약
-                    # (인용 가능한 결과는 모두 자기 마커를 들고 온다). 감사 지적 갭 봉합.
-                    "cite_as": cite_marker(source_id),
-                    "type": "web",
-                    "title": title,
-                    "url": url,
-                    "snippet": snippet,
-                    "checked_at": checked_at,
-                    "published_at": published_at,
-                    "last_updated": last_updated,
-                    "queries": [query],
-                }
-            )
+            if query not in kept["queries"]:
+                kept["queries"].append(query)
+            if "claims" in item:
+                kept["claims"] = list(dict.fromkeys(kept["claims"] + item["claims"]))
         searches.append(
             {
                 "query": query,
                 "status": "ok",
-                "result_count": matched,
+                "result_count": len(outcome["raw"]),
                 "raw_result_count": outcome["raw_result_count"],
+                # 무시한 포함 필터(SearchApi) — 가법 필드, 정직 표기.
+                **({"domains_ignored": outcome["domains_ignored"]}
+                   if "domains_ignored" in outcome else {}),
             }
         )
 
+    # 2단계: 출처 등록은 순차 루프(단일 state, source_id 유일·단조 — 기존 규약).
+    results: list[dict] = []
+    evidence: dict[str, list[int]] = {}
+    for item in merged.values():
+        claims: list[str] = []
+        snippet = item.get("snippet")
+        if "claims" in item:
+            claims, snippet = _claims_snippet(item["claims"], settings)
+        published_at = item.get("date")
+        last_updated = item.get("last_updated")
+        source_id = register_source(
+            tool_context.state,
+            title=item["title"],
+            url=item["url"],
+            source_type="web",
+            snippet=snippet,
+            checked_at=checked_at,
+            meta={"published_at": published_at, "last_updated": last_updated},
+            invocation_id=getattr(tool_context, "invocation_id", None),
+        )
+        results.append(
+            {
+                "source_id": source_id,
+                # 원시 경로도 복사용 마커 동봉 — 그라운딩 경로와 같은 계약
+                # (인용 가능한 결과는 모두 자기 마커를 들고 온다). 감사 지적 갭 봉합.
+                "cite_as": cite_marker(source_id),
+                "type": "web",
+                "title": item["title"],
+                "url": item["url"],
+                "snippet": snippet,
+                "checked_at": checked_at,
+                "published_at": published_at,
+                "last_updated": last_updated,
+                "queries": item["queries"],
+            }
+        )
+        for claim in claims:
+            evidence.setdefault(claim, []).append(source_id)
+
+    # 퍼플렉시티 줄은 접두를 바꾸지 않는다 — 운영 감시기가 "web_search queries="를 퍼플렉시티
+    # 요청 수로 합산한다(ops/monitor config perplexity_requests).
+    label = "web_search" if backend == "perplexity" else f"web_search backend={backend}"
     ok_count = sum(1 for s in searches if s["status"] == "ok")
     if ok_count == 0:
         # 모든 각도가 실패 — 단일 각도 실패의 기존 계약(status=error·error_type=fetch·
         # result_count=0)을 그대로 유지해, 에이전트가 "못 찾음"이 아니라 일시 오류로 처리하게 한다.
-        logger.info(f"web_search queries={len(planned)} status=error error_type=fetch")
+        logger.info(f"{label} queries={len(planned)} status=error error_type=fetch")
         return {
             "status": "error",
             "error_type": searched[0]["error_type"],
@@ -990,7 +1202,7 @@ async def _perplexity_search(
         }
 
     logger.info(
-        f"web_search queries={len(planned)} angles_ok={ok_count} results={len(results)} "
+        f"{label} queries={len(planned)} angles_ok={ok_count} results={len(results)} "
         f"dropped={dropped}"
     )
     response = {
@@ -1001,4 +1213,6 @@ async def _perplexity_search(
         "checked_at": checked_at,
         "result_count": len(results),
     }
+    if evidence:
+        response["evidence"] = [{"text": text, "source_ids": ids} for text, ids in evidence.items()]
     return response

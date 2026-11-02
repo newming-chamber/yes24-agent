@@ -8,7 +8,7 @@
   config 값으로 돈다(요청을 실패시키지 않는다 — WARNING만).
 - **폴백**: 메인 모델이 첫 진행·본문 프레임 전에 벤더 일시 오류로 실패하면 같은 턴을 폴백 모델로
   한 번 다시 돈다. 429면 쿨다운 동안 메인을 건너뛴다(웹검색 그라운딩 쿨다운과 같은 모양 —
-  web_search._mark_grounding_quota_exhausted).
+  web_search._mark_quota_exhausted).
 - **호출 재시도**(CallRetry): 그보다 먼저, 실패한 LLM 요청 한 번만 같은 모델로 짧게 다시 부른다.
   턴 중간(도구 라운드 뒤) 503도 살린다 — 턴 재실행이 아니라 SSE 프레임에 닿지 않는다.
 
@@ -29,7 +29,7 @@ from collections.abc import AsyncGenerator, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, get_args
 
 import httpx
 from google.genai.errors import APIError
@@ -50,7 +50,15 @@ AUDIT_TARGET = "model"
 # model_settings는 행이 하나다(DDL scripts/model_routing.sql이 id=1을 심는다).
 SETTINGS_ROW_ID = 1
 SETTINGS_COLUMNS = (
-    "default_model", "fallback_model", "service_tiers", "reasoning_efforts", "prompt_versions"
+    "default_model", "fallback_model", "service_tiers", "reasoning_efforts", "prompt_versions",
+    "web_search_backend", "perplexity_search_type",
+)
+# 웹 검색 런타임 레버의 허용 값 — config Literal이 정본이다(목록을 따로 두지 않는다).
+WEB_SEARCH_BACKENDS: tuple[str, ...] = get_args(
+    Settings.model_fields["web_search_backend"].annotation
+)
+PERPLEXITY_SEARCH_TYPES: tuple[str, ...] = get_args(
+    Settings.model_fields["perplexity_search_type"].annotation
 )
 # 모델별 맵 열({모델: 값}, 정본 직렬화 JSON 문자열) → (config 기본 맵 필드, 허용 값 필드).
 # 처리 등급·사고 강도·프롬프트 버전 바인딩이 같은 기계(저장·단일 판정·병합·감사·TTL 캐시)를 쓴다.
@@ -216,6 +224,13 @@ class ModelChoice:
     runtime_efforts: dict[str, str] = field(default_factory=dict)
     # {모델 | ANY_MODEL: 프롬프트 버전 id} — 런타임 전용(config 몫 없음), 없는 모델은 코드 프롬프트.
     prompt_versions: dict[str, int] = field(default_factory=dict)
+    # 웹 검색 주 백엔드(web_search 체인의 출발점). 모델 축은 아니지만 owner가 재시작 없이 바꾸는
+    # 런타임 레버라 같은 행·같은 기계(저장 판정·감사·TTL 캐시)를 쓴다.
+    web_search_backend: str = "grounding"
+    web_search_backend_source: str = "config"
+    # 퍼플렉시티 /search search_type(같은 행·같은 기계).
+    perplexity_search_type: str = "fast"
+    perplexity_search_type_source: str = "config"
 
 
 def prompt_version_for(bindings: dict[str, int | None], model: str) -> int | None:
@@ -257,6 +272,20 @@ def encode_model_map(values: dict[str, str]) -> str | None:
     return json.dumps(dict(sorted(values.items())), ensure_ascii=False, separators=(",", ":"))
 
 
+# 별도 키가 필요한 웹 검색 백엔드 → 그 키의 config 필드. 여기 없는 값(grounding)은 Gemini 키를
+# 공유해 항상 가용이다. 키 집합은 WEB_SEARCH_BACKENDS의 부분집합이다(테스트 가드).
+WEB_BACKEND_KEY_FIELDS = {"searchapi": "searchapi_api_key", "perplexity": "perplexity_api_key"}
+
+
+def web_backend_configured(settings: Settings, backend: str) -> bool:
+    """웹 검색 백엔드를 부를 수 있는가 — 키 유무가 곧 가용성이다.
+
+    주 백엔드 저장·서빙 판정(storable_setting)과 실패 전환 대상 판정(web_search 체인)이 같이 쓴다.
+    """
+    field_name = WEB_BACKEND_KEY_FIELDS.get(backend)
+    return field_name is None or bool(getattr(settings, field_name))
+
+
 def storable_setting(settings: Settings, column: str, value: Any) -> bool:
     """model_settings 열에 둘 수 있는 값인가 — 저장(어드민 검증)·서빙(effective_choice) 단일 판정.
 
@@ -264,8 +293,15 @@ def storable_setting(settings: Settings, column: str, value: Any) -> bool:
     - service_tiers·reasoning_efforts: {per_model_targets(열) 모델: 그 열의 허용 값} 맵.
     - prompt_versions: {선택 가능 모델 | ANY_MODEL: 양의 정수 버전 id} 맵. 버전의 존재·폐기·모델
       일치·승격 게이트는 DB 판정이라 어드민 라우트가 같은 트랜잭션에서 더한다(admin_prompts).
+    - web_search_backend: config Literal의 값 중 키가 있는 백엔드(키 없는 주 백엔드는 매 호출
+      not_configured다 — 배포에서 키가 빠지면 서빙도 config로 돌아간다).
+    - perplexity_search_type: config Literal의 값.
     NULL(config 따름)은 호출부가 먼저 거른다.
     """
+    if column == "web_search_backend":
+        return value in WEB_SEARCH_BACKENDS and web_backend_configured(settings, value)
+    if column == "perplexity_search_type":
+        return value in PERPLEXITY_SEARCH_TYPES
     if column == "prompt_versions":
         models = (ANY_MODEL, *settings.selectable_models.values())
         return isinstance(value, dict) and all(
@@ -302,6 +338,10 @@ def effective_choice(settings: Settings, row: dict[str, Any] | None) -> ModelCho
 
     default, default_source = pick("default_model", settings.model_name)
     fallback, fallback_source = pick("fallback_model", settings.fallback_model)
+    backend, backend_source = pick("web_search_backend", settings.web_search_backend)
+    search_type, search_type_source = pick(
+        "perplexity_search_type", settings.perplexity_search_type
+    )
     tiers, runtime_tiers = _per_model(settings, row, "service_tiers")
     efforts, runtime_efforts = _per_model(settings, row, "reasoning_efforts")
     versions, _runtime_versions = _per_model(settings, row, "prompt_versions")
@@ -315,6 +355,10 @@ def effective_choice(settings: Settings, row: dict[str, Any] | None) -> ModelCho
         reasoning_efforts=efforts,
         runtime_efforts=runtime_efforts,
         prompt_versions=versions,
+        web_search_backend=backend,
+        web_search_backend_source=backend_source,
+        perplexity_search_type=search_type,
+        perplexity_search_type_source=search_type_source,
     )
 
 

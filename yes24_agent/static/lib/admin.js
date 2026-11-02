@@ -1662,10 +1662,10 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
     username: '계정명', role: '역할', is_active: '활성', note: '메모', text: '문장', pinned: '고정', active: '노출 설정', valid_from: '노출 시작일', valid_until: '노출 종료일',
     slot: '분야', status: '결과', inserted: '추가 수', force: '다시 생성', user_id: '회원번호', turns: '질의 수', deleted_at: '삭제 요청 시각', app_name: '앱',
     event_key: '이벤트명', starts_on: '시작일', ends_on: '종료일', goods_tic_no_masked: '상품권번호',
-    default_model: '기본 모델', fallback_model: '폴백 모델', service_tiers: '처리 등급', reasoning_efforts: '사고 강도',
+    default_model: '기본 모델', fallback_model: '폴백 모델', service_tiers: '처리 등급', reasoning_efforts: '사고 강도', web_search_backend: '웹 검색 백엔드', perplexity_search_type: '퍼플렉시티 검색 방식',
   };
   // 모델 설정 값: null = 설정 파일 기본값 따름, '' = 폴백 끔(서버 model_settings 규칙).
-  const MODEL_FIELDS = new Set(['default_model', 'fallback_model', 'service_tiers', 'reasoning_efforts']);
+  const MODEL_FIELDS = new Set(['default_model', 'fallback_model', 'service_tiers', 'reasoning_efforts', 'web_search_backend', 'perplexity_search_type']);
   /** 처리 등급 표기 — ''는 표준(서버 litellm_service_tier_options의 빈 값). */
   const tierLabel = (tier) => tier || '표준';
   /** 저장된 등급 맵(정본 직렬화 문자열) → '모델 등급 · …'. 깨진 값은 원문 그대로. */
@@ -1743,21 +1743,21 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       const priceOf = (model, tier) => data.prices.find((row) => row.model === model && row.service_tier === tier && row.in_effect);
       const priceText = (row) => (row ? `입력 ${usd(row.input_usd_per_mtok)} · 출력 ${usd(row.output_usd_per_mtok)} /1M 토큰` : '단가 미등록');
       // 설정 폼 — 바뀐 칸만 보낸다(expected = 화면이 본 저장 행, 다른 관리자가 먼저 바꿨으면 409).
-      const stored = data.stored ?? { default_model: null, fallback_model: null, service_tiers: null, reasoning_efforts: null };
+      const stored = data.stored ?? {};
       const form = el('form', 'manage-form');
-      const select = (field, label, configured, offAllowed) => {
+      /** 단일 값 칸 — choices는 [표기, 값] 목록(서버가 고를 수 있다고 준 값만). */
+      const select = (field, label, configuredText, choices) => {
         const box = el('select');
-        box.append(new Option(`설정 파일 기본값 — ${modelName(configured)}`, CONFIG_CHOICE));
-        if (offAllowed) box.append(new Option('끔', ''));
-        for (const [name, id] of Object.entries(data.selectable)) box.append(new Option(`${name} (${id})`, id));
-        // 저장값이 지금 목록에 없으면(배포가 모델을 뺐다 — 서빙은 이미 무시 중) 'config 따름'으로 보이고
+        box.append(new Option(`설정 파일 기본값 — ${configuredText}`, CONFIG_CHOICE));
+        for (const [text, value] of choices) box.append(new Option(text, value));
+        // 저장값이 지금 목록에 없으면(배포가 모델·키를 뺐다 — 서빙은 이미 무시 중) 'config 따름'으로 보이고
         // 알린다. 그대로 두면 빈 칸이 선택돼 저장 시 ''가 날아가 사유 없는 422가 난다.
         const known = stored[field] == null || [...box.options].some((option) => option.value === stored[field]);
         box.value = known ? stored[field] ?? CONFIG_CHOICE : CONFIG_CHOICE;
         box.name = field;
         const wrap = el('label', null, label);
         wrap.append(box);
-        if (!known) wrap.append(el('small', 'error', `저장된 값 ${stored[field]}은(는) 지금 선택할 수 없는 모델이라 무시되고 있습니다 — 저장하면 설정 파일 기본값으로 바뀝니다.`));
+        if (!known) wrap.append(el('small', 'error', `저장된 값 ${stored[field]}은(는) 지금 선택할 수 없는 값이라 무시되고 있습니다 — 저장하면 설정 파일 기본값으로 바뀝니다.`));
         return wrap;
       };
       // 모델별 맵(처리 등급·사고 강도) — 서버가 열마다 고른 모델 목록(등급은 OpenAI, 강도는 OpenAI·Claude). 같은 모델
@@ -1782,10 +1782,17 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       const mapBoxes = MAPS.map((spec) => spec.entries.map((entry) => mapSelect(spec, entry)));
       const save = el('button', 'primary', '저장');
       save.type = 'submit';
+      const modelChoices = Object.entries(data.selectable).map(([name, id]) => [`${name} (${id})`, id]);
+      const web = data.web_search_backend;
+      const searchType = data.perplexity_search_type;
+      // 단일 값 칸(select) — 저장 비교·expected가 같은 목록을 돈다.
+      const SCALARS = ['default_model', 'fallback_model', 'web_search_backend', 'perplexity_search_type'];
       form.append(
-        select('default_model', '기본 모델', data.config.default_model, false),
-        select('fallback_model', '폴백 모델(메인 모델이 첫 응답 전에 429·5xx·타임아웃으로 실패하면 이 모델로 다시 답한다)', data.config.fallback_model, true),
+        select('default_model', '기본 모델', modelName(data.config.default_model), modelChoices),
+        select('fallback_model', '폴백 모델(메인 모델이 첫 응답 전에 429·5xx·타임아웃으로 실패하면 이 모델로 다시 답한다)', modelName(data.config.fallback_model), [['끔', ''], ...modelChoices]),
         ...mapBoxes.flat(),
+        select('web_search_backend', '웹 검색 백엔드(주 백엔드. 실패하면 다음 백엔드(최종 퍼플렉시티)로 넘어간다. 키가 없는 백엔드는 고를 수 없다)', web.config, web.options.map((value) => [value, value])),
+        select('perplexity_search_type', '퍼플렉시티 검색 방식(fast: 저지연·1/5 단가(기본). web: 종전 방식(되돌리기용).)', searchType.config, searchType.options.map((value) => [value, value])),
         save,
       );
       /** 맵 비교용 정렬 표기(서버 정본 직렬화와 같은 키 순서). */
@@ -1793,7 +1800,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
       form.onsubmit = async (event) => {
         event.preventDefault();
         const changes = {};
-        for (const field of ['default_model', 'fallback_model']) {
+        for (const field of SCALARS) {
           const value = form.elements[field].value === CONFIG_CHOICE ? null : form.elements[field].value;
           if (value !== (stored[field] ?? null)) changes[field] = value;
         }
@@ -1804,7 +1811,7 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
         });
         if (!Object.keys(changes).length) { showToast('바뀐 설정이 없습니다.'); return; }
         save.disabled = true;
-        const expected = Object.fromEntries(['default_model', 'fallback_model', ...MAPS.map((spec) => spec.column)].map((key) => [key, stored[key] ?? null]));
+        const expected = Object.fromEntries([...SCALARS, ...MAPS.map((spec) => spec.column)].map((key) => [key, stored[key] ?? null]));
         try {
           await api('/admin/models', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ changes, expected }) });
           showToast(`저장했습니다. 다른 서버는 ${num(data.settings_ttl_s)}초 안에 따라옵니다.`);
@@ -1818,6 +1825,8 @@ import { coverUrl, formatPrice, isSafeUrl, makeCoverImg, sourceCardType, sourceD
         { label: '기본 모델', value: modelName(data.default.model), source: MODEL_SOURCES[data.default.source] },
         { label: '폴백 모델', value: modelName(data.fallback.model), source: MODEL_SOURCES[data.fallback.source] },
         ...MAPS.flatMap((spec) => spec.entries.map((entry) => ({ label: `${spec.title} · ${names[entry.model] ?? entry.model}`, value: spec.label(entry[spec.value]), source: MODEL_SOURCES[entry.source] }))),
+        { label: '웹 검색 백엔드', value: web.value, source: MODEL_SOURCES[web.source] },
+        { label: '퍼플렉시티 검색 방식', value: searchType.value, source: MODEL_SOURCES[searchType.source] },
       ]);
       const settingsCard = analysisCard('답변 모델 설정', current, `대화 화면에서 모델을 직접 고른 질의는 폴백하지 않습니다. 처리 등급은 OpenAI 경로 모델에만, 사고 강도는 OpenAI·Claude 경로 모델에 있습니다(Gemini는 사고량을 스스로 정한다). 저장하면 이 서버는 바로, 다른 서버는 ${num(data.settings_ttl_s)}초 안에 반영됩니다.`);
       settingsCard.append(form);

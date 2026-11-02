@@ -97,3 +97,38 @@ SET @ddl := IF(
 PREPARE usage_log_effort_ddl FROM @ddl;
 EXECUTE usage_log_effort_ddl;
 DEALLOCATE PREPARE usage_log_effort_ddl;
+
+-- 5) 웹 검색 주 백엔드(2026-11-02 추가 — 다시 적용하면 이 열만 붙는다).
+--    model_settings.web_search_backend: config web_search_backend Literal 값 중 하나(grounding·perplexity·
+--    searchapi). NULL = config 따름. 값 검증(허용 값·키 유무)은 앱이 한다(model_routing.storable_setting).
+--    뷰 의존 없음(operational_views.sql은 model_settings를 읽지 않는다).
+--    순서: 이 DDL → 코드 배포. verify_schema가 이 열을 요구해 열 없이 새 코드는 기동하지 않는다 — 기동을
+--    막지 않으면 설정 SELECT가 매번 실패해 기본·폴백 모델까지 전부 config로 조용히 돌아간다.
+SET @has_web_backend := (
+    SELECT COUNT(*) FROM information_schema.columns
+    WHERE table_schema = DATABASE() AND table_name = 'model_settings' AND column_name = 'web_search_backend'
+);
+SET @ddl := IF(
+    @has_web_backend = 0,
+    'ALTER TABLE model_settings ADD COLUMN web_search_backend VARCHAR(32) NULL, ALGORITHM=INSTANT',
+    'SELECT 1'
+);
+PREPARE model_settings_web_backend_ddl FROM @ddl;
+EXECUTE model_settings_web_backend_ddl;
+DEALLOCATE PREPARE model_settings_web_backend_ddl;
+
+-- 5 이어서) 퍼플렉시티 /search search_type(2026-11-02 추가 — 같은 런타임 레버 묶음, 이 열만 붙는다).
+--    model_settings.perplexity_search_type: config perplexity_search_type Literal 값 중 하나(web·fast).
+--    NULL = config 따름(fast). 값 검증은 앱이 한다(model_routing.storable_setting). 순서·verify_schema는 위와 같다.
+SET @has_search_type := (
+    SELECT COUNT(*) FROM information_schema.columns
+    WHERE table_schema = DATABASE() AND table_name = 'model_settings' AND column_name = 'perplexity_search_type'
+);
+SET @ddl := IF(
+    @has_search_type = 0,
+    'ALTER TABLE model_settings ADD COLUMN perplexity_search_type VARCHAR(16) NULL, ALGORITHM=INSTANT',
+    'SELECT 1'
+);
+PREPARE model_settings_search_type_ddl FROM @ddl;
+EXECUTE model_settings_search_type_ddl;
+DEALLOCATE PREPARE model_settings_search_type_ddl;

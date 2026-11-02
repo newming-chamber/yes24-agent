@@ -1173,9 +1173,14 @@ class ModelSettingsChanges(EditChanges):
     service_tiers: dict[str, str] | None = None
     reasoning_efforts: dict[str, str] | None = None
     prompt_versions: dict[str, int] | None = None
+    # 웹 검색 주 백엔드(config Literal 값 중 키가 있는 것 — storable_setting).
+    web_search_backend: str | None = None
+    # 퍼플렉시티 /search search_type(config Literal 값 — storable_setting).
+    perplexity_search_type: str | None = None
 
     @field_validator(
-        "default_model", "fallback_model", "service_tiers", "reasoning_efforts", "prompt_versions"
+        "default_model", "fallback_model", "service_tiers", "reasoning_efforts", "prompt_versions",
+        "web_search_backend", "perplexity_search_type",
     )
     @classmethod
     def _storable(cls, value, info: ValidationInfo):
@@ -1198,6 +1203,8 @@ class _ModelSettingsExpected(BaseModel):
     service_tiers: str | None = None
     reasoning_efforts: str | None = None
     prompt_versions: str | None = None
+    web_search_backend: str | None = None
+    perplexity_search_type: str | None = None
 
 
 class ModelSettingsEdit(EditBody):
@@ -1464,9 +1471,10 @@ def register_admin(app: FastAPI, settings: Settings, connect=aiomysql.connect) -
     async def admin_update_models(
         body: ModelSettingsEdit, request: Request, actor: AdminActor = Depends(require_owner)
     ) -> dict[str, Any]:
-        """런타임 기본·폴백 모델·모델별 처리 등급·사고 강도·프롬프트 버전 변경(owner 전용, 변경·감사
-        한 트랜잭션). 프롬프트 버전 바인딩은 같은 트랜잭션에서 승격 게이트(첫 승격 = 사유 메모
-        필수)를 지난다(admin_prompts) — 응답의 warnings는 거부가 아닌 경고(base_hash 불일치)다.
+        """런타임 기본·폴백 모델·모델별 처리 등급·사고 강도·프롬프트 버전·웹 검색 주 백엔드 변경
+        (owner 전용, 변경·감사 한 트랜잭션). 프롬프트 버전 바인딩은 같은 트랜잭션에서 승격
+        게이트(첫 승격 = 사유 메모 필수)를 지난다(admin_prompts) — 응답의 warnings는 거부가
+        아닌 경고(base_hash 불일치)다.
 
         이 인스턴스는 곧바로, 다른 서버·컨테이너는 model_settings_ttl_s 안에 따라온다.
         """
