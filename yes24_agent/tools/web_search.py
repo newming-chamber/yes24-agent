@@ -134,6 +134,15 @@ def _url_in_domain_scope(url: str, domain_filters: list[str]) -> bool:
 # 서로 다른 인증(퍼플렉시티 Bearer 헤더 vs Tavily 바디 api_key)을 쓰므로, 클라이언트에는
 # 기본 인증 헤더를 두지 않고 각 요청에서 헤더를 넘겨 키가 다른 API로 새지 않게 한다.
 _shared_client: httpx.AsyncClient | None = None
+# PoolTimeout으로 교체된 옛 공유 클라이언트를 유예 뒤 닫는 태스크(참조 유지·셧다운 정리용).
+# 참조만 버리면 갇힌 연결의 소켓이 순환 GC 시점까지 남는다(실측).
+_retire_tasks: set[asyncio.Task] = set()
+
+
+@lru_cache(maxsize=1)
+def _title_ssl_context():
+    """제목 보강 묶음 클라이언트용 SSL context(1회 생성) — 묶음마다 만들면 루프가 ~6ms 막힌다."""
+    return httpx.create_ssl_context()
 
 
 @lru_cache(maxsize=1)
@@ -364,7 +373,9 @@ def _grounding_prompt(questions: list[str]) -> str:
     )
 
 
-async def _fetch_page_meta(url: str, settings: Settings) -> tuple[str | None, str | None]:
+async def _fetch_page_meta(
+    url: str, settings: Settings, client: httpx.AsyncClient
+) -> tuple[str | None, str | None]:
     """리다이렉트를 따라가 **최종 URL과 페이지 <title>**을 가볍게 긁어온다(실패 무해).
 
     그라운딩 API가 청크마다 주는 값은 `uri`(불투명 리다이렉트)와 `title`(발행처 도메인)
@@ -379,12 +390,8 @@ async def _fetch_page_meta(url: str, settings: Settings) -> tuple[str | None, st
     유지한다. 인용 근거가 아니라 순수 표시 메타다.
     """
     try:
-        client = get_client(settings)
         buf = b""
-        async with client.stream(
-            "GET", url, follow_redirects=True,
-            timeout=settings.web_title_fetch_timeout_s,
-        ) as response:
+        async with client.stream("GET", url) as response:
             if response.status_code != 200:
                 return None, None
             final_url = str(response.url)
@@ -476,15 +483,34 @@ async def _grounding_raw_results(prompt: str, settings: Settings) -> list[dict]:
         # 서버에서는 총 지연을 못 막는다 — 예산은 그 꼬리를 처음으로 진짜 벽에 가둔다.
         # 시한 내 끝난 것만 반영하고 나머지는 취소해 리다이렉트 URL·도메인 표기를 그대로
         # 둔다(개별 실패 폴백과 같은 형태라 경로가 갈라지지 않는다).
-        tasks = [
-            asyncio.ensure_future(_fetch_page_meta(item["url"], settings))
-            for item in raw_results
-        ]
-        _, pending = await asyncio.wait(tasks, timeout=settings.web_title_fetch_timeout_s)
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        #
+        # 클라이언트는 묶음 전용으로 열고 닫는다 — 취소된 요청의 연결은 풀에 busy로 영구히
+        # 남을 수 있고(httpcore 1.0.9: TLS 직후 HTTP/1.1 상태 전이 전 또는 응답 닫기 중 취소,
+        # encode/httpcore#1093), 공유 풀이 그렇게 차면 같은 풀의 퍼플렉시티·Tavily까지 막힌다
+        # (2026-11-01 상용 장애). 묶음 풀은 aclose가 상태와 무관하게 치운다.
+        budget = settings.web_title_fetch_timeout_s
+        tasks: list[asyncio.Future] = []
+        try:
+            async with httpx.AsyncClient(
+                timeout=budget * settings.web_title_fetch_request_ratio,
+                follow_redirects=True,
+                verify=_title_ssl_context(),
+            ) as client:
+                tasks = [
+                    asyncio.ensure_future(_fetch_page_meta(item["url"], settings, client))
+                    for item in raw_results
+                ]
+                _, pending = await asyncio.wait(tasks, timeout=budget)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+        finally:
+            # 바깥(턴 취소·SSE 끊김)에서 취소되면 위 wait가 끊겨 태스크가 고아로 남는다
+            # — 함께 끊는다.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
         for item, task in zip(raw_results, tasks):
             if task.cancelled() or task.exception() is not None:
                 continue
@@ -628,9 +654,60 @@ def get_client(settings: Settings) -> httpx.AsyncClient:
     return _shared_client
 
 
-async def aclose_shared_client() -> None:
-    """웹 검색·열람 공유 클라이언트를 정리한다(서버 shutdown 훅용). 미생성 상태면 무동작."""
+def _pool_stats(client: httpx.AsyncClient) -> str:
+    """교체 로그용 풀 상태(연결 수·idle 수). 갇힌 연결이 원인이면 conns≈한도·idle=0으로 보인다.
+
+    httpx 사설 속성(_transport._pool)에 기대므로 로그 보강 전용이고, 없거나 바뀌면 빈 문자열.
+    """
+    try:
+        conns = client._transport._pool.connections  # type: ignore[attr-defined]
+        return f" conns={len(conns)} idle={sum(c.is_idle() for c in conns)}"
+    except Exception:  # noqa: BLE001 — 진단 보강 실패는 무해
+        return ""
+
+
+def discard_client_on_pool_timeout(
+    exc: Exception, client: httpx.AsyncClient, settings: Settings
+) -> None:
+    """PoolTimeout이면 공유 클라이언트를 버려 다음 호출이 새로 만들게 한다(자가 회복).
+
+    취소로 풀에 갇힌 연결은 저절로 풀리지 않아 재시작 전까지 매 요청이 실패한다. 진행 중
+    요청을 깨지 않도록 즉시 닫지 않고 web_client_retire_delay_s 뒤에 닫는다 — 풀 aclose는
+    상태 판정 없이 갇힌 연결까지 닫는다. 실패한 그 클라이언트일 때만 버린다 — 옛 풀의
+    뒤늦은 실패가 새 클라이언트를 버리지 않게.
+    """
     global _shared_client
+    if not (isinstance(exc, httpx.PoolTimeout) and _shared_client is client):
+        return
+    logger.warning(
+        f"web shared httpx client pool timeout → replacing{_pool_stats(client)} exc={exc!r:.120}"
+    )
+    _shared_client = None
+    delay = settings.web_client_retire_delay_s
+
+    async def _close_later() -> None:
+        try:
+            await asyncio.sleep(delay)
+        finally:  # 셧다운 훅의 취소로 깨어나도 닫는다
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001 — 정리 실패는 무해
+                pass
+
+    task = asyncio.get_running_loop().create_task(_close_later())
+    _retire_tasks.add(task)
+    task.add_done_callback(_retire_tasks.discard)
+
+
+async def aclose_shared_client() -> None:
+    """웹 검색·열람 공유 클라이언트(교체로 은퇴 대기 중인 것 포함)를 정리한다(shutdown 훅용)."""
+    global _shared_client
+    tasks = list(_retire_tasks)
+    if tasks:
+        await asyncio.sleep(0)  # 막 만든 태스크도 sleep에 진입시켜 취소 시 finally가 돌게 한다
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     if _shared_client is not None:
         await _shared_client.aclose()
         _shared_client = None
@@ -706,7 +783,9 @@ async def search_raw(
     except (httpx.HTTPError, ValueError) as exc:
         # httpx.HTTPError: 타임아웃·전송 오류·raise_for_status의 HTTPStatusError 포함.
         # ValueError: 응답이 JSON이 아니거나(response.json()) JSON 객체가 아닐 때.
-        logger.info(f"web_search query={query!r} status=error error_type=fetch")
+        # 예외 repr은 status 앞에 둔다 — 감시기 정규식이 줄 끝(error_type=fetch$)을 묶는다.
+        logger.info(f"web_search query={query!r} exc={exc!r:.120} status=error error_type=fetch")
+        discard_client_on_pool_timeout(exc, client, settings)
         return {
             "query": query,
             "status": "error",

@@ -724,6 +724,10 @@ class Settings(BaseSettings):
     # 요청 하나의 상한이자 **보강 전체의 wall-clock 예산**이다(노브 하나로 표시 메타에 쓸
     # 시간을 정한다). 요청별 상한만으로는 청크가 느리게 계속 흘러오는 서버를 못 막는다.
     web_title_fetch_timeout_s: float = 3.0
+    # 제목 보강 요청 하나의 httpx 타임아웃 = 위 예산 × 이 비율. 예산보다 넉넉히 짧아야 느린
+    # 연결이 외부 cancel이 아니라 httpx 타임아웃(소켓을 닫는다)으로 끝난다 — 차이가 수 ms면
+    # 오히려 경합으로 연결이 샌다(2026-11-02 실측: +5ms에 43개, +7% 이상이면 0).
+    web_title_fetch_request_ratio: float = 0.8
     # 제목 보강 스트림 읽기 바이트 상한 — </title>이 안 나와도 이만큼 받으면 끊는다(표시
     # 보강 전용 요청이 본문 전체를 내려받지 않게). 64KiB면 head 블록은 넉넉히 덮는다.
     web_title_fetch_max_bytes: int = 65536
@@ -774,6 +778,10 @@ class Settings(BaseSettings):
     # 웹 검색 서브콜 상한. **초기값·근거 미기록**(e9cf930). 그라운딩 전환(2026-07-28) 이후
     # 실제 서브콜 지연과 대조된 적 없다.
     web_search_timeout_s: float = 10.0
+    # PoolTimeout으로 교체된 옛 공유 웹 클라이언트를 닫기까지의 유예(초). 옛 풀에서 대기 중이던
+    # 요청이 pool·connect·write·read 위상을 다 쓰는 최악(4 × web_search_timeout_s) + 여유 5s.
+    # 그동안 풀 두 개가 공존한다(최대 연결 2배).
+    web_client_retire_delay_s: float = 45.0
     # web_fetch 본문 상한·리드 마진. Yes24 상세용 fetch_max_chars를 빌려 쓰면 자사 페이지 예산을
     # 바꿀 때 외부 문서 예산이 딸려 움직인다(무관한 두 결정의 커플링) — 별도 필드로 분리한다.
     # 절단 계약(truncated·total_chars·find)은 yes24_fetch와 동일하다(같은 함수를 공유).
@@ -1201,6 +1209,10 @@ class Settings(BaseSettings):
     status_detail_max_chars: int = 120
     # SSE 연결 상한. **초기값·근거 미기록**(e9cf930). 긴 조사 턴의 실제 소요와 대조된 적 없다.
     sse_timeout_s: float = 180.0
+    # 스트림 소비 중단(SSE 끊김·턴 종료) 시 ADK 이벤트 pump 정리를 기다리는 상한(초). 정리는
+    # 바깥 취소에서 가려 끝까지 돌리므로(adk_stream) 취소를 안 듣는 도구가 핸들러를 무기한
+    # 붙잡지 않게 막는다. 정상 정리는 수 ms(2026-11-02 실측).
+    sse_pump_cleanup_timeout_s: float = 30.0
     # 턴 준비 구간(세션 락 → UI 상태·세션 조회/생성 → system 이벤트 → 모델 계획·프롬프트 버전
     # 적재) 상한. 정상 준비는 수십 ms~1s인데, 2026-10-21 QA에서 모든 턴이 첫 DB 쓰기
     # (create_session) 앞에서 예외·로그 없이 216초 넘게 멈췄고 sse_timeout_s는 스트림 루프

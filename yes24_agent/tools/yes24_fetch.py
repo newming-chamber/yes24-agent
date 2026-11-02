@@ -118,7 +118,7 @@ async def yes24_fetch(
     try:
         html = await client.get_text(url)
     except Yes24FetchError as exc:
-        logger.info(f"yes24_fetch url={url!r} status=error error_type=fetch")
+        logger.info(f"yes24_fetch url={url!r} exc={exc.reason!r} status=error error_type=fetch")
         return {
             "status": "error",
             "error_type": "fetch",

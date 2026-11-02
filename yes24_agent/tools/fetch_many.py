@@ -122,7 +122,9 @@ async def fetch_pages(items: list[dict], tool_context, observe_formats: bool = F
             continue
         outcome = next(gathered_iter)
         if isinstance(outcome, Yes24FetchError):
-            logger.info(f"fetch_many url={url!r} status=error error_type=fetch")
+            logger.info(
+                f"fetch_many url={url!r} exc={outcome.reason!r} status=error error_type=fetch"
+            )
             results.append({
                 "status": "error",
                 "error_type": "fetch",

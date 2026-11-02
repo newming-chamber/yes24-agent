@@ -43,6 +43,19 @@ class Yes24FetchError(Exception):
         self.url = url
         self.status_code = status_code
 
+    @property
+    def reason(self) -> str:
+        """로그용 짧은 원인 — 전송 예외 종류(ReadTimeout 등)·HTTP 상태·그 밖엔 메시지 머리.
+
+        도구 로그가 이것 없이 error_type=fetch만 남겨, 2026-11-01 Yes24 검색 실패(4개 컨테이너
+        동시 20~100%)에서 타임아웃인지 5xx인지 오류 페이지 리다이렉트인지 가를 수 없었다.
+        """
+        if self.__cause__ is not None:
+            return type(self.__cause__).__name__
+        if self.status_code is not None:
+            return f"status={self.status_code}"
+        return str(self).split(":", 1)[0][:60]
+
 
 def _hostname(url: str) -> str | None:
     """URL에서 호스트명(소문자)을 추출한다. 파싱 불가 시 None."""

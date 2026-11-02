@@ -202,7 +202,10 @@ async def _search_one(
     try:
         html = await client.get_text(url)
     except Yes24FetchError as exc:
-        logger.info(f"yes24_search query={query!r} status=error error_type=fetch results=0")
+        logger.info(
+            f"yes24_search query={query!r} exc={exc.reason!r} "
+            "status=error error_type=fetch results=0"
+        )
         return {
             "query": query,
             "section": section,

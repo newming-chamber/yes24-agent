@@ -18,7 +18,7 @@ from google.adk.tools import ToolContext
 from yes24_agent.config import get_settings
 from yes24_agent.sources import cite_marker, now_checked_at, register_source
 from yes24_agent.tools._text import window_around_find
-from yes24_agent.tools.web_search import get_client
+from yes24_agent.tools.web_search import discard_client_on_pool_timeout, get_client
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,8 @@ async def web_fetch(url: str, tool_context: ToolContext, find: str | None = None
                 f"{type(extracted_title).__name__}"
             )
     except (httpx.HTTPError, ValueError) as exc:
-        logger.info(f"web_fetch url={url!r} status=error error_type=fetch")
+        logger.info(f"web_fetch url={url!r} exc={exc!r:.120} status=error error_type=fetch")
+        discard_client_on_pool_timeout(exc, client, settings)
         return {
             "status": "error",
             "error_type": "fetch",
