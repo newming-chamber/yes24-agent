@@ -11,13 +11,9 @@ PlanReActPlanner·최신 3세대 모델(3.1-pro/3.6-flash)·"Think in Korean" �
 - **본류 무차단**: 호출자는 이 코루틴을 asyncio task로 띄워 병행시킨다(runner의 병합 대기).
 """
 
-import asyncio
 import logging
-from functools import lru_cache
 
-from google import genai
-from google.genai import types
-
+from yes24_agent import subcall
 from yes24_agent.config import get_settings
 from yes24_agent.usage import record_usage
 
@@ -37,12 +33,6 @@ _TRANSLATE_INSTRUCTION = (
 )
 
 
-@lru_cache(maxsize=1)
-def _client() -> genai.Client:
-    """번역 전용 genai 클라이언트(프로세스당 1개). GOOGLE_API_KEY는 앱 기동 시 매핑됨."""
-    return genai.Client()
-
-
 async def warmup_translation() -> None:
     """서버 기동 시 번역 경로(클라이언트 생성 + TLS/HTTP2 연결)를 미리 데운다.
 
@@ -59,17 +49,13 @@ async def translate_thought_label(label: str) -> str:
     if not settings.thought_translation_model:
         return label
     try:
-        response = await asyncio.wait_for(
-            _client().aio.models.generate_content(
-                model=settings.thought_translation_model,
-                contents=label,
-                config=types.GenerateContentConfig(
-                    system_instruction=_TRANSLATE_INSTRUCTION,
-                    temperature=0,
-                    max_output_tokens=settings.thought_translation_max_tokens,
-                ),
-            ),
-            timeout=settings.thought_translation_timeout_s,
+        response = await subcall.generate(
+            settings.thought_translation_model,
+            label,
+            system_instruction=_TRANSLATE_INSTRUCTION,
+            temperature=0,
+            max_output_tokens=settings.thought_translation_max_tokens,
+            timeout_s=settings.thought_translation_timeout_s,
         )
         # 서브콜 토큰 사용량 기록(부가 채널·무실패). 라벨당 1콜이라 턴당 여러 행이 남는다.
         record_usage(

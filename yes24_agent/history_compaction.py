@@ -36,12 +36,12 @@ from google.adk.apps.app import EventsCompactionConfig
 from google.adk.apps.compaction import _run_compaction_for_token_threshold_config
 from google.adk.apps.llm_event_summarizer import LlmEventSummarizer
 from google.adk.events import Event
-from google.adk.models import Gemini
 from google.adk.sessions import BaseSessionService
 from google.genai import types
 
 from yes24_agent.config import get_settings
 from yes24_agent.session_service import _get_session_lock, load_history_session
+from yes24_agent.subcall import build_llm
 from yes24_agent.usage import record_usage
 
 logger = logging.getLogger(__name__)
@@ -90,8 +90,13 @@ def _config() -> EventsCompactionConfig:
         overlap_size=0,
         token_threshold=settings.history_compaction_token_threshold,
         event_retention_size=settings.history_compaction_retention_events,
+        # 요약 콜도 메인과 같은 재시도(CallRetry) — 백그라운드라 락 보유가 최대 콜 2회+1.5s 는다.
         summarizer=LlmEventSummarizer(
-            llm=Gemini(model=settings.history_compaction_model), prompt_template=_SUMMARY_PROMPT
+            llm=build_llm(
+                settings.history_compaction_model,
+                reasoning_effort=settings.subcall_reasoning_effort,
+            ),
+            prompt_template=_SUMMARY_PROMPT,
         ),
     )
 

@@ -22,14 +22,14 @@
   state의 `{url: reason}` 저장소를 합성한다(RECOMMENDATION_REASONS_STATE_KEY 주석 참조).
 """
 
-import asyncio
 import json
 import logging
 import time
 
 from google.genai import types
 
-from yes24_agent.config import get_genai_client, get_settings
+from yes24_agent import subcall
+from yes24_agent.config import get_settings
 from yes24_agent.usage import record_usage
 
 logger = logging.getLogger(__name__)
@@ -279,19 +279,14 @@ async def extract_turn_meta(
         }
         if prior_turn:
             payload["prior_turn"] = prior_turn
-        response = await asyncio.wait_for(
-            get_genai_client().aio.models.generate_content(
-                model=settings.enrichment_model,
-                contents=json.dumps(payload, ensure_ascii=False),
-                config=types.GenerateContentConfig(
-                    system_instruction=_EXTRACT_INSTRUCTION,
-                    temperature=0,
-                    max_output_tokens=settings.enrichment_max_output_tokens,
-                    response_mime_type="application/json",
-                    response_schema=_response_schema(want_title, has_prior_turn=bool(prior_turn)),
-                ),
-            ),
-            timeout=settings.enrichment_timeout_s,
+        response = await subcall.generate(
+            settings.enrichment_model,
+            json.dumps(payload, ensure_ascii=False),
+            system_instruction=_EXTRACT_INSTRUCTION,
+            temperature=0,
+            max_output_tokens=settings.enrichment_max_output_tokens,
+            response_schema=_response_schema(want_title, has_prior_turn=bool(prior_turn)),
+            timeout_s=settings.enrichment_timeout_s,
         )
         # 서브콜 토큰 사용량 기록(부가 채널·무실패). 이 함수는 세션 문맥을 모른다 —
         # session_id 없는 행으로 남긴다(usage_log NULL 허용).

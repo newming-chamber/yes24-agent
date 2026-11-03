@@ -38,6 +38,7 @@ from pydantic import (
     model_validator,
 )
 
+from yes24_agent import subcall
 from yes24_agent.admin_auth import (
     AdminActor,
     AdminService,
@@ -49,7 +50,7 @@ from yes24_agent.admin_auth import (
     require_editor,
 )
 from yes24_agent.auth import AuthenticatedUser, get_authenticated_user
-from yes24_agent.config import Settings, get_genai_client, get_settings
+from yes24_agent.config import Settings, get_settings
 from yes24_agent.db import MysqlBackedService
 from yes24_agent.session_service import SQLITE_DIALECT, db_dialect, mysql_pool_kwargs
 from yes24_agent.sources import KST
@@ -435,7 +436,6 @@ class SlotSpec:
 class ObserveContext:
     settings: Settings
     client: Any
-    genai_client: Any
     today: dt.date
     exclude: set[int] = field(default_factory=set)
     # 같은 바깥 신호를 나눠 쓰는 슬롯들의 공동 저장소(한 번 모아 여럿이 본다).
@@ -794,25 +794,22 @@ async def observe_web_topics(spec: SlotSpec, ctx: ObserveContext) -> Observed:
         )
         topics = []
         if articles:
-            response = await asyncio.wait_for(
-                ctx.genai_client.aio.models.generate_content(
-                    model=settings.model_name,
-                    contents=json.dumps({"articles": [
-                        {"ref": ref, **{key: row.get(key) for key in (
-                            "title", "snippet", "date", "last_updated"
-                        )}} for ref, row in articles.items()
-                    ]}, ensure_ascii=False),
-                    config=types.GenerateContentConfig(
-                        system_instruction=_TOPIC_PROMPT.format(
-                            count=settings.starter_trend_topics, today=ctx.today.isoformat()
-                        ),
-                        response_mime_type="application/json",
-                        response_schema=_topic_schema(
-                            list(articles), settings.starter_trend_topics,
-                            settings.starter_trend_book_queries,
-                        ), temperature=0.3,
-                    ),
-                ), timeout=settings.starter_timeout_s,
+            response = await subcall.generate(
+                settings.model_name,
+                json.dumps({"articles": [
+                    {"ref": ref, **{key: row.get(key) for key in (
+                        "title", "snippet", "date", "last_updated"
+                    )}} for ref, row in articles.items()
+                ]}, ensure_ascii=False),
+                system_instruction=_TOPIC_PROMPT.format(
+                    count=settings.starter_trend_topics, today=ctx.today.isoformat()
+                ),
+                response_schema=_topic_schema(
+                    list(articles), settings.starter_trend_topics,
+                    settings.starter_trend_book_queries,
+                ),
+                temperature=0.3,
+                timeout_s=settings.starter_timeout_s,
             )
             record_usage("starter_topics", response.usage_metadata, model=settings.model_name)
             payload = json.loads(response.text or "{}")
@@ -1089,7 +1086,7 @@ _CHIP_LABEL_PROMPT = (
 )
 
 
-async def _chip_labels(specs: list[SlotSpec], settings: Settings, genai_client: Any) -> dict:
+async def _chip_labels(specs: list[SlotSpec], settings: Settings) -> dict:
     """슬롯 키 → 칩 라벨. 이름이 그대로 통하면 그대로 두고, 아닌 것만 모델이 손본다.
 
     이름을 코드에서 고쳐 쓸 수는 없다 — 사이트가 주는 이름이라 무엇이 들어올지 모르고,
@@ -1102,7 +1099,7 @@ async def _chip_labels(specs: list[SlotSpec], settings: Settings, genai_client: 
          "name": spec.key.partition(TARGET_SEP)[2]}
         for spec in specs if TARGET_SEP in spec.key
     ]
-    if not items or not genai_client:
+    if not items:
         return {}
     schema = types.Schema(type=types.Type.OBJECT, properties={
         "labels": types.Schema(type=types.Type.ARRAY, items=types.Schema(
@@ -1114,16 +1111,13 @@ async def _chip_labels(specs: list[SlotSpec], settings: Settings, genai_client: 
             required=["key", "label"], property_ordering=["key", "label"],
         ))}, required=["labels"])
     try:
-        response = await asyncio.wait_for(
-            genai_client.aio.models.generate_content(
-                model=settings.starter_model,
-                contents=json.dumps({"items": items}, ensure_ascii=False),
-                config=types.GenerateContentConfig(
-                    system_instruction=_CHIP_LABEL_PROMPT,
-                    response_mime_type="application/json", response_schema=schema,
-                    temperature=0.2,
-                ),
-            ), timeout=settings.starter_timeout_s,
+        response = await subcall.generate(
+            settings.starter_model,
+            json.dumps({"items": items}, ensure_ascii=False),
+            system_instruction=_CHIP_LABEL_PROMPT,
+            response_schema=schema,
+            temperature=0.2,
+            timeout_s=settings.starter_timeout_s,
         )
         record_usage("starter_labels", response.usage_metadata, model=settings.starter_model)
         known = {item["key"] for item in items}
@@ -1336,21 +1330,16 @@ async def generate_slot(
         payload["note"] = observed.note
     model = settings.starter_model
     try:
-        response = await asyncio.wait_for(
-            ctx.genai_client.aio.models.generate_content(
-                model=model,
-                contents=json.dumps(payload, ensure_ascii=False),
-                config=types.GenerateContentConfig(
-                    system_instruction=instruction,
-                    temperature=1.0,
-                    response_mime_type="application/json",
-                    response_schema=_response_schema(
-                        [m.ref for m in materials], count,
-                        book_refs, max_chars=settings.starter_max_chars,
-                    ),
-                ),
+        response = await subcall.generate(
+            model,
+            json.dumps(payload, ensure_ascii=False),
+            system_instruction=instruction,
+            temperature=1.0,
+            response_schema=_response_schema(
+                [m.ref for m in materials], count,
+                book_refs, max_chars=settings.starter_max_chars,
             ),
-            timeout=settings.starter_timeout_s,
+            timeout_s=settings.starter_timeout_s,
         )
         record_usage("starter", response.usage_metadata, model=model)
         raw_items = json.loads(response.text or "{}").get("items") or []
@@ -1391,7 +1380,6 @@ async def build_candidates(
     *,
     today: dt.date,
     client=None,
-    genai_client=None,
     exclude: dict[str, set[int]] | None = None,
 ) -> dict[str, dict]:
     """슬롯들의 관측→생성→검증. 저장은 하지 않는다(서비스·라이브 점검이 공유).
@@ -1400,7 +1388,6 @@ async def build_candidates(
     그대로 간다 — 실패한 슬롯은 어제 세트를 유지한다.
     """
     client = client or get_client(settings)
-    genai_client = genai_client or get_genai_client()
     by_key = {
         spec.key: spec
         for spec in await build_slots(settings, client, today)
@@ -1415,7 +1402,6 @@ async def build_candidates(
         ctx = ObserveContext(
             settings=settings,
             client=client,
-            genai_client=genai_client,
             today=today,
             exclude=(exclude or {}).get(key, set()),
             shared=shared,
@@ -1626,15 +1612,13 @@ class StarterService(MysqlBackedService):
                         # 날마다 '종합 베스트'·'종합 판매'로 바뀐다. 이름이 없는 슬롯만 묻는다.
                         labels = await self._established_labels()
                         labels |= await _chip_labels(
-                            [spec for key, spec in specs.items() if key not in labels],
-                            settings, get_genai_client(),
+                            [spec for key, spec in specs.items() if key not in labels], settings,
                         )
                     exclude = await self.recent_goods(
                         [slot], today, settings.starter_repeat_window_days
                     )
                     ctx = ObserveContext(
-                        settings=settings, client=get_client(settings),
-                        genai_client=get_genai_client(), today=today,
+                        settings=settings, client=get_client(settings), today=today,
                         exclude=exclude.get(slot, set()),
                         shared=shared,
                     )

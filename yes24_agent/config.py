@@ -125,15 +125,22 @@ class Settings(BaseSettings):
     # env: LITELLM_REASONING_EFFORTS='{"openai/responses/gpt-6-luna": "xhigh"}'
     litellm_reasoning_efforts: dict[str, str] = {}
 
+    # 경량 서브콜(enrichment·thought_translation·starters·prefetch 힌트 — subcall.generate)이
+    # LiteLLM 경로 모델일 때의 사고 강도. 유틸은 "이미 있는 것의 구조화"라 깊은 추론이 불필요하고
+    # 지연이 곧 비용이다 — gpt-6-luna low 실호출(2026-11-03): 힌트 2.8s·enrichment 4.0s·번역 1.5s.
+    # 메인 답변의 litellm_reasoning_effort(high)와 다른 축이라 따로 둔다. ""면 미전달(벤더 기본).
+    subcall_reasoning_effort: str = "low"
+
     @model_validator(mode="after")
     def _check_model_levers(self):
-        """기동 시 끊는다 — 전역 사고 강도는 모델별 값과 같은 허용 목록을 지나야 한다
+        """기동 시 끊는다 — 전역·서브콜 사고 강도는 모델별 값과 같은 허용 목록을 지나야 한다
         (none 우회 차단)."""
-        if self.litellm_reasoning_effort not in self.litellm_reasoning_effort_options:
-            raise ValueError(
-                f"litellm_reasoning_effort={self.litellm_reasoning_effort!r}는 허용 목록 밖입니다 "
-                f"({self.litellm_reasoning_effort_options})"
-            )
+        for name in ("litellm_reasoning_effort", "subcall_reasoning_effort"):
+            if getattr(self, name) not in self.litellm_reasoning_effort_options:
+                raise ValueError(
+                    f"{name}={getattr(self, name)!r}는 허용 목록 밖입니다 "
+                    f"({self.litellm_reasoning_effort_options})"
+                )
         return self
     # LiteLLM(OpenAI) 경로 모델별 처리 등급(service_tier) — 키는 selectable_models의 LiteLLM 값
     # (ID에 "/"), 값은 litellm_service_tier_options 중 하나. 없는 모델은 ""(표준 = 미전달).

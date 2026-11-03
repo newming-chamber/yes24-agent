@@ -41,11 +41,11 @@ from functools import lru_cache
 from urllib.parse import urlsplit
 
 import httpx
-from google import genai
 from google.adk.tools import ToolContext
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
+from yes24_agent import subcall
 from yes24_agent.config import Settings, get_settings
 from yes24_agent.model_routing import current_models, web_backend_configured
 from yes24_agent.sources import cite_marker, now_checked_at, register_source
@@ -147,16 +147,6 @@ def _title_ssl_context():
     return httpx.create_ssl_context()
 
 
-@lru_cache(maxsize=1)
-def _grounding_client(timeout_ms: int) -> genai.Client:
-    """그라운딩 서브콜 전용 genai 클라이언트(프로세스당 1개, thought_translation._client 관례).
-
-    빌트인 google_search는 함수 선언과 같은 요청에 혼용이 금지되므로(400 실측), 이 도구
-    내부의 **별도 요청**으로 실행한다 — 에이전트 루프의 커스텀 도구 7종과 충돌하지 않는다.
-    """
-    return genai.Client(http_options=genai_types.HttpOptions(timeout=timeout_ms))
-
-
 # 백엔드별 쿼터 소진 표시(프로세스 전역, 백엔드 → monotonic 시각): 이 시각 전까지 그 백엔드를
 # 건너뛴다. 2026-10-19 상용 장애 — 검색 그라운딩 한도가 소진되면 매 호출이 429라, 호출마다 429를
 # 맞고 전환하면 왕복만 낭비한다. SearchApi도 크레딧·시간당 한도 초과가 429다. 쿨다운(config
@@ -230,23 +220,18 @@ _prefetch_cache: dict[str, tuple[float, asyncio.Task]] = {}
 
 async def _prefetch_hint_needs_web(message: str, settings: Settings) -> bool:
     """경량 모델이 이 메시지에 웹 검색이 필요한지 판단한다(불리언 1개, 짧은 타임아웃)."""
-    response = await asyncio.wait_for(
-        _grounding_client(int(settings.web_grounding_timeout_s * 1000))
-        .aio.models.generate_content(
-            model=settings.web_grounding_model,
-            contents=message,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=_HINT_INSTRUCTION,
-                temperature=0,
-                response_mime_type="application/json",
-                response_schema={
-                    "type": "OBJECT",
-                    "properties": {"needs_web": {"type": "BOOLEAN"}},
-                    "required": ["needs_web"],
-                },
-            ),
-        ),
-        timeout=settings.web_prefetch_hint_timeout_s,
+    response = await subcall.generate(
+        settings.web_grounding_model,
+        message,
+        system_instruction=_HINT_INSTRUCTION,
+        temperature=0,
+        response_schema={
+            "type": "OBJECT",
+            "properties": {"needs_web": {"type": "BOOLEAN"}},
+            "required": ["needs_web"],
+        },
+        timeout_s=settings.web_prefetch_hint_timeout_s,
+        http_timeout_ms=int(settings.web_grounding_timeout_s * 1000),
     )
     # 힌트도 과금되는 LLM 콜이다 — 콜당 1행(부가 채널·무실패, session 문맥 없음).
     record_usage("web_prefetch_hint", response.usage_metadata, model=settings.web_grounding_model)
@@ -481,7 +466,9 @@ async def _grounding_raw_results(
     for _ in range(settings.web_grounding_max_attempts):
         try:
             response = await asyncio.to_thread(
-                _grounding_client(int(settings.web_grounding_timeout_s * 1000))
+                # 빌트인 google_search는 함수 선언과 같은 요청에 혼용이 금지되므로(400 실측)
+                # 이 도구 내부의 **별도 요청**으로 실행한다 — 루프의 커스텀 도구와 충돌 없음.
+                subcall._gemini_client(int(settings.web_grounding_timeout_s * 1000))
                 .models.generate_content,
                 model=settings.web_grounding_model,
                 contents=prompt,
